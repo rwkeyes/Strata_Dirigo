@@ -1,0 +1,14 @@
+#version 450
+// ports/vulkan/shaders/silu_f32.comp - the shader silu.comp becomes on a device without shaderFloat64.
+// Same arithmetic in f32.  The gate compares it against the DOUBLE reference with the tolerance f32 needs, and
+// reports the max relative gap it actually saw, so the cost of the fallback is a measured number.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    const float v = x.v[i];
+    x.v[i] = v / (1.0f + exp(-v));
+}

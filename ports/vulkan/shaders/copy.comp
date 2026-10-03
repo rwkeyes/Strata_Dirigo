@@ -1,0 +1,15 @@
+#version 450
+// ports/vulkan/shaders/copy.comp - the harness self-test.  Six lines, and its whole job is to blame the
+// HARNESS: if this does not reproduce its input exactly then a descriptor binding, a push range or the
+// host-read barrier is wrong, and every other kernel's "mismatch" means nothing.  (Measured lesson from the
+// Atlas port: a swapped binding order made a correct GEMV look like it wrote zeros.)
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Src { float v[]; } src;
+layout(set = 0, binding = 1, std430) buffer Dst { float v[]; } dst;
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    dst.v[i] = src.v[i];
+}

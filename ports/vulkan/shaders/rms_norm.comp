@@ -1,0 +1,52 @@
+#version 450
+// ports/vulkan/shaders/rms_norm.comp - rms_norm_weighted from src/kernels/cuda/elementwise.cu.
+//
+// WHAT IS DELIBERATELY DIFFERENT FROM THE CUDA SOURCE, and why:
+//
+//  1. The CUDA kernel is "one WARP per row" and hardcodes 32 lanes: `threadIdx.x & 31`, `>> 5`, a shuffle-down
+//     tree starting at 16.  A Vulkan subgroup is 64 wide on RADV and 32 (or 16, or 8) on Intel Xe, so the
+//     port is "one SUBGROUP per row" and every width is read from the shader's own builtins.  Copying the
+//     32-lane arithmetic would compute a wrong sum on one vendor and a plausible number on the other.
+//  2. The CUDA reduction is a shuffle-down tree whose summation ORDER is fixed; `subgroupAdd` leaves the
+//     order to the driver.  Both are correct sums and they differ in the last bits, so the gate compares
+//     against a double-precision reference with a tolerance instead of bit-for-bit.
+//  3. CUDA's `w` may be null (`w ? r[c]*w[c] : r[c]`).  Vulkan has no null descriptor here, so the port
+//     REQUIRES a weight buffer: the caller passes ones when the norm is unweighted.  `r * 1.0f * inv` is
+//     exactly `r * inv` in IEEE, so this is a change of interface, not of arithmetic.
+//
+// THE ROW GUARD IS NOT DECORATION.  In the CUDA source its absence was the QSA bug: the launcher rounds the
+// grid up to whole 4-warp blocks, so a 2-row call ran 8 warps and rows 2 and 3 wrote 2*cols floats into the
+// next buffer in the arena.  Vulkan has the same rounding (the host dispatches ceil(rows / subgroups-per-
+// workgroup) groups), so the guard is required here for exactly the same reason, and the gate checks it by
+// filling the slack with NaN and requiring it to survive.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;
+layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } w;
+layout(push_constant, std430) uniform PC { int rows; int cols; float eps; } pc;
+
+void main() {
+    // `gl_NumSubgroups` is a compile-time constant, and it is what the HOST must also divide into when it
+    // sizes the dispatch: rows-per-workgroup = local_size_x / subgroup_size = 256 / subgroupSize.
+    const int row = int(gl_WorkGroupID.x) * int(gl_NumSubgroups) + int(gl_SubgroupID);
+    if (row >= pc.rows) return;
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint cols = uint(pc.cols);
+    const uint base = uint(row) * cols;
+
+    float acc = 0.0;
+    for (uint c = lane; c < cols; c += gl_SubgroupSize) {
+        const float t = x.v[base + c];
+        acc += t * t;
+    }
+    // Every lane ends with the same value, which is what the CUDA kernel's lane-0 broadcast achieves.
+    const float s = subgroupAdd(acc);
+    const float inv = inversesqrt(s / float(pc.cols) + pc.eps);
+
+    for (uint c = lane; c < cols; c += gl_SubgroupSize) {
+        const uint i = base + c;
+        x.v[i] = (x.v[i] * w.v[i]) * inv;
+    }
+}

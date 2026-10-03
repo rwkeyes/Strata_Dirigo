@@ -1,0 +1,17 @@
+#version 450
+// ports/vulkan/shaders/exp_probe.comp - measure the DRIVER's f32 `exp`, because that is what the port's
+// accuracy is limited by.  A gate that fails has to name its cause: an elementwise port's error budget is
+// min(translation bug, driver transcendental accuracy), and only a probe separates them.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;
+layout(set = 0, binding = 1, std430) buffer Y { float v[]; } y;
+layout(set = 0, binding = 2, std430) buffer Z { float v[]; } z;
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    const float v = x.v[i];
+    y.v[i] = exp(v);                                    // the driver's exp
+    z.v[i] = log(1.0f + v);                             // and its log, for the same reason
+}

@@ -1,0 +1,11 @@
+#version 450
+// add_kernel: dst[i] += src[i]
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int n; } pc;
+layout(set = 0, binding = 0, std430) buffer DST { float dst[]; } dst_buf;
+layout(set = 0, binding = 1, std430) buffer SRC { float src[]; } src_buf;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i < pc.n) dst_buf.dst[i] += src_buf.src[i];
+}

@@ -1,0 +1,10 @@
+#version 450
+// scale_kernel: x[i] *= s
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int n; float s; } pc;
+layout(set = 0, binding = 0, std430) buffer X { float x[]; } x_buf;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i < pc.n) x_buf.x[i] *= pc.s;
+}

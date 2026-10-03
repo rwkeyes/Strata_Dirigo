@@ -1,0 +1,4 @@
+# The gate compiles every shader from .comp on every run and deletes stray .spv first, so nothing here may
+# depend on a checked-in binary.  A gate that reads an old .spv tests a stale kernel.
+*.spv
+harness/build/

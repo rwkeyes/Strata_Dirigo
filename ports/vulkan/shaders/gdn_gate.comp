@@ -1,0 +1,41 @@
+#version 450
+// gdn_gate_kernel: gate[i] = softplus(alpha[i] + dt[h]) * ssm_a[h]
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int h_v; int n_tokens; } pc;
+layout(set = 0, binding = 0, std430) buffer ALPHA { float alpha[]; } alpha_buf;
+layout(set = 0, binding = 1, std430) buffer DT { float dt[]; } dt_buf;
+layout(set = 0, binding = 2, std430) buffer SSM_A { float ssm_a[]; } ssm_a_buf;
+layout(set = 0, binding = 3, std430) buffer GATE { float gate[]; } gate_buf;
+
+// softplus, with a log1p that does not rely on the driver's `log` being accurate NEAR 1.
+//
+// MEASURED HISTORY, all by this port's gate rather than by inspection:
+//   v1 `log(1.0f + exp(x))`            -> gate FAIL, worst relative 4.26e-05 (44/48 heads)
+//   v2 Kahan  log(u)*(z/(u-1))         -> gate FAIL, worst relative 4.26e-05 - IDENTICAL, so the log1p form
+//                                         was not the cause and the first fix was wrong about why
+//   v3 (this) series below             -> gate PASS, worst relative 1.02e-06
+//
+// The cause is that the driver's `log` carries an ABSOLUTE error of ~2^-22 near u=1 (RADV derives it from the
+// hardware lg2).  Kahan's cancellation needs log(u) to be the correctly-rounded log of the ROUNDED u; with an
+// approximate log the cancellation fails and the absolute error is left sitting on a result of size z.  That
+// is harmless at z=0.1 (2.5e-06 relative) and 25% at z=1e-06 - and softplus(x) IS exp(x) for negative x, so
+// the whole error lands in the result.  A 18-term Horner series on the alternating series is exact to ~2e-07
+// over the same range, so the port uses it below z = 0.5 and the driver's log above, where 1+z is O(1) and
+// its relative error is ~6e-07.  (Sized offline against double-precision log1p before writing it here.)
+float log1p_series(float z) {
+    float r = 1.0f / 18.0f;
+    for (int k = 17; k >= 1; --k) r = (1.0f / float(k)) - z * r;
+    return z * r;
+}
+
+float log1p_s(float z) { return (z < 0.5f) ? log1p_series(z) : log(1.0f + z); }
+
+float softplus_dev(float x) { return x > 20.0f ? x : log1p_s(exp(x)); }
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    int total = pc.n_tokens * pc.h_v;
+    if (i >= total) return;
+    int h = i % pc.h_v;
+    gate_buf.gate[i] = softplus_dev(alpha_buf.alpha[i] + dt_buf.dt[h]) * ssm_a_buf.ssm_a[h];
+}

@@ -1,0 +1,36 @@
+#version 450
+// ports/vulkan/shaders/f32_to_f16_trunc.comp - THE NEGATIVE CONTROL, and it must never be shipped.
+//
+// It is f32_to_f16.comp with the round-to-nearest-even decision removed: the mantissa is truncated and the
+// sticky bit ignored.  It compiles, validates, and produces plausible fp16 values that differ from the
+// engine's `f16_from_f32` on a large fraction of inputs.  The gate asserts that this shader FAILS the same
+// bit-exact comparison the real one passes - that is what proves the gate can fail, instead of merely
+// reporting that everything agrees.
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;
+layout(set = 0, binding = 1, std430) buffer Y { uint16_t v[]; } y;
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+uint16_t f16_trunc(float f) {
+    uint xx = floatBitsToUint(f);
+    uint sign = (xx >> 16) & 0x8000u;
+    uint rawexp = (xx >> 23) & 0xFFu;
+    int exp = int(rawexp) - 127 + 15;
+    uint man = xx & 0x7FFFFFu;
+    if (rawexp == 0xFFu) return uint16_t(sign | 0x7C00u | (man != 0u ? 0x200u : 0u));
+    if (exp >= 31) return uint16_t(sign | 0x7C00u);
+    if (exp <= 0) {
+        if (exp < -10) return uint16_t(sign);
+        man |= 0x800000u;
+        uint sh = uint(14 - exp);
+        return uint16_t(sign | ((man >> sh) & 0x3FFu));            // <-- truncated, not rounded
+    }
+    return uint16_t(sign | (uint(exp) << 10) | (man >> 13));       // <-- truncated, not rounded
+}
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    y.v[i] = f16_trunc(x.v[i]);
+}
