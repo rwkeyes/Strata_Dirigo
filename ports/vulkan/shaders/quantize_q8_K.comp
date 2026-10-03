@@ -1,0 +1,90 @@
+// ports/vulkan/shaders/quantize_q8_K.comp - ggml's block_q8_K: 292 bytes per 256 elements,
+// { float d ; int8_t qs[256] ; int16_t bsums[16] }.
+//
+// Q8_K is the other half of `VEC_DOT_TYPE` and covers the numerically SENSITIVE weights (the attention
+// projections and ssm_out), so this is transcribed from the source rather than from the format description.  The
+// four things that look like mistakes and are not:
+//
+//   1. `iscale = -127/max`, NOT -128/max.  The source carries the -128 version COMMENTED OUT with a note that
+//      IQ2_XXS would need it for an awkward AVX path.  Using -128 is a 0.79% scaling error - the same order as
+//      the quantisation step, so it produces a working-looking activation that ggml never sees.
+//   2. `max` is the SIGNED value at the largest magnitude, and the comparison is STRICTLY greater, so a tie keeps
+//      the FIRST maximum.  The sign then runs through everything: a POSITIVE max gives a NEGATIVE iscale, so the
+//      +max element maps to -127 and the -max element maps to +127.  A port using `>=` would pick the other
+//      element of a tie and flip the sign of the whole block.
+//   3. The rounding is `nearest_int`, which is round-half-to-EVEN via the 12582912.0f magic number - NOT
+//      `round`'s half-away-from-zero.  They differ only on exact ties, which is precisely why the wrong one
+//      survives end-to-end testing; the gate constructs ties on purpose.
+//   4. The product is ROUNDED before the magic adds to it.  The source uses `__fmul_rn` for that, because nvcc
+//      otherwise contracts the multiply into the add as an FMA - a more accurate product, but not the same one -
+//      and it flips the result wherever the true value sits just off a .5 boundary.  `precise` is the portable
+//      equivalent: it emits OpDecorate NoContraction.
+//
+// The zero block is written in full (d = 0, qs = 0, AND bsums = 0).  ggml's `continue` leaves bsums UNWRITTEN,
+// which is indistinguishable from a zeroed block to a dot product but not to a byte comparison - the source
+// records the divergence deliberately and the gate holds it.
+//
+// `min(127, v)` has no lower counterpart: it is defensive, since |iscale*x| <= 127 for every element by
+// construction.  Noted rather than "fixed", because the asymmetry is the source's.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; } X_;
+layout(set = 0, binding = 1, std430) buffer BLK { uint8_t b[]; } B_;
+
+layout(push_constant) uniform Pc {
+    int n_blocks;
+} pc;
+
+const int QK_K = 256;
+const int Q8K_BYTES = 292;
+
+// ggml's `nearest_int` (ggml-quants.c L621).  The magic number is 1.5 * 2^23: adding it forces the mantissa's
+// integer part into the low bits, and the mask/subtract recover it.  `memcpy` in the source is a bit
+// reinterpretation, which is `floatBitsToInt` here.
+int nearest_int(float fval) {
+    const float val = fval + 12582912.0f;
+    return (floatBitsToInt(val) & 0x007fffff) - 0x00400000;
+}
+
+void main() {
+    const int blk = int(gl_GlobalInvocationID.x);
+    if (blk >= pc.n_blocks) return;
+    const int xb = blk * QK_K;
+    const int ob = blk * Q8K_BYTES;
+
+    float mx = 0.0, amax = 0.0;
+    for (int j = 0; j < QK_K; ++j) {
+        const float ax = abs(X_.x[xb + j]);
+        if (ax > amax) {                 // strictly greater: a tie keeps the FIRST maximum
+            amax = ax;
+            mx = X_.x[xb + j];
+        }
+    }
+    if (amax == 0.0) {
+        for (int i = 0; i < 4 + QK_K + 32; ++i) B_.b[ob + i] = uint8_t(0);
+        return;
+    }
+
+    const float iscale = -127.0 / mx;    // -127, and the sign of mx carries into every code
+    int bsum[16];
+    for (int j = 0; j < 16; ++j) bsum[j] = 0;
+    for (int j = 0; j < QK_K; ++j) {
+        precise float prod = iscale * X_.x[xb + j];   // rounded before nearest_int adds to it
+        const int v = min(127, nearest_int(prod));
+        bsum[j / 16] += v;
+        B_.b[ob + 4 + j] = uint8_t(v < 0 ? v + 256 : v);
+    }
+    for (int j = 0; j < 16; ++j) {
+        const int s16 = bsum[j] < 0 ? bsum[j] + 65536 : bsum[j];
+        B_.b[ob + 4 + QK_K + j * 2] = uint8_t(s16 & 0xFF);
+        B_.b[ob + 4 + QK_K + j * 2 + 1] = uint8_t((s16 >> 8) & 0xFF);
+    }
+    // the scale is an fp32 in this format - no fp16 rounding here, unlike block_q8_0
+    const uint dbits = floatBitsToUint(1.0 / iscale);
+    for (int i = 0; i < 4; ++i) B_.b[ob + i] = uint8_t((dbits >> (8 * i)) & 0xFFu);
+}

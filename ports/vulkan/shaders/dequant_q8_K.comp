@@ -1,0 +1,32 @@
+// ports/vulkan/shaders/dequant_q8_K.comp - block_q8_K back to floats: x[i] = qs[i] * d, with `d` an fp32 read
+// straight out of the block (this format stores the reciprocal's result unrounded, so there is no fp16 step).
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BLK { uint8_t b[]; } B_;
+layout(set = 0, binding = 1, std430) buffer X { float x[]; } X_;
+
+layout(push_constant) uniform Pc {
+    int n_blocks;
+} pc;
+
+const int QK_K = 256;
+const int Q8K_BYTES = 292;
+
+void main() {
+    const int blk = int(gl_GlobalInvocationID.x);
+    if (blk >= pc.n_blocks) return;
+    const int xb = blk * QK_K;
+    const int ob = blk * Q8K_BYTES;
+    const uint dbits = uint(B_.b[ob]) | (uint(B_.b[ob + 1]) << 8) | (uint(B_.b[ob + 2]) << 16) |
+                       (uint(B_.b[ob + 3]) << 24);
+    const float d = uintBitsToFloat(dbits);
+    for (int i = 0; i < QK_K; ++i) {
+        const int raw = int(B_.b[ob + 4 + i]);
+        const int q = raw > 127 ? raw - 256 : raw;
+        X_.x[xb + i] = float(q) * d;
+    }
+}

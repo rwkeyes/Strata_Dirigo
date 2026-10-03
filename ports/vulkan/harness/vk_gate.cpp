@@ -1093,6 +1093,224 @@ void case_quantize_q8_0(Ctx& ctx, const std::string& dir) {
     ctx.free(b_deq);
 }
 
+// ---- block_q8_K, transcribed from quantize_act.cu ----
+// The signed-max rule and the -127 are not style: `max` is the SIGNED value at the largest magnitude and the
+// comparison is strictly greater, so a tie keeps the first one, and the resulting sign runs into every code.
+static int nearest_int_host(float fval) {
+    const float val = fval + 12582912.0f;
+    int i;
+    std::memcpy(&i, &val, 4);
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+static void q8_K_host_block(const float* x, uint8_t* out292, bool half_away = false) {
+    const int QK_K = 256;
+    float mx = 0.0f, amax = 0.0f;
+    for (int j = 0; j < QK_K; ++j) {
+        const float ax = std::fabs(x[j]);
+        if (ax > amax) {
+            amax = ax;
+            mx = x[j];
+        }
+    }
+    std::memset(out292, 0, 292);
+    if (amax == 0.0f) return;
+    const float iscale = -127.0f / mx;
+    int bsum[16] = {0};
+    for (int j = 0; j < QK_K; ++j) {
+        // the product must be ROUNDED before nearest_int adds the magic.  `(double)` here is not a precision
+        // trick: a product of two floats is exact in double, so rounding it back to float is the correctly
+        // rounded f32 product - and it cannot be contracted into the magic's add the way a plain `a*b` can.
+        const float prod = (float) ((double) iscale * (double) x[j]);
+        int v;
+        if (half_away) {
+            v = (int) (prod + (prod >= 0.0f ? 0.5f : -0.5f));   // the rule that is NOT the reference's
+        } else {
+            v = nearest_int_host(prod);                        // rint: nearest, ties to EVEN
+        }
+        v = std::min(127, v);
+        bsum[j / 16] += v;
+        out292[4 + j] = (uint8_t) (int8_t) v;
+    }
+    for (int j = 0; j < 16; ++j) {
+        const uint16_t s = (uint16_t) (int16_t) bsum[j];
+        out292[4 + QK_K + 2 * j] = (uint8_t) (s & 0xFF);
+        out292[4 + QK_K + 2 * j + 1] = (uint8_t) (s >> 8);
+    }
+    const float d = 1.0f / iscale;
+    std::memcpy(out292, &d, 4);
+}
+
+// quantize_q8_K: 292 bytes per 256 elements - the numerically SENSITIVE weights, so every check is `==`.
+//
+// The blocks are chosen to walk the three rules a plausible port gets wrong, plus the one place where the source
+// deliberately DIVERGES from ggml:
+//   * a tie for the maximum, where `>` keeps the FIRST element and `>=` would flip the sign of the whole block,
+//   * exact rounding ties (maximum = -127 makes `iscale` exactly 1.0), where nearest_int goes to EVEN while the
+//     other plausible rule goes away from zero,
+//   * a POSITIVE maximum, which makes iscale negative and therefore maps the +max element to -127,
+//   * and an all-zero block, whose bsums the source zeroes on purpose while ggml leaves them unwritten.
+// Then the round trip, whose bound here is half a code step with no subnormal term: this format stores an fp32.
+void case_quantize_q8_K(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_K.spv") || !have(dir, "dequant_q8_K.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("quantize_q8_K", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    const int QK_K = 256, BYTES = 292;
+    const int nb = 6;
+    const int n = nb * QK_K;
+    std::vector<float> x(n, 0.0f);
+    // block 0: all zeros -> the deliberate divergence (d, qs AND bsums all zero)
+    // block 1: a TIE for the maximum, negative element first
+    {
+        x[QK_K + 0] = -5.0f;
+        x[QK_K + 5] = 5.0f;
+        for (int i = 6; i < QK_K; ++i) x[QK_K + i] = 0.25f * (float) ((i % 7) - 3);
+    }
+    // block 2: maximum = -127 -> iscale is exactly 1.0, so the rest are EXACT rounding ties
+    {
+        const float ties[8] = {2.5f, 3.5f, -2.5f, -3.5f, 0.5f, 1.5f, -0.5f, -4.5f};
+        x[2 * QK_K] = -127.0f;
+        for (int i = 1; i < QK_K; ++i) x[2 * QK_K + i] = ties[i % 8];
+    }
+    // block 3: a POSITIVE maximum -> negative iscale -> the +max element must map to -127
+    {
+        x[3 * QK_K] = 2.0f;
+        for (int i = 1; i < QK_K; ++i) x[3 * QK_K + i] = 2.0f * (float) ((i % 11) - 5) / 5.0f;
+    }
+    // block 4: ordinary random data
+    for (int i = 4 * QK_K; i < 5 * QK_K; ++i) x[i] = rndf(1.0f) * 3.0f;
+    // block 5: a very small maximum -> a very small fp32 scale (this format never rounds `d` to fp16)
+    for (int i = 5 * QK_K; i < 6 * QK_K; ++i) x[i] = 1.0e-30f * (float) ((i % 13) - 6);
+
+    const size_t blk_bytes = (size_t) nb * BYTES;
+    const size_t slack = 64;
+    Buf bx = ctx.alloc(n * 4);
+    Buf b_blocks = ctx.alloc(blk_bytes + slack);
+    Buf b_deq = ctx.alloc(n * 4);
+    ctx.write(bx, x.data(), n * 4);
+    const uint8_t SENT = 0x5A;
+    std::vector<uint8_t> sink(blk_bytes + slack, SENT);
+    ctx.write(b_blocks, sink.data(), sink.size());
+    struct { int n_blocks; } pc{nb};
+
+    std::vector<uint8_t> want(blk_bytes, 0);
+    for (int b = 0; b < nb; ++b) q8_K_host_block(&x[(size_t) b * QK_K], &want[(size_t) b * BYTES]);
+
+    VkPipeline pq = ctx.pipeline(dir + "/quantize_q8_K.spv", 2, 4);
+    ctx.dispatch(pq, {&bx, &b_blocks}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
+    std::vector<uint8_t> got(blk_bytes + slack);
+    ctx.read(b_blocks, got.data(), got.size());
+
+    int bad = 0, first_bad = -1;
+    for (size_t i = 0; i < want.size(); ++i) {
+        if (got[i] != want[i]) {
+            if (first_bad < 0) first_bad = (int) i;
+            ++bad;
+        }
+    }
+    for (size_t i = blk_bytes; i < got.size(); ++i) {
+        if (got[i] != SENT) ++bad;
+    }
+    if (bad) {
+        std::printf("      first differing byte %d = block %d, %s\n", first_bad, first_bad / BYTES,
+                    (first_bad % BYTES) < 4 ? "scale" : ((first_bad % BYTES) < 4 + QK_K ? "codes" : "bsums"));
+    }
+    verdict("quantize_q8_K (ggml bytes)", bad == 0, bad, (int) (blk_bytes + slack), (double) bad,
+            "differing bytes (292-byte blocks + guard)");
+
+    // bsums called out separately: a bsums error hidden inside "bytes differ" would not say WHAT broke, and the
+    // zero-block divergence is specifically about bsums
+    {
+        int bs_bad = 0;
+        for (int b = 0; b < nb; ++b) {
+            for (int j = 0; j < 16; ++j) {
+                const size_t o = (size_t) b * BYTES + 4 + QK_K + 2 * j;
+                const int16_t want_s = (int16_t) (uint16_t) (want[o] | (want[o + 1] << 8));
+                const int16_t got_s = (int16_t) (uint16_t) (got[o] | (got[o + 1] << 8));
+                if (want_s != got_s) ++bs_bad;
+            }
+        }
+        verdict("quantize_q8_K bsums (16 per block)", bs_bad == 0, bs_bad, nb * 16, (double) bs_bad,
+                "differing int16 sums");
+    }
+
+    // the SIGN rule, as its own check.  code(x) = round(-127 * x/mx), so it is the RATIO to the signed maximum
+    // that decides: the element HOLDING the maximum always lands on -127 whatever its sign, and the extreme
+    // element of the OPPOSITE sign lands on +127.  Writing the first version of this I expected the opposite for
+    // a negative maximum, which is what the byte-exact check next door was there to overrule - the rule is
+    // worth stating as a check precisely because "the max maps to -127" is not the intuitive phrasing.
+    {
+        int sign_bad = 0, sign_checks = 0;
+        struct { int b, idx; int expect; } probes[4] = {
+            {3, 0, -127},   // block 3: max +2.0 at index 0
+            {2, 0, -127},   // block 2: max -127.0 at index 0
+            {1, 0, -127},   // block 1: the tie is won by the FIRST element, -5.0
+            {1, 5, +127},   // ...and the +5.0 it tied with is the opposite extreme, so +127
+        };
+        for (int pi = 0; pi < 4; ++pi) {
+            const int b = probes[pi].b, idx = probes[pi].idx;
+            const int raw = got[(size_t) b * BYTES + 4 + idx];
+            const int code = raw > 127 ? raw - 256 : raw;
+            ++sign_checks;
+            if (code != probes[pi].expect) {
+                ++sign_bad;
+                std::printf("      block %d index %d holds %+.1f but its code is %d, expected %d\n", b, idx,
+                            (double) x[(size_t) b * QK_K + idx], code, probes[pi].expect);
+            }
+        }
+        verdict("quantize_q8_K signed-max rule", sign_bad == 0, sign_bad, sign_checks, (double) sign_bad,
+                "elements whose code has the wrong sign");
+    }
+
+    // does the tie block actually separate nearest-even from round-away?  If not, the tie block proves nothing.
+    {
+        int diff = 0;
+        std::vector<uint8_t> away(BYTES, 0);
+        q8_K_host_block(&x[2 * QK_K], away.data(), true);
+        for (int j = 0; j < QK_K; ++j) {
+            if (away[4 + j] != want[(size_t) 2 * BYTES + 4 + j]) ++diff;
+        }
+        char label[96];
+        std::snprintf(label, sizeof label, "q8_K tie block separates half-even from half-away");
+        verdict(label, diff > 0, 0, QK_K, (double) diff, "codes that differ between the two rules");
+    }
+
+    // round trip: the bound is half a code step, with no subnormal term - this format stores an fp32 scale
+    {
+        int deq_bad = 0, bound_bad = 0;
+        double worst = 0;
+        std::vector<float> back(n, 0.0f);
+        VkPipeline pd = ctx.pipeline(dir + "/dequant_q8_K.spv", 2, 4);
+        ctx.dispatch(pd, {&b_blocks, &b_deq}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
+        ctx.read(b_deq, back.data(), n * 4);
+        for (int b = 0; b < nb; ++b) {
+            float d;
+            std::memcpy(&d, &got[(size_t) b * BYTES], 4);
+            for (int i = 0; i < QK_K; ++i) {
+                const int raw = got[(size_t) b * BYTES + 4 + i];
+                const int q = raw > 127 ? raw - 256 : raw;
+                // rounded to f32 exactly as the kernel's single f32 multiply rounds: 7-bit code times 24-bit
+                // scale is up to 31 significant bits, which is NOT representable in f32
+                const float expect = (float) ((double) q * (double) d);
+                if (back[(size_t) b * QK_K + i] != expect) ++deq_bad;
+                if (d == 0.0f) continue;
+                const double ratio = std::fabs((double) back[(size_t) b * QK_K + i] - (double) x[(size_t) b * QK_K + i]) /
+                                     (0.5 * std::fabs((double) d) + 1e-30);
+                worst = std::max(worst, ratio);
+                if (ratio > 1.0 + 1e-6) ++bound_bad;
+            }
+        }
+        verdict("dequant_q8_K (exact)", deq_bad == 0, deq_bad, n, (double) deq_bad, "differing values");
+        verdict("q8_K round trip", bound_bad == 0, bound_bad, n, worst, "worst |x'-x| / (0.5 code step)");
+    }
+
+    ctx.free(bx);
+    ctx.free(b_blocks);
+    ctx.free(b_deq);
+}
+
 // kv_q8: the quantisation, transcribed from kv_q8.hpp's own formula -
 //     scale = fp16(max|x| / 127),  code = clamp(rint(x / scale), -127, 127)
 // - including the detail that matters: the scale is rounded to fp16 FIRST and the codes are computed against
@@ -1952,6 +2170,7 @@ int main(int argc, char** argv) {
     case_reserve_policy();
     case_reserve_refusal();
     case_quantize_q8_0(ctx, dir);
+    case_quantize_q8_K(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

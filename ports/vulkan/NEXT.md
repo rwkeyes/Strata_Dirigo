@@ -110,25 +110,45 @@ Two things worth carrying forward:
   naive bound failed by 1.15x on exactly that block, and the two-term bound is hit at a ratio of 1.00 - tight, not
   loose.
 
-### Still to port from quantize_act.cu
+## quantize_act is COMPLETE (five kernels, all byte-exact)
 
-`quantize_q8_K` (292 bytes per 256 elements: `{ f32 d ; int8 qs[256] ; int16 bsums[16] }`) and `dequant_q8_K`.
-It is the other half of `VEC_DOT_TYPE` and covers the numerically SENSITIVE weights. Three traps already
-transcribed in the source and verified to compile here: `iscale = -127/max` (NOT -128, where `max` is the SIGNED
-value at the largest magnitude, so a positive max maps the `+max` element to -127); `nearest_int`'s
-round-half-to-EVEN via the 12582912.0f magic (`floatBitsToInt` makes it portable, and it is NOT `round`'s
-half-away rule); and `precise`/`__fmul_rn` so the product is rounded before the magic adds to it. Then `ple`, then
-the GEMV wave.
+`quantize_q8_K.comp` and `dequant_q8_K.comp` finish the file: 292 bytes per 256 elements,
+`{ f32 d ; int8 qs[256] ; int16 bsums[16] }`, the other half of `VEC_DOT_TYPE` and the format the numerically
+SENSITIVE weights use. Byte-exact over all six blocks (1816/1816 bytes, guard region included) plus the 16 int16
+sums per block.
 
-`kv_gather_q8` — the dequantising reader (one thread per 4 values, `fp16(code * scale)` into the scratch the
-attention kernels read). With BOTH entry points in place the pair can be tested as a **round trip** (append then
-gather, compared against the original within the 8-bit bound), which is stronger than either half alone.
+Three traps that were transcribed from the source and are now pinned by the gate:
 
-Then `quantize_act.cu`, `ple.cu`, then the GEMV wave.
+* `iscale = -127/max`, NOT -128. The -128 version sits in the source COMMENTED OUT with a note that IQ2_XXS needs
+  it for an awkward AVX path; using it is a 0.79% scaling error, the same order as the quantisation step, so it
+  produces an activation that looks fine and that ggml never sees.
+* `max` is the SIGNED value at the largest magnitude and the comparison is STRICTLY greater, so a tie keeps the
+  FIRST element. What that means in practice: `code(x) = round(-127 * x/mx)`, so the element HOLDING the maximum
+  lands on -127 whatever its sign, and the opposite extreme lands on +127. A test written from the intuitive
+  phrasing ("a positive max maps to -127") gets a negative maximum backwards - it did, and the byte-exact check
+  overruled it. The rule is now its own four-element check.
+* The rounding is `nearest_int`'s round-half-to-EVEN via the 12582912.0f magic, NOT `round`'s half-away. The tie
+  block separates them on **159 of 256 codes** - the sharpest evidence yet that a rule was implemented rather
+  than approximated.
 
-Then `quantize_act.cu`, `ple.cu`, then the GEMV wave (`native_bf16.cu`, `s_gemv.cu`, `s2_gemv*.cu`) — that wave
-is where throughput lives and where the interface convention gets its first real test.
+The zero block is written in full (d, qs AND bsums). ggml's `continue` leaves bsums unwritten, which a dot product
+cannot tell from zero but a byte comparison can; the source records the divergence deliberately and the gate holds
+it. `min(127, v)` likewise has no lower counterpart - defensive, since `|iscale*x| <= 127` by construction.
+
+### One comparison rule learned twice in this file
+
+A kernel's f32 result can only be compared against a HIGHER-PRECISION oracle when the result is exactly
+representable. A q8_0 dequant multiplies a 7-bit code by an 11-bit fp16 (18 bits - exact in f32, so a `double`
+oracle agreed by luck). q8_K multiplies the same 7-bit code by a full 24-bit fp32 scale: up to 31 bits, NOT
+representable, so the device's correctly rounded f32 product differs from the exact double one and 687 of 1536
+values "failed". Round the oracle to f32 the way the kernel rounds before comparing, and confine bit-exactness to
+where it is genuinely exact rather than merely convenient.
+
+### Next: `ple`, then the GEMV wave
+
+`ple.cu` is the last of the non-GEMV kernels. Then `native_bf16.cu`, `s_gemv.cu`, `s2_gemv*.cu` - throughput
+lives there, and the interface convention gets its first real test (weight layouts, not elementwise).
 
 Same shape as every case so far: read the CUDA source first, build the oracle from the engine's own function
 (never from a description of it), sentinel every range the kernel must not touch, and give each branch of the
-source an adversarial case. Tolerances come from measurement — print the err/tol ratio and keep it visible.
+source an adversarial case. Tolerances come from measurement - print the err/tol ratio and keep it visible.
