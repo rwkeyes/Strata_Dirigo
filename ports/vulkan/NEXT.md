@@ -291,12 +291,31 @@ TWO SHAPE DIFFERENCES FROM THE SOURCE, both deliberate:
   codebook means every lane reads a different index, the pattern it handles worst. The port's table is a literal
   in the shader, so the trap cannot arise.
 
-### STILL IN `s_gemv.cu` (the file is 40,810 bytes; this kernel is the quantized-activation one)
+## `s_gemv_split` is in - the fp16 activation, and the kernel `attn_output`/`shared_expert` use
 
-`s_gemv_kernel` (the naive fp16 reference, one thread per row), `s_gemv_split_kernel` (fp16, one block per row -
-**the kernel `attn_output` and `shared_expert` actually use**), `s_gemv_q8k_kernel` (the naive Q8_K one), and the
-host wrappers including the `_async` forms. Then `s2_gemv_fast.cu` (7,297) with `s2_gemv_quads`/`s2_gemv_fast`,
-which the source itself defers to a later phase.
+Both activation kinds of the S-family GEMV now exist: `s_gemv_q8_split.comp` (Q8_K / Q8_0) and
+`s_gemv_split.comp` (fp16), sharing `common/sform_decode.glsl`. Both are one workgroup per output row with the
+source's per-thread structure: QE=4 for the fp16 kernel (four consecutive elements share one code word, one scale
+and one offset, because every group size the format defines is a multiple of four), four accumulators combined as
+`(acc0+acc1)+(acc2+acc3)`, then the workgroup reduction.
+
+The fp16 activation is read as **32-bit pairs** (`unpackHalf2x16`), which is the source's own `__half2` view, and
+the gate's activation values walk the conversion's paths deliberately: the smallest SUBNORMAL half, a zero, a
+large value, negatives, small normals. Group 16 is included because it is the smallest group the format allows
+and it is what makes the quad's "one group per quad" assumption tight.
+
+ONE MORE CUDA-TO-GLSL TRAP, in the same family as `half` and `out`: **`float2` is not a GLSL type, it is
+`vec2`.** The source's `__half22float2` returns a float2 and writing that name in a shader parses as an
+undeclared identifier.
+
+### STILL IN `s_gemv.cu` (the file is 40,810 bytes; both activation kinds are now covered) (the file is 40,810 bytes; this kernel is the quantized-activation one)
+
+`s_gemv_kernel` (the naive fp16 reference, one thread per row) and `s_gemv_q8k_kernel` (the naive Q8_K one).
+Both exist in the source as the REFERENCE the split kernels are checked against - "the naive one is the reference
+the split one is checked against" - and the port has a stricter reference in its double oracle, so porting them
+buys the same cross-check the source has rather than new coverage. Then the host wrappers including the `_async`
+forms, and `s2_gemv_fast.cu` (7,297) with `s2_gemv_quads`/`s2_gemv_fast`, which the source itself defers to a
+later phase ("the speed win is `__dp4a` ... and that belongs to Phase 3 once the numerics are settled").
 
 ### THE REST OF THE WAVE - and its size, which is the number that matters
 

@@ -1,0 +1,111 @@
+// ports/vulkan/shaders/s_gemv_split.comp - the S-family GEMV over an FP16 activation, one workgroup per output
+// row (s_gemv.cu's s_gemv_split_kernel).
+//
+// **THIS IS THE KERNEL `attn_output` AND `shared_expert` USE**, so it is the expert path's main GEMV and it has
+// to exist alongside the quantized-activation one or half the model keeps a different instruction count. The
+// decode is shared with it through common/sform_decode.glsl - one implementation, because a second decode of the
+// canonical form is a second thing to get wrong.
+//
+// WHY A ROW-SPLIT KERNEL EXISTS AT ALL, in the source's own words: the naive `s_gemv` gives one thread per
+// output row, so its parallelism IS the output width - and the expert gate/up shape is [2560 x 640], which is 640
+// threads over 48 SMs. Measured, that orientation ran **4.6x slower** than the transposed one with identical
+// weights. This variant makes the parallelism independent of the output width.
+//
+// IT IS NOT BIT-IDENTICAL TO `s_gemv`, and the source says so: the partial sums are added in a different order.
+// Both are kept there - the naive one is the reference the split one is checked against - and the port checks
+// this kernel against a double oracle, which is the same idea with a stricter reference.
+//
+// THE QUAD. `QE` is 4: four consecutive elements share ONE code word (1, 2 or 4 bytes for S2/S4/S8) and ONE scale
+// and offset, because every group size this format defines (16, 32, 64) is a multiple of four. So the loop takes
+// one code load, one scale load and one offset load per four elements instead of per element - which is the
+// transformation the source describes as removing "a divide, a modulo and a shift" per element. The bit order is
+// the little-endian one: element `i+k` is bits `[k*CODE_BITS, (k+1)*CODE_BITS)` of the word at byte `i/PER_BYTE`.
+//
+// Four accumulators rather than one, again from the source's measurement: a single `acc += ...` serialises every
+// FMA behind the previous one's latency, so the SM idles at 0.4% of FP32 peak; four independent chains keep four
+// FMAs in flight. The four are combined as `(acc0+acc1)+(acc2+acc3)` and then reduced across the workgroup.
+//
+// THE ACTIVATION IS READ AS 32-BIT PAIRS, which is the source's own view (`const __half2*`), so element pairs
+// (i, i+1) and (i+2, i+3) are one word each. `unpackHalf2x16` is the exact widening direction, so there is no
+// rounding here to get wrong.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+// the activation as 32-bit words, each holding two fp16 elements (little-endian half order)
+layout(set = 0, binding = 0, std430) readonly buffer ACT { uint v[]; } act;
+layout(set = 0, binding = 1, std430) readonly buffer CODES { uint8_t b[]; } codes;
+layout(set = 0, binding = 2, std430) readonly buffer SCALES { float v[]; } scales;
+// always bound; `has_offset` says whether to read it (Vulkan has no null descriptor)
+layout(set = 0, binding = 3, std430) readonly buffer OFFSET { float v[]; } offset;
+layout(set = 0, binding = 4, std430) buffer Y { float v[]; } y;
+
+#include "common/sform_decode.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC {
+    int n_in; int n_out; int code_bits; int byte_shift; int bias; int codebook; int group_shift; int has_offset;
+} pc;
+
+const uint QE = 4u;
+
+uint load_word(uint at, uint bytes_per_word) {
+    uint v = uint(codes.b[at]);
+    if (bytes_per_word >= 2u) v |= uint(codes.b[at + 1u]) << 8u;
+    if (bytes_per_word >= 4u) v |= (uint(codes.b[at + 2u]) << 16u) | (uint(codes.b[at + 3u]) << 24u);
+    return v;
+}
+
+void main() {
+    const uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.n_out)) return;                 // workgroup-uniform: the reduction's barriers stay legal
+
+    const uint n_in = uint(pc.n_in);
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint per_byte = 8u / uint(pc.code_bits);
+    const uint bytes_per_word = QE * uint(pc.code_bits) / 8u;    // 1 for S2, 2 for S4, 4 for S8
+    const uint mask = (1u << uint(pc.code_bits)) - 1u;
+    const uint cshift = uint(pc.code_bits);
+    const uint gshift = uint(pc.group_shift);
+    const uint bshift = uint(pc.byte_shift);
+    const uint cbase = o * (n_in / per_byte);
+    const uint sbase = o * (n_in >> gshift);
+    const bool use_off = pc.has_offset != 0;
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    uint i = lid * QE;
+    for (; i + QE <= n_in; i += lsize * QE) {
+        const uint g = i >> gshift;                  // the whole quad is in one group: group_elems % 4 == 0
+        const float d = scales.v[sbase + g];
+        const float b = use_off ? offset.v[sbase + g] : 0.0;
+        const uint w = load_word(cbase + (i >> bshift), bytes_per_word);
+        // `vec2`, NOT `float2`: the CUDA source's `__half22float2` returns a float2, and GLSL spells the
+        // type `vec2` - writing `float2` parses as an undeclared identifier, the same class of trap as `half`
+        // and `out`.
+        const vec2 f01 = unpackHalf2x16(act.v[i >> 1u]);          // elements i, i+1
+        const vec2 f23 = unpackHalf2x16(act.v[(i >> 1u) + 1u]);   // elements i+2, i+3
+        acc0 += (sform_decode(w & mask, pc.bias, pc.codebook) * d + b) * f01.x;
+        acc1 += (sform_decode((w >> cshift) & mask, pc.bias, pc.codebook) * d + b) * f01.y;
+        acc2 += (sform_decode((w >> (2u * cshift)) & mask, pc.bias, pc.codebook) * d + b) * f23.x;
+        acc3 += (sform_decode((w >> (3u * cshift)) & mask, pc.bias, pc.codebook) * d + b) * f23.y;
+    }
+    // the last, partial quad - at most one per invocation
+    for (; i < n_in; i += lsize * QE) {
+        for (uint k = 0u; k < QE && i + k < n_in; ++k) {
+            const uint e = i + k;
+            const uint g = e >> gshift;
+            const uint code = (uint(codes.b[cbase + (e >> bshift)]) >> ((e & (per_byte - 1u)) * cshift)) & mask;
+            const vec2 hw = unpackHalf2x16(act.v[e >> 1u]);
+            const float xv = ((e & 1u) == 0u) ? hw.x : hw.y;
+            acc0 += (sform_decode(code, pc.bias, pc.codebook) * scales.v[sbase + g] +
+                     (use_off ? offset.v[sbase + g] : 0.0)) * xv;
+        }
+    }
+
+    const float total = wg_sum((acc0 + acc1) + (acc2 + acc3));
+    if (lid == 0u) y.v[o] = total;
+}
