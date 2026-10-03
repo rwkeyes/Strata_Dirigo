@@ -76,6 +76,41 @@ are version-gated *features we could adopt*, not compatibility we owe:
 
 ---
 
+## 3b. Which kernel for PERFORMANCE, and what the minimum is
+
+**First, what a kernel can and cannot buy here.** Steady-state throughput for this port is set by Mesa and by the
+card's clocks, not by the kernel: the daemon does the arithmetic. The kernel enters performance in three places,
+and all three are about *sustained* running rather than peak speed:
+
+1. **Memory management under pressure** - what happens when the card is full while the desktop is live on it.
+2. **Scheduling on the migration queue** - how buffer moves are handled.
+3. **Stability** - an engine reset costs the entire request, so a kernel that resets is slower than one that does
+   not, whatever the clocks say. For unattended inference this dominates the other two.
+
+**The ladder, by what each cycle actually changed for Battlemage:**
+
+| Kernel | What it does for performance here |
+|---|---|
+| 7.0 | Baseline. Xe SR-IOV + multi-device SVM (Battlematrix) - neither is used by this port. |
+| 7.1 | vRAM memory-pressure / OOM behaviour (the path a full card takes). **But: conflicting performance reports** - Phoronix measured 7.1 *helping* the Arc B580, while a community report claims a **50-90% OpenGL regression starting with 7.1**. Both exist, and neither is this port's workload. Measure, do not trust either. |
+| 7.2 | Stable. Battlemage G21 **cold-boot black-screen fix** (a display fix is a performance fix when the card drives the desktop). Its headline "cache aware scheduling" is a **CPU** scheduler feature for multi-die CPUs, not a GPU one - do not count it here. |
+| 7.3 | **TTM actively evicts unprotected buffers to free VRAM for protected allocations below protection limits** - it stops a large protected allocation from falling back to system memory. That is exactly this port's shape (a big resident allocation plus a live desktop). Not stable yet (rc5). |
+| 7.4 | **CPU binds + ULLS on the migration queue**, which Phoronix describes as *a big improvement for Battlemage* - the first cycle with a Battlemage-specific performance change. |
+
+**Best performance: 7.4**, when it lands - the only cycle flagged as a Battlemage performance improvement. Of the
+kernels runnable today, **7.2 stable** is the best choice: it has the display fix and the memory-pressure work
+from 7.1, and none of 7.1's disputed behaviour. **7.3** is the better bet on paper for this workload specifically
+(the TTM eviction change), but it is rc5; take it when it is stable (expected 2026-10-18). **Avoid 7.1** unless
+measured on the actual card.
+
+**Recommended minimum:**
+* **To run at all:** 6.12 on an Arc B580 / BMG-G21, 6.14 on an Arc Pro B70 / BMG-G31. Older is a fatal refusal
+  in the compat layer, and downgrading for stability is a dead end (6.8 has no support at all).
+* **For a box where the Arc drives the display: 7.2.** The oldest stable kernel with both the vRAM
+  memory-pressure work (7.1) and the Battlemage display fix, and outside the 6.14-6.19 crash-report range.
+* **For unattended inference: 7.4**, for cold reset recovery - until then the GuC 640 ms preemption timeout above
+  is what decides whether a long generation survives.
+
 ## 4. What this means for the display-reserve work already in the port
 
 The reserve logic (1024 MiB default, 256 MiB floor, 25% cap, enforced refusal) reads its free figure from
@@ -116,8 +151,11 @@ whole Linux compatibility surface is three reads.
 
 | Rule | Severity | Behaviour |
 |---|---|---|
-| Intel + kernel < 6.14 | **Fatal** | refuses to run: no BMG support before 6.14, and 6.8 has none at all |
-| Intel + 6.14 <= kernel < 7.0 | Warn | the recurring xe compute-load crash range: keep submissions bounded, smoke-test first |
+| Intel + kernel below the **per-card** Battlemage floor | **Fatal** | refuses to run. The floor is not one number: **6.12** for the Arc B580 (verified: the first mainline kernel with Xe2 enabled out of the box) and **6.14** for the Arc Pro B70 (BMG-G31, a later part) |
+| Intel + floor <= kernel < 7.0 | Warn | the recurring xe compute-load crash range: keep submissions bounded, smoke-test first |
+| Intel + 7.1 | Note | its Battlemage performance reports CONFLICT (§3b) |
+| Intel + 7.4+ | Info | CPU binds and ULLS on the migration queue - the first Battlemage-flagged performance change |
+| Intel, any kernel | Note | individual submissions must finish inside the GuC preemption timeout: **640 ms** (`CONFIG_DRM_XE_PREEMPT_TIMEOUT` on the 7.0 kernel inspected). Overrunning it is an engine reset under LLM inference, not a slowdown |
 | Intel + 7.1 / 7.2 | Info | the vRAM memory-pressure work is present |
 | Intel + kernel >= 7.3 | Note | TTM eviction is more aggressive: re-verify the reserve, don't assume 7.2 behaviour |
 | Intel + Mesa < 26.2 + no driver figure | Warn | names the Mesa version that added `VK_EXT_memory_budget` support on Intel |

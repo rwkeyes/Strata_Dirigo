@@ -91,7 +91,8 @@ bool looks_discrete(uint64_t heap_total_bytes, uint64_t host_ram_bytes) {
     return heap_total_bytes < (host_ram_bytes / 100ull * 90ull);
 }
 
-std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, bool budget_from_driver) {
+std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, uint32_t device_id,
+                                        bool budget_from_driver) {
     std::vector<Advisory> out;
     const bool intel = vendor_id == 0x8086;
     const auto& k = env.kernel;
@@ -109,12 +110,22 @@ std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, 
     }
 
     if (intel) {
-        // Battlemage (Xe2) needs the xe driver; 6.8 predates BMG support entirely and 6.14 is where it arrives.
-        if (k.below(6, 14)) {
+        // The Battlemage floor is PER CARD, and the first version of this rule got it wrong by using 6.14 for
+        // every Battlemage device.  Verified for the B580 (0xe20b): 6.12 is "the first mainline kernel where Xe2
+        // graphics are enabled out of the box" (Phoronix's B580 review; Intel's own community answer; the
+        // ubuntu-mate thread).  Our field notes record 6.14 for the Arc Pro B70 (0xe223), a later BMG-G31 part,
+        // so the floor is taken from the device id rather than from the vendor.
+        int min_maj = 6, min_min = 12;
+        const char* min_why =
+            "6.12 is the first mainline kernel with Xe2 graphics enabled out of the box (verified for the Arc B580)";
+        if (device_id == 0xe223) {
+            min_min = 14;
+            min_why = "our field notes record 6.14 for the Arc Pro B70 (BMG-G31), a later Battlemage part";
+        }
+        if (k.below(min_maj, min_min)) {
             out.push_back({Severity::Fatal,
-                           "kernel " + k.str() + " cannot drive Battlemage: the xe driver has no BMG support "
-                           "before 6.14 (and 6.8 has none for the generation at all).  Do not downgrade hoping "
-                           "for stability."});
+                           "kernel " + k.str() + " cannot drive this Battlemage device: " + min_why +
+                               ".  Do not downgrade hoping for stability."});
         } else if (k.below(7, 0)) {
             out.push_back({Severity::Warn,
                            "kernel " + k.str() + " is in the range with recurring xe compute-load crashes "
@@ -125,6 +136,23 @@ std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, 
             out.push_back({Severity::Info, "kernel " + k.str() + " carries the Xe vRAM memory-pressure work "
                                                                "(7.1), which is the path a full card takes."});
         }
+        if (k.at_least(7, 1) && k.below(7, 2)) {
+            out.push_back({Severity::Note,
+                           "7.1 has CONFLICTING performance reports on Battlemage: Phoronix measured 7.1 "
+                           "improving the Arc B580, while a community report claims a 50-90% OpenGL regression "
+                           "beginning with 7.1.  Both exist - measure on the actual card instead of trusting "
+                           "either."});
+        }
+        if (k.at_least(7, 4)) {
+            out.push_back({Severity::Info, "kernel " + k.str() + " lands CPU binds and ULLS on the migration "
+                                                               "queue, which Phoronix describes as a big "
+                                                               "improvement for Battlemage."});
+        }
+        out.push_back({Severity::Note,
+                       "every individual submission must complete inside the GuC preemption timeout "
+                       "(CONFIG_DRM_XE_PREEMPT_TIMEOUT = 640 ms on the 7.0 kernel inspected).  Exceeding it is an "
+                       "engine reset under LLM inference on Battlemage, not a slowdown - keep the work per "
+                       "submission bounded."});
         if (k.at_least(7, 3)) {
             out.push_back({Severity::Note,
                            "kernel " + k.str() + ": TTM eviction became more aggressive in 7.3.  That changes "

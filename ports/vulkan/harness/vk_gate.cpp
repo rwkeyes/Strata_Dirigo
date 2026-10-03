@@ -552,29 +552,38 @@ void case_reserve_policy() {
 // fails if a boundary moves, rather than passing on prose it merely recognises.
 void case_compat_rules() {
     const uint32_t INTEL = 0x8086, AMD = 0x1002;
-    struct Case { const char* rel; uint32_t vendor; const char* mesa; bool budget;
+    const uint32_t B580 = 0xe20b, ARC_PRO_B70 = 0xe223;
+    struct Case { const char* rel; uint32_t vendor; uint32_t device; const char* mesa; bool budget;
                   const char* must_have; const char* must_not; const char* what; };
     const Case cases[] = {
-        {"6.13.0", INTEL, "Mesa 26.2.0", true, "no BMG support", "", "6.13 cannot drive Battlemage (fatal)"},
-        {"6.14.0", INTEL, "Mesa 26.2.0", true, "compute-load crashes", "no BMG support",
-         "6.14 warns; it is no longer impossible"},
-        {"6.19.0", INTEL, "Mesa 26.2.0", true, "compute-load crashes", "", "6.19 is still in the warn range"},
-        {"7.0.0", INTEL, "Mesa 26.2.0", true, "", "compute-load crashes", "7.0 leaves the warn range"},
-        {"7.1.0", INTEL, "Mesa 26.2.0", true, "memory-pressure", "", "7.1 carries the vRAM pressure work"},
-        {"7.2.0", INTEL, "Mesa 26.2.0", true, "", "TTM eviction", "7.2 has no TTM note"},
-        {"7.3.0", INTEL, "Mesa 26.2.0", true, "TTM eviction", "", "7.3 makes TTM eviction aggressive"},
-        {"7.0.0", INTEL, "Mesa 25.2.8", false, "26.2", "", "old Mesa + no driver figure -> warn"},
-        {"7.0.0", INTEL, "Mesa 26.2.0", false, "", "predates VK_EXT_memory_budget",
+        {"6.11.0", INTEL, B580, "Mesa 26.2.0", true, "first mainline kernel", "",
+         "6.11 cannot drive an Arc B580 (fatal)"},
+        {"6.12.0", INTEL, B580, "Mesa 26.2.0", true, "compute-load crashes", "first mainline kernel",
+         "6.12 is the B580 floor: runs, but still the crash range"},
+        {"6.13.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "later Battlemage part", "",
+         "the same 6.13 IS fatal for the Arc Pro B70 - the floor is per card"},
+        {"6.14.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "compute-load crashes", "later Battlemage part",
+         "6.14 clears the Arc Pro floor and warns instead"},
+        {"6.19.0", INTEL, B580, "Mesa 26.2.0", true, "compute-load crashes", "", "6.19 is still in the warn range"},
+        {"7.0.0", INTEL, B580, "Mesa 26.2.0", true, "preemption timeout", "compute-load crashes",
+         "7.0 leaves the warn range and carries the preempt-timeout note"},
+        {"7.1.0", INTEL, B580, "Mesa 26.2.0", true, "CONFLICTING", "", "7.1's conflicting performance reports"},
+        {"7.2.0", INTEL, B580, "Mesa 26.2.0", true, "", "CONFLICTING", "7.2 drops the 7.1 performance note"},
+        {"7.2.0", INTEL, B580, "Mesa 26.2.0", true, "", "TTM eviction", "7.2 has no TTM note"},
+        {"7.3.0", INTEL, B580, "Mesa 26.2.0", true, "TTM eviction", "", "7.3 makes TTM eviction aggressive"},
+        {"7.4.0", INTEL, B580, "Mesa 26.2.0", true, "migration queue", "", "7.4 brings the Battlemage bind work"},
+        {"7.0.0", INTEL, B580, "Mesa 25.2.8", false, "26.2", "", "old Mesa + no driver figure -> warn"},
+        {"7.0.0", INTEL, B580, "Mesa 26.2.0", false, "", "predates VK_EXT_memory_budget",
          "Mesa 26.2 silences the same warning"},
-        {"7.0.0", AMD, "Mesa 25.2.8", false, "outside every range", "", "a non-Intel device gets no Intel rules"},
-        {"7.3.0-rc5", INTEL, "Mesa 26.2.0", true, "prerelease", "", "a prerelease kernel is called out"},
+        {"7.0.0", AMD, 0x744c, "Mesa 25.2.8", false, "outside every range", "", "a non-Intel device gets no Intel rules"},
+        {"7.3.0-rc5", INTEL, B580, "Mesa 26.2.0", true, "prerelease", "", "a prerelease kernel is called out"},
     };
     int bad = 0;
     for (const Case& c : cases) {
         HostEnv e{};
         e.kernel = parse_kernel_release(c.rel);
         e.mesa_version = c.mesa;
-        const std::vector<Advisory> adv = compat_advisories(e, c.vendor, c.budget);
+        const std::vector<Advisory> adv = compat_advisories(e, c.vendor, c.device, c.budget);
         std::string all;
         for (const Advisory& a : adv) all += a.text + "\n";
         const bool have = c.must_have[0] == '\0' || all.find(c.must_have) != std::string::npos;
@@ -586,12 +595,13 @@ void case_compat_rules() {
         }
     }
     // The fatality itself must be real on both sides of its boundary.
-    HostEnv old_kernel{}; old_kernel.kernel = parse_kernel_release("6.13.0");
-    HostEnv new_kernel{}; new_kernel.kernel = parse_kernel_release("6.14.0");
-    const bool fatal_discriminates = any_fatal(compat_advisories(old_kernel, INTEL, true)) &&
-                                     !any_fatal(compat_advisories(new_kernel, INTEL, true));
+    HostEnv below{}; below.kernel = parse_kernel_release("6.11.0");
+    HostEnv at{}; at.kernel = parse_kernel_release("6.12.0");
+    const bool fatal_discriminates = any_fatal(compat_advisories(below, INTEL, B580, true)) &&
+                                     !any_fatal(compat_advisories(at, INTEL, B580, true)) &&
+                                     any_fatal(compat_advisories(at, INTEL, ARC_PRO_B70, true));
     if (!fatal_discriminates) { std::printf("      fatal boundary does not discriminate\n"); ++bad; }
-    verdict("compat: advisory rules (11 cases + boundary)", bad == 0, bad,
+    verdict("compat: advisory rules (15 cases + 3-way boundary)", bad == 0, bad,
             (int) (sizeof(cases) / sizeof(cases[0]) + 1), 0.0, "case mismatches");
 }
 

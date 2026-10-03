@@ -365,7 +365,7 @@ void Ctx::configure_display_reserve() {
     ledger_untrusted_ = !budget_.from_driver && looks_discrete(budget_.heap_total, env_.host_ram_bytes) &&
                         forced_budget_bytes_ == 0;
 
-    advisories_ = compat_advisories(env_, info_.vendor_id, budget_.from_driver);
+    advisories_ = compat_advisories(env_, info_.vendor_id, info_.device_id, budget_.from_driver);
     for (const Advisory& a : advisories_) {
         std::fprintf(stderr, "vk_compat[%s] %s\n", severity_name(a.sev), a.text.c_str());
     }

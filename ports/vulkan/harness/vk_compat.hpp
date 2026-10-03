@@ -63,7 +63,10 @@ bool parse_mesa_version(const std::string& driver_info, int& major, int& minor, 
 
 // The rules.  `vendor_id` and `budget_from_driver` come from the chosen device and the memory query; a
 // caller that has not queried yet passes budget_from_driver = false and gets the conservative reading.
-std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, bool budget_from_driver);
+// `device_id` matters: the Battlemage floor is per-card (the B580 from 6.12, the Arc Pro B70 per our field
+// notes from 6.14), so a vendor-only rule would be wrong for one of them.
+std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, uint32_t device_id,
+                                        bool budget_from_driver);
 bool any_fatal(const std::vector<Advisory>& v);
 
 // True when the device's local heap is small relative to host RAM, i.e. a real discrete card rather than a
