@@ -144,9 +144,12 @@ std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, 
                            "either."});
         }
         if (k.at_least(7, 4)) {
-            out.push_back({Severity::Info, "kernel " + k.str() + " lands CPU binds and ULLS on the migration "
-                                                               "queue, which Phoronix describes as a big "
-                                                               "improvement for Battlemage."});
+            // This cannot fire while 7.4 is unrelased (verified via kernel.org/releases.json 2026-10-03: latest
+            // stable 7.2.9, mainline 7.3-rc5, no 7.4 of any kind).  It exists so that the day such a kernel is
+            // running, the note appears rather than the rules silently having nothing to say.
+            out.push_back({Severity::Info, "kernel " + k.str() + " is at or beyond the 7.4 cycle, which carries "
+                                                               "CPU binds and ULLS on the migration queue - the "
+                                                               "first Battlemage-flagged performance change."});
         }
         out.push_back({Severity::Note,
                        "every individual submission must complete inside the GuC preemption timeout "

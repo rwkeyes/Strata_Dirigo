@@ -38,13 +38,26 @@ any better. Those are verification and gating questions, not porting questions.
 | **7.1** | **stable, 2026-06-14** (DRM merged 2026-04-20) | Xe: **memory-pressure / out-of-memory behaviour for vRAM** (new userspace API); Nova Lake P + Xe3P_LPG initial enablement; DRM RAS over Netlink |
 | **7.2** | **stable, 2026-08-16** | Xe: **Battlemage G21 cold-boot black-screen fix**; Panther Lake Xe3 Arc B390 performance; Crescent Island improvements; cache-aware scheduling |
 | **7.3** | **NOT STABLE — rc5 (2026-09-27), stable expected 2026-10-18** | Xe: Nova Lake-S graphics enabled **by default**, Xe3P considered stable; **TTM eviction more aggressive**; rc5 DRM fixes (AI bug fixes, Crescent Island power brake) |
-| 7.4 | merge window open, first Xe PR landed | Xe: **cold reset recovery**; vRAM health check + degraded-memory handling |
+| ~~7.4~~ | **DOES NOT EXIST YET — see the note below** | patches *labelled* "for 7.4" sit in drm-next/linux-next; there is no 7.4 release and not even a 7.4-rc |
 
 Sources: Phoronix 7.1-graphics / 7.3-DRM / 7.3-rc5 / Intel-Xe-Linux-7.4-First-PR articles; Wikipedia kernel
 version history (7.2 = 16 Aug 2026); ostechnix RC schedule (7.3-rc1 30 Aug → rc5 27 Sep); kernel community
 forums for the engine-reset reports.
 
 **7.3 is not released.** If a deliverable says "supports through 7.3", it currently means "supports 7.3-rc5".
+
+**7.4 does not exist.** An earlier revision of this document listed 7.4 as a row in the ladder and put it first in
+the performance recommendation, on the strength of press coverage of Intel's Xe pull requests *targeting* the 7.4
+cycle. That was wrong: a patch labelled "for 7.4" is a patch queued for a cycle that has not opened, and the
+label is a target, not a kernel. Check it yourself rather than trusting any snapshot in a document:
+
+    curl -s https://www.kernel.org/releases.json | python3 -c \
+      "import json,sys; d=json.load(sys.stdin); print(d['latest_stable']['version']); \
+       [print(r['version'], r['moniker'], r['released']['isodate'][:10]) for r in d['releases'][:6]]"
+
+Verified on 2026-10-03: latest stable **7.2.9** (released that day), mainline **7.3-rc5**, and no 7.4 of any kind.
+The 7.4 material (cold reset recovery, vRAM health check, CPU binds + ULLS on the migration queue) is real work
+in flight and belongs in this document as *expected*, never as *available*.
 
 ---
 
@@ -97,11 +110,18 @@ and all three are about *sustained* running rather than peak speed:
 | 7.3 | **TTM actively evicts unprotected buffers to free VRAM for protected allocations below protection limits** - it stops a large protected allocation from falling back to system memory. That is exactly this port's shape (a big resident allocation plus a live desktop). Not stable yet (rc5). |
 | 7.4 | **CPU binds + ULLS on the migration queue**, which Phoronix describes as *a big improvement for Battlemage* - the first cycle with a Battlemage-specific performance change. |
 
-**Best performance: 7.4**, when it lands - the only cycle flagged as a Battlemage performance improvement. Of the
-kernels runnable today, **7.2 stable** is the best choice: it has the display fix and the memory-pressure work
-from 7.1, and none of 7.1's disputed behaviour. **7.3** is the better bet on paper for this workload specifically
-(the TTM eviction change), but it is rc5; take it when it is stable (expected 2026-10-18). **Avoid 7.1** unless
-measured on the actual card.
+**Recommendations are in terms of kernels you can install, and that is the whole of the ladder above.**
+
+* **Best you can install today: 7.2 stable** (7.2.9 as of 2026-10-03). It has the Battlemage display fix and the
+  memory-pressure work from 7.1, and none of 7.1's disputed behaviour. This is the answer.
+* **In about two weeks: 7.3**, which is the better bet on paper for this workload specifically (the TTM eviction
+  change). It is 7.3-rc5 today; stable is expected 2026-10-18. Take it then, not now.
+* **Avoid 7.1** unless measured on the actual card (see the conflicting reports above).
+* **7.4 is not a recommendation, because it does not exist.** The cycle that will become 7.4 is queued, not
+  open: on the observed 7.3 cadence (rc1 2026-08-30 to stable 2026-10-18, seven weeks) a 7.4 stable would be
+  expected around **late December 2026 / January 2027** - an estimate from that cadence, not a promise. When it
+  does land it is the cycle with the Battlemage-flagged work (CPU binds + ULLS on the migration queue) and cold
+  reset recovery, and it deserves reconsideration then.
 
 **Recommended minimum:**
 * **To run at all:** 6.12 on an Arc B580 / BMG-G21, 6.14 on an Arc Pro B70 / BMG-G31. Older is a fatal refusal
@@ -154,7 +174,7 @@ whole Linux compatibility surface is three reads.
 | Intel + kernel below the **per-card** Battlemage floor | **Fatal** | refuses to run. The floor is not one number: **6.12** for the Arc B580 (verified: the first mainline kernel with Xe2 enabled out of the box) and **6.14** for the Arc Pro B70 (BMG-G31, a later part) |
 | Intel + floor <= kernel < 7.0 | Warn | the recurring xe compute-load crash range: keep submissions bounded, smoke-test first |
 | Intel + 7.1 | Note | its Battlemage performance reports CONFLICT (§3b) |
-| Intel + 7.4+ | Info | CPU binds and ULLS on the migration queue - the first Battlemage-flagged performance change |
+| Intel + 7.4+ | Info | CPU binds and ULLS on the migration queue - the first Battlemage-flagged performance change. **Cannot fire today: no 7.4 exists.** It is in place so the day one does, the note appears |
 | Intel, any kernel | Note | individual submissions must finish inside the GuC preemption timeout: **640 ms** (`CONFIG_DRM_XE_PREEMPT_TIMEOUT` on the 7.0 kernel inspected). Overrunning it is an engine reset under LLM inference, not a slowdown |
 | Intel + 7.1 / 7.2 | Info | the vRAM memory-pressure work is present |
 | Intel + kernel >= 7.3 | Note | TTM eviction is more aggressive: re-verify the reserve, don't assume 7.2 behaviour |
