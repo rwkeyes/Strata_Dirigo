@@ -1,0 +1,47 @@
+// ports/vulkan/shaders/gemm_fma.comp - C[MxN] = A[MxK] * B[KxN] in plain FMA.
+//
+// WHY THIS EXISTS.  The cooperative-matrix kernel cannot dispatch a shape that is not a multiple of 16, and M=1
+// - a single-token decode step - is exactly such a shape.  So the matrix-unit path, which is the fast one, is
+// STRUCTURALLY unavailable for decode, and a port that only had it would fall over on the first generated token.
+// This kernel has no shape precondition at all: M=1, ragged edges, K below one tile, odd dimensions.
+//
+// It is also the fallback for devices with no usable cooperative-matrix config (measured: llvmpipe exposes no
+// CMA, and Alchemist's CMA path regresses), which is why it reads fp32 rather than the CMA path's fp16: 16-bit
+// storage access is itself a device feature, and the fallback is the kernel that should need nothing but plain
+// Vulkan compute.  The pair is complementary on purpose - the engine picks by SHAPE first (M<16 must take this
+// path) and by device capability second.
+//
+// This is a correctness kernel, not a fast one: one invocation per output element with the K-loop reading global
+// memory.  That is deliberate for the first version - no shared memory, no barrier, no subgroup op, so it runs
+// on anything - and it is what makes it the floor the other paths must not go below.  The tiled shared-memory
+// version is the optimisation to make when this path carries real work, and the numbers to beat are the CMA
+// kernel's (worst relative error 4.5e-4 against the same host reference).
+//
+// GRID LIMIT worth knowing: the element index is gl_GlobalInvocationID.x, so a matrix needs M*N < 2^32
+// invocations.  A 4096-row by 110k-vocab output tile (a vocab projection) is ~4.5e8 - inside the limit but not
+// by much, and a 2-D grid is the eventual shape.  The caller sizes the grid; this kernel guards the top edge.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Abuf { float a[]; } A;
+layout(set = 0, binding = 1, std430) readonly buffer Bbuf { float b[]; } B;
+layout(set = 0, binding = 2, std430) buffer Cbuf { float c[]; } C;
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.m * pc.n) return;              // the grid is rounded up; surplus invocations exit
+    const uint row = idx / pc.n;
+    const uint col = idx % pc.n;
+    float acc = 0.0;
+    for (uint t = 0u; t < pc.k; ++t) {
+        acc += A.a[row * pc.k + t] * B.b[t * pc.n + col];
+    }
+    C.c[idx] = acc;
+}

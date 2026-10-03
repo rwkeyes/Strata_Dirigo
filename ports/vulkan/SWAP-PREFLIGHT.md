@@ -30,6 +30,10 @@ card rather than after it.
 
 ## 1. The item that matters most: the local model dies with the card
 
+**DECIDED (2026-10-03): swap now, and accept cloud tokens for subagents until an Arc backend can serve a
+model.** The alternatives below are kept as the fallbacks if the gap runs long, but nothing waits on them: the
+card goes in when it arrives, and local delegation is expected to be down until the Vulkan backend can serve.
+
 `strata-coder.service` is what Hermes subagents run on (delegation endpoint `:18110`). It is the engine under
 development, built for AMD: `backend = hip`, `gpu = 0`, and the process maps `libamdhip64.so.7`. **Removing the
 7900 XTX removes the local coder**, and the port that would put it on Arc is not finished — so there is a window

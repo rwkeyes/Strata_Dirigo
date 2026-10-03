@@ -873,6 +873,73 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// THE FALLBACK GEMM.  No shape precondition, no device requirement: this is the path that must work everywhere
+// the CMA path does not - and the shapes the CMA path CANNOT take are the interesting ones here.  M=1 is a
+// single-token decode step; 17x13x5 is every kind of ragged edge at once; K=8 is below one matrix-unit tile.
+// All of them are normal runtime shapes, which is why the fallback cannot carry the 16-multiple contract.
+void case_gemm_fma(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gemm_fma.spv")) return;
+    struct Shape { int m, n, k; const char* what; };
+    const Shape shapes[] = {
+        {64, 64, 64, "the shape both GEMM paths can take"},
+        {1, 64, 64, "M=1 - single-token decode, structurally impossible for the CMA path"},
+        {256, 1, 64, "N=1 - a single-column projection"},
+        {17, 13, 5, "ragged in every dimension"},
+        {2, 48, 96, "small M, K beyond one tile"},
+    };
+    for (const Shape& sh : shapes) {
+        const int m = sh.m, n = sh.n, k = sh.k;
+        std::vector<float> a((size_t) m * k), b((size_t) k * n);
+        for (float& v : a) v = rndf(1.0f);
+        for (float& v : b) v = rndf(1.0f);
+        std::vector<float> ref((size_t) m * n);
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < n; ++c) {
+                double acc = 0.0;
+                for (int t = 0; t < k; ++t) acc += (double) a[(size_t) r * k + t] * (double) b[(size_t) t * n + c];
+                ref[(size_t) r * n + c] = (float) acc;
+            }
+        }
+        const uint64_t nout = (uint64_t) m * n;
+        const uint64_t slack = 256;                  // NaN pad: an over-write must be DETECTED, not tolerated
+        Buf ba = ctx.alloc((uint64_t) a.size() * 4);
+        Buf bb = ctx.alloc((uint64_t) b.size() * 4);
+        Buf bc = ctx.alloc((nout + slack) * 4);
+        ctx.write(ba, a.data(), a.size() * 4);
+        ctx.write(bb, b.data(), b.size() * 4);
+        std::vector<float> out(nout + slack, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(bc, out.data(), out.size() * 4);
+
+        // The grid is rounded UP from the element count: the surplus invocations must exit, and the guard bytes
+        // below the output are what prove they did.
+        const uint32_t groups = (uint32_t) ((nout + kLocalSize - 1) / kLocalSize);
+        VkPipeline p = ctx.pipeline(dir + "/gemm_fma.spv", 3, 12);
+        struct { uint32_t m, n, k; } pc{(uint32_t) m, (uint32_t) n, (uint32_t) k};
+        ctx.dispatch(p, {&ba, &bb, &bc}, &pc, sizeof(pc), groups);
+        ctx.read(bc, out.data(), out.size() * 4);
+
+        int bad = 0, guard_bad = 0;
+        double worst = 0;
+        for (uint64_t i = 0; i < nout; ++i) {
+            if (!close_enough(out[i], ref[i], 1e-4f, 1e-4f)) ++bad;
+            const double rel = std::fabs((double) out[i] - ref[i]) / (std::fabs((double) ref[i]) + 1e-30);
+            worst = std::max(worst, rel);
+        }
+        for (uint64_t i = nout; i < out.size(); ++i) {
+            if (!std::isnan(out[i])) ++guard_bad;
+        }
+        char label[80];
+        std::snprintf(label, sizeof label, "gemm_fma %dx%dx%d", m, n, k);
+        const bool ok = bad == 0 && guard_bad == 0;
+        const int shown = bad + guard_bad;
+        std::printf("      %-34s %s\n", label, sh.what);
+        verdict(label, ok, shown, (int) out.size(), worst, "worst rel err");
+        ctx.free(ba);
+        ctx.free(bb);
+        ctx.free(bc);
+    }
+}
+
 // The GEMM's shape precondition, tested in both directions.  The negative controls matter more than the positive
 // ones here: M=1 is the shape a decode step actually produces, and dispatching it silently computes nothing.
 void case_gemm_shape_contract() {
@@ -1111,6 +1178,7 @@ int main(int argc, char** argv) {
     case_memory_budget(ctx);
     case_reserve_policy();
     case_reserve_refusal();
+    case_gemm_fma(ctx, dir);
     case_gemm_shape_contract();
     case_gemm_coopmat(ctx, dir);
     case_copy(ctx, dir);

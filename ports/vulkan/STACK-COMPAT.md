@@ -264,7 +264,27 @@ with it), and the new case **perturbed the memory-budget check** by allocating b
 up to 2 MiB, so a few buffers move `heapUsage` by ~9 MB). Both fixed; the case now runs after the device-state
 checks, with a comment saying why.
 
-**Honest state:** the matrix-unit path works end to end and is verified on AMD silicon. What remains for the B70
+#### The pair, and why both exist
+
+`shaders/gemm_fma.comp` is the same product in plain FMA with **no shape precondition**, and the reason is
+structural rather than a performance fallback: the cooperative-matrix path cannot take the shapes decode
+produces. `M=1` is not a multiple of 16, so its tile count is zero and the kernel computes nothing — the matrix
+units are unavailable for exactly the step that runs once per generated token. So the engine selects by **shape
+first** (M < 16 must take the FMA path) and by **device capability second**.
+
+It is also the floor everywhere else: measured, llvmpipe exposes no usable CMA config at all, and Alchemist's CMA
+path regresses. That is why it reads fp32 while the CMA kernel reads fp16 — 16-bit storage access is itself a
+device feature, and the fallback is the kernel that should require nothing but plain Vulkan compute.
+
+It is a correctness kernel, not a fast one: one invocation per output element, K-loop straight from global memory
+— no shared memory, no barrier, no subgroup op, so it runs anywhere, including the software implementation.
+Verified on **both** implementations present: **46 passed, 0 failed** on RADV and **40 passed, 0 failed, 1 skipped**
+on llvmpipe (the skip is the CMA case, which that device genuinely cannot run). Shapes tested include 1×64×64
+(decode), 256×1×64, 17×13×5 (ragged in every dimension) and 2×48×96; worst relative error 2.6e-4 — fp32 quality,
+against the CMA path's 4.5e-4 on fp16 operands.
+
+**Honest state:** the matrix-unit path works end to end and is verified on AMD silicon; the fallback path works
+everywhere the port runs. What remains for the B70
 is Intel-specific — the same shader on Xe2, its subgroup width (16/32 rather than 64), and the dequant step the
 real engine needs, since IQ1_M weights must be dequantized to fp16 before the matrix units can consume them.
 
