@@ -51,16 +51,12 @@ static void fill_info(DeviceInfo& di, VkPhysicalDevice pd) {
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     VkPhysicalDevice16BitStorageFeatures f16{};
     f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
-    VkPhysicalDeviceShaderFloat16Int8Features f8{};
-    f8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
     VkPhysicalDeviceSubgroupProperties sg{};
     sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     f2.pNext = &f16;
-    f16.pNext = &f8;
     vkGetPhysicalDeviceFeatures2(pd, &f2);
     di.storage_buffer_16bit = f16.storageBuffer16BitAccess;
     di.shader_int16 = f2.features.shaderInt16;
-    di.shader_int64 = f2.features.shaderInt64;
     di.shader_float64 = f2.features.shaderFloat64;
 
     VkPhysicalDeviceProperties2 p2{};
@@ -178,17 +174,16 @@ Ctx::Ctx(int want_device, bool need_16bit) {
 
     VkPhysicalDeviceFeatures2 f2{};
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    // Ask for exactly what the ported kernels use, and only where the device reports it.  Requesting a
+    // feature the device lacks fails vkCreateDevice outright - and `shaderFloat16` was requested here for no
+    // reason at all (no ported kernel stores fp16), i.e. a pure compatibility risk on hardware that lacks it.
+    // `shaderFloat64` is queried but not requested: the one kernel that wanted it (silu) cannot be expressed
+    // through glslang's SPIR-V backend, so nothing in the shipping set needs it.
     VkPhysicalDevice16BitStorageFeatures f16{};
     f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     f16.storageBuffer16BitAccess = info_.storage_buffer_16bit ? VK_TRUE : VK_FALSE;
-    VkPhysicalDeviceShaderFloat16Int8Features f8{};
-    f8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-    f8.shaderFloat16 = VK_TRUE;
     f2.pNext = &f16;
-    f16.pNext = &f8;
     f2.features.shaderInt16 = info_.shader_int16 ? VK_TRUE : VK_FALSE;
-    f2.features.shaderInt64 = info_.shader_int64 ? VK_TRUE : VK_FALSE;
-    f2.features.shaderFloat64 = info_.shader_float64 ? VK_TRUE : VK_FALSE;
 
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -237,7 +232,7 @@ Ctx::Ctx(int want_device, bool need_16bit) {
 
 Ctx::~Ctx() {
     if (dev_ != VK_NULL_HANDLE) vkDeviceWaitIdle(dev_);
-    for (auto& pv : pvals_) {
+    for (Pipe& pv : pipes_) {
         if (pv.pipe) vkDestroyPipeline(dev_, pv.pipe, nullptr);
         if (pv.layout) vkDestroyPipelineLayout(dev_, pv.layout, nullptr);
         if (pv.set_layout) vkDestroyDescriptorSetLayout(dev_, pv.set_layout, nullptr);
@@ -295,11 +290,13 @@ void Ctx::read(const Buf& b, void* dst, uint64_t bytes, uint64_t offset) {
 }
 
 VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t push_bytes) {
-    PipeKey k{spv_path, nbufs, push_bytes};
-    for (size_t i = 0; i < pkeys_.size(); ++i) {
-        if (pkeys_[i] == k) return pvals_[i].pipe;
+    for (const Pipe& p : pipes_) {
+        if (p.spv_path == spv_path && p.nbufs == nbufs && p.push_bytes == push_bytes) return p.pipe;
     }
-    PipeVal pv{};
+    Pipe pv{};
+    pv.spv_path = spv_path;
+    pv.nbufs = nbufs;
+    pv.push_bytes = push_bytes;
 
     std::vector<VkDescriptorSetLayoutBinding> binds(nbufs);
     for (uint32_t i = 0; i < nbufs; ++i) {
@@ -356,8 +353,7 @@ VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t p
     VK_CHECK(vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpci, nullptr, &pv.pipe));
     vkDestroyShaderModule(dev_, module, nullptr);
 
-    pkeys_.push_back(k);
-    pvals_.push_back(pv);
+    pipes_.push_back(pv);
     return pv.pipe;
 }
 
@@ -366,10 +362,10 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     // Find the pipeline layout/set that belongs to this pipeline handle.
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    for (auto& pv : pvals_) {
-        if (pv.pipe == pipe) {
-            layout = pv.layout;
-            set = pv.set;
+    for (const Pipe& p : pipes_) {
+        if (p.pipe == pipe) {
+            layout = p.layout;
+            set = p.set;
         }
     }
     if (!layout) {
@@ -431,12 +427,6 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     VK_CHECK(vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX));
     vkDestroyFence(dev_, fence, nullptr);
     vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
-}
-
-void Ctx::die(const std::string& what) {
-    err_ = what;
-    std::fprintf(stderr, "%s\n", what.c_str());
-    std::exit(1);
 }
 
 }  // namespace portvk

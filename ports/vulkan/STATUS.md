@@ -29,6 +29,16 @@ the fp16 overflow point (65504 → 65536), infinities, a signalling NaN pattern 
 a missing `if (row >= rows) return;` overwrites the buffer that follows — so the case pads the allocation
 with NaN and requires it to survive.
 
+## Audit
+
+`ports/vulkan/AUDIT.md` — a full pass against the standing code guideline plus the Arc/Vulkan and performance
+rules. Nine code-guideline findings (duplicated reference implementation, dead code, parallel containers, a
+hardcoded path, a constant repeated nine times, `-Werror`) and six compatibility findings — two of them real
+defects (**`rms_norm` coupled the host's dispatch to the driver's subgroup width**, which would skip tail rows
+silently on Intel where the driver picks a SIMD width per kernel; and **an fp16 device feature requested with
+no fp16 in any kernel**, which fails `vkCreateDevice` on hardware that lacks it). All fixed and re-verified,
+four new automated checks added, and each one proven able to fail.
+
 ## Two defects found by the gate (both real, both fixed, both measured)
 
 1. **`gdn_gate` first version: softplus lost 4.3e-05 relative.** The delegated translation wrote

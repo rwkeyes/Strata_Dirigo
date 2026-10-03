@@ -2,9 +2,8 @@
 // a device, host-visible buffers, and "load this SPIR-V, bind these N buffers, push these bytes, dispatch
 // G groups".  Everything the CUDA backend does with cudaMalloc/cudaMemcpy/<<<>>> has an entry point here.
 //
-// Deliberately NOT here yet (and listed in ports/vulkan/PORT-PLAN.md): device-local staging, command-buffer
-// RECORDING (the CUDA-graph replacement), timeline semaphores, VK_EXT_memory_budget, and the 8-bit-storage
-// descriptor set.  Those are stages 3+ of the plan; this is stage 1 and it has to be exactly right first.
+// Deliberately NOT here yet (stages 3+ of ports/vulkan/plan/PORT-PLAN.md): device-local staging, command-buffer
+// RECORDING (the CUDA-graph replacement), timeline semaphores, VK_EXT_memory_budget, and 8-bit storage.
 #pragma once
 
 #include <vulkan/vulkan.h>
@@ -15,9 +14,10 @@
 
 namespace portvk {
 
-// One buffer, host-visible and host-coherent on purpose: this layer exists to answer "does the ported
-// kernel compute the right numbers", and staging plus fences would only add ways for the GATE to be wrong.
-// The engine's own backend will use device-local memory + staging (PORT-PLAN.md, stage 4).
+// One buffer, host-visible and host-coherent on purpose: this layer exists to answer "does the ported kernel
+// compute the right numbers", and staging plus fences would only add ways for the GATE to be wrong.  The
+// engine's own backend must use device-local memory + staging (PORT-PLAN.md stage 4) - a coherence-first
+// allocation is a correctness device, not a performance one.
 struct Buf {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -31,16 +31,21 @@ struct DeviceInfo {
     uint32_t api = 0;
     bool storage_buffer_16bit = false;   // VK_KHR_16bit_storage storageBuffer16BitAccess
     bool shader_int16 = false;
-    bool shader_int64 = false;
     bool shader_float64 = false;
     uint32_t subgroup_size = 0;
+    // The DEVICE_LOCAL heap total.  **NOT a model-size budget, and on Intel Arc it is actively misleading**:
+    // Arc reports its dedicated VRAM (often 256 MB - 512 MB, or the resizable-BAR window) here, not the
+    // shared system memory the GPU actually allocates from.  A fit calculation built on this number would
+    // refuse models that fit or accept models that do not.  Sizing must come from the driver's own budget
+    // (VK_EXT_memory_budget: heap_budget - heap_usage) plus the driver's memory info.
     uint64_t heap_device_local_bytes = 0;
 };
 
 class Ctx {
 public:
-    // `want_device` < 0 picks the first device that has a compute queue; otherwise it is an index into the
-    // enumerated list (STRATA_VK_DEVICE).  Enumerating without picking is a supported use (list_devices).
+    // `want_device` < 0 picks the first device with a compute queue and the required features; otherwise it is
+    // an index into the enumerated list (STRATA_VK_DEVICE).  `need_16bit` selects only devices that can run
+    // the 16-bit-storage kernels.
     explicit Ctx(int want_device = -1, bool need_16bit = false);
     ~Ctx();
     Ctx(const Ctx&) = delete;
@@ -68,15 +73,12 @@ public:
     void dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                   uint32_t groups);
 
-    const char* last_error() const { return err_.c_str(); }
-
 private:
-    struct PipeKey {
-        std::string path;
-        uint32_t nbufs = 0, push = 0;
-        bool operator==(const PipeKey& o) const { return path == o.path && nbufs == o.nbufs && push == o.push; }
-    };
-    struct PipeVal {
+    // One pipeline and everything that must be created and destroyed with it.  A key list parallel to a value
+    // list is two containers that have to stay the same length by hand; one struct cannot drift.
+    struct Pipe {
+        std::string spv_path;
+        uint32_t nbufs = 0, push_bytes = 0;
         VkPipeline pipe = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
@@ -93,11 +95,7 @@ private:
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
     uint32_t mem_type_ = 0;
-    std::vector<PipeKey> pkeys_;
-    std::vector<PipeVal> pvals_;
-    std::string err_;
-
-    void die(const std::string& what);
+    std::vector<Pipe> pipes_;
 };
 
 }  // namespace portvk

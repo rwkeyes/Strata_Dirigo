@@ -12,6 +12,13 @@
 //     real one passes.  A gate nobody has seen fail is decoration.
 #include "vk_compute.hpp"
 
+// The engine's bit converters, INCLUDED rather than transcribed.  The tree already ships them as
+// host-includable headers (`STRATA_BF16_HD`/`STRATA_HD` expand to nothing outside CUDA/HIP) and the engine's
+// own convention is that the kernel and its test both include it.  A hand copy here would be a SECOND
+// definition of the thing under test: it can drift, and a drift re-points the gate at the wrong reference.
+#include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -30,41 +37,9 @@ namespace {
 
 int g_fail = 0, g_pass = 0, g_skip = 0;
 
-// ---------------------------------------------------------------- the engine's own conversions, as bits
-// From include/strata/kernels/bf16_bits.hpp: round-to-nearest-EVEN on bit 16, NaN passed through quieted.
-uint16_t bf16_from_f32(float f) {
-    uint32_t i;
-    std::memcpy(&i, &f, 4);
-    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (uint16_t) ((i >> 16) | 64u);
-    i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
-    return (uint16_t) (i >> 16);
-}
-
-// From include/strata/kernels/f16_bits.hpp.  The three regimes (normal / subnormal / overflow) are each
-// explicit, and the overflow case must SATURATE to inf rather than producing a NaN.
-uint16_t f16_from_f32(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const uint32_t rawexp = (x >> 23) & 0xFFu;
-    int exp = (int) rawexp - 127 + 15;
-    uint32_t man = x & 0x7FFFFFu;
-    if (rawexp == 0xFFu) return (uint16_t) (sign | 0x7C00u | (man ? 0x200u : 0u));
-    if (exp >= 31) return (uint16_t) (sign | 0x7C00u);
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t) sign;
-        man |= 0x800000u;
-        const uint32_t sh = (uint32_t) (14 - exp);
-        uint32_t h = (man >> sh) & 0x3FFu;
-        const uint32_t rem = man & ((1u << sh) - 1u);
-        if (rem > (1u << (sh - 1)) || (rem == (1u << (sh - 1)) && (h & 1u))) ++h;
-        return (uint16_t) (sign | h);
-    }
-    uint16_t h = (uint16_t) (sign | ((uint32_t) exp << 10) | (man >> 13));
-    const uint32_t rem = man & 0x1FFFu;
-    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
-    return h;
-}
+// ------------------------------------------------------------------ the engine's own converters
+using strata::kernels::bf16_from_f32;
+using strata::kernels::f16_from_f32;
 
 // src/kernels/cuda/elementwise.cu / elementwise_parity.cpp: the large-x branch is load-bearing, above 20 the
 // function is `x` to f32 precision and `expf` overflows at 88.
@@ -96,7 +71,12 @@ void skip(const char* name, const char* why) {
     std::fflush(stdout);
 }
 
-uint32_t groups_for(uint64_t n, uint32_t local) { return (uint32_t) ((n + local - 1) / local); }
+// The workgroup size every kernel in this slice declares.  Named ONCE, and gates/run_gate.sh asserts it
+// equals each shader's compiled OpExecutionMode LocalSize: the same number written in two places is an
+// agreement that drifts.
+constexpr uint32_t kLocalSize = 256;
+
+uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocalSize - 1) / kLocalSize); }
 
 // A kernel whose .spv is missing (not written yet, or removed) is a LOUD skip: a case that cannot run must
 // never be counted as one that agreed.
@@ -113,14 +93,14 @@ bool have(const std::string& dir, const char* spv) {
 // 0. THE HARNESS ITSELF.  If this fails nothing below means anything.
 void case_copy(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "copy.spv")) return;
-    const uint32_t N = 1024, LOCAL = 256;
+    const uint32_t N = 1024;
     std::vector<float> a(N);
     for (auto& v : a) v = (float) (int32_t) rnd() * 1e-6f;
     Buf src = ctx.alloc(N * 4), dst = ctx.alloc(N * 4);
     ctx.write(src, a.data(), N * 4);
     VkPipeline p = ctx.pipeline(dir + "/copy.spv", 2, 4);
     struct { int32_t n; } pc{N};
-    ctx.dispatch(p, {&src, &dst}, &pc, sizeof(pc), groups_for(N, LOCAL));
+    ctx.dispatch(p, {&src, &dst}, &pc, sizeof(pc), groups_for(N));
     std::vector<float> got(N);
     ctx.read(dst, got.data(), N * 4);
     int bad = 0;
@@ -132,14 +112,14 @@ void case_copy(Ctx& ctx, const std::string& dir) {
 
 void case_scale(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "scale.spv")) return;
-    const uint32_t N = 1000, LOCAL = 256;
+    const uint32_t N = 1000;
     std::vector<float> a(N), want(N);
     for (uint32_t i = 0; i < N; ++i) { a[i] = rndf(2.0f); want[i] = a[i] * -1.75f; }
     Buf x = ctx.alloc(N * 4);
     ctx.write(x, a.data(), N * 4);
     VkPipeline p = ctx.pipeline(dir + "/scale.spv", 1, 8);
     struct { int32_t n; float s; } pc{N, -1.75f};
-    ctx.dispatch(p, {&x}, &pc, sizeof(pc), groups_for(N, LOCAL));
+    ctx.dispatch(p, {&x}, &pc, sizeof(pc), groups_for(N));
     std::vector<float> got(N);
     ctx.read(x, got.data(), N * 4);
     int bad = 0;
@@ -150,7 +130,7 @@ void case_scale(Ctx& ctx, const std::string& dir) {
 
 void case_add(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "add.spv")) return;
-    const uint32_t N = 1000, LOCAL = 256;
+    const uint32_t N = 1000;
     std::vector<float> d(N), s(N), want(N);
     for (uint32_t i = 0; i < N; ++i) { d[i] = rndf(1.0f); s[i] = rndf(1.0f); want[i] = d[i] + s[i]; }
     Buf dst = ctx.alloc(N * 4), src = ctx.alloc(N * 4);
@@ -158,7 +138,7 @@ void case_add(Ctx& ctx, const std::string& dir) {
     ctx.write(src, s.data(), N * 4);
     VkPipeline p = ctx.pipeline(dir + "/add.spv", 2, 4);
     struct { int32_t n; } pc{N};
-    ctx.dispatch(p, {&dst, &src}, &pc, sizeof(pc), groups_for(N, LOCAL));
+    ctx.dispatch(p, {&dst, &src}, &pc, sizeof(pc), groups_for(N));
     std::vector<float> got(N);
     ctx.read(dst, got.data(), N * 4);
     int bad = 0;
@@ -224,10 +204,9 @@ void run_conversion(Ctx& ctx, const std::string& dir, const char* tag, const cha
     for (uint32_t i = 0; i < N; ++i) want[i] = ref(f[i]);
     Buf x = ctx.alloc(N * 4), y = ctx.alloc(N * 2);
     ctx.write(x, f.data(), N * 4);
-    const uint32_t LOCAL = 256;
     VkPipeline p = ctx.pipeline(dir + "/" + spv, 2, 4);
     struct { int32_t n; } pc{(int32_t) N};
-    ctx.dispatch(p, {&x, &y}, &pc, sizeof(pc), groups_for(N, LOCAL));
+    ctx.dispatch(p, {&x, &y}, &pc, sizeof(pc), groups_for(N));
     std::vector<uint16_t> got(N);
     ctx.read(y, got.data(), N * 2);
     int bad = 0;
@@ -248,7 +227,7 @@ void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
     // softplus branch is crossed - a fixture that never exceeds 20 cannot see the branch at all.
     for (int n_tokens : {1, 3}) {
-        const int h_v = 48, n = n_tokens * h_v, LOCAL = 256;
+        const int h_v = 48, n = n_tokens * h_v;
         std::vector<float> alpha(n), dt(h_v), a(h_v), want(n);
         for (int t = 0; t < n_tokens; ++t)
             for (int h = 0; h < h_v; ++h) {
@@ -270,7 +249,7 @@ void case_gdn_gate(Ctx& ctx, const std::string& dir) {
         ctx.write(bS, a.data(), h_v * 4);
         VkPipeline p = ctx.pipeline(dir + "/gdn_gate.spv", 4, 8);
         struct { int32_t h_v; int32_t n_tokens; } pc{h_v, n_tokens};
-        ctx.dispatch(p, {&bA, &bD, &bS, &bG}, &pc, sizeof(pc), groups_for(n, LOCAL));
+        ctx.dispatch(p, {&bA, &bD, &bS, &bG}, &pc, sizeof(pc), groups_for(n));
         std::vector<float> got(n);
         ctx.read(bG, got.data(), n * 4);
         int bad = 0;
@@ -311,19 +290,16 @@ void case_gdn_gate(Ctx& ctx, const std::string& dir) {
 // overwritten and this case fails - which is exactly how the QSA bug reached a running engine.
 void case_rms_norm(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "rms_norm.spv")) return;
-    const uint32_t LOCAL = 256;
-    const uint32_t sg = ctx.info().subgroup_size ? ctx.info().subgroup_size : 32;
-    const uint32_t per_wg = LOCAL / sg;
-    if (per_wg == 0) {
-        skip("rms_norm_weighted", "subgroup larger than the workgroup");
-        return;
-    }
+    // ONE WORKGROUP PER ROW (see the shader header), so the dispatch is exactly `rows` groups.  The earlier
+    // subgroup-per-row version had to divide local_size_x by the DEVICE's reported subgroupSize here, and the
+    // width a driver actually compiles a kernel at is the driver's choice - too few groups skips tail rows
+    // silently.  The width now lives only inside the kernel, where it is a constant of the pipeline that runs.
     struct Shape { int rows, cols; bool weighted; };
     const Shape shapes[] = {{2, 256, true}, {5, 512, true}, {8, 1024, false}, {3, 4096, true}};
     for (const Shape& sh : shapes) {
         const int rows = sh.rows, cols = sh.cols;
         const uint64_t n = (uint64_t) rows * cols;
-        const uint64_t padded = n + (uint64_t) per_wg * cols + 8;   // slack for a missing row guard
+        const uint64_t padded = n + 2u * cols + 8;   // slack so an over-dispatch is DETECTED, not tolerated
         std::vector<float> x(padded), w(padded), ref(padded);
         for (uint64_t i = 0; i < n; ++i) { x[i] = rndf(1.0f); w[i] = sh.weighted ? rndf(1.0f) + 0.5f : 1.0f; }
         const float NaN = std::numeric_limits<float>::quiet_NaN();
@@ -343,7 +319,7 @@ void case_rms_norm(Ctx& ctx, const std::string& dir) {
         ctx.write(bw, w.data(), padded * 4);
         VkPipeline p = ctx.pipeline(dir + "/rms_norm.spv", 2, 12);
         struct { int32_t rows; int32_t cols; float eps; } pc{rows, cols, 1e-6f};
-        ctx.dispatch(p, {&bx, &bw}, &pc, sizeof(pc), (uint32_t) ((rows + per_wg - 1) / per_wg));
+        ctx.dispatch(p, {&bx, &bw}, &pc, sizeof(pc), (uint32_t) rows);
         std::vector<float> got(padded);
         ctx.read(bx, got.data(), padded * 4);
         int bad = 0;
@@ -368,12 +344,11 @@ void case_rms_norm(Ctx& ctx, const std::string& dir) {
 }
 
 void case_silu(Ctx& ctx, const std::string& dir) {
-    const uint32_t N = 1000, LOCAL = 256;
+    const uint32_t N = 1000;
     if (!have(dir, "silu_f32.spv")) return;
     // shaders/blocked/silu_fp64.comp exists but does not compile on this host's glslang (no double overload of
     // `exp` reaches SPIR-V on glslang 14.0 or 15.1) - see shaders/blocked/README.md.  The f32 shader is the
     // shipping path, so the gate MEASURES its gap against the DOUBLE reference instead of assuming it is exact.
-    const bool fp64 = false;
     std::vector<float> x(N), ref(N);
     for (uint32_t i = 0; i < N; ++i) {
         x[i] = rndf(6.0f);
@@ -382,22 +357,20 @@ void case_silu(Ctx& ctx, const std::string& dir) {
     }
     Buf bx = ctx.alloc(N * 4);
     ctx.write(bx, x.data(), N * 4);
-    VkPipeline p = ctx.pipeline(dir + (fp64 ? "/silu.spv" : "/silu_f32.spv"), 1, 4);
+    VkPipeline p = ctx.pipeline(dir + "/silu_f32.spv", 1, 4);
     struct { int32_t n; } pc{(int32_t) N};
-    ctx.dispatch(p, {&bx}, &pc, sizeof(pc), groups_for(N, LOCAL));
+    ctx.dispatch(p, {&bx}, &pc, sizeof(pc), groups_for(N));
     std::vector<float> got(N);
     ctx.read(bx, got.data(), N * 4);
-    const double rel = fp64 ? 0.0 : 2e-6;               // fp64 path must be bit-exact against the double math
+    const double rel = 2e-6;                            // what the f32 path needs against the double reference
     int bad = 0;
     double worst = 0;
     for (uint32_t i = 0; i < N; ++i) {
-        if (!close_enough(got[i], ref[i], rel, fp64 ? 0.0 : 1e-12)) ++bad;
+        if (!close_enough(got[i], ref[i], rel, 1e-12)) ++bad;
         const double r = std::fabs((double) got[i] - ref[i]) / (std::fabs((double) ref[i]) + 1e-30);
         worst = std::max(worst, r);
     }
-    char tag[64];
-    std::snprintf(tag, sizeof tag, "silu_inplace%s", fp64 ? "" : " (f32 fallback)");
-    verdict(tag, bad == 0, bad, (int) N, worst, fp64 ? "relative (fp64: must be 0)" : "relative (tol 2e-6)");
+    verdict("silu_inplace (f32 vs double ref)", bad == 0, bad, (int) N, worst, "relative (tol 2e-6)");
     ctx.free(bx);
 }
 
@@ -407,14 +380,14 @@ void case_silu(Ctx& ctx, const std::string& dir) {
 // only this separates them.
 void case_exp_probe(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "exp_probe.spv")) return;
-    const uint32_t N = 201, LOCAL = 256;
+    const uint32_t N = 201;
     std::vector<float> x(N);
     for (uint32_t i = 0; i < N; ++i) x[i] = -20.0f + 0.2f * (float) i;
     Buf bx = ctx.alloc(N * 4), by = ctx.alloc(N * 4), bz = ctx.alloc(N * 4);
     ctx.write(bx, x.data(), N * 4);
     VkPipeline p = ctx.pipeline(dir + "/exp_probe.spv", 3, 4);
     struct { int32_t n; } pc{(int32_t) N};
-    ctx.dispatch(p, {&bx, &by, &bz}, &pc, sizeof(pc), groups_for(N, LOCAL));
+    ctx.dispatch(p, {&bx, &by, &bz}, &pc, sizeof(pc), groups_for(N));
     std::vector<float> ye(N), zl(N);
     ctx.read(by, ye.data(), N * 4);
     ctx.read(bz, zl.data(), N * 4);
@@ -438,7 +411,10 @@ void case_exp_probe(Ctx& ctx, const std::string& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string dir = "/home/bob/strata-vulkan-port/shaders";
+    // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
+    // of .spv files is an ERROR - a gate that runs zero cases must never report success.
+    const char* env_dir = std::getenv("STRATA_VK_SPV_DIR");
+    std::string dir = env_dir ? env_dir : "shaders";
     int dev = -1;
     bool list = false;
     for (int i = 1; i < argc; ++i) {
@@ -465,6 +441,10 @@ int main(int argc, char** argv) {
                 VK_VERSION_MINOR(di.api), VK_VERSION_PATCH(di.api), di.subgroup_size,
                 (int) di.storage_buffer_16bit, (int) di.shader_int16, (int) di.shader_float64,
                 (double) di.heap_device_local_bytes / (1024.0 * 1024 * 1024));
+    if (di.heap_device_local_bytes < 4ull * 1024 * 1024 * 1024) {
+        std::printf("   note: the DEVICE_LOCAL heap is small.  On Intel Arc that is the BAR window, NOT the "
+                    "model budget - do not size a model from it.\n");
+    }
     case_copy(ctx, dir);
     case_scale(ctx, dir);
     case_add(ctx, dir);
@@ -476,5 +456,11 @@ int main(int argc, char** argv) {
     case_exp_probe(ctx, dir);
     case_silu(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
+    // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
+    // need) is not a suite that agreed with the reference, and it must not look like one.
+    if (g_pass == 0) {
+        std::printf("== FAIL: no case reached a verdict\n");
+        return 1;
+    }
     return g_fail ? 1 : 0;
 }
