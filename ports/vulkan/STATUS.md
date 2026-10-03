@@ -37,7 +37,14 @@ hardcoded path, a constant repeated nine times, `-Werror`) and six compatibility
 defects (**`rms_norm` coupled the host's dispatch to the driver's subgroup width**, which would skip tail rows
 silently on Intel where the driver picks a SIMD width per kernel; and **an fp16 device feature requested with
 no fp16 in any kernel**, which fails `vkCreateDevice` on hardware that lacks it). All fixed and re-verified,
-four new automated checks added, and each one proven able to fail.
+five new automated checks added, each proven able to fail — including a CROSS-IMPLEMENTATION arm, which was
+added after the same shaders measured worst-case relative error 1.13 on llvmpipe (subgroup 8) while passing on
+RADV (subgroup 64): a reduction combine stage assumed `gl_NumSubgroups <= gl_SubgroupSize`. Fixed and verified
+green on both implementations.
+
+**Verified on two Vulkan implementations:** RADV/7900 XTX (subgroup 64) and llvmpipe/CPU (subgroup 8) — 14/14
+each, run automatically by `gates/run_gate.sh`. The Intel ICD is present but has no device on this machine, so
+the arm reports it as no-device; it will run automatically when an Arc card is in the box.
 
 ## Two defects found by the gate (both real, both fixed, both measured)
 

@@ -94,4 +94,36 @@ passed="$(sed -n 's/^== \([0-9]*\) passed.*/\1/p' <<<"$summary")"
 skipped="$(sed -n 's/.* \([0-9]*\) skipped$/\1/p' <<<"$summary")"
 if [ "${passed:-0}" -eq 0 ]; then echo "== zero cases passed"; exit 1; fi
 if [ "${skipped:-0}" -ne 0 ]; then echo "== $skipped case(s) SKIPPED - a skipped case is not a passing one"; exit 1; fi
-echo "== shader checks + numeric gate: $summary"
+
+# -----------------------------------------------------------------------------------------------------------
+# CROSS-IMPLEMENTATION ARM.  Every ICD that reports a device is run, because a kernel can be correct on one
+# implementation and wrong on another: the reduction below was written for a 64-lane subgroup and silently
+# dropped 24 of 32 subgroup sums at 8 lanes (llvmpipe), where every value came out ~2x off.  That was invisible
+# on the only device it had been tested on.  An ICD with no device is reported as such and skipped - skipping a
+# MISSING HARDWARE is honest; skipping a present implementation is not.
+echo "== cross-implementation arm (every Vulkan ICD that reports a device)"
+impls=0
+for icd in /usr/share/vulkan/icd.d/*.json; do
+  [ -e "$icd" ] || continue
+  name="$(basename "$icd" .json)"
+  first="$(VK_ICD_FILENAMES="$icd" "$BUILD/vk_gate" --list 2>/dev/null | head -1)"
+  if [ -z "$first" ]; then
+    printf '  --   %-16s no device on this machine\n' "$name"
+    continue
+  fi
+  impls=$((impls+1))
+  icd_log="$BUILD/icd-$name.log"
+  if VK_ICD_FILENAMES="$icd" "$BUILD/vk_gate" --spv-dir "$SH" >"$icd_log" 2>&1; then
+    printf '  OK   %-16s %s\n' "$name" "$(grep -E '^== [0-9]+ passed' "$icd_log" | tail -1)"
+  else
+    printf '  FAIL %-16s %s\n' "$name" "$(grep -E '^== [0-9]+ passed' "$icd_log" | tail -1)"
+    grep -E '^FAIL' "$icd_log" | head -5
+    rc=1
+  fi
+done
+if [ "$impls" -lt 2 ]; then
+  echo "  note: only $impls implementation(s) exercised - a width-dependent defect can hide in a single one"
+fi
+[ $rc -eq 0 ] || { echo "== cross-implementation arm FAILED"; exit 1; }
+
+echo "== shader checks + numeric gate: $summary ($impls implementation(s))"

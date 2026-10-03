@@ -64,10 +64,18 @@ void main() {
     if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < MAX_SUBGROUPS) partial[gl_SubgroupID] = sub;
     barrier();
 
-    // Stage 2: the first subgroup combines one entry per subgroup.  `gl_NumSubgroups` is this pipeline's own
-    // compile-time count, so the number of entries read matches the number written at any width.
+    // Stage 2: the first subgroup combines one entry per subgroup.
+    //
+    // **THIS MUST LOOP, AND THE FIRST VERSION DID NOT.** It read `partial[gl_SubgroupInvocationID]` for
+    // `gl_SubgroupInvocationID < gl_NumSubgroups`, which is only correct while gl_NumSubgroups <= the subgroup
+    // width - true at width 64 (4 entries) and at 32 (8), false at width 8 where there are 32 entries and a
+    // subgroup has 8 lanes. It silently dropped 24 of 32 subgroup sums, so the sum came out ~1/4 of the truth,
+    // `inv` was 2x too large and every value was ~2x off: measured worst relative error 1.13 on a CPU Vulkan
+    // implementation (llvmpipe, subgroup 8) against 2.35e-07 on RADV (subgroup 64). Same defect class as a
+    // hardcoded 32-lane assumption, one level up - and it is invisible on the only device it was tested on.
     if (gl_SubgroupID == 0u) {
-        float t = (gl_SubgroupInvocationID < gl_NumSubgroups) ? partial[gl_SubgroupInvocationID] : 0.0;
+        float t = 0.0;
+        for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize) t += partial[i];
         t = subgroupAdd(t);
         if (gl_SubgroupInvocationID == 0u) row_inv = inversesqrt(t / float(pc.cols) + pc.eps);
     }

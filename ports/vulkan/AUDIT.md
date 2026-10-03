@@ -87,9 +87,38 @@ the Intel-specific form of the "SIMD width is the silent killer" trap, and it is
 
 **Fixed** — rewritten as one **workgroup** per row (`shaders/rms_norm.comp`): dispatch is exactly `rows`
 workgroups, the width appears only inside the kernel (`gl_NumSubgroups`, `gl_SubgroupSize` — compile-time
-constants of the pipeline that actually runs), the reduction is a two-stage subgroup + shared-memory sum sized
-for the narrowest hardware subgroup, and the guard is now workgroup-uniform so the barriers are legal. The
-host's subgroup arithmetic is gone. Re-verified on all four shapes (worst relative 2.35e-07).
+constants of the pipeline that actually runs), and the guard is now workgroup-uniform so the barriers are legal.
+The host's subgroup arithmetic is gone.
+
+**AND THE FIRST VERSION OF THAT FIX WAS ITSELF WRONG — see §3.1b. The correction is kept here rather than
+quietly edited out, because the way it was found is the finding.**
+
+### 3.1b The rewrite's combine stage assumed `gl_NumSubgroups <= gl_SubgroupSize` (HIGH, FIXED, found on a second implementation)
+
+The new two-stage reduction combined **one entry per subgroup** by having the first subgroup read
+`partial[gl_SubgroupInvocationID]` for `gl_SubgroupInvocationID < gl_NumSubgroups`. That is correct only while
+the number of subgroups does not exceed the subgroup's lane count:
+
+| subgroup size | subgroups (local_size_x = 256) | entries the stage could read | |
+|---|---|---|---|
+| 64 (RADV) | 4 | 4 | correct |
+| 32 | 8 | 8 | correct |
+| 16 | 16 | 16 | correct |
+| **8 (llvmpipe, and a width Intel's compiler may pick)** | **32** | **8** | **drops 24 of 32 sums** |
+
+Measured on llvmpipe: **worst relative error 1.13 on all four shapes, against 2.35e-07 on RADV.** The arithmetic
+matches exactly — three quarters of the sum missing, so `rsqrt(mean)` is 2x too large and every element comes
+out ~2x off. It is the same defect class as a hardcoded 32-lane assumption, one level up, and it was **invisible
+on the only implementation the port had ever been run on**.
+
+**Fixed** — the stage now accumulates with a stride (`for (i = lane; i < gl_NumSubgroups; i += gl_SubgroupSize)`),
+which is correct at any ratio. Re-verified: **14/14 on RADV (subgroup 64) and 14/14 on llvmpipe (subgroup 8)**.
+
+**Root cause of the near-miss: the port had only ever been tested on one Vulkan implementation.** `run_gate.sh`
+now has a cross-implementation arm that runs the gate on **every ICD that reports a device** and fails if any of
+them fails (absent hardware is reported as absent, which is honest; a present implementation is never skipped).
+On this box that means RADV and llvmpipe; on the target box it will mean the Intel ICD the moment the card is
+present — which is exactly the implementation whose per-kernel SIMD width motivated §3.1.
 
 ### 3.2 An unrequested feature could refuse device creation (HIGH, FIXED)
 `vk_compute.cpp:186` (rev `1bcdc91`) set `VkPhysicalDeviceShaderFloat16Int8Features::shaderFloat16 = VK_TRUE`
@@ -158,9 +187,10 @@ Xe2 needs a toolchain bump (glslang ≥ 16, or naga/rust-gpu). Recorded in the p
 | empty shader set | ran the gate in a copy with no `.comp` files → `refusing to report success`, exit 1 |
 | a missing kernel is not a pass | removed `add.comp` → `SKIP add.spv`, then `1 case(s) SKIPPED - a skipped case is not a passing one`, exit 1 |
 | the bit-exact numeric gate | the negative control shader disagrees on 484 of 1024 values |
+| cross-implementation (new) | it is what found §3.1b: the same shaders, unchanged, produce worst-case relative error 1.13 on llvmpipe and 2.4e-07 on RADV |
 
-**Two of my own checks were defective and the self-test is what caught them** — worth recording, because both
-are the exact failure modes the guideline's audit rules warn about:
+**Three of this audit's own artifacts were defective, and each was caught by testing rather than by reading** —
+worth recording, because they are the exact failure modes the guideline's audit rules warn about:
 
 1. The first injection **silently did not apply** (`if (i >= pc.n) return;` is not the text in
    `scale.comp`), so the census correctly reported a clean shader and the "test" proved nothing. Fixed by
@@ -169,11 +199,16 @@ are the exact failure modes the guideline's audit rules warn about:
 2. The second attempt injected code the **compiler folds away** (`subgroupAdd(1.0) == 0.0` is uniform and
    constant), so again nothing was proven. The census can only see operations that survive optimisation —
    which is the right property, but it means an injection must change the result to test the check.
+3. **The §3.1 fix introduced §3.1b**, and no amount of self-testing on this box could have found it: the
+   self-tests all ran on the same implementation. A second implementation with a different subgroup width found
+   it in one run. The general rule this audit arrives at: *for a kernel whose correctness depends on a runtime
+   width — subgroup, SIMD, warp — one implementation is not a test, it is an anecdote.*
 
 Along the way a script's exit status was read from a pipeline (`... | tail -2; echo $?`) and reported `0` for a
 command that had correctly exited 1 — an exit code is not a result.
 
-**UNVERIFIED (stated as such, not as findings):** anything on Intel silicon — the subgroup widths ANV actually
+**UNVERIFIED (stated as such, not as findings):** the Intel ICD itself (present but deviceless here, so the
+cross-implementation arm reports it as no-device and it is genuinely untested); anything else on Intel silicon — the subgroup widths ANV actually
 compiles, whether the workgroup-per-row reduction is fast enough there, `VK_EXT_memory_budget` on the Arc
 driver, 8-bit storage for `embedding_gather`, cooperative matrix, and the Battlemage stability question in §3.5.
 The harness cannot answer any of them without the card.
