@@ -24,7 +24,7 @@ card rather than after it.
 | 9 | **VRAM safety rule cannot use the driver figure** | **ACTION** | Mesa 25.2.8 < 26.2 (anv heap budget tracking); noble tops out at 25.2.8 and the configured Intel (kobuk) PPA carries no `mesa-vulkan-drivers` |
 | 10 | **Display connector** | **ACTION** | Monitor is on `card2-HDMI-A-2`; B-series Pro cards are 4× DisplayPort (or mini-DP) and have no HDMI |
 | 11 | Resizable BAR | **ACTION** | Current card's BAR is 256M — ReBAR off; Intel asks for it on Arc |
-| 12 | XMX / cooperative matrix | **GAP** | toolchain emits no cooperative matrix (glslang 14.0 via shaderc 2023.8, 15.1 standalone) |
+| 12 | XMX / cooperative matrix | **PATH PROVEN, TUNING PENDING** | the toolchain *does* emit it (corrected 2026-10-03 - the "absent" verdict was a broken probe shader of mine); a CMA GEMM now exists and is verified on RADV on three shapes, worst relative error 4.5e-4 |
 | 13 | Engine sizing | **ACTION** | serve config uses `--resident-budget-gib 20`, tuned for the 24 GiB card; the B70 has 32 GiB |
 | 14 | Physical fit | **CHECK** | 2-slot blower, ~267 mm, 230 W reference (160–290 W by partner) — confirm a PCIe power connector and PSU headroom |
 
@@ -71,10 +71,13 @@ would have to move to a motherboard port.
 
 ## 4. Performance expectations to set before, not after
 
-- **The XMX engines are unreachable today.** The B70's headline (256 XMX engines, 367 INT8 TOPS) is exactly what
-  cooperative matrix exposes, and this toolchain cannot emit it (§4.3b of `STACK-COMPAT.md`). Until shaderc/glslang
-  is upgraded, the port on a B70 is a **bandwidth-bound plain-FMA** engine on 608 GB/s with 32 GB — which is still
-  a bigger, faster card than the 7900 XTX for this workload, but it is not the 367-TOPS number.
+- **The matrix-unit path exists and is verified - on AMD, not yet on Intel.** A cooperative-matrix GEMM
+  (`C = A·B`, fp16 operands, fp32 accumulator) is in the port and passes on three shapes against a host
+  reference, worst relative error 4.5e-4 — the fp16 storage format's own limit, not the kernel's. What is still
+  Intel-specific and unmeasured is the same shader on Xe2: its subgroup width (16/32 rather than RADV's 64) and,
+  for the real engine, the dequant step, because IQ1_M weights must become fp16 before the matrix units can
+  consume them. Two things are not gated on that at all: the 32 GB and the 608 GB/s are available to the
+  plain-FMA kernels on day one, which is already more than the card being removed offers.
 - **Resizable BAR:** the current card shows a 256M BAR (ReBAR off). Intel asks for ReBAR for Arc performance;
   check the BIOS (Above-4G decoding + ReBAR) before benchmarking, or the numbers will be quietly low.
 - **Engine sizing:** `--resident-budget-gib 20` was tuned for 24 GiB. On 32 GiB there is room to raise it, and the
@@ -122,3 +125,10 @@ Recording these because each one would have caused a wrong action:
    *name* for the B70 is absent from the driver, but the **PCI ID table** is what decides, and Mesa 25.2.0 added
    `0xe220-0xe223` as BMG G31. Name missing ≠ device unsupported.
 4. **"24 GiB"** as the card size throughout the reserve discussion — that was the AMD card. The B70 is **32 GiB**.
+
+5. **"The toolchain cannot emit cooperative matrix, so XMX is unreachable."** Wrong, and wrong *because the check
+   was wrong*: the probe shader omitted `GL_KHR_memory_scope_semantics`, called `coopmatMulAdd` instead of
+   `coopMatMulAdd`, and used `gl_MatrixLayoutRowMajor` instead of `gl_CooperativeMatrixLayoutRowMajor`. `glslc`
+   emits the opcode and the SPIR-V validates. That false verdict reached three documents before the probe was made
+   to compile the real kernel; a capability probe that is a fixture rather than the shipping shader can report a
+   limitation that does not exist.

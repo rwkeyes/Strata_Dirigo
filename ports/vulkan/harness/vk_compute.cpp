@@ -80,6 +80,51 @@ static std::string fs_basename(const std::string& p) {
     return at == std::string::npos ? p : p.substr(at + 1);
 }
 
+// VK_KHR_cooperative_matrix, asked as two questions: does the extension+feature exist, and is there a config we
+// can actually run?  Source of the second fact is the driver's own property list.  A null instance skips the
+// query rather than guessing.
+static void fill_coopmat(VkInstance inst, DeviceInfo& di, VkPhysicalDevice pd) {
+    if (inst == VK_NULL_HANDLE) return;
+    uint32_t ec = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &ec, nullptr);
+    std::vector<VkExtensionProperties> exts(ec);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &ec, exts.data());
+    bool has_ext = false;
+    for (const auto& e : exts) {
+        if (std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) has_ext = true;
+    }
+    if (!has_ext) return;
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf{};
+    cmf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceFeatures2 q2{};
+    q2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    q2.pNext = &cmf;
+    vkGetPhysicalDeviceFeatures2(pd, &q2);
+    di.cooperative_matrix = cmf.cooperativeMatrix == VK_TRUE;
+    if (!di.cooperative_matrix) return;
+
+    auto get_props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+                         vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+    if (!get_props) return;
+    uint32_t n = 0;
+    get_props(pd, &n, nullptr);
+    if (n == 0) return;
+    std::vector<VkCooperativeMatrixPropertiesKHR> props(n);
+    for (auto& c : props) {
+        c.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+        c.pNext = nullptr;
+    }
+    get_props(pd, &n, props.data());
+    for (const auto& c : props) {
+        if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 && c.scope == VK_SCOPE_SUBGROUP_KHR &&
+            c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+            di.cm_f16_f32 = true;
+        }
+    }
+}
+
 static void fill_info(DeviceInfo& di, VkPhysicalDevice pd) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(pd, &props);
@@ -130,6 +175,7 @@ std::vector<DeviceInfo> Ctx::list_devices() {
     for (auto pd : pds) {
         DeviceInfo di{};
         fill_info(di, pd);
+        fill_coopmat(inst, di, pd);
         out.push_back(di);
     }
     vkDestroyInstance(inst, nullptr);
@@ -161,6 +207,7 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     for (uint32_t i = 0; i < n; ++i) {
         DeviceInfo di{};
         fill_info(di, pds[i]);
+        fill_coopmat(instance_, di, pds[i]);
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &qn, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qn);
@@ -188,6 +235,7 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     phys_ = pds[(size_t) chosen];
     device_index_ = chosen;
     fill_info(info_, phys_);
+    fill_coopmat(instance_, info_, phys_);
 
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(phys_, &qn, nullptr);
@@ -224,19 +272,28 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     f16.storageBuffer16BitAccess = info_.storage_buffer_16bit ? VK_TRUE : VK_FALSE;
     f2.pNext = &f16;
+    // A cooperative-matrix pipeline needs BOTH the feature and the extension enabled, and only where the device
+    // reported them - the same rule as every other feature here.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmfeat{};
+    cmfeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    cmfeat.cooperativeMatrix = info_.cooperative_matrix ? VK_TRUE : VK_FALSE;
+    f16.pNext = &cmfeat;
     f2.features.shaderInt16 = info_.shader_int16 ? VK_TRUE : VK_FALSE;
 
     // VK_EXT_memory_budget adds NO entry points: a capability check plus the name in the enabled list is the
     // whole wiring, and enabling it is what makes the driver report a budget instead of a raw heap size.
     const char* const kBUDGET_EXT = "VK_EXT_memory_budget";
     const bool want_budget_ext = device_has_extension(phys_, kBUDGET_EXT);
+    std::vector<const char*> want_exts;
+    if (want_budget_ext) want_exts.push_back(kBUDGET_EXT);
+    if (info_.cooperative_matrix) want_exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = want_budget_ext ? 1u : 0u;
-    dci.ppEnabledExtensionNames = want_budget_ext ? &kBUDGET_EXT : nullptr;
+    dci.enabledExtensionCount = (uint32_t) want_exts.size();
+    dci.ppEnabledExtensionNames = want_exts.empty() ? nullptr : want_exts.data();
     VK_CHECK(vkCreateDevice(phys_, &dci, nullptr, &dev_));
     vkGetDeviceQueue(dev_, queue_family_, 0, &queue_);
 

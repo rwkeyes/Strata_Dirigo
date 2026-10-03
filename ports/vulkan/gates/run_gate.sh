@@ -79,42 +79,54 @@ done
 # -----------------------------------------------------------------------------------------------------------
 # TOOLCHAIN PROBES.  These do not decide whether the port RUNS - they decide what it CAN do, and every one of
 # them is a property of a tool version rather than of this code, so they will change under us.  Two matter:
-#   * cooperative matrix: the only route from Vulkan to Xe2's matrix units.  Needs glslang > 15.1; absent here.
-#   * fp64 math builtins: whether the CUDA source's double-precision silu can be expressed at all.
+#   * cooperative matrix: the only route from Vulkan to the matrix units (Intel XMX / AMD WMMA).  It IS supported
+#     by this toolchain - the earlier "absent" verdict came from a broken probe shader, not from glslc.
+#   * fp64: double ARITHMETIC compiles; exp(double) does not, which is what keeps the silu reference host-side.
 echo "== toolchain probes (capability, not correctness)"
 TP="$BUILD/toolprobe"; mkdir -p "$TP"
 missing=""
 for t in glslc spirv-val g++; do command -v "$t" >/dev/null || missing="$missing $t"; done
 if [ -n "$missing" ]; then echo "  FAIL required tool(s) absent:$missing"; exit 1; fi
 
-cat > "$TP/coopmat.comp" <<'EOF'
+# Cooperative matrix: compile the REAL kernel, not a throwaway fixture.  The fixture this replaces was itself
+# broken - it omitted GL_KHR_memory_scope_semantics, called `coopmatMulAdd` (the extension spells it
+# `coopMatMulAdd`) and used `gl_MatrixLayoutRowMajor` (it is `gl_CooperativeMatrixLayoutRowMajor`) - so the
+# answer to "does it compile?" was reported as a toolchain limitation that did not exist.  A probe that IS the
+# shipping shader cannot drift away from the capability it claims.
+if glslc --target-env=vulkan1.3 -fshader-stage=compute "$SH/gemm_coopmat.comp" -o "$TP/coopmat.spv" 2>"$TP/coopmat.err"; then
+  coop="SUPPORTED - OpCooperativeMatrixMulAddKHR is emitted"
+else
+  coop="ABSENT - $(head -1 "$TP/coopmat.err" | cut -c1-64)"
+fi
+
+# fp64: arithmetic and transcendentals are DIFFERENT questions, and the old single probe conflated them.  Basic
+# double arithmetic compiles fine on this toolchain; what it cannot express is exp(double), which is the actual
+# reason the double-precision silu reference is still a host-side oracle.
+cat > "$TP/fp64_arith.comp" <<'EOF'
 #version 450
-#extension GL_KHR_cooperative_matrix : require
+#extension GL_ARB_gpu_shader_fp64 : require
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) buffer O { float v[]; } o;
-void main() {
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
-    a = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(0.0);
-    b = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(0.0);
-    c = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    c = coopmatMulAdd(a, b, c);
-    o.v[gl_LocalInvocationIndex] = c[0];
-}
+void main() { double d = double(o.v[gl_LocalInvocationIndex]) * 1.5 + 2.0; o.v[0] = float(d); }
 EOF
-if glslc --target-env=vulkan1.3 -fshader-stage=compute "$TP/coopmat.comp" -o "$TP/coopmat.spv" 2>"$TP/coopmat.err"; then
-  coop="SUPPORTED"; else coop="absent (drivable?)"; fi
-
-cat > "$TP/fp64.comp" <<'EOF'
+cat > "$TP/fp64_exp.comp" <<'EOF'
 #version 450
 #extension GL_ARB_gpu_shader_fp64 : require
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) buffer O { float v[]; } o;
 void main() { double d = double(o.v[gl_LocalInvocationIndex]); o.v[0] = float(exp(-d)); }
 EOF
-if glslc --target-env=vulkan1.3 -fshader-stage=compute "$TP/fp64.comp" -o "$TP/fp64.spv" 2>"$TP/fp64.err"; then
-  fp64="SUPPORTED"; else fp64="absent"; fi
+a_ok=no; if glslc --target-env=vulkan1.3 -fshader-stage=compute "$TP/fp64_arith.comp" -o "$TP/fp64a.spv" 2>"$TP/fp64a.err"; then a_ok=yes; fi
+e_ok=no; if glslc --target-env=vulkan1.3 -fshader-stage=compute "$TP/fp64_exp.comp" -o "$TP/fp64e.spv" 2>"$TP/fp64e.err"; then e_ok=yes; fi
+if [ "$a_ok" = yes ] && [ "$e_ok" = no ]; then
+  fp64="arithmetic yes, exp(double) NO (host-side oracle stays)"
+elif [ "$a_ok" = yes ]; then
+  fp64="SUPPORTED"
+elif [ "$e_ok" = no ]; then
+  fp64="absent (no fp64 at all)"
+else
+  fp64="odd: exp(double) compiles but arithmetic does not"
+fi
 
 if spirv-val --target-env vulkan1.3 "$ROOT/shaders/copy.spv" >/dev/null 2>&1; then valform="--target-env <env>"; else valform="unknown"; fi
 
@@ -122,8 +134,8 @@ printf '  %-42s %s\n' "glslc (shader compile)"        "$(glslc --version 2>/dev/
 printf '  %-42s %s\n' "spirv-val (SPIR-V validation)" "$(spirv-val --version 2>/dev/null | head -1)"
 printf '  %-42s %s\n' "g++ (harness build, C++20)"    "$(g++ --version 2>/dev/null | head -1)"
 printf '  %-42s %s\n' "spirv-val accepted arg form"   "$valform"
-printf '  %-42s %s\n' "cooperative matrix -> Xe2 XMX path" "$coop"
-printf '  %-42s %s\n' "fp64 math builtins (silu fidelity)" "$fp64"
+printf '  %-42s %s\n' "cooperative matrix (matrix-unit path)" "$coop"
+printf '  %-42s %s\n' "fp64 arithmetic / transcendentals" "$fp64"
 echo "  (a capability reported absent here is a TOOLCHAIN limit, not a port defect - see STACK-COMPAT.md)"
 
 echo "== building the harness (-Werror: hygiene is part of the gate)"

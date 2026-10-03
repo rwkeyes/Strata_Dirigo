@@ -229,14 +229,44 @@ the failure reported for tensor-parallel LLM inference on Battlemage, asked abou
 exactly those terms. This is why the port's design rule is **bounded work per submission** (PORT-PLAN §4b), and
 it is the constraint to check first if a long run dies mid-generation.
 
-### 4.3b The toolchain gates the performance path
+### 4.3b The matrix-unit path (`VK_KHR_cooperative_matrix`)
 
-The biggest performance item for Battlemage is reaching Xe2's **matrix units**, and that is a *toolchain*
-question before it is a code question: cooperative matrix is the only Vulkan route to them, and it is **absent**
-on this toolchain. So the honest statement of the performance ceiling today is *bandwidth-bound plain-FMA
-shaders*: correct, but not using the silicon's matrix engines. The probe in `gates/run_gate.sh` reports the
-capability on every run, so a toolchain that emits it shows up as a line of output instead of something somebody
-has to remember to re-check.
+**Correction, same day, after building it:** this section previously said the toolchain could not emit cooperative
+matrix and that Battlemage's XMX engines were therefore unreachable. **That was wrong, and the fault was in my
+check, not in the toolchain.** The probe shader I wrote omitted `GL_KHR_memory_scope_semantics`, misspelled
+`coopMatMulAdd` (it is not `coopmatMulAdd`), and used `gl_MatrixLayoutRowMajor` instead of
+`gl_CooperativeMatrixLayoutRowMajor`. `glslc` — shaderc 2023.8, glslang 14, well below the version the skill
+blamed — emits `OpCooperativeMatrixMulAddKHR` and `spirv-val` accepts it for Vulkan 1.3. The probe now compiles
+the **shipping kernel** rather than a fixture, so it cannot drift from the capability it claims.
+
+What is true, and matters more than the toolchain question:
+
+- **The config is hardware, and the driver's list is the only authority.** Measured on RADV / RX 7900 XTX: 14
+  supported configs, all `M16 N16 K16` with subgroup scope; the only floating-point ones are `f16×f16→f16` and
+  `f16×f16→f32`. **There is no fp32-operand config at all**, so an fp32 cooperative-matrix GEMM compiles and still
+  cannot run. Selection must come from `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` — never from "it
+  compiled", which is the same trap in a new place.
+- **It is not a universal win.** On Intel it is gated to Xe2 because it *regresses* on Alchemist, so the pipeline
+  is chosen by device property, never by vendor.
+- **A device without it is a loud SKIP**, neither a pass nor a failure (§6), and the suite fails closed on skips.
+
+`shaders/gemm_coopmat.comp` is the first kernel on this path (`C = A·B`, fp16 operands with an fp32 accumulator),
+verified against a host reference on three shapes — 64³, 32×16×48, 16×64×32 — with worst relative error 4.5e-4,
+i.e. **fp16-operand precision, the storage format's own limit rather than the kernel's**. The reference is built
+from the fp16-rounded operands for exactly that reason. The dispatch is one 16×16 tile per *subgroup*, with the
+per-workgroup tile count derived inside the kernel from `gl_WorkGroupSize/gl_SubgroupSize`; the host dispatches an
+upper bound and the kernel discards the surplus, because over-dispatch is free while under-dispatch silently drops
+output — the `rms_norm` defect, avoided by construction here.
+
+Two of its defects were found by the shape matrix rather than by inspection: the tile→(row,col) mapping was
+**transposed** (invisible on a square tile grid, where transposing still visits every tile — the 64³ case passed
+with it), and the new case **perturbed the memory-budget check** by allocating before it (RADV rounds allocations
+up to 2 MiB, so a few buffers move `heapUsage` by ~9 MB). Both fixed; the case now runs after the device-state
+checks, with a comment saying why.
+
+**Honest state:** the matrix-unit path works end to end and is verified on AMD silicon. What remains for the B70
+is Intel-specific — the same shader on Xe2, its subgroup width (16/32 rather than 64), and the dequant step the
+real engine needs, since IQ1_M weights must be dequantized to fp16 before the matrix units can consume them.
 
 ### 4.4 Honest limit
 

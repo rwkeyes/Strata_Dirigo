@@ -61,6 +61,11 @@ struct DeviceInfo {
     uint32_t vendor_id = 0, device_id = 0;
     uint32_t api = 0;
     bool storage_buffer_16bit = false;   // VK_KHR_16bit_storage storageBuffer16BitAccess
+    // VK_KHR_cooperative_matrix - the ONLY route to the matrix units (Intel XMX, AMD WMMA).  Two separate facts,
+    // because the second is not implied by the first: on RADV the 14 supported configs are all M16 N16 K16 with
+    // subgroup scope and NONE of them takes fp32 operands, so an fp32 GEMM compiles and still cannot run.
+    bool cooperative_matrix = false;     // extension + feature present
+    bool cm_f16_f32 = false;             // ...and a usable config exists: M16 N16 K16 subgroup, f16/f16 -> f32
     bool shader_int16 = false;
     bool shader_float64 = false;
     uint32_t subgroup_size = 0;

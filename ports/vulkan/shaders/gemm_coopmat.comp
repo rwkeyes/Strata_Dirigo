@@ -1,0 +1,76 @@
+// ports/vulkan/shaders/gemm_coopmat.comp - C[MxN] = A[MxK] * B[KxN] on the matrix units.
+//
+// This is the cooperative-matrix path (Intel XMX, AMD WMMA).  Four things about it are properties of the
+// HARDWARE or of the toolchain, measured rather than assumed, and they shape everything below:
+//
+//  1. The config is not free.  Queried on RADV / RX 7900 XTX (2026-10-03): 14 supported configs, ALL of them
+//     M16 N16 K16 with subgroup scope, and the only floating-point ones are (f16,f16 -> f16) and (f16,f16 -> f32).
+//     There is NO fp32 A/B config anywhere in the list, so the operands are fp16 and the accumulator is fp32.
+//     The compiler will happily build a cooperative-matrix shader no device can run, so the caller selects this
+//     pipeline from the driver's own config list, not from "it compiled".
+//  2. It is not universally an improvement: on Intel it is gated to Xe2 because it REGRESSES on Alchemist, so
+//     selection must be by device property, never by vendor.
+//  3. The tile is 16x16x16, so every dimension must be a multiple of 16.  The caller checks that; there is no
+//     ragged-edge fallback here.
+//  4. The extension is NOT the limitation it was believed to be.  `glslc` (shaderc 2023.8 / glslang 14) emits
+//     OpCooperativeMatrixMulAddKHR fine - the earlier "the toolchain cannot do this" verdict came from a probe
+//     shader of mine that was itself broken (missing GL_KHR_memory_scope_semantics, the misspelled
+//     `coopmatMulAdd`, and `gl_MatrixLayoutRowMajor` instead of `gl_CooperativeMatrixLayoutRowMajor`).
+//
+// DISPATCH: one 16x16 tile per SUBGROUP, and how many tiles a workgroup covers is derived from the shader's own
+// constants (gl_WorkGroupSize / gl_SubgroupSize) rather than from a width the host looked up.  The host
+// dispatches an UPPER BOUND - one workgroup per tile - and the bounds check discards the surplus.  That
+// direction matters: over-dispatch costs nothing, while under-dispatch silently drops output rows, which is
+// exactly the defect the rms_norm kernel had when its host divided by the driver's reported subgroup width.
+// With local_size 256 a RADV workgroup (subgroup 64) holds 4 tiles, an Intel one (32) holds 8, and the work is
+// spread rather than idling.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// gl_SubgroupID / gl_SubgroupSize: core in Vulkan 1.1, but glslang wants the extension declared before it emits
+// them.
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+
+// fp16 storage for the operands (the only floating-point config there is) and fp32 for the accumulator.
+layout(set = 0, binding = 0, std430) coherent readonly buffer Abuf { float16_t a[]; } A;
+layout(set = 0, binding = 1, std430) coherent readonly buffer Bbuf { float16_t b[]; } B;
+layout(set = 0, binding = 2, std430) coherent buffer Cbuf { float c[]; } C;
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+const uint TILE = 16u;
+
+void main() {
+    const uint tiles_n = pc.n / TILE;
+    const uint tiles_m = pc.m / TILE;
+    const uint total = tiles_m * tiles_n;
+    const uint per_wg = max(1u, gl_WorkGroupSize.x / gl_SubgroupSize);
+    const uint tile = gl_WorkGroupID.x * per_wg + gl_SubgroupID;
+    if (tile >= total) return;                     // surplus workgroups exit; no duplicate tile is computed
+
+    const uint tm = (tile / tiles_n) * TILE;       // row of the output tile: row-major over the tile grid
+    const uint tn = (tile % tiles_n) * TILE;       // column
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> amat;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> bmat;
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc;
+    acc = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+
+    // K is walked in 16-column chunks.  RowMajor means elements (row,*) come from buf[element + row*stride], so
+    // the strides are the row pitches of the full matrices and the element offsets are the tile's origin.
+    for (uint kk = 0u; kk < pc.k; kk += TILE) {
+        coopMatLoad(amat, A.a, tm * pc.k + kk, pc.k, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(bmat, B.b, kk * pc.n + tn, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(amat, bmat, acc);
+    }
+
+    coopMatStore(acc, C.c, tm * pc.n + tn, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

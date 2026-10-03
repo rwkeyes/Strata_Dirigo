@@ -872,6 +872,89 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// THE MATRIX-UNIT PATH (VK_KHR_cooperative_matrix).  This is the only case here whose kernel the toolchain can
+// build for ANY device and which still cannot RUN on most of them: the config is hardware, and the driver's own
+// list is the only authority.  Measured on RADV: 14 configs, all M16 N16 K16 subgroup-scope, and the only
+// floating-point ones are (f16,f16 -> f16) and (f16,f16 -> f32) - so there is no fp32-operand config to fall
+// back on.  A device without one is a loud SKIP, never a pass and never a failure.
+//
+// The reference is built from the fp16-ROUNDED operands, because that is what the kernel receives: comparing
+// against the fp32 originals would charge the kernel for the storage format's own precision.
+void case_gemm_coopmat(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gemm_coopmat.spv")) return;
+    if (!ctx.info().cooperative_matrix) {
+        skip("gemm_coopmat", "device exposes no VK_KHR_cooperative_matrix - the matrix units are unreachable here");
+        return;
+    }
+    if (!ctx.info().cm_f16_f32) {
+        skip("gemm_coopmat", "no usable config: needs M16 N16 K16 subgroup-scope with f16 A/B and an f32 accumulator");
+        return;
+    }
+    struct Shape { int m, n, k; };
+    // Three shapes on purpose.  The square one cannot tell the two tile-grid axes apart (transposing the
+    // mapping still visits every tile), so one wide and one tall case are required: {32,16,48} caught the
+    // transposed row/column mapping that the square case passed with.
+    const Shape shapes[] = {{64, 64, 64}, {32, 16, 48}, {16, 64, 32}};
+    for (const Shape& sh : shapes) {
+        const int m = sh.m, n = sh.n, k = sh.k;
+        std::vector<float> af((size_t) m * k), bf((size_t) k * n);
+        for (float& v : af) v = rndf(1.0f);
+        for (float& v : bf) v = rndf(1.0f);
+        std::vector<uint16_t> a16(af.size()), b16(bf.size());
+        std::vector<float> ar(af.size()), br(bf.size());
+        for (size_t i = 0; i < af.size(); ++i) { a16[i] = f16_from_f32(af[i]); ar[i] = strata::kernels::f32_from_f16(a16[i]); }
+        for (size_t i = 0; i < bf.size(); ++i) { b16[i] = f16_from_f32(bf[i]); br[i] = strata::kernels::f32_from_f16(b16[i]); }
+        std::vector<float> ref((size_t) m * n);
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < n; ++c) {
+                double acc = 0.0;
+                for (int t = 0; t < k; ++t) {
+                    acc += (double) ar[(size_t) r * k + t] * (double) br[(size_t) t * n + c];
+                }
+                ref[(size_t) r * n + c] = (float) acc;
+            }
+        }
+        const uint64_t nout = (uint64_t) m * n;
+        const uint64_t slack = 512;    // NaN pad: a stray write past the output must be DETECTED, not tolerated
+        Buf ba = ctx.alloc((uint64_t) a16.size() * 2);
+        Buf bb = ctx.alloc((uint64_t) b16.size() * 2);
+        Buf bc = ctx.alloc((nout + slack) * 4);
+        ctx.write(ba, a16.data(), a16.size() * 2);
+        ctx.write(bb, b16.data(), b16.size() * 2);
+        std::vector<float> out(nout + slack, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(bc, out.data(), out.size() * 4);
+
+        // DELIBERATE OVER-DISPATCH: 8 workgroups more than there are tiles.  The kernel is supposed to discard
+        // the surplus (`tile >= total` returns), and this is what proves it - the guard bytes stay NaN and no
+        // tile is computed twice.  Under-dispatch is the direction that silently loses output, so the host
+        // always dispatches an upper bound.
+        const uint32_t tiles = (uint32_t) ((m / 16) * (n / 16));
+        VkPipeline p = ctx.pipeline(dir + "/gemm_coopmat.spv", 3, 12);
+        struct { uint32_t m, n, k; } pc{(uint32_t) m, (uint32_t) n, (uint32_t) k};
+        ctx.dispatch(p, {&ba, &bb, &bc}, &pc, sizeof(pc), tiles + 8);
+        ctx.read(bc, out.data(), out.size() * 4);
+
+        int bad = 0, guard_bad = 0;
+        double worst = 0;
+        for (uint64_t i = 0; i < nout; ++i) {
+            if (!close_enough(out[i], ref[i], 1e-3f, 1e-4f)) ++bad;
+            const double rel = std::fabs((double) out[i] - ref[i]) / (std::fabs((double) ref[i]) + 1e-30);
+            worst = std::max(worst, rel);
+        }
+        for (uint64_t i = nout; i < out.size(); ++i) {
+            if (!std::isnan(out[i])) ++guard_bad;
+        }
+        char label[64];
+        std::snprintf(label, sizeof label, "gemm_coopmat %dx%dx%d", m, n, k);
+        const bool ok = bad == 0 && guard_bad == 0;
+        if (!ok && guard_bad) std::printf("      %d write(s) into the guard region below output\n", guard_bad);
+        verdict(label, ok, bad + guard_bad, (int) out.size(), worst, "worst rel err");
+        ctx.free(ba);
+        ctx.free(bb);
+        ctx.free(bc);
+    }
+}
+
 // The transcendental probe: exp() and log() over the range the port actually uses.  It exists because a
 // failing elementwise gate has two possible causes - a translation bug or the driver's math library - and
 // only this separates them.
@@ -929,9 +1012,10 @@ int main(int argc, char** argv) {
     }
     if (list) {
         for (auto& d : Ctx::list_devices()) {
-            std::printf("%s (vendor 0x%04x device 0x%04x, api %u.%u.%u, subgroup %u, 16bit-storage %d, fp64 %d)\n",
+            std::printf("%s (vendor 0x%04x device 0x%04x, api %u.%u.%u, subgroup %u, 16bit-storage %d, fp64 %d, coopmat %d/%d)\n",
                         d.name.c_str(), d.vendor_id, d.device_id, VK_VERSION_MAJOR(d.api), VK_VERSION_MINOR(d.api),
-                        VK_VERSION_PATCH(d.api), d.subgroup_size, (int) d.storage_buffer_16bit, (int) d.shader_float64);
+                        VK_VERSION_PATCH(d.api), d.subgroup_size, (int) d.storage_buffer_16bit, (int) d.shader_float64,
+                        (int) d.cooperative_matrix, (int) d.cm_f16_f32);
         }
         return 0;
     }
@@ -986,9 +1070,13 @@ int main(int argc, char** argv) {
     case_firmware_variants();
     case_compat_host(ctx);
     case_ledger_rule(ctx);
+    // ORDER MATTERS: this case checks what the driver reported before anything of ours had allocated.  RADV
+    // rounds an allocation up to 2 MiB, so putting an allocating kernel case ahead of it moves heapUsage by
+    // megabytes and the requery legitimately stops agreeing.
     case_memory_budget(ctx);
     case_reserve_policy();
     case_reserve_refusal();
+    case_gemm_coopmat(ctx, dir);
     case_copy(ctx, dir);
     case_scale(ctx, dir);
     case_add(ctx, dir);
