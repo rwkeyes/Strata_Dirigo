@@ -446,11 +446,21 @@ void case_memory_budget(Ctx& ctx) {
     verdict(uma ? "budget: independent requery agrees (10% tol, UMA)" : "budget: independent requery agrees",
             agrees, agrees ? 0 : 1, 1, (double) dusage, uma ? "usage delta (UMA tolerance)" : "mismatch count");
 
-    // (b) the reserve arithmetic, against the free figure this test computed itself
-    const uint64_t free_here = budget > usage ? budget - usage : 0;
-    const uint64_t usable_here = free_here > ctx.reserve_bytes() ? free_here - ctx.reserve_bytes() : 0;
-    const bool arith_ok = (ctx.usable_bytes() == usable_here);
-    verdict("budget: free - reserve == usable", arith_ok, arith_ok ? 0 : 1, 1, 0.0, "mismatch count");
+    // (b) the reserve arithmetic: usable must be max(0, free - reserve).  Computed from a FRESH snapshot, and for
+    // a software implementation compared with the same tolerance as (a) and for the same reason - llvmpipe's
+    // budget figures track system-wide memory availability, which moves with anything on the box, including the
+    // file reads and compiler runs this very gate performs.  On a discrete card the equality is required, and
+    // there it is what catches a policy that ignores the reserve or uses the wrong free figure.
+    const uint64_t free_fresh = b.heap_budget > b.heap_usage ? b.heap_budget - b.heap_usage : 0;
+    const uint64_t usable_fresh = free_fresh > ctx.reserve_bytes() ? free_fresh - ctx.reserve_bytes() : 0;
+    const uint64_t reported = ctx.usable_bytes();
+    const uint64_t darith = reported > usable_fresh ? reported - usable_fresh : usable_fresh - reported;
+    const bool arith_ok = uma ? (darith <= free_fresh / 10 + (1u << 20)) : (reported == usable_fresh);
+    if (!arith_ok) std::printf("      arithmetic: reported %llu vs expected %llu (free %llu, reserve %llu)\n",
+                               (unsigned long long) reported, (unsigned long long) usable_fresh,
+                               (unsigned long long) free_fresh, (unsigned long long) ctx.reserve_bytes());
+    verdict(uma ? "budget: free - reserve == usable (10% tol, UMA)" : "budget: free - reserve == usable",
+            arith_ok, arith_ok ? 0 : 1, 1, (double) darith, uma ? "usable delta (UMA tolerance)" : "mismatch count");
 
     // (c) the figure TRACKS allocations.  A number that never moves is a constant, not a measurement - and a
     //     backend that sizes itself from a constant is the failure this whole section exists to prevent.
