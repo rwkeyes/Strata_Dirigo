@@ -75,6 +75,11 @@ static bool device_has_extension(VkPhysicalDevice pd, const char* want) {
     return false;
 }
 
+static std::string fs_basename(const std::string& p) {
+    const size_t at = p.find_last_of('/');
+    return at == std::string::npos ? p : p.substr(at + 1);
+}
+
 static void fill_info(DeviceInfo& di, VkPhysicalDevice pd) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(pd, &props);
@@ -365,7 +370,25 @@ void Ctx::configure_display_reserve() {
     ledger_untrusted_ = !budget_.from_driver && looks_discrete(budget_.heap_total, env_.host_ram_bytes) &&
                         forced_budget_bytes_ == 0;
 
+    stack_ = detect_stack();
     advisories_ = compat_advisories(env_, info_.vendor_id, info_.device_id, budget_.from_driver);
+    for (const Advisory& a : stack_advisories(stack_, info_.vendor_id)) advisories_.push_back(a);
+
+    // The stack table, printed whether or not anything is wrong, because "which loader / which ICD / which
+    // libdrm" is the first question whenever a GPU is missing from enumeration.
+    std::fprintf(stderr, "vk_stack: loader %s", stack_.loader_version.empty() ? "(not found)"
+                                                                             : stack_.loader_version.c_str());
+    if (!stack_.libdrm_version.empty()) std::fprintf(stderr, " | libdrm %s", stack_.libdrm_version.c_str());
+    std::fprintf(stderr, " | session %s | Level-Zero %s | OpenCL %s\n", stack_.session_type.c_str(),
+                 stack_.level_zero ? "yes" : "no", stack_.opencl ? "yes" : "no");
+    for (const IcdEntry& e : stack_.icds) {
+        std::fprintf(stderr, "vk_stack: ICD %-22s api %-9s -> %s\n", fs_basename(e.file).c_str(),
+                     e.api_version.c_str(), e.resolves() ? e.resolved.c_str() : "!! UNRESOLVED");
+    }
+    for (const StackFile& f : stack_.firmware) {
+        std::fprintf(stderr, "vk_stack: firmware %-18s %s\n", f.name.c_str(),
+                     f.present() ? f.found_path.c_str() : "(absent)");
+    }
     for (const Advisory& a : advisories_) {
         std::fprintf(stderr, "vk_compat[%s] %s\n", severity_name(a.sev), a.text.c_str());
     }

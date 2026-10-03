@@ -28,6 +28,8 @@
 #include <limits>
 #include <random>
 #include <sys/wait.h>
+
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -44,6 +46,12 @@ using portvk::parse_kernel_release;
 using portvk::any_fatal;
 using portvk::looks_discrete;
 using portvk::parse_mesa_version;
+using portvk::StackReport;
+using portvk::detect_stack;
+using portvk::stack_advisories;
+using portvk::resolve_icd_library;
+using portvk::parse_so_version;
+using portvk::IcdEntry;
 
 namespace {
 
@@ -420,8 +428,23 @@ void case_memory_budget(Ctx& ctx) {
             usage += bp.heapUsage[i];
         }
     }
-    const bool agrees = (budget == b.heap_budget) && (usage == b.heap_usage);
-    verdict("budget: independent requery agrees", agrees, agrees ? 0 : 1, 1, 0.0, "mismatch count");
+    // A software implementation's heap IS system memory, so its usage figure moves with everything else on the
+    // machine and an exact-equality requery is the wrong test for it (measured: llvmpipe disagreed between two
+    // queries with nothing of ours in between).  A discrete card's number only moves when someone allocates, so
+    // there the equality is required.  Same distinction as the tracking check below, computed once.
+    const long hpages = sysconf(_SC_PHYS_PAGES);
+    const long hpsize = sysconf(_SC_PAGE_SIZE);
+    const uint64_t host_ram_here = (hpages > 0 && hpsize > 0) ? (uint64_t) hpages * (uint64_t) hpsize : 0;
+    const bool uma = (host_ram_here != 0) && (b.heap_total >= (host_ram_here / 100ull * 90ull));
+
+    const uint64_t dbudget = budget > b.heap_budget ? budget - b.heap_budget : b.heap_budget - budget;
+    const uint64_t dusage = usage > b.heap_usage ? usage - b.heap_usage : b.heap_usage - usage;
+    const bool agrees = uma ? (dbudget <= b.heap_budget / 10 && dusage <= b.heap_usage / 10 + (1u << 20))
+                            : (budget == b.heap_budget && usage == b.heap_usage);
+    if (!agrees) std::printf("      requery delta: budget %llu bytes, usage %llu bytes\n",
+                             (unsigned long long) dbudget, (unsigned long long) dusage);
+    verdict(uma ? "budget: independent requery agrees (10% tol, UMA)" : "budget: independent requery agrees",
+            agrees, agrees ? 0 : 1, 1, (double) dusage, uma ? "usage delta (UMA tolerance)" : "mismatch count");
 
     // (b) the reserve arithmetic, against the free figure this test computed itself
     const uint64_t free_here = budget > usage ? budget - usage : 0;
@@ -453,10 +476,7 @@ void case_memory_budget(Ctx& ctx) {
     //     0-byte change on one run and 7.38e6 on another.  There the result is REPORTED with its reason rather
     //     than demanded.  A discrete card gets the hard requirement, which is where it matters (an Arc with
     //     32 GB on a 64 GB box is 50%, well under the bar).
-    const long pages = sysconf(_SC_PHYS_PAGES);
-    const long psize = sysconf(_SC_PAGE_SIZE);
-    const uint64_t host_ram = (pages > 0 && psize > 0) ? (uint64_t) pages * (uint64_t) psize : 0;
-    const bool uma_or_software = (host_ram != 0) && (b.heap_total >= (host_ram / 100ull * 90ull));
+    const bool uma_or_software = uma;                       // computed once, above
     const int64_t changed = (int64_t) (usage_after - before);
     const bool tracks = changed >= (4 << 20);
     if (uma_or_software) {
@@ -464,7 +484,7 @@ void case_memory_budget(Ctx& ctx) {
         std::printf("INFO  %-28s usage moved %lld bytes for an 8 MiB alloc; NOT required here because the local "
                     "heap is %.0f%% of system RAM (software/UMA device - the OS protects the desktop)\n",
                     "budget tracking (informational)", (long long) changed,
-                    100.0 * (double) b.heap_total / (double) host_ram);
+                    100.0 * (double) b.heap_total / (double) host_ram_here);
     } else {
         verdict("budget: usage tracks an 8 MiB alloc", tracks, tracks ? 0 : 1, 1, (double) changed,
                 "bytes of usage change (bar: >= 4 MiB)");
@@ -677,6 +697,90 @@ void case_ledger_rule(Ctx& ctx) {
     }
 }
 
+// THE REST OF THE STACK, part 1: what is actually installed, and whether each ICD's library resolves.
+void case_stack_components(Ctx& ctx) {
+    const StackReport& s = ctx.stack();
+    std::printf("INFO  %-28s loader %s | libdrm %s | session %s | Level-Zero %s | OpenCL %s\n", "stack",
+                s.loader_version.empty() ? "(not found)" : s.loader_version.c_str(),
+                s.libdrm_version.empty() ? "(not found)" : s.libdrm_version.c_str(), s.session_type.c_str(),
+                s.level_zero ? "yes" : "no", s.opencl ? "yes" : "no");
+    int unresolved = 0;
+    for (const IcdEntry& e : s.icds) {
+        if (!e.resolves()) ++unresolved;
+    }
+    std::printf("      %zu ICD file(s): %d unresolved; %zu firmware blob(s) probed: ", s.icds.size(), unresolved,
+                s.firmware.size());
+    for (const auto& f : s.firmware) std::printf("%s=%s ", f.name.c_str(), f.present() ? "present" : "absent");
+    std::printf("\n");
+
+    // An empty ICD list would make "every ICD resolves" vacuously true, so the count is asserted first.
+    const bool have_icds = !s.icds.empty();
+    verdict("stack: ICD files enumerated", have_icds, have_icds ? 0 : 1, 1, (double) s.icds.size(), "ICD files");
+    const bool all_resolve = have_icds && unresolved == 0;
+    verdict("stack: every ICD library resolves", all_resolve, unresolved, (int) s.icds.size(), (double) unresolved,
+            "unresolved ICDs");
+    const bool loader_ok = s.loader_version.empty() || parse_so_version(s.loader_version, *new int, *new int, *new int);
+    verdict("stack: loader version readable", loader_ok, loader_ok ? 0 : 1, 1, 0.0, "parse failures");
+    const bool fw_probed = s.firmware.size() == 3;
+    verdict("stack: firmware blobs probed", fw_probed, fw_probed ? 0 : 1, 3, 0.0, "blobs probed");
+}
+
+// THE REST OF THE STACK, part 2: the ICD resolution logic, with BOTH controls.  The first version of this check
+// tested the JSON's library_path as a file path and reported all nine working ICDs as broken - `library_path` is
+// normally a bare soname (`libvulkan_radeon.so`) that the loader resolves through the system library path.  So
+// the check must be shown to accept a resolvable name AND to reject an unresolvable one.
+void case_icd_resolution() {
+    int a = 0, b = 0, c = 0;
+    const bool p1 = parse_so_version("libvulkan.so.1.3.275", a, b, c) && a == 1 && b == 3 && c == 275;
+    const bool p2 = parse_so_version("libdrm.so.2.125.0", a, b, c) && a == 2 && b == 125 && c == 0;
+    const bool p3 = !parse_so_version("libfoo.so", a, b, c);            // no numeric tail -> false, not "1.0.0"
+    verdict("stack: .so version parser (3 shapes)", p1 && p2 && p3, (p1 ? 0 : 1) + (p2 ? 0 : 1) + (p3 ? 0 : 1), 3,
+            0.0, "parse failures");
+
+    // A bare soname must RESOLVE (positive control) and a bogus one must NOT (negative control).
+    const std::string bare = resolve_icd_library("libvulkan_radeon.so");
+    const std::string bogus = resolve_icd_library("libno_such_vulkan_driver_xyz.so");
+    const std::string abs_missing = resolve_icd_library("/nonexistent/dir/libvulkan_nope.so");
+    const std::string abs_present = bare.empty() ? std::string() : resolve_icd_library(bare);
+    const bool ok = !bare.empty() && bogus.empty() && abs_missing.empty() && abs_present == bare;
+    verdict("stack: ICD library resolution (bare/abs/bogus)", ok, ok ? 0 : 1, 4, 0.0, "resolution mismatches");
+    if (!ok) std::printf("      bare=\"%s\" bogus=\"%s\" abs_missing=\"%s\"\n", bare.c_str(), bogus.c_str(),
+                         abs_missing.c_str());
+
+    // End-to-end negative control through the detector: a stale ICD naming a library that is not there.
+    const std::string stale = "/tmp/vkport_stale_icd.json";
+    const std::string good = "/tmp/vkport_good_icd.json";
+    const std::string icd_template = R"({"ICD": {"api_version": "1.4.318", "library_path": ")";
+    {
+        std::ofstream f(stale);
+        f << icd_template << "libno_such_vulkan_driver_xyz.so" << R"("}, "file_format_version": "1.0.1"})" << "\n";
+    }
+    {
+        std::ofstream f(good);
+        f << icd_template << "libvulkan_radeon.so" << R"("}, "file_format_version": "1.0.1"})" << "\n";
+    }
+    setenv("VK_ICD_FILENAMES", stale.c_str(), 1);
+    const StackReport s_stale = detect_stack();
+    const std::vector<Advisory> adv_stale = stack_advisories(s_stale, 0x1002);
+    setenv("VK_ICD_FILENAMES", good.c_str(), 1);
+    const StackReport s_good = detect_stack();
+    unsetenv("VK_ICD_FILENAMES");
+
+    auto flagged = [](const std::vector<Advisory>& v, const char* needle) {
+        for (const Advisory& x : v) {
+            if (x.text.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+    const bool stale_flagged = !s_stale.icds.empty() && !s_stale.icds[0].resolves() &&
+                               flagged(adv_stale, "does not resolve");
+    const bool good_clean = !s_good.icds.empty() && s_good.icds[0].resolves() && !flagged(stack_advisories(s_good, 0x1002), "does not resolve");
+    verdict("stack: stale ICD detected (neg control)", stale_flagged, stale_flagged ? 0 : 1, 1, 0.0, "not flagged");
+    verdict("stack: resolvable ICD not flagged (pos control)", good_clean, good_clean ? 0 : 1, 1, 0.0, "false alarm");
+    std::remove(stale.c_str());
+    std::remove(good.c_str());
+}
+
 // The transcendental probe: exp() and log() over the range the port actually uses.  It exists because a
 // failing elementwise gate has two possible causes - a translation bug or the driver's math library - and
 // only this separates them.
@@ -786,6 +890,8 @@ int main(int argc, char** argv) {
                     "model budget - do not size a model from it.\n");
     }
     case_compat_rules();
+    case_stack_components(ctx);
+    case_icd_resolution();
     case_compat_host(ctx);
     case_ledger_rule(ctx);
     case_memory_budget(ctx);

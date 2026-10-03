@@ -76,9 +76,60 @@ done
 
 [ $rc -eq 0 ] || { echo "== shader checks FAILED"; exit 1; }
 
+# -----------------------------------------------------------------------------------------------------------
+# TOOLCHAIN PROBES.  These do not decide whether the port RUNS - they decide what it CAN do, and every one of
+# them is a property of a tool version rather than of this code, so they will change under us.  Two matter:
+#   * cooperative matrix: the only route from Vulkan to Xe2's matrix units.  Needs glslang > 15.1; absent here.
+#   * fp64 math builtins: whether the CUDA source's double-precision silu can be expressed at all.
+echo "== toolchain probes (capability, not correctness)"
+TP="$BUILD/toolprobe"; mkdir -p "$TP"
+missing=""
+for t in glslc spirv-val g++; do command -v "$t" >/dev/null || missing="$missing $t"; done
+if [ -n "$missing" ]; then echo "  FAIL required tool(s) absent:$missing"; exit 1; fi
+
+cat > "$TP/coopmat.comp" <<'EOF'
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer O { float v[]; } o;
+void main() {
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    a = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(0.0);
+    b = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(0.0);
+    c = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    c = coopmatMulAdd(a, b, c);
+    o.v[gl_LocalInvocationIndex] = c[0];
+}
+EOF
+if glslc --target-env=vulkan1.3 -fshader-stage=compute "$TP/coopmat.comp" -o "$TP/coopmat.spv" 2>"$TP/coopmat.err"; then
+  coop="SUPPORTED"; else coop="absent (drivable?)"; fi
+
+cat > "$TP/fp64.comp" <<'EOF'
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer O { float v[]; } o;
+void main() { double d = double(o.v[gl_LocalInvocationIndex]); o.v[0] = float(exp(-d)); }
+EOF
+if glslc --target-env=vulkan1.3 -fshader-stage=compute "$TP/fp64.comp" -o "$TP/fp64.spv" 2>"$TP/fp64.err"; then
+  fp64="SUPPORTED"; else fp64="absent"; fi
+
+if spirv-val --target-env vulkan1.3 "$ROOT/shaders/copy.spv" >/dev/null 2>&1; then valform="--target-env <env>"; else valform="unknown"; fi
+
+printf '  %-42s %s\n' "glslc (shader compile)"        "$(glslc --version 2>/dev/null | head -1)"
+printf '  %-42s %s\n' "spirv-val (SPIR-V validation)" "$(spirv-val --version 2>/dev/null | head -1)"
+printf '  %-42s %s\n' "g++ (harness build, C++20)"    "$(g++ --version 2>/dev/null | head -1)"
+printf '  %-42s %s\n' "spirv-val accepted arg form"   "$valform"
+printf '  %-42s %s\n' "cooperative matrix -> Xe2 XMX path" "$coop"
+printf '  %-42s %s\n' "fp64 math builtins (silu fidelity)" "$fp64"
+echo "  (a capability reported absent here is a TOOLCHAIN limit, not a port defect - see STACK-COMPAT.md)"
+
 echo "== building the harness (-Werror: hygiene is part of the gate)"
 g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
     -o "$BUILD/vk_gate" "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" \
+    "$ROOT/harness/vk_stack.cpp" \
     "$ROOT/harness/vk_gate.cpp" -lvulkan || exit 1
 
 echo "== numeric gate"

@@ -1,5 +1,5 @@
 // ports/vulkan/harness/vk_compat.cpp - see the header.  Every rule below cites the range it comes from, and the
-// ranges are in ports/vulkan/KERNEL-COMPAT.md with their sources.
+// ranges are in ports/vulkan/STACK-COMPAT.md with their sources.
 #include "vk_compat.hpp"
 
 #include <sys/utsname.h>

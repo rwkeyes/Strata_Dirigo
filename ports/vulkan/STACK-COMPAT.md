@@ -1,4 +1,7 @@
-# Linux kernel compatibility, performance and recommendations — Arc/Vulkan port
+# Linux stack compatibility, performance and recommendations — Arc/Vulkan port
+
+*Renamed from `KERNEL-COMPAT.md`: the kernel is one component among several this port depends on, and the
+others are covered in section 3.5.*
 
 **For:** whoever ships or runs the Vulkan backend on Intel Arc.
 **Port:** `ports/vulkan/` on branch `vulkan-arc-port`.
@@ -61,7 +64,9 @@ card, and `VkPhysicalDeviceDriverProperties` for the userspace driver and its ve
 
 ---
 
-## 3. Kernel compatibility
+## 3. Stack compatibility
+
+### 3.0 The kernel
 
 ### 3.1 The ladder
 
@@ -101,7 +106,7 @@ Neither is compatibility we owe; both are optional and both need a fallback.
    `intel: madvise purgeable VMAs in Xe KMD` and `anv: fixup compute queue detection`. Before it, the port's
    ledger rule applies (§6.2) — which is a refusal, not a guess.
 
-### 3.4 The axis that is not the kernel
+### 3.4 Kernel-side configuration and hardware
 
 | Component | Requirement | Why |
 |---|---|---|
@@ -111,6 +116,30 @@ Neither is compatibility we owe; both are optional and both need a fallback.
 | Userspace | **Mesa ≥ 26.2** on Intel for a trustworthy free figure | see §3.3 |
 | Hardware | Resizable BAR as large as the card allows (16 GB observed on a B580, 32 GB on this box's card) | it sizes the local heap the driver reports |
 | Firmware | current `bmg_guc_70.bin` | stale GuC firmware is implicated in several engine-reset reports |
+
+### 3.5 The rest of the stack: drivers, libraries, tools
+
+Detected by `harness/vk_stack.{hpp,cpp}` (filesystem only: no device node, no shelling out, nothing requiring
+privileges) and printed on every run.
+
+| Component | Detected | Why it matters here | Rule |
+|---|---|---|---|
+| **Vulkan loader** | `libvulkan.so.1` symlink target (here `1.3.275`) | the **only** stack component this port links. A loader older than an ICD's advertised `api_version` is the first suspect when a documented extension vanishes, though usually harmless since the loader is a thin trampoline | Note |
+| **ICD files** | `/usr/share/vulkan/icd.d/*.json`, plus `VK_DRIVER_FILES` / `VK_ICD_FILENAMES`, which **replace** the default search rather than adding to it | `library_path` is normally a **bare soname** (`libvulkan_radeon.so`) that the loader resolves through the system library path. An ICD naming a library that cannot be resolved makes its GPU **silently vanish** from enumeration | Warn |
+| **Mesa (ANV / RADV)** | `VkPhysicalDeviceDriverProperties.driverInfo` | 26.2 or newer for a driver-backed free-memory figure on Intel; the same release added purgeable VMAs and the compute-queue fix | Warn (see 6.1) |
+| **libdrm** | `libdrm.so.2` symlink target (here `2.125.0`) | Mesa's dependency, not the port's; its version tracks the kernel interface Mesa speaks | reported, no rule |
+| **GPU firmware** | `/lib/firmware/xe/bmg_guc_70.bin`, `xe/bmg_huc.bin`, `i915/bmg_dmc.bin` | a missing GuC blob is a driver that fails to **probe** (`firmware production part check failure`, `probe ... failed with -71`), not a slow driver, and stale firmware recurs in the reset reports. The **loaded** version exists only in `dmesg` (`GuC firmware: ... version N`), so this check reports presence and **refuses to invent a version** | Warn when an Intel GPU is present and a blob is missing |
+| **Level-Zero / OpenCL** | `libze_intel_gpu.so.1` (1.17.39395 here), `libOpenCL.so.1` | they serve the **SYCL/OpenCL** path, **not** this Vulkan port | Info, labelled so nobody debugs the wrong stack |
+| **Session type** | `XDG_SESSION_TYPE` (x11 here) | a Wayland compositor was measured holding **354 MB** on a two-display desktop; an X11 session holds a different amount. This is what the reserve is sized against | Info |
+| **Build toolchain** | `glslc`, `spirv-val`, `g++` versions **and capability probes**, run by `gates/run_gate.sh` every time | **cooperative matrix is absent on this toolchain** (glslang 14.0 via shaderc, 15.1 standalone): the only Vulkan route to Xe2's matrix units, so the performance ceiling is a *tool* limit rather than a port defect. The `fp64` math builtins are absent too (the silu-fidelity item) | probes printed each run; a capability appearing changes what the port can promise |
+
+Two lessons are baked into the code here rather than only written down. First, **the ICD check's first version was
+wrong**: it tested `library_path` as a file path and reported all nine working ICDs on this box as broken, because
+bare sonames are resolved by the loader rather than found beside the JSON. The resolver now searches the standard
+library directories and `$LD_LIBRARY_PATH`, accepts `.N` suffixed variants, and the case carries **both** controls,
+so a stale ICD must be flagged and a resolvable one must not. Second, **an ICD scan has to respect the replace
+semantics of `VK_DRIVER_FILES`**, or it reports the system's ICDs as "the" ICDs whenever that variable is set,
+which is exactly what made the first negative control inspect the wrong entry.
 
 ---
 
@@ -143,6 +172,15 @@ individual submission must complete inside it. Overrunning it is **an engine res
 the failure reported for tensor-parallel LLM inference on Battlemage, asked about on Intel's own forum in
 exactly those terms. This is why the port's design rule is **bounded work per submission** (PORT-PLAN §4b), and
 it is the constraint to check first if a long run dies mid-generation.
+
+### 4.3b The toolchain gates the performance path
+
+The biggest performance item for Battlemage is reaching Xe2's **matrix units**, and that is a *toolchain*
+question before it is a code question: cooperative matrix is the only Vulkan route to them, and it is **absent**
+on this toolchain. So the honest statement of the performance ceiling today is *bandwidth-bound plain-FMA
+shaders*: correct, but not using the silicon's matrix engines. The probe in `gates/run_gate.sh` reports the
+capability on every run, so a toolchain that emits it shows up as a line of output instead of something somebody
+has to remember to re-check.
 
 ### 4.4 Honest limit
 
@@ -275,4 +313,5 @@ Corrections kept here rather than inline, so the body of the document reads as t
 |---|---|
 | 2026-10-03 | **7.4 does not exist.** An earlier revision listed it as a ladder row and put it first in the performance recommendation, on the strength of press coverage of pull requests *targeting* the 7.4 cycle. A patch labelled "for 7.4" is queued for a cycle that has not opened. Recommendations are now restricted to installable kernels, and §1.3 gives the command to check. |
 | 2026-10-03 | **The Battlemage floor is 6.12, per card**, not 6.14 for all Intel. 6.12 is the first mainline kernel with Xe2 out of the box (B580); 6.14 is what our notes record for the Arc Pro B70 (BMG-G31). The rule now keys on the PCI device ID. |
+| 2026-10-03 | **Extended from the kernel to the whole stack** (3.5): the loader, ICD files and their library resolution, libdrm, GPU firmware blobs, the Level-Zero/OpenCL path (labelled as *not* this port), the session type, and the build toolchain's capability probes. The document was renamed to match. The ICD check's first version was wrong in a way worth recording: it treated `library_path` as a file path and declared all nine working ICDs broken. |
 | 2026-10-03 | **The reserve floor is 512 MiB**, not 256, after a field report of a two-display KDE/Wayland session holding 354 MB in `kwin_wayland` alone — the old floor was below the compositor it exists to protect. |

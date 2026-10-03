@@ -15,6 +15,7 @@
 #pragma once
 
 #include "vk_compat.hpp"
+#include "vk_stack.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -100,6 +101,9 @@ public:
     // What this box is, and what that means.  Detected from uname + /sys/module + the device's driver
     // properties: the port opens no device node, so this is the whole of its Linux compatibility surface.
     const HostEnv& host_env() const { return env_; }
+    // The rest of the stack - loader, ICDs, libdrm, firmware, session, accelerator runtimes - detected from the
+    // filesystem with no device access.  Its advisories are appended to the same list as the kernel's.
+    const StackReport& stack() const { return stack_; }
     const std::vector<Advisory>& advisories() const { return advisories_; }
     // True when the free figure is a ledger and the card is discrete, i.e. when sizing from it would be the
     // over-allocation that filled an RX 6800 that drives the desktop.  In that state nothing is allocatable
@@ -150,6 +154,7 @@ private:
     uint64_t forced_budget_bytes_ = 0;   // 0 = off (STRATA_VK_MAX_BUDGET_MIB)
     bool ledger_untrusted_ = false;      // ledger fallback + discrete card + no explicit limit
     HostEnv env_{};
+    StackReport stack_{};
     std::vector<Advisory> advisories_{};
 
     int device_index_ = -1;
