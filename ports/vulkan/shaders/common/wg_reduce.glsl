@@ -27,6 +27,13 @@ shared float rp_partial[MAX_SUBGROUPS];
 shared float rp_total;
 
 float wg_sum(float v) {
+    // **THE LEADING BARRIER IS NOT DECORATION ONCE THIS IS CALLED MORE THAN ONCE PER INVOCATION.**  The total is
+    // read out of shared memory and a later call reuses the arrays, so without this a fast invocation can write
+    // the next total before a slow one has read the previous one.  The CUDA equivalent (`block_sum` in ple.cu)
+    // carries the same barrier and its comment gives the same reason - "invisible in most runs and a slightly
+    // different norm when it fires".  The single-call kernels never reach it; the multi-token MMVF reduces once
+    // per activation row and does.
+    barrier();
     const float sub = subgroupAdd(v);
     if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < MAX_SUBGROUPS) rp_partial[gl_SubgroupID] = sub;
     barrier();

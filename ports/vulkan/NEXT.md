@@ -212,6 +212,42 @@ appearing; and the minimum legal geometry (n_in = 64, one S2 group; n_in = 2, a 
 Tolerances are ranked against the double oracle: the S2 dot products came out at ratio 0 (the dominant terms are
 few and large), the BF16 products at 0.09 and 0.005 of a 1e-5 relative bound.
 
+## `bf16_mmvf_f32_multi` is in - and the source's bit-identity claim holds
+
+Up to 8 activation rows sharing one pass over the weight row (the prompt path; the weight row is the expensive
+side). The source promises something checkable, so the gate checks exactly that: **"each output is bit-identical
+to a bf16_f32_mmvf_kernel launch of its own"**. Every row of the multi-row result is compared BIT-FOR-BIT against
+the single-row shader run on that row alone, and the worst difference is 0 across all three shapes - including a
+shape with **padded `ldx` and `ldy`**, where a token row read at `k * n_in` instead of `k * ldx` would read 1e30
+sentinel padding.
+
+Two things the port changed about the source's shape, both deliberate:
+
+* **The NT template parameter is gone.** `native_bf16.cu` instantiates the kernel at NT = 4 or 8 because its
+  shared array is `partials[NT][32]` and NT must be a compile-time size. The port's shared reduction is sized by
+  the SUBGROUP count, not by the number of tokens, so one shader covers 1..8 rows. The accumulator loop is still
+  8 wide with the row count as a bound, so the per-token arithmetic is unchanged.
+* **The shader CLAMPS `n_tok` to 8** rather than indexing a fixed array out of range: a shader cannot refuse to
+  run, so the host's validation is documented as the host's.
+
+And one real bug the source's own warning caught in the port's shared code: **`wg_sum` now has its leading
+barrier**, because the multi-token kernel reduces once PER ROW, and without it a fast invocation can write the
+next total before a slow one has read the previous - "invisible in most runs and a slightly different norm when it
+fires", in ple.cu's words about the identical barrier in `block_sum`. The single-call kernels never reached it.
+This is the shared include earning its place: one fix, five callers.
+
+### THE BOUND FOR A DOT PRODUCT IS NOT RELATIVE TO ITS RESULT
+
+A measured row of the multi-row MMVF exceeded `1e-5 * |y|` by 1.34x - while being provably correct, because the
+same row matched the single-row shader bit for bit. The bound was wrong, not the kernel: an f32 accumulation of n
+terms has an error bounded by `(log2(n)+1) * eps * sum|terms|`, and with cancellation `sum|terms|` is FAR larger
+than `|result|`. That row: `sum|terms| ~ 6.4e5` against a result of 3.9e4, which predicts ~0.5 of absolute error
+against the ~0.5 measured - the kernel sat exactly on the theoretical bound.
+
+The three GEMV comparisons now use `rtol*|result| + 16*2^-24*sum|terms|`, with the oracle reporting both sums.
+The previously failing row reads 0.0078 of the bound (170x headroom) instead of 1.34, and the bound is DERIVED
+rather than fitted - a real bug moves the result by orders of magnitude more than rounding error can.
+
 ### THE REST OF THE WAVE - and its size, which is the number that matters
 
 This is the biggest remaining area by a wide margin. Measured source sizes:

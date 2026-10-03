@@ -1,0 +1,73 @@
+// ports/vulkan/shaders/bf16_mmvf_f32_multi.comp - the BF16 matrix-vector product for up to 8 activation rows
+// sharing one pass over the weight row (native_bf16.cu's bf16_f32_mmvf_multi_kernel).
+//
+// The point is BANDWIDTH: the prompt path multiplies the same weight matrix by several token vectors, and the
+// weight row is the expensive side, so it is read ONCE and every token keeps its own accumulator.
+//
+// THE CONTRACT THAT MAKES THIS TESTABLE, quoted from the source: "each output is bit-identical to a
+// bf16_f32_mmvf_kernel launch of its own".  Not approximately - bit-identical, because every token sees the same
+// pair order, the same two ordered FMAs, and the same reduction, so this kernel is the single-row kernel with the
+// weight read hoisted.  The port keeps that property by keeping the per-thread structure identical and using the
+// same 256-wide reduction, and the gate asserts it DIRECTLY: the multi-row output is compared bit-for-bit with
+// the single-row shader's output for each row, on top of the usual comparison against a double oracle.
+//
+// WHERE THIS DELIBERATELY DIVERGES FROM THE SOURCE'S SHAPE.  `native_bf16.cu` instantiates the kernel with an NT
+// template parameter (4 or 8 rows) because the CUDA shared array is `partials[NT][32]` and NT must be a
+// compile-time size.  The port's reduction does not need the row count as a compile-time quantity - the shared
+// reduction is sized by the SUBGROUP count, not by the number of tokens - so one shader covers 1..8 rows and the
+// NT specialisation disappears.  The accumulator loop is still a fixed 8 wide with the row count as a bound, so
+// the per-token arithmetic is unchanged.
+//
+// `ldx` AND `ldy` ARE THE ROW STRIDES, and they are not required to equal the row width: the prompt path packs
+// several rows with padding (`ldx` even, per the source's own validation).  Reading a token row at `k * n_in`
+// instead of `k * ldx` is silent with compact rows and wrong with padded ones, so the gate runs a padded shape.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;
+layout(set = 0, binding = 1, std430) readonly buffer W { uint v[]; } w;
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int n_tok; int ldx; int ldy; } pc;
+
+const int MAX_TOK = 8;
+
+float bf16_to_f32(uint h) { return uintBitsToFloat(h << 16u); }
+
+void main() {
+    const uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.n_out)) return;
+
+    const uint groups = uint(gl_WorkGroupSize.x);
+    const uint n_in = uint(pc.n_in), n_pairs = n_in / 2u;
+    const uint ldx = uint(pc.ldx), ldy = uint(pc.ldy);
+    // the host validates 1..8; the shader CLAMPS rather than indexing a fixed array out of range, because a
+    // shader cannot refuse to run
+    const uint n_tok = min(uint(pc.n_tok), uint(MAX_TOK));
+    const uint lid = gl_LocalInvocationIndex;
+    const uint wbase = o * n_pairs;
+
+    float acc[MAX_TOK];
+    for (int k = 0; k < MAX_TOK; ++k) acc[k] = 0.0;
+
+    for (uint pair = lid; pair < n_pairs; pair += groups) {
+        const uint packed = w.v[wbase + pair];
+        const float w0 = bf16_to_f32(packed & 0xFFFFu);
+        const float w1 = bf16_to_f32(packed >> 16u);
+        for (uint k = 0; k < n_tok; ++k) {
+            const uint base = k * ldx + 2u * pair;
+            acc[k] = fma(w0, x.v[base], acc[k]);          // element 2p of row k
+            acc[k] = fma(w1, x.v[base + 1u], acc[k]);     // element 2p+1 of row k
+        }
+    }
+
+    // one reduction PER ROW, through the shared reduction - which is why that needs its leading barrier
+    for (uint k = 0; k < n_tok; ++k) {
+        const float total = wg_sum(acc[k]);
+        if (lid == 0u) y.v[k * ldy + o] = total;
+    }
+}

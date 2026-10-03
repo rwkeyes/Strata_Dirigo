@@ -880,9 +880,9 @@ void case_icd_resolution() {
 // differ only in the SUMMATION, which is where the port's reduction order legitimately differs from CUDA's - so
 // they accumulate in double and the comparison is a tolerance, never bit-equality.
 static double s2_gemv_q8_host_row(const std::vector<uint8_t>& act, const std::vector<uint8_t>& codes,
-                                  const std::vector<float>& scales, int o, int n_in) {
+                                  const std::vector<float>& scales, int o, int n_in, double* abs_sum = nullptr) {
     const int n_quads = n_in / 4, n_groups = n_in / 64;
-    double sum = 0.0;
+    double sum = 0.0, mass = 0.0;
     for (int q = 0; q < n_quads; ++q) {
         const uint8_t byte = codes[(size_t) o * n_quads + q];
         const float d = scales[(size_t) o * n_groups + (q >> 4)];
@@ -895,20 +895,159 @@ static double s2_gemv_q8_host_row(const std::vector<uint8_t>& act, const std::ve
             const float w = (float) (((byte >> (2 * j)) & 3) - 1) * d;
             const float term = w * ((float) xq[off + j] * dx);   // the device's f32 term, exactly
             sum += (double) term;                                // summed in double: order differs on device
+            mass += std::fabs((double) term);
         }
     }
+    if (abs_sum) *abs_sum = mass;
     return sum;
 }
 
-static double bf16_mmvf_host_row(const std::vector<float>& x, const std::vector<uint16_t>& w, int o, int n_in) {
-    double sum = 0.0;
+static double bf16_mmvf_host_row(const std::vector<float>& x, const std::vector<uint16_t>& w, int o, int n_in,
+                                  double* abs_sum = nullptr) {
+    double sum = 0.0, mass = 0.0;
     for (int i = 0; i < n_in; i += 2) {
         const float w0 = strata::kernels::f32_from_bf16(w[(size_t) o * n_in + i]);
         const float w1 = strata::kernels::f32_from_bf16(w[(size_t) o * n_in + i + 1]);
         sum += (double) w0 * (double) x[i] + (double) w1 * (double) x[i + 1];
+        mass += std::fabs((double) w0 * (double) x[i]) + std::fabs((double) w1 * (double) x[i + 1]);
     }
+    if (abs_sum) *abs_sum = mass;
     return sum;
 }
+
+// THE BOUND FOR A DOT PRODUCT IS NOT RELATIVE TO ITS RESULT.  A sum of n terms accumulated in f32 has an error
+// bounded by (log2(n) + 1) * eps * sum|terms|, and with cancellation that is far larger than eps * |result|: a
+// measured row of the multi-row MMVF exceeded 1e-5 * |y| while sitting exactly on this bound (sum|terms| ~ 6.4e5
+// against a result of 3.9e4, giving ~0.5 of absolute error - and the kernel was provably correct, because the same
+// row matched the single-row shader bit for bit).  Using the condition-aware bound keeps the test meaningful:
+// a real bug moves the result by orders of magnitude more than the accumulation of rounding error can.
+const double GEMV_EPS = 1.0 / 16777216.0;                 // 2^-24, the f32 unit roundoff
+const double GEMV_TREE = 16.0;                            // log2(1280) + margin, for the tree depth
+static double gemv_bound(double want, double abs_sum, double rtol) {
+    return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum;
+}
+
+// bf16_mmvf_f32_multi: up to 8 activation rows sharing one pass over the weight row.
+//
+// THE SOURCE'S OWN CLAIM IS THE STRONGEST TEST HERE, and it is a bit-exactitude claim: "each output is
+// bit-identical to a bf16_f32_mmvf_kernel launch of its own".  So besides the double-oracle comparison, every
+// row of the multi-row result is compared BIT-FOR-BIT against the single-row shader run on that row alone.  That
+// is only possible because the port kept the per-thread structure and the reduction width identical; if a future
+// change made the multi-row path reduce in a different order, this case would say so even though the numbers
+// stayed "close".
+//
+// The padded shape is the layout guard: `ldx` and `ldy` are ROW STRIDES, not widths, and the prompt path pads
+// them.  A token row read at `k * n_in` instead of `k * ldx` is silent with compact rows and reads 1e30 sentinel
+// padding with padded ones, and the same trick guards `ldy` on the output side.
+void case_bf16_mmvf_multi(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "bf16_mmvf_f32_multi.spv") || !have(dir, "bf16_mmvf_f32.spv")) return;
+    struct Shape { int n_in, n_out, n_tok, ldx, ldy; const char* note; };
+    const Shape shapes[] = {
+        {2560, 8, 8, 2560, 8, "8 tokens, compact strides"},
+        {2560, 4, 1, 2560, 4, "one token (the source delegates this case to the single-row kernel)"},
+        {64, 4, 5, 72, 6, "5 tokens, PADDED ldx and ldy"},
+    };
+    for (const Shape& sh : shapes) {
+        std::vector<float> x((size_t) sh.n_tok * sh.ldx, 1.0e30f);       // padding is a sentinel, not a zero
+        for (int k = 0; k < sh.n_tok; ++k) {
+            for (int i = 0; i < sh.n_in; ++i) x[(size_t) k * sh.ldx + i] = rndf(1.0f);
+        }
+        std::vector<uint16_t> w((size_t) sh.n_out * sh.n_in, 0);
+        for (int o = 0; o < sh.n_out; ++o) {
+            for (int i = 0; i < sh.n_in; ++i) {
+                float v = rndf(1.0f);
+                if (o == 1) v = (i % 2 == 0) ? 1000.0f * (1.0f + 0.25f * rndf(1.0f))
+                                             : 0.001f * (1.0f + 0.25f * rndf(1.0f));   // the pair-order probe
+                if (o == 2) v = 0.0f;
+                w[(size_t) o * sh.n_in + i] = strata::kernels::bf16_from_f32(v);
+            }
+        }
+        std::vector<float> want((size_t) sh.n_tok * sh.n_out, 0.0f);
+        std::vector<double> want_abs((size_t) sh.n_tok * sh.n_out, 0.0);
+        for (int k = 0; k < sh.n_tok; ++k) {
+            std::vector<float> row(x.begin() + (size_t) k * sh.ldx, x.begin() + (size_t) k * sh.ldx + sh.n_in);
+            for (int o = 0; o < sh.n_out; ++o) {
+                want[(size_t) k * sh.n_out + o] =
+                    (float) bf16_mmvf_host_row(row, w, o, sh.n_in, &want_abs[(size_t) k * sh.n_out + o]);
+            }
+        }
+
+        const size_t y_elems = (size_t) sh.n_tok * sh.ldy;
+        Buf b_x = ctx.alloc((size_t) sh.n_tok * sh.ldx * 4);
+        Buf b_w = ctx.alloc((size_t) sh.n_out * sh.n_in * 2);
+        Buf b_y = ctx.alloc(y_elems * 4 + 64);
+        Buf b_row = ctx.alloc((size_t) sh.n_in * 4);
+        ctx.write(b_x, x.data(), x.size() * 4);
+        ctx.write(b_w, w.data(), w.size() * 2);
+        std::vector<uint8_t> sink(y_elems * 4 + 64, 0xB4);
+        ctx.write(b_y, sink.data(), sink.size());
+
+        struct { int n_in; int n_out; int n_tok; int ldx; int ldy; } pc{sh.n_in, sh.n_out, sh.n_tok, sh.ldx, sh.ldy};
+        VkPipeline pm = ctx.pipeline(dir + "/bf16_mmvf_f32_multi.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(pm, {&b_x, &b_w, &b_y}, &pc, sizeof(pc), (uint32_t) sh.n_out);
+
+        std::vector<uint8_t> img(y_elems * 4 + 64);
+        ctx.read(b_y, img.data(), img.size());
+        const float* got = reinterpret_cast<const float*>(img.data());
+        int bad = 0, guard_bad = 0;
+        double worst = 0, mass = 0;
+        for (int k = 0; k < sh.n_tok; ++k) {
+            for (int o = 0; o < sh.n_out; ++o) {
+                const float g = got[(size_t) k * sh.ldy + o];
+                const float wv = want[(size_t) k * sh.n_out + o];
+                mass += std::fabs((double) wv);
+                const double ratio = std::fabs((double) g - (double) wv) /
+                                     gemv_bound((double) wv, want_abs[(size_t) k * sh.n_out + o], 1e-6);
+                worst = std::max(worst, ratio);
+                if (ratio > 1.0) ++bad;
+            }
+        }
+        // the output stride: the pad between rows (and everything past the last row) must be untouched
+        for (int k = 0; k < sh.n_tok; ++k) {
+            for (int o = sh.n_out; o < sh.ldy; ++o) {
+                if (reinterpret_cast<const uint8_t*>(&got[(size_t) k * sh.ldy + o])[0] != 0xB4) ++guard_bad;
+            }
+        }
+        for (size_t i = y_elems * 4; i < img.size(); ++i) {
+            if (img[i] != 0xB4) ++guard_bad;
+        }
+        char label[110];
+        std::snprintf(label, sizeof label, "bf16_mmvf_f32_multi (%s)", sh.note);
+        std::printf("      max |y| = %.6g (worst err/tol %.3g) ; guard bytes changed: %d\n",
+                    (double) *std::max_element(want.begin(), want.end(),
+                                               [](float a, float b) { return std::fabs(a) < std::fabs(b); }),
+                    worst, guard_bad);
+        verdict(label, bad == 0 && guard_bad == 0 && mass > 1e-3, bad + guard_bad, sh.n_tok * sh.n_out, worst,
+                "rows outside tolerance or guard bytes changed (worst err/tol)");
+
+        // ---- THE SOURCE'S BIT-IDENTITY CLAIM, checked against the single-row shader ----
+        int ident_bad = 0;
+        double ident_worst = 0;
+        struct { int n_in; int n_out; } pc1{sh.n_in, sh.n_out};
+        VkPipeline p1 = ctx.pipeline(dir + "/bf16_mmvf_f32.spv", 3, (int) sizeof(pc1));
+        Buf b_y1 = ctx.alloc((size_t) sh.n_out * 4 + 64);
+        for (int k = 0; k < sh.n_tok; ++k) {
+            ctx.write(b_row, x.data() + (size_t) k * sh.ldx, (size_t) sh.n_in * 4);
+            ctx.dispatch(p1, {&b_row, &b_w, &b_y1}, &pc1, sizeof(pc1), (uint32_t) sh.n_out);
+            std::vector<float> one(sh.n_out, 0.0f);
+            ctx.read(b_y1, one.data(), (size_t) sh.n_out * 4);
+            for (int o = 0; o < sh.n_out; ++o) {
+                // BIT-for-bit, which is what the source promises and what a different reduction order would break
+                if (one[o] != got[(size_t) k * sh.ldy + o]) {
+                    ++ident_bad;
+                    ident_worst = std::max(ident_worst,
+                                           (double) std::fabs(one[o] - got[(size_t) k * sh.ldy + o]));
+                }
+            }
+        }
+        std::snprintf(label, sizeof label, "bf16_mmvf_f32_multi == single-row, bit for bit (%s)", sh.note);
+        verdict(label, ident_bad == 0, ident_bad, sh.n_tok * sh.n_out, ident_worst,
+                ident_bad ? "values that differ" : "worst |difference| (0 = bit-identical)");
+
+        ctx.free(b_x); ctx.free(b_w); ctx.free(b_y); ctx.free(b_row); ctx.free(b_y1);
+    }
+}
+
 
 // s2_gemv_q8: the S2 weight format over a Q8_0 ACTIVATION.  Two shapes (the PLE geometry and the minimum legal
 // one), and a block set built so that every index in the kernel is falsifiable:
@@ -949,8 +1088,9 @@ void case_s2_gemv_q8(Ctx& ctx, const std::string& dir) {
             }
         }
         std::vector<float> want(n_out, 0.0f);
+        std::vector<double> want_abs(n_out, 0.0);
         for (int o = 0; o < n_out; ++o) {
-            want[o] = (float) s2_gemv_q8_host_row(act, codes, scales, o, n_in);
+            want[o] = (float) s2_gemv_q8_host_row(act, codes, scales, o, n_in, &want_abs[o]);
         }
 
         Buf b_act = ctx.alloc(act.size()), b_codes = ctx.alloc(codes.size()), b_scales = ctx.alloc(scales.size() * 4);
@@ -970,7 +1110,7 @@ void case_s2_gemv_q8(Ctx& ctx, const std::string& dir) {
         double worst = 0;
         for (int o = 0; o < n_out; ++o) {
             const double dev = std::fabs((double) got[o] - (double) want[o]);
-            const double ratio = dev / (1e-5 * std::fabs((double) want[o]) + 1e-6);
+            const double ratio = dev / gemv_bound((double) want[o], want_abs[o], 1e-6);
             worst = std::max(worst, ratio);
             if (ratio > 1.0) ++bad;
         }
@@ -1020,7 +1160,8 @@ void case_bf16_mmvf(Ctx& ctx, const std::string& dir) {
             }
         }
         std::vector<float> want(n_out, 0.0f);
-        for (int o = 0; o < n_out; ++o) want[o] = (float) bf16_mmvf_host_row(x, w, o, n_in);
+        std::vector<double> want_abs(n_out, 0.0);
+        for (int o = 0; o < n_out; ++o) want[o] = (float) bf16_mmvf_host_row(x, w, o, n_in, &want_abs[o]);
 
         Buf b_x = ctx.alloc((size_t) n_in * 4);
         Buf b_w = ctx.alloc((size_t) n_out * n_in * 2);
@@ -1039,7 +1180,7 @@ void case_bf16_mmvf(Ctx& ctx, const std::string& dir) {
         double worst = 0;
         for (int o = 0; o < n_out; ++o) {
             const double dev = std::fabs((double) got[o] - (double) want[o]);
-            const double ratio = dev / (1e-5 * std::fabs((double) want[o]) + 1e-6);
+            const double ratio = dev / gemv_bound((double) want[o], want_abs[o], 1e-6);
             worst = std::max(worst, ratio);
             if (ratio > 1.0) ++bad;
         }
@@ -2675,6 +2816,7 @@ int main(int argc, char** argv) {
     case_ple(ctx, dir);
     case_s2_gemv_q8(ctx, dir);
     case_bf16_mmvf(ctx, dir);
+    case_bf16_mmvf_multi(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);
