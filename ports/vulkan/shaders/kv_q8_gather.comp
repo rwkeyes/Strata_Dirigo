@@ -1,0 +1,70 @@
+// ports/vulkan/shaders/kv_q8_gather.comp - dequantise selected q8 cells, ported from src/kernels/cuda/kv_q8.cu.
+//
+// The reader half of kv_q8.  One thread per FOUR consecutive values, as the source does (it reads a `char4` and
+// writes a `ushort4`): the four values of a thread always sit inside one 64-value group, because 64 is a multiple
+// of 4, so a single scale lookup covers them.
+//
+//     out[id][head][d] = fp16(code[row][d] * scale[row][d / 64])
+//
+// The scratch layout is the FP16 one the attention kernels already read - `[id][kv_head][head_dim]` - so
+// qsa_attend and the native attention adapter are untouched by the storage change.  Only STORAGE moved.
+//
+// NO RESIDENCY CHECK HERE, and that is faithful rather than an omission: the source does not test `page < 0`
+// either, because the selection that produced `ids` only ever returns resident cells.  Adding a guard would have
+// to invent a value to write for a cell that cannot be selected.
+//
+// K and V are the same kernel bound to different buffers (six bindings, two dispatches) rather than two kernels
+// that could drift - the same choice the append makes for its two destinations.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer CODES { int8_t c[]; } CODES_;
+layout(set = 0, binding = 1, std430) readonly buffer SCALES { uint16_t s[]; } SC_;
+layout(set = 0, binding = 2, std430) readonly buffer TAB { int t[]; } TAB_;
+layout(set = 0, binding = 3, std430) readonly buffer IDS { int v[]; } IDS_;
+layout(set = 0, binding = 4, std430) readonly buffer STEP { int s[]; } ST_;
+layout(set = 0, binding = 5, std430) buffer SCRATCH { uint16_t y[]; } OUT_;
+
+#include "common/f16_bits.glsl"
+#define f16_from_f32(f) f16_from_f32_port(f)
+
+layout(push_constant) uniform Pc {
+    int kv_heads;
+    int head_dim;
+    int page_size;
+} pc;
+
+void main() {
+    // The real count comes from the step buffer (the grid is sized by max_ids, the capacity), which is what makes
+    // this step capturable: the source reads it the same way.
+    const int n_ids = ST_.s[3];                    // kStepWidth
+    const int per = pc.head_dim / 4;
+    const int total = n_ids * pc.kv_heads * per;
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= total) return;                        // the grid is rounded up; surplus threads exit
+
+    const int row_span = pc.kv_heads * per;
+    const int id = i / row_span;
+    const int rem = i - id * row_span;
+    const int h = rem / per;
+    const int q4 = rem - h * per;
+
+    const int cell = IDS_.v[id];
+    const int page = TAB_.t[cell / pc.page_size];
+    const int row = (page * pc.kv_heads + h) * pc.page_size + (cell % pc.page_size);
+
+    const int groups = pc.head_dim / 64;
+    const int d = q4 * 4;
+    // Widening a half to a float is exact, so the builtin cannot round differently from the engine here.
+    const float sc = unpackHalf2x16(uint(SC_.s[row * groups + d / 64])).x;
+    const int src = row * pc.head_dim + d;
+    const int dst = (id * pc.kv_heads + h) * pc.head_dim + d;
+    for (int t = 0; t < 4; ++t) {
+        OUT_.y[dst + t] = f16_from_f32(float(CODES_.c[src + t]) * sc);
+    }
+}

@@ -1037,6 +1037,192 @@ void case_kv_q8(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// kv_q8 GATHER: the dequantising reader.  Two things are checked and they are different in kind.
+//
+// (1) BIT-EXACTNESS of the dequantised output against the engine's formula, because the scratch feeds attention
+//     and a value that is merely close is a wrong number in the attention input.  The synthetic cache uses a
+//     scale set that walks the fp16 conversion's paths: zero, one, a SUBNORMAL, a half, a normal and the largest
+//     finite half - times codes up to +-127, so the products reach the overflow branch too.
+// (2) THE ROUND TRIP - append floats, gather them back, compare against the originals - which is the property the
+//     engine actually depends on and which neither half proves alone: it only holds if the scale the append
+//     wrote is exactly the scale the gather reads.
+void case_kv_q8_gather(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "kv_q8_gather.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("kv_q8 gather", "device lacks storageBuffer8BitAccess - the int8 code path cannot run here");
+        return;
+    }
+    const int kv_heads = 2, head_dim = 256, page_size = 16, pages = 2, groups = head_dim / 64;
+    const int rows = pages * kv_heads * page_size;
+    const int per = head_dim / 4;
+    const size_t code_bytes = (size_t) rows * head_dim;
+    const size_t scale_elems = (size_t) rows * groups;
+    const uint16_t SENT = 0xDEADu;
+
+    // ---- (1) the synthetic cache, both sides ----
+    const uint16_t scale_set[6] = {0x0000u, 0x3C00u, 0x0001u, 0x3800u, 0x4C00u, 0x7BFFu};
+    std::vector<int8_t> kq(code_bytes), vq(code_bytes);
+    std::vector<uint16_t> ks(scale_elems), vs(scale_elems);
+    for (size_t i = 0; i < code_bytes; ++i) {
+        kq[i] = (int8_t) ((int) (i % 255) - 127);
+        vq[i] = (int8_t) ((int) ((i * 7) % 255) - 127);
+    }
+    for (size_t i = 0; i < scale_elems; ++i) {
+        ks[i] = scale_set[i % 6];
+        vs[i] = scale_set[(i + 3) % 6];
+    }
+    const std::vector<int32_t> table = {0, 1};          // cell 0..15 -> page 0, 16..31 -> page 1
+    const std::vector<int32_t> ids = {0, 20, 21};       // spans both pages and different offsets
+    const int n_ids = (int) ids.size();
+    const std::vector<int32_t> step = {0, 0, 0, n_ids, 0};
+
+    const size_t scratch_elems = (size_t) n_ids * kv_heads * head_dim;
+    const uint64_t slack = 128;
+    Buf b_tab = ctx.alloc(table.size() * 4), b_ids = ctx.alloc(ids.size() * 4), b_step = ctx.alloc(step.size() * 4);
+    ctx.write(b_tab, table.data(), table.size() * 4);
+    ctx.write(b_ids, ids.data(), ids.size() * 4);
+    ctx.write(b_step, step.data(), step.size() * 4);
+
+    const uint32_t groups_needed = (uint32_t) (((size_t) n_ids * kv_heads * per + kLocalSize - 1) / kLocalSize);
+    VkPipeline pg = ctx.pipeline(dir + "/kv_q8_gather.spv", 6, 12);
+    struct { int kv_heads, head_dim, page_size; } pc{kv_heads, head_dim, page_size};
+
+    for (int side = 0; side < 2; ++side) {              // 0 = K, 1 = V (same kernel, different buffers)
+        Buf b_codes = ctx.alloc(code_bytes), b_scales = ctx.alloc(scale_elems * 2);
+        Buf b_out = ctx.alloc((scratch_elems + slack) * 2);
+        ctx.write(b_codes, (side ? vq : kq).data(), code_bytes);
+        ctx.write(b_scales, (side ? vs : ks).data(), scale_elems * 2);
+        std::vector<uint16_t> got(scratch_elems + slack, SENT);
+        ctx.write(b_out, got.data(), got.size() * 2);
+        ctx.dispatch(pg, {&b_codes, &b_scales, &b_tab, &b_ids, &b_step, &b_out}, &pc, sizeof(pc), groups_needed);
+        ctx.read(b_out, got.data(), got.size() * 2);
+
+        std::vector<uint16_t> want = got;                            // start from the sentinel image
+        for (size_t i = 0; i < want.size(); ++i) want[i] = SENT;
+        const std::vector<int8_t>& codes = side ? vq : kq;
+        const std::vector<uint16_t>& scales = side ? vs : ks;
+        for (int id = 0; id < n_ids; ++id) {
+            for (int h = 0; h < kv_heads; ++h) {
+                const int cell = ids[id];
+                const int page = table[cell / page_size];
+                const int row = (page * kv_heads + h) * page_size + (cell % page_size);
+                for (int d = 0; d < head_dim; ++d) {
+                    const float sc = strata::kernels::f32_from_f16(scales[(size_t) row * groups + d / 64]);
+                    const float v = (float) codes[(size_t) row * head_dim + d] * sc;
+                    want[(size_t) (id * kv_heads + h) * head_dim + d] = strata::kernels::f16_from_f32(v);
+                }
+            }
+        }
+        int bad = 0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            if (got[i] != want[i]) ++bad;
+        }
+        char label[96];
+        std::snprintf(label, sizeof label, "kv_q8 gather %s (bit-exact)", side ? "V" : "K");
+        verdict(label, bad == 0, bad, (int) want.size(), (double) bad,
+                bad ? "differing halves (incl. the guard region)" : "differing halves");
+        ctx.free(b_codes);
+        ctx.free(b_scales);
+        ctx.free(b_out);
+    }
+
+    // ---- (2) the round trip: floats -> append -> gather -> compare with the originals ----
+    {
+        const int pos = 20;
+        std::vector<float> kcur((size_t) kv_heads * head_dim), vcur((size_t) kv_heads * head_dim);
+        for (float& v : kcur) v = rndf(1.0f);
+        for (float& v : vcur) v = rndf(1.0f);
+        // One group with a tiny maximum, so the scale lands in the fp16 SUBNORMAL range: that is the path where
+        // the builtin and the engine's converter could disagree for a different reason than overflow.
+        for (int t = 0; t < 64; ++t) {
+            kcur[3 * 64 + t] = 1.0e-5f * (float) (t + 1);
+        }
+        const std::vector<int32_t> rtable = {0, 0};      // both blocks resident on page 0
+        const std::vector<int32_t> rstep = {pos, pos + 1, 0, 1, 0};
+        const std::vector<int32_t> rids = {pos};
+
+        Buf b_kq = ctx.alloc(code_bytes), b_vq = ctx.alloc(code_bytes);
+        Buf b_ks = ctx.alloc(scale_elems * 2), b_vs = ctx.alloc(scale_elems * 2);
+        Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+        Buf b_rt = ctx.alloc(rtable.size() * 4), b_rs = ctx.alloc(rstep.size() * 4);
+        Buf b_ri = ctx.alloc(rids.size() * 4);
+        std::vector<int8_t> zero_q(code_bytes, 0);
+        std::vector<uint16_t> zero_s(scale_elems, 0);
+        ctx.write(b_kq, zero_q.data(), code_bytes);
+        ctx.write(b_vq, zero_q.data(), code_bytes);
+        ctx.write(b_ks, zero_s.data(), scale_elems * 2);
+        ctx.write(b_vs, zero_s.data(), scale_elems * 2);
+        ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+        ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+        ctx.write(b_rt, rtable.data(), rtable.size() * 4);
+        ctx.write(b_rs, rstep.data(), rstep.size() * 4);
+        ctx.write(b_ri, rids.data(), rids.size() * 4);
+
+        const uint32_t athreads = (uint32_t) (2 * kv_heads * groups);
+        VkPipeline pa = ctx.pipeline(dir + "/kv_q8_append.spv", 8, 16);
+        struct { int kv_heads, head_dim, page_size, host_layout; } apc{kv_heads, head_dim, page_size, 0};
+        ctx.dispatch(pa, {&b_kq, &b_vq, &b_ks, &b_vs, &b_rt, &b_rs, &b_kc, &b_vc}, &apc, sizeof(apc),
+                     (athreads + kLocalSize - 1) / kLocalSize);
+
+        const size_t rt_elems = (size_t) kv_heads * head_dim;
+        Buf b_kout = ctx.alloc(rt_elems * 2), b_vout = ctx.alloc(rt_elems * 2);
+        std::vector<uint16_t> sink(rt_elems, SENT);
+        ctx.write(b_kout, sink.data(), rt_elems * 2);
+        ctx.write(b_vout, sink.data(), rt_elems * 2);
+        const uint32_t gthreads = (uint32_t) (kv_heads * per);
+        ctx.dispatch(pg, {&b_kq, &b_ks, &b_rt, &b_ri, &b_rs, &b_kout}, &pc, sizeof(pc),
+                     (gthreads + kLocalSize - 1) / kLocalSize);
+        ctx.dispatch(pg, {&b_vq, &b_vs, &b_rt, &b_ri, &b_rs, &b_vout}, &pc, sizeof(pc),
+                     (gthreads + kLocalSize - 1) / kLocalSize);
+
+        std::vector<uint16_t> kgot(rt_elems), vgot(rt_elems);
+        ctx.read(b_kout, kgot.data(), rt_elems * 2);
+        ctx.read(b_vout, vgot.data(), rt_elems * 2);
+
+        int bad = 0, bound_bad = 0;
+        double worst_ratio = 0;
+        for (int h = 0; h < kv_heads; ++h) {
+            // the gathered output is in the scratch layout [id][h][head_dim], so it is indexed by h directly -
+            // the cache row only mattered to the append
+            for (int g = 0; g < groups; ++g) {
+                const int xbase = h * head_dim + g * 64;
+                std::vector<int8_t> codes;
+                uint16_t sbits = 0;
+                kv_q8_quantize_group(&kcur[xbase], 64, codes, sbits);
+                const float sc = strata::kernels::f32_from_f16(sbits);
+                for (int t = 0; t < 64; ++t) {
+                    const int d = g * 64 + t;
+                    // the pair must agree BIT-EXACTLY: this only holds if the append's scale is exactly what the
+                    // gather reads back
+                    const uint16_t want = strata::kernels::f16_from_f32((float) codes[t] * sc);
+                    if (kgot[(size_t) h * head_dim + d] != want) ++bad;
+                    // and the QUANTISATION bound, stated separately because it is a quality claim, not equality:
+                    // one code step is the scale, so an error above the scale means the quantiser is wrong rather
+                    // than merely lossy
+                    const double got = (double) strata::kernels::f32_from_f16(kgot[(size_t) h * head_dim + d]);
+                    const double orig = (double) kcur[xbase + t];
+                    const double ratio = std::fabs(got - orig) / ((double) sc + 1e-30);
+                    worst_ratio = std::max(worst_ratio, ratio);
+                    if (std::fabs(got - orig) > (double) sc) ++bound_bad;
+                }
+            }
+        }
+        (void) vgot;   // V is exercised by the same code path; K carries the adversarial group
+        char label[96];
+        std::snprintf(label, sizeof label, "kv_q8 round trip (append then gather)");
+        const bool ok = bad == 0 && bound_bad == 0;
+        verdict(label, ok, bad + bound_bad, (int) (kv_heads * head_dim), worst_ratio,
+                ok ? "worst |x'-x|/scale" : "failures (bit-exact + bound)");
+        ctx.free(b_kq); ctx.free(b_vq); ctx.free(b_ks); ctx.free(b_vs);
+        ctx.free(b_kc); ctx.free(b_vc); ctx.free(b_rt); ctx.free(b_rs); ctx.free(b_ri);
+        ctx.free(b_kout); ctx.free(b_vout);
+    }
+
+    ctx.free(b_tab);
+    ctx.free(b_ids);
+    ctx.free(b_step);
+}
+
 // THE HOST-SIDE ORACLE for rope: `build_rope_table`'s own float64 loop, copied rather than paraphrased (it is
 // the thing the port must agree with, so it must not be re-derived from the description of it).  The kernel
 // receives this table, so the ONLY difference left between device and reference is one rotation step in float
@@ -1546,6 +1732,7 @@ int main(int argc, char** argv) {
     case_reserve_policy();
     case_reserve_refusal();
     case_kv_q8(ctx, dir);
+    case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);
     case_gemm_fma(ctx, dir);
     case_gemm_shape_contract();

@@ -70,7 +70,23 @@ Use the port's own `f16_from_f32` (transcribed from `strata/kernels/f16_bits.hpp
 `f32_to_f16` case) in every kernel that converts. Reading a half BACK is a pure widening conversion with no
 rounding to get wrong, so `unpackHalf2x16` is exact and stays.
 
-## Next: the second half of kv_q8, then the rest of the wave
+## kv_q8 is COMPLETE (append, gather, round trip)
+
+`kv_q8_append.comp` and `kv_q8_gather.comp` are both in and gated, and the pair is verified as a **round trip**
+(floats -> append -> gather -> compare with the originals). Measured worst `|x'-x| / scale` = **0.53**, which is
+what a correct round-to-nearest quantiser gives: below one code step, so the quantiser is optimal rather than
+merely inside a loose bound. The round trip is also bit-exact against the host oracle, which only holds if the
+scale the append WROTE is exactly the scale the gather READS.
+
+The gather also settles a conversion question the append raised: a group whose scale lands in the fp16
+**subnormal** range round-trips exactly, so `unpackHalf2x16` and the engine's `f32_from_f16` agree there - it is
+only the PACKING direction where the builtin differs (see the packHalf2x16 section above).
+
+The engine's fp16 converter now lives in ONE place, `shaders/common/f16_bits.glsl`, included by the three kernels
+that convert (`#include` works in glslc, resolved relative to the including file). Three copies of a bit-exact
+function were three chances to diverge, and `shaders/*.comp` deliberately does not glob into `common/`.
+
+## Next: the rest of the wave
 
 `kv_gather_q8` — the dequantising reader (one thread per 4 values, `fp16(code * scale)` into the scratch the
 attention kernels read). With BOTH entry points in place the pair can be tested as a **round trip** (append then
