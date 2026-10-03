@@ -139,7 +139,9 @@ card and decode fell 41 -> 30 tok/s (#380/#377). A free-memory number that ignor
    it is absent the fallback is the heap total - which is a **ledger, not a measurement**, and the code says so
    out loud rather than degrading silently.
 2. **Holds back a desktop reserve**, as a pure function with a floor and a cap: default **1024 MiB**, never
-   below **256 MiB**, never more than **25%** of the card. It composes with the engine's own 700 MiB rather than
+   below **512 MiB**, never more than **25%** of the card. The floor was 256 MiB until field data moved it: a
+   two-display KDE/Wayland B580 desktop held **354 MB in kwin_wayland alone**, so 256 MiB was a reserve smaller
+   than the compositor it was meant to protect. It composes with the engine's own 700 MiB rather than
    overlapping it, because the engine's planner subtracts that from the figure this layer reports as usable.
 3. **Refuses, loudly, rather than over-allocating.** The check runs against the driver's figure plus the
    reserve *before* any allocation, and names the numbers. A backend that cannot fit must say so; allocating
@@ -151,7 +153,7 @@ What that yields, from the real code (`STRATA_VK_FORCE_BUDGET_MIB` used to pose 
 |---|---|---|---|
 | Arc 32 GiB, desktop default | 32.0 GiB | 1.0 GiB | 31.0 GiB |
 | Arc 32 GiB, browser doing GPU compositing | 32.0 GiB | 2.0 GiB | 30.0 GiB |
-| Headless box (no display) | 32.0 GiB | 0.25 GiB (floor) | 31.75 GiB |
+| Headless box (no display) | 32.0 GiB | 0.5 GiB (floor) | 31.5 GiB |
 | Card already busy (e.g. another model resident) | 3.0 GiB | 1.0 GiB | 2.0 GiB |
 | Card nearly full | 0.5 GiB | 1.0 GiB | **0 -> refuses everything** |
 
@@ -160,8 +162,9 @@ Measured on this box as a live example of why the driver figure matters: the res
 that would have saved the RX 6800 incident.
 
 **Tunables** (env, engine-side names to follow in stage 6): `STRATA_VK_DESKTOP_RESERVE_MIB` (default 1024),
-`STRATA_VK_RESERVE_FLOOR_MIB` (default 256; set 0 only for a small correctness harness that must run beside a
-resident model). 512 MiB is the compositor-only floor; 1.5-2 GiB is the number if a browser is compositing.
+`STRATA_VK_RESERVE_FLOOR_MIB` (default 512; set 0 only for a small correctness harness that must run beside a
+resident model). 512 MiB is the compositor-only floor (measured: 354 MB for a two-display KDE/Wayland session);
+1.5-2 GiB is the number if a browser is compositing.
 
 **Display safety beyond memory, which no reserve can buy back:**
 

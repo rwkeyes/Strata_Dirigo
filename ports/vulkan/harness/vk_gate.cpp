@@ -503,7 +503,7 @@ void case_reserve_policy() {
     // while the policy was correct: the test was measuring integer arithmetic, not the rule.)
     struct Case { uint64_t want, heap, expect; bool clamped; const char* what; };
     const Case cases[] = {
-        {0, 24 * GiB, 256 * MiB, false, "no request -> the 256 MiB floor"},
+        {0, 24 * GiB, 512 * MiB, false, "no request -> the 512 MiB floor"},
         {1024 * MiB, 24 * GiB, 1024 * MiB, false, "1024 MiB on a 24 GiB card is taken as asked"},
         {16 * GiB, 24 * GiB, 6 * GiB, true, "16 GiB requested on a 24 GiB card -> clamped to 25%"},
         {2 * GiB, 4 * GiB, 1 * GiB, true, "25% of a small card wins over a big request"},
@@ -511,7 +511,7 @@ void case_reserve_policy() {
     };
     int bad = 0;
     for (const Case& c : cases) {
-        const ReserveDecision d = compute_desktop_reserve(c.want, c.heap, 256 * MiB, 25);
+        const ReserveDecision d = compute_desktop_reserve(c.want, c.heap, 512 * MiB, 25);   // the shipping floor
         const uint64_t diff = d.reserve_bytes > c.expect ? d.reserve_bytes - c.expect : c.expect - d.reserve_bytes;
         if (diff > MiB || d.clamped_by_cap != c.clamped) {
             std::printf("      policy %s: got %.4f GiB (clamped=%d), expected %.4f GiB (clamped=%d)\n", c.what,
@@ -522,14 +522,14 @@ void case_reserve_policy() {
     }
     // The discriminator: if the clamp stopped firing, the clamped case would return the request instead of the
     // cap - so require the two to differ.  A policy test whose cases all pass either way proves nothing.
-    const ReserveDecision clamped = compute_desktop_reserve(16 * GiB, 24 * GiB, 256 * MiB, 25);
+    const ReserveDecision clamped = compute_desktop_reserve(16 * GiB, 24 * GiB, 512 * MiB, 25);
     const bool clamp_discriminates = clamped.reserve_bytes != (16 * GiB) && clamped.clamped_by_cap;
     if (!clamp_discriminates) {
         std::printf("      clamp discriminator failed: reserve=%.2f GiB clamped_flag=%d\n",
                     (double) clamped.reserve_bytes / (double) GiB, (int) clamped.clamped_by_cap);
         ++bad;
     }
-    const bool floor_discriminates = compute_desktop_reserve(0, 24 * GiB, 256 * MiB, 25).raised_to_floor;
+    const bool floor_discriminates = compute_desktop_reserve(0, 24 * GiB, 512 * MiB, 25).raised_to_floor;
     if (!floor_discriminates) {
         std::printf("      floor discriminator failed\n");
         ++bad;

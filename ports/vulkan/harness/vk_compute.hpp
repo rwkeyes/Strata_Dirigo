@@ -87,6 +87,7 @@ public:
     // ---- the display contract -------------------------------------------------------------------------
     // The reserve is configured once, after the device is up and before anything is allocated.
     //   STRATA_VK_DESKTOP_RESERVE_MIB  what to hold back for the desktop (default 1024)
+    //   STRATA_VK_RESERVE_FLOOR_MIB    the floor under it (default 512)
     //   STRATA_VK_FORCE_BUDGET_MIB     test hook: pretend the whole heap is this many MiB (refusals must be
     //                                  demonstrable without filling a real card)
     //   STRATA_VK_NO_MEMORY_BUDGET     test hook: take the labelled ledger-only fallback

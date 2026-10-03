@@ -337,10 +337,13 @@ void Ctx::configure_display_reserve() {
     const char* rsv = std::getenv("STRATA_VK_DESKTOP_RESERVE_MIB");
     if (rsv && *rsv) want_bytes = (uint64_t) std::strtoull(rsv, nullptr, 10) << 20;
 
-    // 256 MiB floor: a card with nothing to spare still must not be filled to the last byte.  Lowering it to 0
-    // is a TEST hook - the numerical gate needs a few MiB of buffers, and on this box the resident local model
-    // already holds the card, so a 256 MiB floor would (correctly) refuse even the gate.
-    uint64_t floor_bytes = 256ull << 20;
+    // 512 MiB floor, raised from 256 on field evidence: a KDE/Wayland B580 desktop with two displays was
+    // measured holding 354 MB of GPU memory in kwin_wayland ALONE (before any application), so a 256 MiB floor
+    // was a reserve smaller than a real desktop's compositor.  A card with nothing to spare still must not be
+    // filled to the last byte.  Lowering the floor to 0 is a TEST hook - the numerical gate needs a few MiB of
+    // buffers, and on this box the resident local model already holds the card, so even the floor would
+    // (correctly) refuse the gate.
+    uint64_t floor_bytes = 512ull << 20;
     const char* flr = std::getenv("STRATA_VK_RESERVE_FLOOR_MIB");
     if (flr && *flr) floor_bytes = (uint64_t) std::strtoull(flr, nullptr, 10) << 20;
 
