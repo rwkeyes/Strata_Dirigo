@@ -341,9 +341,10 @@ remedy. That is the shape that filled an RX 6800 driving a desktop (`docs/AMD_HI
 
 ### 6.3 How this is verified
 
-`gates/run_gate.sh` reports **36 passed, 0 failed, 0 skipped** on the primary implementation and **34** on the
-software one (`lvp`) at the time of writing; the gate prints its own totals, so a number here that disagrees with
-a run is a stale document, not a result. Implementations present here (RADV and
+`gates/run_gate.sh` **prints its own totals** and they move with every case added, so this document does not
+quote them: quoting a count here has gone stale twice inside a day (a number in a document is a copy of a fact
+that lives in the tool). Run it and read the last line. Skips are counted separately and the suite fails closed -
+a run that skipped the kernels the shaders need is not agreement. Implementations present here (RADV and
 llvmpipe), and the Linux-compatibility parts are covered by:
 
 * a **15-case advisory table** with a **three-way boundary discriminator** (below the floor / at the floor on a
