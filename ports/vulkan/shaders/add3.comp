@@ -1,0 +1,18 @@
+// ports/vulkan/shaders/add3.comp - `result = hidden + gated + conv`, elementwise (ple.cu's add3_kernel).
+//
+// Three inputs rather than the two `add.comp` takes, and written left-to-right as the source is: (h+g)+c, not
+// h+(g+c).  The parenthesisation is the value of the shader being separate - the sums round where the source
+// rounds, which a two-dispatch "add, then add" would also happen to give, but only by luck of ordering.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer H { float v[]; } hidden;
+layout(set = 0, binding = 1, std430) readonly buffer G { float v[]; } gated;
+layout(set = 0, binding = 2, std430) readonly buffer C { float v[]; } conv;
+layout(set = 0, binding = 3, std430) buffer O { float v[]; } result;
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    result.v[i] = hidden.v[i] + gated.v[i] + conv.v[i];
+}

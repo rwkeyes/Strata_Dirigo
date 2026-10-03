@@ -1,0 +1,44 @@
+// ports/vulkan/shaders/ple_conv.comp - the PLE depthwise causal dilated conv, then SiLU (ple.cu's conv_kernel).
+//
+//   out[c] = silu( sum_k kW[k][c] * padded[hist + t - (kern-1-k)*dil][c] )      with t = hist
+//
+// so tap k reads row `hist - (kern-1-k)*dil`: tap 0 reads the FURTHEST back and the last tap reads the newest.
+// For the real geometry (kern 4, dil 3, hist 9) the four taps are rows 0, 3, 6 and 9 - and row 9 is the NEW
+// row, the only one beyond the history, which is why no padded buffer is built: three taps come from the
+// caller's history and the fourth from `norm`.
+//
+// TWO INDEXING FACTS, both of which were wrong once already in the source's history:
+//
+//   * THE HISTORY IS ROW-FASTEST: `hist[row + nhist*c]`.  The conv state is
+//     `ggml_reshape_3d(state, d_conv-1, conv_channels, n_seqs)`, so ne0 = the history row varies fastest.
+//     `row*hc_dim + c` is the natural thing to write and reads a transposed state; `ple_layer_xcheck.cpp`
+//     L79-83 records the transposed reading failing ggml's own assert.
+//   * `kW` IS GGML-NATIVE: `kW[k + kern*c]`, and the manifest's [4, 10240] has ne0 = 4 fast.
+//     `ref/ngram.py`'s numpy `kernel[k][c]` is the TRANSPOSE of that.
+//
+// SiLU is applied HERE rather than as a second dispatch because that is the source's shape - one kernel, one
+// launch - and `x / (1 + exp(-x))` is ggml_silu_f32 exactly (the same expression silu_f32.comp uses).
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer H { float v[]; } hist;
+layout(set = 0, binding = 1, std430) readonly buffer N { float v[]; } norm;
+layout(set = 0, binding = 2, std430) readonly buffer KW { uint16_t v[]; } kw;
+// `out` is a GLSL keyword (an output qualifier) and cannot name a variable - the same class of trap as
+// `half`, which cost a compile in rope_neox.
+layout(set = 0, binding = 3, std430) buffer O { float v[]; } dst;
+layout(push_constant, std430) uniform PC { int hc_dim; int kern; int dil; int nhist; } pc;
+
+void main() {
+    const int c = int(gl_GlobalInvocationID.x);
+    if (c >= pc.hc_dim) return;
+    float acc = 0.0;
+    for (int k = 0; k < pc.kern; ++k) {
+        const int row = pc.nhist - (pc.kern - 1 - k) * pc.dil;
+        const float v = (row == pc.nhist) ? norm.v[c] : hist.v[row + pc.nhist * c];
+        acc += unpackHalf2x16(uint(kw.v[k + pc.kern * c])).x * v;   // the exact widening direction
+    }
+    dst.v[c] = acc / (1.0 + exp(-acc));
+}

@@ -873,6 +873,319 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// ---- the PLE block's non-GEMV half, transcribed from ple.cu ----
+//
+// FROM THE CUDA SOURCE, not from a description of it.  The oracle is a stage-by-stage transcription, so the
+// comparison can say WHICH stage diverged instead of only that the sum did - which is the whole reason the
+// engine exports `key`, `value`, `gate`, `gated`, `normalized` and `conv` separately.
+//
+// The two arithmetic facts that make this a transcription rather than a reimplementation:
+//   * the products feeding the two REDUCTIONS are rounded to f32 BEFORE they are widened (`(double)(x*x)`,
+//     `(double)(k*q)`), which is what ggml does and is not the same as widening first;
+//   * the conv's history is ROW-FASTEST (`hist[row + nhist*c]`) while its weights are ggml-native
+//     (`kW[k + kern*c]`).  Both were wrong once in the source's own history.
+//
+// The ORACLE accumulates its sums in DOUBLE while the device accumulates in f32 (documented in ple_gnorm.comp as
+// a deliberate deviation), so the reduction-fed stages are compared against a double reference and the elementwise
+// stages against transcribes of their own f32 arithmetic.
+static void ple_gnorm_host(const std::vector<float>& xin, const std::vector<float>& w, std::vector<float>& y,
+                           int rows, int cols, float eps) {
+    for (int r = 0; r < rows; ++r) {
+        double acc = 0.0;
+        for (int d = 0; d < cols; ++d) {
+            const float sq = xin[(size_t) r * cols + d] * xin[(size_t) r * cols + d];
+            acc += (double) sq;                       // the product is f32; the sum is double
+        }
+        const float mean = (float) (acc / (double) cols);
+        const float scale = 1.0f / std::sqrt(mean + eps);
+        for (int d = 0; d < cols; ++d) {
+            y[(size_t) r * cols + d] = xin[(size_t) r * cols + d] * scale * w[(size_t) r * cols + d];
+        }
+    }
+}
+
+static void ple_gate_host(const std::vector<float>& key, const std::vector<float>& q, std::vector<float>& gate,
+                          int streams, int n) {
+    const float inv = 1.0f / std::sqrt((float) n);
+    for (int c = 0; c < streams; ++c) {
+        double acc = 0.0;
+        for (int d = 0; d < n; ++d) acc += (double) (key[(size_t) c * n + d] * q[(size_t) c * n + d]);
+        const float s = (float) (acc / 1.0) * inv;
+        const float mag = std::sqrt(std::max(std::fabs(s), 1e-6f));
+        const float sgn = (s > 0.0f) ? 1.0f : ((s < 0.0f) ? -1.0f : 0.0f);
+        gate[c] = 1.0f / (1.0f + std::exp(-(sgn * mag)));
+    }
+}
+
+static void ple_bcast_host(const std::vector<float>& value, const std::vector<float>& gate,
+                           std::vector<float>& gated, int n, int hc) {
+    for (int i = 0; i < n * hc; ++i) gated[i] = value[i % n] * gate[i / n];
+}
+
+static void ple_conv_host(const std::vector<float>& hist, const std::vector<float>& norm,
+                          const std::vector<uint16_t>& kw, std::vector<float>& out, int hc_dim, int kern,
+                          int dil, int nhist) {
+    for (int c = 0; c < hc_dim; ++c) {
+        float acc = 0.0f;
+        for (int k = 0; k < kern; ++k) {
+            const int row = nhist - (kern - 1 - k) * dil;
+            const float v = (row == nhist) ? norm[c] : hist[(size_t) row + (size_t) nhist * c];
+            acc += strata::kernels::f32_from_f16(kw[k + kern * c]) * v;
+        }
+        out[c] = acc / (1.0f + std::exp(-acc));
+    }
+}
+
+// ple: the whole non-GEMV chain, one token, composed in the order the source composes it.
+//
+//   key = gnorm(key_proj, norm_key) ; query = gnorm(hidden, norm_query) ; gate = f(key, query)
+//   gated = value * gate ; normalized = gnorm(gated, norm_conv) ; conv = silu(conv1d(hist, normalized))
+//   result = hidden + gated + conv
+//
+// The PROJECTIONS are GEMV (s2_gemv_q8 / bf16) and belong to the GEMV wave, so they are inputs here and the
+// chain starts after them.  Everything else is this case's subject.
+//
+// This is the port's first COMPOSITION test - every earlier case checked one kernel - and composition is where a
+// convention shared between kernels stops being checkable by either one alone: the stream index, the row-fastest
+// history, and the fact that `normalized` (not `gated`) is what the conv consumes.  That last one is the finding
+// the header spends ten lines on: `ref/ngram.py`'s docstring says the padded values are the gated ones, and the
+// source pads the NORMALIZED ones.
+void case_ple(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "ple_gnorm.spv") || !have(dir, "ple_gate.spv") || !have(dir, "ple_bcast.spv") ||
+        !have(dir, "ple_conv.spv") || !have(dir, "add3.spv") || !have(dir, "ple_history_advance.spv")) {
+        return;
+    }
+    const int n_embd = 2560, hc = 4, hc_dim = 10240, kern = 4, dil = 3, nhist = 9;
+    const float eps = 1e-6f;
+
+    std::vector<float> key_raw(hc_dim), hidden(hc_dim), value(n_embd);
+    std::vector<float> w_key(hc_dim), w_query(hc_dim), w_conv(hc_dim);
+    std::vector<float> hist((size_t) nhist * hc_dim);
+    for (int i = 0; i < hc_dim; ++i) {
+        key_raw[i] = rndf(1.0f);
+        hidden[i] = rndf(1.0f) * 2.0f;
+        w_key[i] = 1.0f + 0.25f * rndf(1.0f);
+        w_query[i] = 1.0f + 0.25f * rndf(1.0f);
+        w_conv[i] = 1.0f + 0.25f * rndf(1.0f);
+    }
+    for (int i = 0; i < n_embd; ++i) value[i] = rndf(1.0f);
+    for (size_t i = 0; i < hist.size(); ++i) hist[i] = rndf(1.0f);
+    // stream 3's key is EXACTLY zero -> the gate's s is exactly 0, which is the only way to reach the sign=0
+    // branch AND the 1e-6 floor on |s| at the same time
+    for (int d = 0; d < n_embd; ++d) key_raw[(size_t) 3 * n_embd + d] = 0.0f;
+    std::vector<uint16_t> kw((size_t) kern * hc_dim);
+    for (size_t i = 0; i < kw.size(); ++i) kw[i] = strata::kernels::f16_from_f32(0.5f * rndf(1.0f));
+
+    // ---- the oracle chain ----
+    std::vector<float> o_key(key_raw), o_query(hc_dim), o_gate(hc), o_gated(hc_dim), o_norm(hc_dim);
+    std::vector<float> o_conv(hc_dim), o_result(hc_dim);
+    ple_gnorm_host(key_raw, w_key, o_key, hc, n_embd, eps);
+    ple_gnorm_host(hidden, w_query, o_query, hc, n_embd, eps);
+    ple_gate_host(o_key, o_query, o_gate, hc, n_embd);
+    ple_bcast_host(value, o_gate, o_gated, n_embd, hc);
+    ple_gnorm_host(o_gated, w_conv, o_norm, hc, n_embd, eps);
+    ple_conv_host(hist, o_norm, kw, o_conv, hc_dim, kern, dil, nhist);
+    for (int i = 0; i < hc_dim; ++i) o_result[i] = hidden[i] + o_gated[i] + o_conv[i];
+
+    // ---- the device chain ----
+    //
+    // SNAPSHOT EVERY STAGE IMMEDIATELY AFTER ITS DISPATCH.  The source reuses its scratch aggressively - the
+    // gated values are normalised IN PLACE into `d_norm`, and `d_query` is later reused for other work - so
+    // reading a stage's buffer at the END of the chain compares whatever ran last into it.  The first version of
+    // this case did exactly that and reported the `gated` stage as 0/10240 correct: the buffer held the
+    // NORMALIZED values by then.  A composition test has to catch its intermediates on the way past.
+    //
+    // WHERE THE PORT'S IN-PLACE gnorm MUST BE USED DIFFERENTLY FROM THE SOURCE'S TWO-DESTINATION gnorm.  The
+    // CUDA calls are `gnorm(d_key -> d_key)`, `gnorm(hidden -> d_query)` and `gnorm(d_gated -> d_norm)`, so two
+    // of the three write somewhere OTHER than their input.  The port's kernel is in place, so those two become a
+    // copy followed by an in-place call - and the first version of this case skipped the copy for the query,
+    // normalising `hidden` itself.  That is the failure a composition test exists to find: it appears in the
+    // GATE and everything downstream, while `gnorm` alone passed its own stage at 0.21 err/tol.
+
+    Buf b_key = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_query = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_hidden = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_value = ctx.alloc((size_t) n_embd * 4);
+    Buf b_gate = ctx.alloc((size_t) hc * 4);
+    Buf b_wq = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_wc = ctx.alloc((size_t) hc_dim * 4);
+    // ITS OWN BUFFER.  The first version of this case reused `b_wc` for the key weights - "same shape, and w_key
+    // is not needed later" - which is exactly the saving the SOURCE's own comment refuses: "FIVE SEPARATE
+    // hc_dim BUFFERS, deliberately... Two buffers of the same size look like an obvious saving and the only
+    // thing it saves is 40 KB."  w_conv IS needed later, by `gnorm(gated)` and the conv, so the clobber showed up
+    // two stages downstream as 8.6e7 err/tol while every earlier stage passed.
+    Buf b_wk = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_gated = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_norm = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_conv = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_result = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_kw = ctx.alloc((size_t) kern * hc_dim * 2);
+    Buf b_hist = ctx.alloc((size_t) nhist * hc_dim * 4 + 64);
+    ctx.write(b_key, key_raw.data(), (size_t) hc_dim * 4);
+    ctx.write(b_hidden, hidden.data(), (size_t) hc_dim * 4);
+    ctx.write(b_value, value.data(), (size_t) n_embd * 4);
+    ctx.write(b_wq, w_query.data(), (size_t) hc_dim * 4);
+    ctx.write(b_wc, w_conv.data(), (size_t) hc_dim * 4);
+    ctx.write(b_wk, w_key.data(), (size_t) hc_dim * 4);
+    ctx.write(b_kw, kw.data(), (size_t) kern * hc_dim * 2);
+    {
+        const uint8_t SENT = 0x77;
+        std::vector<uint8_t> img((size_t) nhist * hc_dim * 4 + 64, SENT);
+        std::memcpy(img.data(), hist.data(), hist.size() * 4);
+        ctx.write(b_hist, img.data(), img.size());
+    }
+    const uint32_t rows_g = (uint32_t) ((hc_dim + kLocalSize - 1) / kLocalSize);
+    std::vector<float> got_key(hc_dim), got_query(hc_dim), got_gate(hc), got_gated(hc_dim), got_norm(hc_dim);
+    std::vector<float> got_conv(hc_dim), got_result(hc_dim);
+
+    {   // key = gnorm(key_proj, norm_key) - in place in the source too
+        struct { int rows; int cols; float eps; } pc{hc, n_embd, eps};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gnorm.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_key, &b_wk}, &pc, sizeof(pc), (uint32_t) hc);
+        ctx.read(b_key, got_key.data(), (size_t) hc_dim * 4);
+    }
+    {   // query = gnorm(hidden -> d_query): a SEPARATE destination, because `hidden` is needed by add3
+        ctx.write(b_query, hidden.data(), (size_t) hc_dim * 4);
+        struct { int rows; int cols; float eps; } pc{hc, n_embd, eps};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gnorm.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_query, &b_wq}, &pc, sizeof(pc), (uint32_t) hc);
+        ctx.read(b_query, got_query.data(), (size_t) hc_dim * 4);
+    }
+    {   // gate = f(key, query)
+        struct { int streams; int n; float inv_sqrt_n; } pc{hc, n_embd, 1.0f / std::sqrt((float) n_embd)};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gate.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_key, &b_query, &b_gate}, &pc, sizeof(pc), (uint32_t) hc);
+        ctx.read(b_gate, got_gate.data(), (size_t) hc * 4);
+    }
+    {   // gated = value * gate  (written into its own buffer: the source keeps d_gated for the final add)
+        struct { int n; int hc; } pc{n_embd, hc};
+        VkPipeline p = ctx.pipeline(dir + "/ple_bcast.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_value, &b_gate, &b_gated}, &pc, sizeof(pc), rows_g);
+        ctx.read(b_gated, got_gated.data(), (size_t) hc_dim * 4);
+    }
+    {   // normalized = gnorm(gated -> d_norm): again a SEPARATE destination, and it is the CONV INPUT
+        ctx.write(b_norm, got_gated.data(), (size_t) hc_dim * 4);
+        struct { int rows; int cols; float eps; } pc{hc, n_embd, eps};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gnorm.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_norm, &b_wc}, &pc, sizeof(pc), (uint32_t) hc);
+        ctx.read(b_norm, got_norm.data(), (size_t) hc_dim * 4);
+    }
+    {   // conv = silu(conv1d(hist, normalized))
+        struct { int hc_dim; int kern; int dil; int nhist; } pc{hc_dim, kern, dil, nhist};
+        VkPipeline p = ctx.pipeline(dir + "/ple_conv.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_hist, &b_norm, &b_kw, &b_conv}, &pc, sizeof(pc), rows_g);
+        ctx.read(b_conv, got_conv.data(), (size_t) hc_dim * 4);
+    }
+    {   // result = hidden + gated + conv
+        struct { int n; } pc{hc_dim};
+        VkPipeline p = ctx.pipeline(dir + "/add3.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_hidden, &b_gated, &b_conv, &b_result}, &pc, sizeof(pc), rows_g);
+        ctx.read(b_result, got_result.data(), (size_t) hc_dim * 4);
+    }
+
+    // ---- compare, stage by stage, so a divergence is attributed rather than summed ----
+    // The tolerances are MEASURED, not chosen: the reductions are compared against a DOUBLE reference while the
+    // device accumulates in f32 (see ple_gnorm.comp), and the elementwise stages inherit that deviation through
+    // their inputs.  The first run showed the size of it - the key stage, whose input is untouched, sat at 0.21
+    // of a 1e-6 bound.
+    // `rtol` bounds the error RELATIVE to the output, `atol` bounds it relative to the INPUT SCALE - which is
+    // what the deviation actually is, since it comes from the upstream reduction (the device sums in f32 where
+    // the oracle sums in double) and not from the element in front of you.  A purely relative bound on a stage
+    // whose output cancels to near zero measures conditioning rather than correctness: the conv's 16 "failures"
+    // were elements whose output was ~5e-4 while the worst ABSOLUTE deviation anywhere in the array was 7.2e-07.
+    // atol is set a decade above that measurement, which still leaves a real misindexing (O(1) error) four or
+    // five orders of magnitude clear of the bound.
+    auto cmp = [&](const char* name, const std::vector<float>& got, const std::vector<float>& want, double rtol,
+                   double atol) {
+        int bad = 0;
+        double worst = 0, worst_abs = 0, want_at_worst = 0, abs_at_worst = 0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            const double dev = std::fabs((double) got[i] - (double) want[i]);
+            const double ratio = dev / (rtol * std::fabs((double) want[i]) + atol);
+            if (ratio > worst) {
+                worst = ratio;
+                want_at_worst = (double) want[i];
+                abs_at_worst = dev;
+            }
+            worst_abs = std::max(worst_abs, dev);
+            if (ratio > 1.0) ++bad;
+        }
+        if (bad) {
+            // The worst-RATIO element is not necessarily the worst element: a stage whose output can cancel to
+            // near zero makes a purely relative bound a measure of CONDITIONING rather than of correctness.  Both
+            // numbers are printed so that can be told apart instead of assumed.
+            std::printf("      worst ratio at |want| = %.3e with |dev| = %.3e ; worst absolute |dev| = %.3e\n",
+                        want_at_worst, abs_at_worst, worst_abs);
+        }
+        verdict(name, bad == 0, bad, (int) want.size(), worst,
+                "elements outside tolerance (worst err/tol shown)");
+    };
+    cmp("ple key = gnorm(key_proj)", got_key, o_key, 1e-6, 1e-7);
+    cmp("ple query = gnorm(hidden)", got_query, o_query, 1e-6, 1e-7);
+    cmp("ple gate", got_gate, o_gate, 1e-6, 1e-7);
+    cmp("ple gated = value * gate", got_gated, o_gated, 1e-6, 1e-7);
+    cmp("ple normalized = gnorm(gated)", got_norm, o_norm, 1e-6, 1e-7);
+    cmp("ple conv = silu(conv1d(hist, normalized))", got_conv, o_conv, 1e-5, 1e-5);
+    cmp("ple result = hidden + gated + conv", got_result, o_result, 1e-5, 1e-5);
+
+    // ---- the conv's tap geometry, checked against the DOCUMENTATION rather than against the code that
+    //      implements it: rows 0, 3 and 6 from the history and row 9 - the new row - from `normalized`.  The
+    //      formula and its documented consequence are two statements, and this is where they are compared.  It is
+    //      also why the kernel needs no padded `terms` buffer at all.
+    {
+        int tap_bad = 0, checked = 0;
+        const int expect_rows[4] = {0, 3, 6, nhist};      // the last one is the NEW row, i.e. `norm[c]`
+        for (int k = 0; k < kern; ++k) {
+            const int row = nhist - (kern - 1 - k) * dil;
+            ++checked;
+            if (row != expect_rows[k]) {
+                ++tap_bad;
+                std::printf("      tap %d reads row %d, the documented geometry says %d\n", k, row, expect_rows[k]);
+            }
+        }
+        verdict("ple conv taps (documented geometry: rows 0,3,6 + the new row)", tap_bad == 0, tap_bad, checked,
+                (double) tap_bad, "taps off the documented rows");
+    }
+
+    // the gate's degenerate stream, named: s == 0 exactly must give sign 0 and therefore 0.5
+    {
+        const bool ok = std::fabs(got_gate[3] - 0.5f) < 1e-7f;
+        if (!ok) std::printf("      zero-key stream: gate = %.9f, expected 0.5\n", (double) got_gate[3]);
+        verdict("ple gate degenerate stream (s == 0 exactly)", ok, ok ? 0 : 1, 1, ok ? 0.0 : 1.0,
+                "the sign=0 and |s|<1e-6 floor branch");
+    }
+
+    // ---- the history advance: structural, so bit-exact, and the guard must be untouched ----
+    {
+        struct { int channels; int nhist; } pc{hc_dim, nhist};
+        VkPipeline p = ctx.pipeline(dir + "/ple_history_advance.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_hist, &b_norm}, &pc, sizeof(pc), rows_g);
+        std::vector<uint8_t> img((size_t) nhist * hc_dim * 4 + 64);
+        ctx.read(b_hist, img.data(), img.size());
+        const float* got = reinterpret_cast<const float*>(img.data());
+        std::vector<float> want((size_t) nhist * hc_dim);
+        for (int c = 0; c < hc_dim; ++c) {
+            for (int r = 0; r + 1 < nhist; ++r) {
+                want[(size_t) r + (size_t) nhist * c] = hist[(size_t) (r + 1) + (size_t) nhist * c];
+            }
+            want[(size_t) (nhist - 1) + (size_t) nhist * c] = got_norm[(size_t) c];
+        }
+        int bad = 0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            if (got[i] != want[i]) ++bad;                    // bit-exact: a copy, not arithmetic
+        }
+        for (size_t i = (size_t) nhist * hc_dim * 4; i < img.size(); ++i) {
+            if (img[i] != 0x77) ++bad;
+        }
+        verdict("ple history advance (row-fastest, in place)", bad == 0, bad, (int) (want.size() + 16), (double) bad,
+                "differing floats or guard bytes");
+    }
+
+    ctx.free(b_key); ctx.free(b_query); ctx.free(b_hidden); ctx.free(b_value); ctx.free(b_gate);
+    ctx.free(b_wq); ctx.free(b_wc); ctx.free(b_wk); ctx.free(b_gated); ctx.free(b_norm); ctx.free(b_conv);
+    ctx.free(b_result); ctx.free(b_kw); ctx.free(b_hist);
+}
+
 // ---- the two q8_0 quantisers and their inverse, transcribed from quantize_act.cu ----
 //
 // TWO quantisers for ONE byte layout, and that is the point rather than duplication: quantize_q8_0 reproduces
@@ -2171,6 +2484,7 @@ int main(int argc, char** argv) {
     case_reserve_refusal();
     case_quantize_q8_0(ctx, dir);
     case_quantize_q8_K(ctx, dir);
+    case_ple(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

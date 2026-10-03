@@ -1,0 +1,46 @@
+// ports/vulkan/shaders/ple_gate.comp - the PLE gate from src/kernels/cuda/ple.cu.
+//
+//     s[c]    = sum_d key[c][d] * query[c][d] / sqrt(n_embd)
+//     mag     = sqrt(max(|s|, 1e-6))
+//     gate[c] = sigmoid(sign(s) * mag)
+//
+// ONE WORKGROUP PER STREAM, one scalar out.  Three details that look incidental and are not:
+//
+//   * The PRODUCT is rounded in f32 before it is widened into the accumulator (`acc += (double)(kc[d]*qc[d])`),
+//     which is what ggml's own dot product does.  Widening first is a different number.
+//   * The clamp is on |s| and the SIGN IS CARRIED SEPARATELY.  `sigmoid(sign(s) * sqrt(|s|))` is symmetric about
+//     0.5 - feeding `s` into the square root instead would produce a gate that cannot tell +s from -s.
+//   * The 1e-6 floor only bites near zero, where sqrt's derivative is infinite; without it the gate is fine but
+//     the derivative through the backward pass would not be.
+//
+// The sum is accumulated in f32 here against the source's double (see ple_gnorm.comp for why this deviation is
+// taken deliberately); everything downstream of the sum is bit-for-bit the source's arithmetic.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer K { float v[]; } key;
+layout(set = 0, binding = 1, std430) readonly buffer Q { float v[]; } query;
+layout(set = 0, binding = 2, std430) buffer G { float v[]; } gate;
+layout(push_constant, std430) uniform PC { int streams; int n; float inv_sqrt_n; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    if (c >= uint(pc.streams)) return;
+
+    const uint n = uint(pc.n);
+    const uint base = c * n;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float acc = 0.0;
+    for (uint d = lid; d < n; d += lsize) acc += key.v[base + d] * query.v[base + d];
+
+    const float s = wg_sum(acc) * pc.inv_sqrt_n;
+    const float mag = sqrt(max(abs(s), 1e-6));
+    const float sgn = (s > 0.0) ? 1.0 : ((s < 0.0) ? -1.0 : 0.0);
+    if (lid == 0u) gate.v[c] = 1.0 / (1.0 + exp(-(sgn * mag)));
+}

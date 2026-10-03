@@ -1,0 +1,14 @@
+// ports/vulkan/shaders/ple_bcast.comp - `gated[c][d] = value[d] * gate[c]`, the value broadcast over the hc
+// streams.  Elementwise, and the index split (`i % n` / `i / n`) is the whole content of it.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer V { float v[]; } value;
+layout(set = 0, binding = 1, std430) readonly buffer G { float v[]; } gate;
+layout(set = 0, binding = 2, std430) buffer O { float v[]; } gated;
+layout(push_constant, std430) uniform PC { int n; int hc; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n * pc.hc)) return;
+    gated.v[i] = value.v[i % uint(pc.n)] * gate.v[i / uint(pc.n)];
+}

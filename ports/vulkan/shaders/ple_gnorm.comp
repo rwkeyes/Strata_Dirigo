@@ -1,0 +1,57 @@
+// ports/vulkan/shaders/ple_gnorm.comp - `grouped_norm` from src/kernels/cuda/ple.cu.
+//
+//     mean = sum_d x[c][d]^2 / n_embd ; scale = 1/sqrt(mean + eps) ; y[c][d] = x[c][d] * scale * w[c][d]
+//
+// ONE WORKGROUP PER STREAM.  ggml's form is `reshape_3d(x, n_embd, hc, T)` then `rms_norm(eps) * w`, so ne0 =
+// n_embd is the reduction axis and each of the `hc` streams is normalised on its own; in the flat layout stream
+// c occupies [c*n_embd, (c+1)*n_embd).  The WEIGHT IS PER-STREAM too - it is hc_dim long, not n_embd - which is
+// why this cannot simply reuse rms_norm_weighted: besides the weight length there are three deliberate
+// arithmetic differences, each of which moves the last bits.
+//
+// WHY THIS IS NOT A REUSE OF rms_norm.comp, listed because "two RMS norms" invites a merge:
+//   1. THE MULTIPLY ORDER.  The CUDA kernel is `xc[d] * scale * wc[d]`, i.e. (x*scale)*w; rms_norm_weighted
+//      computes (x*w)*inv.  Both round twice and they are not the same rounding, so they are not the same value.
+//   2. THE INVERSE ROOT.  `1.0f / sqrtf(mean + eps)` - a correctly rounded sqrt then a division - against
+//      `inversesqrt`, whose accuracy GLSL leaves to the implementation.
+//   3. THE ACCUMULATOR.  The CUDA source accumulates `(double)(x*x)` with the PRODUCT rounded to f32 first
+//      (that is literally `ggml_compute_forward_rms_norm_f32`), so the sum is done in double.
+//
+// Point 3 is where this port DEVIATES, and it is the same deviation rms_norm_weighted already carries: the sum
+// is accumulated in f32 (a 2560-element f32 sum is ~1e-7 relative, and the gate measures it against a
+// double-precision reference instead of asserting bit-equality).  Double accumulation would mean requiring the
+// device's shaderFloat64 for the WHOLE PLE chain - and an Intel card that does not expose it would then refuse
+// to run PLE at all, which trades a 1e-7 error for a functional loss.  Points 1 and 2 are honoured exactly,
+// because they cost nothing.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;
+layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } w;
+layout(push_constant, std430) uniform PC { int rows; int cols; float eps; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.rows)) return;             // workgroup-uniform: the barriers below stay legal
+
+    const uint cols = uint(pc.cols);
+    const uint base = row * cols;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float acc = 0.0;
+    for (uint c = lid; c < cols; c += lsize) {
+        const float t = x.v[base + c];
+        acc += t * t;                             // the product is rounded in f32 before it joins the sum
+    }
+    const float mean = wg_sum(acc) / float(cols);
+    const float scale = 1.0 / sqrt(mean + pc.eps);   // the source's form, not inversesqrt
+
+    for (uint c = lid; c < cols; c += lsize) {
+        const uint i = base + c;
+        x.v[i] = x.v[i] * scale * w.v[i];          // (x*scale)*w, left to right as written
+    }
+}

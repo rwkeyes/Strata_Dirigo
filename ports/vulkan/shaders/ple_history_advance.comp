@@ -1,0 +1,29 @@
+// ports/vulkan/shaders/ple_history_advance.comp - slide the normalized-row history by one token (ple.cu's
+// history_advance_kernel).
+//
+//     hist[r][c] = old_hist[r+1][c]  for r+1 < NG_HIST ;  hist[NG_HIST-1][c] = normalized[c]
+//
+// ONE THREAD OWNS EACH CHANNEL, which is what makes the IN-PLACE shift well-defined: the column a thread shifts
+// is the column no other thread touches, so the read of row r+1 always precedes the write of row r within that
+// thread's own loop and no barrier is needed.  The alternative (one thread per element, shifting in place) races
+// on the same column.
+//
+// ROW-FASTEST again: `hist[row + nhist*channel]`.  This is the SAME state the conv reads, and the header says
+// the layout comes from `ggml_reshape_3d(state, d_conv-1, conv_channels, n_seqs)` rather than being a choice.
+//
+// The block does not update the history itself - the caller owns the cache - so this is a separate entry point,
+// and being a pure function of (history, normalized) is what makes the chunked-versus-single-shot property
+// testable.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer H { float v[]; } hist;
+layout(set = 0, binding = 1, std430) readonly buffer N { float v[]; } norm;
+layout(push_constant, std430) uniform PC { int channels; int nhist; } pc;
+
+void main() {
+    const int c = int(gl_GlobalInvocationID.x);
+    if (c >= pc.channels) return;
+    const uint base = uint(pc.nhist * c);
+    for (int row = 0; row + 1 < pc.nhist; ++row) hist.v[base + uint(row)] = hist.v[base + uint(row) + 1u];
+    hist.v[base + uint(pc.nhist - 1)] = norm.v[c];
+}

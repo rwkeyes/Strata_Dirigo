@@ -62,7 +62,7 @@ for f in "${comps[@]}"; do
   # gather came back with a subgroup reduction plus an atomicAdd, commented as "safer").
   census="$(spirv-dis "$SH/$name.spv" | grep -oE 'OpGroupNonUniform[A-Za-z]*|OpControlBarrier|OpAtomic[A-Za-z]*' | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"
   case "$name" in
-    rms_norm)
+    rms_norm|ple_gnorm|ple_gate)
       grep -q 'OpGroupNonUniformFAdd' <<<"$census" || fail "$name (no subgroup reduction in the SPIR-V - the kernel did not lower its sum)"
       ;;
     *)

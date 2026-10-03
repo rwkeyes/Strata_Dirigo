@@ -144,10 +144,47 @@ representable, so the device's correctly rounded f32 product differs from the ex
 values "failed". Round the oracle to f32 the way the kernel rounds before comparing, and confine bit-exactness to
 where it is genuinely exact rather than merely convenient.
 
-### Next: `ple`, then the GEMV wave
+## `ple` is COMPLETE, and it is the port's first COMPOSITION test
 
-`ple.cu` is the last of the non-GEMV kernels. Then `native_bf16.cu`, `s_gemv.cu`, `s2_gemv*.cu` - throughput
-lives there, and the interface convention gets its first real test (weight layouts, not elementwise).
+Six kernels - `ple_gnorm`, `ple_gate`, `ple_bcast`, `ple_conv`, `add3`, `ple_history_advance` - plus a new shared
+`shaders/common/wg_reduce.glsl` that the three reducers use (rms_norm_weighted, ple_gnorm, ple_gate), so the two
+silent reduction defects have one home instead of three.
+
+Every earlier case checked ONE kernel. Composition is where a convention shared between kernels stops being
+checkable by either alone, and this one found three bugs - **all three in the test harness, none in a kernel**,
+which is itself the finding: each kernel passed its own stage while the chain was wrong three times.
+
+1. **The source's separate DESTINATIONS are not optional.** The CUDA calls are `gnorm(d_key -> d_key)`,
+   `gnorm(hidden -> d_query)` and `gnorm(d_gated -> d_norm)`: two of the three write somewhere other than their
+   input. The port's kernel is in place, so those become a copy then an in-place call. Skipping the copy for the
+   query normalised `hidden` itself - which broke the gate and everything after it, while `gnorm` alone scored
+   0.21 err/tol on its own stage. `ple_block`'s scratch comment says the same thing about its five hc_dim buffers
+   ("two buffers of the same size look like an obvious saving and the only thing it saves is 40 KB"), and the test
+   harness then reproduced that exact bug: reusing the convolution-weight slot for the key weights clobbered
+   `w_conv` and showed up TWO STAGES LATER as 8.6e7 err/tol.
+2. **A composition test must SNAPSHOT each stage as it passes.** Reading the buffers at the end of the chain
+   compares whatever ran last into them: the `gated` buffer held the NORMALIZED values by then and the stage
+   reported 0/10240 correct.
+3. **A relative tolerance on a cancelling output measures CONDITIONING, not correctness.** The conv "failed" 16
+   of 10240 elements at up to 6x the bound while the worst ABSOLUTE deviation anywhere in the array was 7.2e-07
+   on inputs of order 1 - those 16 outputs had cancelled to ~5e-4. The bounds now carry an absolute floor
+   relative to the input scale (a decade above the measurement), which still leaves a real misindexing four or
+   five orders of magnitude clear. Print the worst absolute deviation next to the ratio, so this is measured
+   rather than assumed.
+
+Two smaller traps: **`out` is a GLSL reserved word** (an output qualifier) and cannot name a variable - the same
+class as `half`; and `blah.comp.spv` is the wrong artifact name, because the gate strips `.comp` when it writes
+the SPIR-V.
+
+Verified: the key/query/normalized reductions sit at 0.19-0.21 of a 1e-6 relative bound, the gate at 0.06, and the
+history advance is bit-exact over 92176 floats with the guard past the state untouched. The history advance is
+in place and one thread owns a whole column - which is what makes the shift well-defined without a barrier.
+
+### Next: the GEMV wave
+
+`native_bf16.cu`, `s_gemv.cu`, `s2_gemv*.cu` - throughput lives there, and the interface convention (weight
+layouts, not elementwise) gets its first real test. `ple.cu` also calls three things from that wave that are not
+yet ported: `s2_gemv_q8` (the key projection), `bf16_gemv_fp32_mmvf` (the value projection) and `to_bf16`.
 
 Same shape as every case so far: read the CUDA source first, build the oracle from the engine's own function
 (never from a description of it), sentinel every range the kernel must not touch, and give each branch of the
