@@ -276,8 +276,10 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     // Ask for exactly what the ported kernels use, and only where the device reports it.  Requesting a
     // feature the device lacks fails vkCreateDevice outright - and `shaderFloat16` was requested here for no
     // reason at all (no ported kernel stores fp16), i.e. a pure compatibility risk on hardware that lacks it.
-    // `shaderFloat64` is queried but not requested: the one kernel that wanted it (silu) cannot be expressed
-    // through glslang's SPIR-V backend, so nothing in the shipping set needs it.
+    // `shaderFloat64` IS now requested where the device reports it: quantize_q8_0 rounds its codes from a
+    // FLOAT64 quotient (the reference divides in float64 and rints, and an f32 quotient crosses a .5 boundary
+    // differently), so that kernel cannot run without this feature.  silu's double-precision form remains
+    // inexpressible through glslang and is still host-side only.
     VkPhysicalDevice16BitStorageFeatures f16{};
     f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     f16.storageBuffer16BitAccess = info_.storage_buffer_16bit ? VK_TRUE : VK_FALSE;
@@ -293,6 +295,7 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     cmfeat.cooperativeMatrix = info_.cooperative_matrix ? VK_TRUE : VK_FALSE;
     f8feat.pNext = &cmfeat;
     f2.features.shaderInt16 = info_.shader_int16 ? VK_TRUE : VK_FALSE;
+    f2.features.shaderFloat64 = info_.shader_float64 ? VK_TRUE : VK_FALSE;
 
     // VK_EXT_memory_budget adds NO entry points: a capability check plus the name in the enabled list is the
     // whole wiring, and enabling it is what makes the driver report a budget instead of a raw heap size.

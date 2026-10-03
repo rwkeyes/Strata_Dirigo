@@ -873,6 +873,226 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// ---- the two q8_0 quantisers and their inverse, transcribed from quantize_act.cu ----
+//
+// TWO quantisers for ONE byte layout, and that is the point rather than duplication: quantize_q8_0 reproduces
+// GGML'S BYTES (what the pack holds and what moe_hit_parity checks), while quantize_q8_0_scaled reproduces THIS
+// ENGINE'S CPU PATH (what a hit must match a miss against).  They differ in the rounding rule on purpose, so a
+// test that used one oracle for both would be testing the wrong thing for one of them.
+//
+//   ggml : d32 = amax/127 in fp32, codes = rint(x/d32) in FLOAT64            - round half to EVEN
+//   cpu  : s = amax/127 in fp32, codes = trunc(x * (1/s) +- 0.5)             - round half AWAY from zero
+//   both : the stored scale is fp16, and a reader dequantises with THAT, not with d32
+static void q8_0_ggml_block(const float* x, uint8_t* out34) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+    if (amax == 0.0f) {
+        const uint16_t zb = strata::kernels::f16_from_f32(0.0f);
+        out34[0] = (uint8_t) (zb & 0xFF);
+        out34[1] = (uint8_t) (zb >> 8);
+        for (int i = 0; i < 32; ++i) out34[2 + i] = 0;
+        return;
+    }
+    const float d32 = amax / 127.0f;
+    const uint16_t d16 = strata::kernels::f16_from_f32(d32);
+    out34[0] = (uint8_t) (d16 & 0xFF);
+    out34[1] = (uint8_t) (d16 >> 8);
+    for (int i = 0; i < 32; ++i) {
+        double q = std::nearbyint((double) x[i] / (double) d32);   // rint: nearest, ties to even
+        if (q > 127.0) q = 127.0;
+        if (q < -128.0) q = -128.0;
+        out34[2 + i] = (uint8_t) (int8_t) (int) q;
+    }
+}
+
+static void q8_0_cpu_block(const float* x, uint8_t* out34, float* scale) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+    const float s = amax > 0.f ? amax / 127.f : 0.f;
+    const float inv = s > 0.f ? 1.f / s : 0.f;
+    *scale = s;
+    const uint16_t d16 = strata::kernels::f16_from_f32(s);
+    out34[0] = (uint8_t) (d16 & 0xFF);
+    out34[1] = (uint8_t) (d16 >> 8);
+    for (int i = 0; i < 32; ++i) {
+        const float t = x[i] * inv;
+        const float r = t + (t >= 0.f ? 0.5f : -0.5f);
+        int v = (int) r;
+        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+        out34[2 + i] = (uint8_t) (int8_t) v;
+    }
+}
+
+// quantize_act: the activation -> block_q8_0 conversion, and its inverse.
+//
+// This is a BYTE-EXACT reproduction of someone else's quantiser, so every comparison here is `==` on the 34-byte
+// block, not a tolerance.  The block set is chosen to walk the paths that a tolerance would hide:
+//   * an ALL-ZERO block (ggml leaves it zeroed - and a written zero block is not the same as an untouched one),
+//   * a block sitting on EXACT ROUNDING TIES, which is the only place the two quantisers may disagree, so one
+//     block proves both contracts at once,
+//   * a tiny amax, whose fp16 scale lands in the SUBNORMAL range,
+//   * and values on the clamp boundary.
+// Then the round trip: quantise, dequantise, and check every value against the ORIGINAL within one code step.
+void case_quantize_q8_0(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_0.spv") || !have(dir, "quantize_q8_0_scaled.spv") || !have(dir, "dequant_q8_0.spv")) {
+        return;
+    }
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("quantize_q8_0", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    const int nb = 6;
+    const int n = nb * 32;
+    std::vector<float> x(n, 0.0f);
+    // block 0: all zeros
+    for (int i = 0; i < 32; ++i) x[i] = 0.0f;
+    // block 1: amax = 127 -> d32 is exactly 1.0, so the rest are EXACT ties
+    {
+        const float ties[8] = {2.5f, 3.5f, -2.5f, -3.5f, 0.5f, 1.5f, -0.5f, -4.5f};
+        x[32] = 127.0f;
+        for (int i = 1; i < 32; ++i) x[32 + i] = ties[i % 8];
+    }
+    // blocks 2-3: ordinary random data
+    for (int i = 64; i < 128; ++i) x[i] = rndf(1.0f) * 4.0f;
+    // block 4: a tiny maximum -> the fp16 scale is SUBNORMAL
+    for (int i = 128; i < 160; ++i) x[i] = 1.0e-5f * (float) (i - 128) - 5.0e-6f;
+    // block 5: the clamp boundary - the largest value is the maximum, so its code is +-127
+    for (int i = 160; i < 192; ++i) x[i] = (i % 2 ? -1.0f : 1.0f) * 127.0f;
+    for (int i = 161; i < 192; i += 2) x[i] = -0.125f * (float) (i - 160);
+
+    const size_t blk_bytes = (size_t) nb * 34;
+    const size_t slack = 64;
+    Buf bx = ctx.alloc(n * 4);
+    Buf b_blocks = ctx.alloc(blk_bytes + slack);
+    Buf b_scales = ctx.alloc((size_t) nb * 4);
+    Buf b_deq = ctx.alloc(n * 4);
+    ctx.write(bx, x.data(), n * 4);
+
+    const uint8_t SENT = 0xA5;
+    std::vector<uint8_t> sink(blk_bytes + slack, SENT);
+    ctx.write(b_blocks, sink.data(), sink.size());
+    struct { int n_blocks; } pc{nb};
+
+    int ggml_bad = 0, cpu_bad = 0, scale_bad = 0, deq_bad = 0, bound_bad = 0;
+    double worst_ratio = 0;
+
+    // ---- ggml's variant (needs fp64: its codes come from a float64 quotient) ----
+    std::vector<uint8_t> want_ggml(blk_bytes, 0);
+    for (int b = 0; b < nb; ++b) q8_0_ggml_block(&x[(size_t) b * 32], &want_ggml[(size_t) b * 34]);
+    if (!ctx.info().shader_float64) {
+        skip("quantize_q8_0 (ggml bytes)", "device lacks shaderFloat64 - the reference divides in float64");
+    } else {
+        VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0.spv", 2, 4);
+        ctx.dispatch(p, {&bx, &b_blocks}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
+        std::vector<uint8_t> got(blk_bytes + slack);
+        ctx.read(b_blocks, got.data(), got.size());
+        for (size_t i = 0; i < want_ggml.size(); ++i) {
+            if (got[i] != want_ggml[i]) ++ggml_bad;
+        }
+        for (size_t i = blk_bytes; i < got.size(); ++i) {
+            if (got[i] != SENT) ++ggml_bad;
+        }
+        verdict("quantize_q8_0 (ggml bytes)", ggml_bad == 0, ggml_bad, (int) (blk_bytes + slack), (double) ggml_bad,
+                "differing bytes (34-byte blocks + guard)");
+    }
+
+    // ---- the CPU path's variant: same blocks, fp32 scales, half-away rounding ----
+    {
+        std::vector<uint8_t> want_cpu(blk_bytes, 0);
+        std::vector<float> want_scales(nb, 0.0f);
+        for (int b = 0; b < nb; ++b) q8_0_cpu_block(&x[(size_t) b * 32], &want_cpu[(size_t) b * 34], &want_scales[b]);
+        std::vector<uint8_t> sink2(blk_bytes + slack, SENT);
+        ctx.write(b_blocks, sink2.data(), sink2.size());
+        VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0_scaled.spv", 3, 4);
+        ctx.dispatch(p, {&bx, &b_blocks, &b_scales}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
+        std::vector<uint8_t> got(blk_bytes + slack);
+        std::vector<float> got_scales(nb, 0.0f);
+        ctx.read(b_blocks, got.data(), got.size());
+        ctx.read(b_scales, got_scales.data(), (size_t) nb * 4);
+        for (size_t i = 0; i < want_cpu.size(); ++i) {
+            if (got[i] != want_cpu[i]) ++cpu_bad;
+        }
+        for (size_t i = blk_bytes; i < got.size(); ++i) {
+            if (got[i] != SENT) ++cpu_bad;
+        }
+        for (int b = 0; b < nb; ++b) {
+            if (got_scales[b] != want_scales[b]) ++scale_bad;      // the fp32 scale, bit for bit
+        }
+        if (ggml_bad == 0 && cpu_bad == 0) {
+            // the two must DISAGREE on the tie block, or one of the two rules was not implemented
+            int diff_tie = 0;
+            for (int i = 0; i < 32; ++i) {
+                if (want_ggml[34 + 2 + i] != want_cpu[34 + 2 + i]) ++diff_tie;
+            }
+            if (diff_tie == 0) {
+                std::printf("      the tie block did not separate the two rounding rules\n");
+                ++cpu_bad;
+            } else {
+                std::printf("      tie block: %d of 32 codes differ between half-even and half-away\n", diff_tie);
+            }
+        }
+        verdict("quantize_q8_0_scaled (cpu bytes)", cpu_bad == 0, cpu_bad, (int) (blk_bytes + slack), (double) cpu_bad,
+                "differing bytes (34-byte blocks + guard)");
+        verdict("quantize_q8_0_scaled fp32 scales", scale_bad == 0, scale_bad, nb, (double) scale_bad,
+                "differing fp32 scales");
+    }
+
+    // ---- the round trip: dequantise the ggml blocks and compare against the originals ----
+    {
+        std::vector<uint8_t> blocks(blk_bytes, 0);
+        ctx.read(b_blocks, blocks.data(), blk_bytes);   // still holds the CPU variant; use its own blocks
+        // build the dequant input explicitly from the ggml oracle so the check does not depend on dispatch order
+        std::vector<uint8_t> gb(blk_bytes, 0);
+        for (int b = 0; b < nb; ++b) q8_0_ggml_block(&x[(size_t) b * 32], &gb[(size_t) b * 34]);
+        ctx.write(b_blocks, gb.data(), blk_bytes);
+        VkPipeline p = ctx.pipeline(dir + "/dequant_q8_0.spv", 2, 4);
+        ctx.dispatch(p, {&b_blocks, &b_deq}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
+        std::vector<float> got(n);
+        ctx.read(b_deq, got.data(), n * 4);
+        for (int b = 0; b < nb; ++b) {
+            const uint16_t dbits = (uint16_t) (gb[(size_t) b * 34] | (gb[(size_t) b * 34 + 1] << 8));
+            const double d = (double) strata::kernels::f32_from_f16(dbits);
+            if (b == 0 && d != 0.0) ++deq_bad;
+            // THE BOUND IS NOT "one code step", and the difference is the interesting part.  The codes round
+            // against the FP32 `d32`, but the block STORES fp16 `d16`, so the error has two terms:
+            //     |q*d16 - x| <= 0.5*|d32|            (rounding to nearest)
+            //                 + |q| * |d16 - d32|     (the stored scale is not the one the codes used)
+            // The second term is negligible while d16 is normal, and it DOMINATES once d16 lands in the fp16
+            // SUBNORMAL range, where the grid step is fixed at ~6e-8 and a small `d32` is represented coarsely:
+            // at |q| = 127 that is several code steps of error, inherent to the format rather than to the kernel.
+            // Measured here: the +-one-code-step claim fails by 1.15x on exactly that block, which is what sent
+            // this bound back to the arithmetic.
+            const float d32 = [&] {
+                float amax = 0.0f;
+                for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[(size_t) b * 32 + i]));
+                return amax == 0.0f ? 0.0f : amax / 127.0f;
+            }();
+            for (int i = 0; i < 32; ++i) {
+                const int raw = gb[(size_t) b * 34 + 2 + i];
+                const int q = raw > 127 ? raw - 256 : raw;
+                const double want = (double) q * d;
+                if ((double) got[(size_t) b * 32 + i] != want) ++deq_bad;   // exact: it is a multiply of exact values
+                const double orig = (double) x[(size_t) b * 32 + i];
+                if (d32 == 0.0) continue;
+                const double bound = 0.5 * (double) d32 + std::fabs((double) q) * std::fabs((double) d - (double) d32);
+                const double ratio = std::fabs((double) got[(size_t) b * 32 + i] - orig) / (bound + 1e-30);
+                worst_ratio = std::max(worst_ratio, ratio);
+                if (ratio > 1.0 + 1e-9) ++bound_bad;
+            }
+        }
+        verdict("dequant_q8_0 (exact)", deq_bad == 0, deq_bad, n, (double) deq_bad, "differing values");
+        char label[96];
+        std::snprintf(label, sizeof label, "q8_0 round trip (quantise then dequantise)");
+        verdict(label, bound_bad == 0, bound_bad, n, worst_ratio,
+                bound_bad ? "values beyond one code step" : "worst |x'-x|/scale");
+    }
+
+    ctx.free(bx);
+    ctx.free(b_blocks);
+    ctx.free(b_scales);
+    ctx.free(b_deq);
+}
+
 // kv_q8: the quantisation, transcribed from kv_q8.hpp's own formula -
 //     scale = fp16(max|x| / 127),  code = clamp(rint(x / scale), -127, 127)
 // - including the detail that matters: the scale is rounded to fp16 FIRST and the codes are computed against
@@ -1731,6 +1951,7 @@ int main(int argc, char** argv) {
     case_memory_budget(ctx);
     case_reserve_policy();
     case_reserve_refusal();
+    case_quantize_q8_0(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

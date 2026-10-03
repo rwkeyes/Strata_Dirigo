@@ -86,7 +86,39 @@ The engine's fp16 converter now lives in ONE place, `shaders/common/f16_bits.gls
 that convert (`#include` works in glslc, resolved relative to the including file). Three copies of a bit-exact
 function were three chances to diverge, and `shaders/*.comp` deliberately does not glob into `common/`.
 
-## Next: the rest of the wave
+## quantize_act: the q8_0 trio is in, q8_K is next
+
+`quantize_q8_0.comp` (ggml's bytes), `quantize_q8_0_scaled.comp` (this engine's CPU path), `dequant_q8_0.comp`.
+Every comparison is `==` on the 34-byte block, because this is a reproduction of someone else's quantiser.
+
+**TWO quantisers for ONE layout is the design, not duplication:** the first reproduces GGML's bytes (what the
+pack holds, what `moe_hit_parity` checks), the second reproduces THIS ENGINE's CPU reference, because a hit and a
+miss for the same expert must produce the same number. They round differently ON PURPOSE - and the gate proves
+both rather than one: a synthetic block whose maximum is exactly 127 makes `d32` exactly 1.0, so eight of its
+values sit on EXACT rounding ties, and the two rules disagree on **19 of 32 codes** there (half-even vs
+half-away). A single oracle would have tested the wrong contract for one of them.
+
+Two things worth carrying forward:
+
+* **`precise` is the portable `__fmul_rn`.** GLSL's `precise` emits `OpDecorate NoContraction`, which is how a
+  rounded multiply is pinned against being contracted into an FMA - the same thing the CUDA source does
+  explicitly, and what `quantize_q8_K` needs for its `nearest_int` magic.
+* **"One code step" is the wrong error bound when the stored scale is SUBNORMAL.** The codes round against the
+  fp32 `d32` but the block stores fp16 `d16`, so the error is
+  `0.5*|d32| + |q| * |d16 - d32|`. The second term is negligible while `d16` is normal and dominates once it is
+  subnormal (the fp16 grid step there is fixed at ~6e-8, so a small `d32` is represented coarsely). Measured: the
+  naive bound failed by 1.15x on exactly that block, and the two-term bound is hit at a ratio of 1.00 - tight, not
+  loose.
+
+### Still to port from quantize_act.cu
+
+`quantize_q8_K` (292 bytes per 256 elements: `{ f32 d ; int8 qs[256] ; int16 bsums[16] }`) and `dequant_q8_K`.
+It is the other half of `VEC_DOT_TYPE` and covers the numerically SENSITIVE weights. Three traps already
+transcribed in the source and verified to compile here: `iscale = -127/max` (NOT -128, where `max` is the SIGNED
+value at the largest magnitude, so a positive max maps the `+max` element to -127); `nearest_int`'s
+round-half-to-EVEN via the 12582912.0f magic (`floatBitsToInt` makes it portable, and it is NOT `round`'s
+half-away rule); and `precise`/`__fmul_rn` so the product is rounded before the magic adds to it. Then `ple`, then
+the GEMV wave.
 
 `kv_gather_q8` — the dequantising reader (one thread per 4 values, `fp16(code * scale)` into the scratch the
 attention kernels read). With BOTH entry points in place the pair can be tested as a **round trip** (append then

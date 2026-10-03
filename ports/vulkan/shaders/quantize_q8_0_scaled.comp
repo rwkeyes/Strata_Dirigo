@@ -1,0 +1,63 @@
+// ports/vulkan/shaders/quantize_q8_0_scaled.comp - the SAME 34-byte blocks, the CPU path's fp32 scale, and the
+// CPU path's ROUNDING RULE.
+//
+// Why a second quantiser for the same layout: the engine computes every routed expert twice.  MISSES go through
+// the CPU's `act_quant_q8_1`; HITS went through quantize_q8_0 above.  Those are not the same quantization, and
+// the difference was measured with both real implementations linked: 0 of 2560 int8 activations differed, but
+// 80 of 80 SCALES did, by up to 4.761e-04 relative (2^-11) - the block stores fp16 `d` while `ActQ::scale` is
+// fp32.  This variant writes the same blocks plus a parallel fp32 scale array carrying `d32` unrounded, so a hit
+// can use the CPU's multiplier.
+//
+// The rounding is deliberately the OPPOSITE of the shader next door: reciprocal multiply, then round half AWAY
+// FROM ZERO.  That is the CPU path's rule, and its job is to match THIS ENGINE's CPU reference rather than
+// ggml's bytes - because a hit and a miss for the same expert on the same layer must produce the same number.
+// Two quantisers for one layout is not duplication; it is two contracts, and collapsing them would silently
+// change one of them.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// uint16_t is the shared converter's return type: the int16 arithmetic-types extension is what makes it a TYPE
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; } X_;
+layout(set = 0, binding = 1, std430) buffer BLK { uint8_t b[]; } B_;
+layout(set = 0, binding = 2, std430) buffer SC { float s[]; } SC_;
+
+#include "common/f16_bits.glsl"
+#define f16_from_f32(f) f16_from_f32_port(f)
+
+layout(push_constant) uniform Pc {
+    int n_blocks;
+} pc;
+
+const int QK8_0 = 32;
+
+void main() {
+    const int blk = int(gl_GlobalInvocationID.x);
+    if (blk >= pc.n_blocks) return;
+    const int xb = blk * QK8_0;
+    const int ob = blk * 34;
+
+    float amax = 0.0;
+    for (int i = 0; i < QK8_0; ++i) amax = max(amax, abs(X_.x[xb + i]));
+    // verbatim from the CPU path, including the guard - the fp32 value here must be bit-identical to the `s`
+    // the CPU used, which is the whole reason this variant exists
+    const float s = amax > 0.0 ? amax / 127.0 : 0.0;
+    const float inv = s > 0.0 ? 1.0 / s : 0.0;
+    SC_.s[blk] = s;
+
+    const uint16_t d16 = f16_from_f32(s);
+    B_.b[ob] = uint8_t(d16 & 0xFFu);
+    B_.b[ob + 1] = uint8_t(d16 >> 8);
+
+    for (int i = 0; i < QK8_0; ++i) {
+        // reciprocal multiply, then `t + copysign(0.5, t)` truncated toward zero = round half AWAY from zero
+        const float t = X_.x[xb + i] * inv;
+        const float r = t + (t >= 0.0 ? 0.5 : -0.5);
+        int v = int(r);                                  // GLSL `int()` truncates toward zero, as the C cast does
+        v = clamp(v, -127, 127);
+        B_.b[ob + 2 + i] = uint8_t(v < 0 ? v + 256 : v);
+    }
+}
