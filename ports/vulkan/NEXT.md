@@ -248,6 +248,56 @@ The three GEMV comparisons now use `rtol*|result| + 16*2^-24*sum|terms|`, with t
 The previously failing row reads 0.0078 of the bound (170x headroom) instead of 1.34, and the bound is DERIVED
 rather than fitted - a real bug moves the result by orders of magnitude more than rounding error can.
 
+## `s_gemv_q8_split` is in - the S-family canonical decode, over both quantized activations
+
+The heart of this is ONE decode for S2, S4 and S8 (`docs/pack-format.md`): `value = decode(code) * scale +
+offset`, with the codebook choosing between the affine `code + bias` and ggml's non-linear `kvalues_iq4nl`. It now
+lives in `shaders/common/sform_decode.glsl` rather than once per kernel, because a second decode of the canonical
+form is a second thing to get wrong.
+
+The kernel is one shader for BOTH quantized activation kinds - `block_q8_K` (292 bytes / 256 elements, an f32
+scale) and `block_q8_0` (34 bytes / 32, an fp16 scale) - exactly as the source is one kernel templated on the
+format. The only difference IS the loader; the weight decode, the octet loop, the codebook and the reduction are
+identical.
+
+**`Q8_0` IS STRUCTURAL, NOT AN OPTIMISATION CHOICE.** `ffn_down_shexp` is IQ4_NL/Q4_0/Q5_0/Q8_0 in every layer
+with `n_in = 640`, and 640 is a multiple of 32 but not of 256 - so Q8_K is impossible for it rather than merely
+unimplemented. The gate runs that shape, and the source's header is explicit that describing this as "Q8_K is not
+implemented" was wrong for several rounds.
+
+The forms tested are the ones the PACK contains, because the attribute vector is what the kernel takes as
+arguments - and one of them is the reason to test attributes rather than arbitrary numbers:
+
+* S2 / Q8_K / group 64 - the Q2_0 shapes, 31.64 GiB of the pack.
+* S4 / Q8_K / bias -8 - Q4_0's attributes.
+* S8 / Q8_0 / n_in 640 - `ffn_down_shexp`.
+* IQ4_NL codebook / Q8_0 - the non-linear table, a separate decode path.
+* **A form WITH AN OFFSET** - Q4_K's. This is the only case where the offset's POSITION is observable: the offset
+  belongs to the weight, so the term is `(code*scale + offset) * x`. Writing the mathematically equal
+  `code*scale*x + offset*x` performs two multiplications and an addition where the correct form performs one of
+  each, so it ROUNDS DIFFERENTLY - and every no-offset type cannot tell. The source records that this was wrong
+  until a Q4_K case existed.
+* S2 / Q8_K / group 16 - a second group size, so the shift is not tested at one value only.
+
+TWO SHAPE DIFFERENCES FROM THE SOURCE, both deliberate:
+
+* The CUDA kernel is WARP per output row and ends in a 32-lane shuffle butterfly. The port cannot size anything
+  from a device-wide subgroup default (the `rms_norm` lesson: the driver may compile a kernel at another width
+  and the host would dispatch too few rows), so it is one WORKGROUP per row with the shared reduction. The
+  per-thread accumulator structure and the term arithmetic are the source's; the lane-to-element mapping is not,
+  which is why this comparison is against a double reference rather than bit-for-bit.
+* The port has no `__constant__` memory to misuse. The source's own comment records that keeping `kvalues_iq4nl`
+  in constant memory cost **2.12x** - constant memory is fast when the access is uniform, and a non-linear
+  codebook means every lane reads a different index, the pattern it handles worst. The port's table is a literal
+  in the shader, so the trap cannot arise.
+
+### STILL IN `s_gemv.cu` (the file is 40,810 bytes; this kernel is the quantized-activation one)
+
+`s_gemv_kernel` (the naive fp16 reference, one thread per row), `s_gemv_split_kernel` (fp16, one block per row -
+**the kernel `attn_output` and `shared_expert` actually use**), `s_gemv_q8k_kernel` (the naive Q8_K one), and the
+host wrappers including the `_async` forms. Then `s2_gemv_fast.cu` (7,297) with `s2_gemv_quads`/`s2_gemv_fast`,
+which the source itself defers to a later phase.
+
 ### THE REST OF THE WAVE - and its size, which is the number that matters
 
 This is the biggest remaining area by a wide margin. Measured source sizes:

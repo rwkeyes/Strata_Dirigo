@@ -927,6 +927,162 @@ static double gemv_bound(double want, double abs_sum, double rtol) {
     return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum;
 }
 
+// ---- the S-family canonical decode, transcribed from s_gemv.cu ----
+//
+// ONE decode for S2, S4 and S8: `value = decode(code) * scale + offset`, with the codebook choosing between the
+// affine `code + bias` and ggml's non-linear `kvalues_iq4nl[code & 15]`.  The BIAS is applied to the code in the
+// integer domain; the OFFSET belongs to the weight and is applied AFTER the scale, because writing
+// `code*scale*x + offset*x` is a mathematically equal expression that ROUNDS DIFFERENTLY.
+static const int kIq4nlHost[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+static double s_gemv_q8_host_row(const std::vector<uint8_t>& act, const std::vector<uint8_t>& codes,
+                                const std::vector<float>& scales, const std::vector<float>& offsets,
+                                bool has_offset, int code_bits, int bias, int codebook, int group_elems, bool q8k,
+                                int o, int n_in, double* abs_sum) {
+    const int per_byte = 8 / code_bits;
+    const int n_groups = n_in / group_elems;
+    const int codes_per_row = n_in / per_byte;
+    double sum = 0.0, mass = 0.0;
+    for (int i = 0; i < n_in; ++i) {
+        const int g = i / group_elems;
+        const float d = scales[(size_t) o * n_groups + g];
+        const float b = has_offset ? offsets[(size_t) o * n_groups + g] : 0.0f;
+        const int code = (codes[(size_t) o * codes_per_row + i / per_byte] >> ((i % per_byte) * code_bits)) &
+                         ((1 << code_bits) - 1);
+        const float dec = (codebook == 1) ? (float) kIq4nlHost[code & 0x0F] : (float) (code + bias);
+        const float w = dec * d + b;                       // the offset inside the weight, before the activation
+        float a;
+        if (q8k) {
+            const uint8_t* blk = &act[(size_t) (i / 256) * 292];
+            float dd;
+            std::memcpy(&dd, blk, 4);
+            const int8_t q = reinterpret_cast<const int8_t*>(blk + 4)[i % 256];
+            a = dd * (float) q;
+        } else {
+            const uint8_t* blk = &act[(size_t) (i / 32) * 34];
+            const float dd = strata::kernels::f32_from_f16((uint16_t) (blk[0] | (blk[1] << 8)));
+            const int8_t q = reinterpret_cast<const int8_t*>(blk + 2)[i % 32];
+            a = dd * (float) q;
+        }
+        const float term = w * a;
+        sum += (double) term;
+        mass += std::fabs((double) term);
+    }
+    if (abs_sum) *abs_sum = mass;
+    return sum;
+}
+
+// s_gemv_q8_split: the S-family GEMV over a Q8_K or Q8_0 activation.
+//
+// The forms below are the ones the PACK actually contains rather than arbitrary combinations, because the
+// attribute vector is what the kernel takes as arguments: S2 (the Q2_0 shapes, 31.64 GiB of the pack), S4 with
+// Q4_0's bias -8, S8 with Q5_0/Q8_0's, the non-linear IQ4_NL codebook, and a Q4_K-like form WITH AN OFFSET -
+// the one case where the offset's position inside the term is observable, since every other type's offset is
+// zero.  Plus the two activation kinds: Q8_K at the K-quant geometry (n_in 2560, group 64) and Q8_0 at
+// ffn_down_shexp's (n_in 640, group 32), which is the shape where Q8_K is structurally impossible and only the
+// Q8_0 path exists at all.
+void case_s_gemv_q8_split(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s_gemv_q8_split.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("s_gemv_q8_split", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    struct Form {
+        int bits, bias, group, codebook, n_in, n_out;
+        bool has_offset, q8k;
+        const char* note;
+    };
+    const Form forms[] = {
+        {2, -1, 64, 0, 2560, 8, false, true, "S2 / Q8_K, group 64 (the Q2_0 shapes)"},
+        {4, -8, 32, 0, 2560, 8, false, true, "S4 / Q8_K, bias -8 (Q4_0)"},
+        {8, 0, 32, 0, 640, 8, false, false, "S8 / Q8_0, n_in 640 (ffn_down_shexp: Q8_K is impossible here)"},
+        {4, 0, 32, 1, 640, 8, false, false, "IQ4_NL codebook / Q8_0"},
+        {4, 0, 32, 0, 2560, 8, true, true, "offset form / Q8_K (Q4_K: the offset's position is observable)"},
+        {2, -1, 16, 0, 2560, 8, false, true, "S2 / Q8_K, group 16"},
+    };
+    for (const Form& f : forms) {
+        const int per_byte = 8 / f.bits;
+        const int n_groups = f.n_in / f.group;
+        const int codes_per_row = f.n_in / per_byte;
+        const int blk_elems = f.q8k ? 256 : 32;
+        const int blk_bytes = f.q8k ? 292 : 34;
+        const int n_blocks = f.n_in / blk_elems;
+
+        std::vector<uint8_t> act((size_t) n_blocks * blk_bytes, 0);
+        for (int b = 0; b < n_blocks; ++b) {
+            const float d = (b == 1) ? 0.0f : 0.03125f * (float) (b + 1);      // distinct per block
+            if (f.q8k) {
+                std::memcpy(&act[(size_t) b * 292], &d, 4);
+            } else {
+                const uint16_t bits = strata::kernels::f16_from_f32(d);
+                act[(size_t) b * 34] = (uint8_t) (bits & 0xFF);
+                act[(size_t) b * 34 + 1] = (uint8_t) (bits >> 8);
+            }
+            for (int i = 0; i < blk_elems; ++i) {
+                act[(size_t) b * blk_bytes + (f.q8k ? 4 : 2) + i] = (uint8_t) (int8_t) (((i * 13 + b * 7) % 255) - 127);
+            }
+        }
+        std::vector<uint8_t> codes((size_t) f.n_out * codes_per_row, 0);
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) ((i * 37 + 11) & 0xFF);   // every code value
+        std::vector<float> scales((size_t) f.n_out * n_groups, 0.0f), offsets((size_t) f.n_out * n_groups, 0.0f);
+        for (int o = 0; o < f.n_out; ++o) {
+            for (int g = 0; g < n_groups; ++g) {
+                const float mag = 0.015625f * (float) (g + 1);                      // distinct per group
+                scales[(size_t) o * n_groups + g] = ((g % 7) == 5) ? -mag : mag;    // negative groups too
+                offsets[(size_t) o * n_groups + g] = 0.5f * (float) (o + 1) - 0.25f * (float) g;
+            }
+        }
+        std::vector<float> want(f.n_out, 0.0f);
+        std::vector<double> want_abs(f.n_out, 0.0);
+        for (int o = 0; o < f.n_out; ++o) {
+            want[o] = (float) s_gemv_q8_host_row(act, codes, scales, offsets, f.has_offset, f.bits, f.bias,
+                                                f.codebook, f.group, f.q8k, o, f.n_in, &want_abs[o]);
+        }
+
+        Buf b_act = ctx.alloc(act.size()), b_codes = ctx.alloc(codes.size()), b_scales = ctx.alloc(scales.size() * 4);
+        Buf b_off = ctx.alloc(offsets.size() * 4), b_y = ctx.alloc((size_t) f.n_out * 4 + 64);
+        ctx.write(b_act, act.data(), act.size());
+        ctx.write(b_codes, codes.data(), codes.size());
+        ctx.write(b_scales, scales.data(), scales.size() * 4);
+        ctx.write(b_off, offsets.data(), offsets.size() * 4);
+        std::vector<uint8_t> sink((size_t) f.n_out * 4 + 64, 0x6D);
+        ctx.write(b_y, sink.data(), sink.size());
+
+        const int byte_shift = (per_byte == 4) ? 2 : ((per_byte == 2) ? 1 : 0);
+        int group_shift = 0;
+        while ((1 << group_shift) < f.group) ++group_shift;
+        struct { int n_in, n_out, code_bits, byte_shift, bias, codebook, group_shift, has_offset, q8k; } pc{
+            f.n_in, f.n_out, f.bits, byte_shift, f.bias, f.codebook, group_shift, f.has_offset ? 1 : 0, f.q8k ? 1 : 0};
+        VkPipeline p = ctx.pipeline(dir + "/s_gemv_q8_split.spv", 5, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_act, &b_codes, &b_scales, &b_off, &b_y}, &pc, sizeof(pc), (uint32_t) f.n_out);
+
+        std::vector<uint8_t> img((size_t) f.n_out * 4 + 64);
+        ctx.read(b_y, img.data(), img.size());
+        const float* got = reinterpret_cast<const float*>(img.data());
+        int bad = 0;
+        double worst = 0, mass = 0;
+        for (int o = 0; o < f.n_out; ++o) {
+            mass += std::fabs((double) want[o]);
+            const double ratio = std::fabs((double) got[o] - (double) want[o]) /
+                                 gemv_bound((double) want[o], want_abs[o], 1e-6);
+            worst = std::max(worst, ratio);
+            if (ratio > 1.0) ++bad;
+        }
+        for (size_t i = (size_t) f.n_out * 4; i < img.size(); ++i) {
+            if (img[i] != 0x6D) ++bad;
+        }
+        char label[120];
+        std::snprintf(label, sizeof label, "s_gemv_q8_split %s", f.note);
+        std::printf("      max |y| = %.6g (worst err/tol %.3g) ; y[0] = %.6g\n",
+                    (double) *std::max_element(want.begin(), want.end(),
+                                               [](float a, float b) { return std::fabs(a) < std::fabs(b); }),
+                    worst, (double) got[0]);
+        verdict(label, bad == 0 && mass > 1e-3, bad, f.n_out, worst, "rows outside tolerance (worst err/tol)");
+        ctx.free(b_act); ctx.free(b_codes); ctx.free(b_scales); ctx.free(b_off); ctx.free(b_y);
+    }
+}
+
+
 // bf16_mmvf_f32_multi: up to 8 activation rows sharing one pass over the weight row.
 //
 // THE SOURCE'S OWN CLAIM IS THE STRONGEST TEST HERE, and it is a bit-exactitude claim: "each output is
@@ -2817,6 +2973,7 @@ int main(int argc, char** argv) {
     case_s2_gemv_q8(ctx, dir);
     case_bf16_mmvf(ctx, dir);
     case_bf16_mmvf_multi(ctx, dir);
+    case_s_gemv_q8_split(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

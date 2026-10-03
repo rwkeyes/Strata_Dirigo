@@ -66,7 +66,7 @@ for f in "${comps[@]}"; do
   # uses __fmaf_rn the SPIR-V must carry the fused operation.
   fma="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpExtInst .* Fma ')"
   case "$name" in
-    rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi)
+    rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split)
       grep -q 'OpGroupNonUniformFAdd' <<<"$census" || fail "$name (no subgroup reduction in the SPIR-V - the kernel did not lower its sum)"
       ;;
     *)

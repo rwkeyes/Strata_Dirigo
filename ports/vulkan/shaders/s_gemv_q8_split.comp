@@ -1,0 +1,155 @@
+// ports/vulkan/shaders/s_gemv_q8_split.comp - the S-family GEMV over a QUANTIZED activation, one workgroup per
+// output row (s_gemv.cu's s_gemv_q8_split_kernel, templated there on <CODE_BITS, Q8K>).
+//
+// ONE SHADER FOR BOTH QUANTIZED ACTIVATION KINDS - block_q8_K (292 bytes / 256 elements, an f32 scale) and
+// block_q8_0 (34 bytes / 32 elements, an fp16 scale) - exactly as the source is one kernel templated on the
+// format. The only difference IS the loader: the weight decode, the quad loop, the codebook and the reduction
+// are identical, and a second copy with a different loader would be a second thing to get wrong.
+//
+// WHY THESE TWO ACTIVATIONS. `ggml_mul_mat` converts the activation to the weight's `vec_dot_type`, and the
+// activation contract is NOT fp16: every K-quant and IQ-quant wants Q8_K, and the legacy block formats (Q2_0,
+// Q4_0, Q5_0, Q8_0, IQ4_NL) want Q8_0. The two differ by 0.6-0.9% per GEMV against a 1e-3 tolerance, and the
+// K-quants are the numerically SENSITIVE dense weights (the attention projections, ssm_out).
+//
+// `Q8_0` IS NOT AN OPTIMISATION CHOICE FOR THE LEGACY FORMATS, IT IS STRUCTURAL. `ffn_down_shexp` is
+// IQ4_NL/Q4_0/Q5_0/Q8_0 in every layer with n_in = 640, and 640 is a multiple of 32 but NOT of 256 - so Q8_K is
+// impossible for it rather than merely unimplemented. The gate runs that shape.
+//
+// WHAT DIFFERS FROM THE SOURCE'S SHAPE, and why. The CUDA kernel is WARP per output row and finishes with a
+// 32-lane shuffle butterfly. The port cannot assume a subgroup width (that was the rms_norm lesson: a host that
+// sizes a dispatch from a device-wide subgroup default silently skips rows when the driver picks another width),
+// so it is one WORKGROUP per output row with the shared reduction - which also means the elements each thread
+// owns are strided by 256 rather than 32. The per-thread accumulator structure is the source's (sixteen
+// accumulators over a 16-element double-octet, combined by the same tree of pairwise adds) and so is the term
+// arithmetic; only the row's lane-to-element mapping changes, which is why the comparison is against a double
+// reference and not bit-for-bit.
+//
+// THE 16-ELEMENT OCTET AND ITS ONE-BLOCK GUARANTEE. `QE` is 16, the loop advances `i` by 256*16, and the
+// activation block is 256 (Q8_K) or 32 (Q8_0) elements - so `i % 256` and `i % 32` are always multiples of 16
+// and all sixteen elements of one iteration lie inside ONE block. The source hoists the block division out of
+// the sixteen loads for exactly this reason (it was sixteen 64-bit divisions per iteration), and the port does
+// the same. The tail loop below still uses the per-element accessor because its elements do not share a block.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ACT { uint8_t b[]; } act;
+layout(set = 0, binding = 1, std430) readonly buffer CODES { uint8_t b[]; } codes;
+layout(set = 0, binding = 2, std430) readonly buffer SCALES { float v[]; } scales;
+// ALWAYS BOUND, even when the form has no offset: Vulkan has no null descriptor. The push constant's
+// `has_offset` says whether to read it, as the fp16 split kernel does for its weight in rms_norm.comp.
+layout(set = 0, binding = 3, std430) readonly buffer OFFSET { float v[]; } offset;
+layout(set = 0, binding = 4, std430) buffer Y { float v[]; } y;
+
+#include "common/sform_decode.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC {
+    int n_in; int n_out; int code_bits; int byte_shift; int bias; int codebook; int group_shift; int has_offset;
+    int q8k;
+} pc;
+
+const uint QE = 16u;
+
+// one code word: 1, 2 or 4 little-endian bytes, assembled by hand so the byte order is stated rather than
+// inherited from a reinterpretation
+uint load_word(uint at, uint bytes_per_word) {
+    uint v = uint(codes.b[at]);
+    if (bytes_per_word >= 2u) v |= uint(codes.b[at + 1u]) << 8u;
+    if (bytes_per_word >= 4u) v |= (uint(codes.b[at + 2u]) << 16u) | (uint(codes.b[at + 3u]) << 24u);
+    return v;
+}
+
+// the activation at element `e`, used by the tail loop only
+float act_at(uint e) {
+    const uint blk_elems = (pc.q8k != 0) ? 256u : 32u;
+    const uint blk_bytes = (pc.q8k != 0) ? 292u : 34u;
+    const uint blk = (e / blk_elems) * blk_bytes;
+    float d;
+    uint qs;
+    if (pc.q8k != 0) {
+        d = uintBitsToFloat(uint(act.b[blk]) | (uint(act.b[blk + 1u]) << 8u) | (uint(act.b[blk + 2u]) << 16u) |
+                            (uint(act.b[blk + 3u]) << 24u));
+        qs = blk + 4u;
+    } else {
+        d = unpackHalf2x16(uint(act.b[blk]) | (uint(act.b[blk + 1u]) << 8u)).x;
+        qs = blk + 2u;
+    }
+    const int raw = int(act.b[qs + (e % blk_elems)]);
+    return d * float(raw > 127 ? raw - 256 : raw);
+}
+
+void main() {
+    const uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.n_out)) return;                 // workgroup-uniform: the reduction's barriers stay legal
+
+    const uint n_in = uint(pc.n_in);
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint n_in_per_byte = 8u / uint(pc.code_bits);
+    const uint bytes_per_word = 4u * uint(pc.code_bits) / 8u;     // 1 for S2, 2 for S4, 4 for S8
+    const uint mask = (1u << uint(pc.code_bits)) - 1u;
+    const uint cbase = o * (n_in / n_in_per_byte);
+    const uint sbase = o * (n_in >> uint(pc.group_shift));
+    const uint gshift = uint(pc.group_shift);
+    const uint bshift = uint(pc.byte_shift);
+    const bool use_off = pc.has_offset != 0;
+
+    float acc[16];
+    for (int k = 0; k < 16; ++k) acc[k] = 0.0;
+
+    uint i = lid * QE;
+    for (; i + QE <= n_in; i += lsize * QE) {
+        const uint g = i >> gshift;                  // the whole octet is in one group
+        const float d = scales.v[sbase + g];
+        const float b = use_off ? offset.v[sbase + g] : 0.0;
+        const uint cp = cbase + (i >> bshift);
+        const uint v0 = load_word(cp, bytes_per_word);
+        const uint v1 = load_word(cp + bytes_per_word, bytes_per_word);
+        const uint v2 = load_word(cp + 2u * bytes_per_word, bytes_per_word);
+        const uint v3 = load_word(cp + 3u * bytes_per_word, bytes_per_word);
+
+        // all 16 elements lie in ONE activation block (see the header note)
+        const uint blk_elems = (pc.q8k != 0) ? 256u : 32u;
+        const uint blk_bytes = (pc.q8k != 0) ? 292u : 34u;
+        const uint xb = (i / blk_elems) * blk_bytes;
+        float xd;
+        uint xqs;
+        if (pc.q8k != 0) {
+            xd = uintBitsToFloat(uint(act.b[xb]) | (uint(act.b[xb + 1u]) << 8u) |
+                                 (uint(act.b[xb + 2u]) << 16u) | (uint(act.b[xb + 3u]) << 24u));
+            xqs = xb + 4u;
+        } else {
+            xd = unpackHalf2x16(uint(act.b[xb]) | (uint(act.b[xb + 1u]) << 8u)).x;
+            xqs = xb + 2u;
+        }
+        const uint xi = i % blk_elems;
+
+        for (uint k = 0u; k < QE; ++k) {
+            const uint word = (k < 4u) ? v0 : ((k < 8u) ? v1 : ((k < 12u) ? v2 : v3));
+            const uint sh = (k & 3u) * uint(pc.code_bits);
+            const float w = sform_decode((word >> sh) & mask, pc.bias, pc.codebook) * d + b;
+            const int raw = int(act.b[xqs + xi + k]);
+            acc[k] += w * (xd * float(raw > 127 ? raw - 256 : raw));
+        }
+    }
+    // the last, partial octet - at most one per invocation
+    for (; i < n_in; i += lsize * QE) {
+        for (uint k = 0u; k < QE && i + k < n_in; ++k) {
+            const uint e = i + k;
+            const uint g = e >> gshift;
+            const uint code = (uint(codes.b[cbase + (e >> bshift)]) >> ((e & (n_in_per_byte - 1u)) * uint(pc.code_bits))) & mask;
+            acc[k] += (sform_decode(code, pc.bias, pc.codebook) * scales.v[sbase + g] + (use_off ? offset.v[sbase + g] : 0.0)) *
+                      act_at(e);
+        }
+    }
+
+    // the source's tree over the sixteen accumulators, then the workgroup reduction
+    const float sum = (((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))) +
+                      (((acc[8] + acc[9]) + (acc[10] + acc[11])) + ((acc[12] + acc[13]) + (acc[14] + acc[15])));
+    const float total = wg_sum(sum);
+    if (lid == 0u) y.v[o] = total;
+}
