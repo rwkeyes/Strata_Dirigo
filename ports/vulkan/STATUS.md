@@ -57,7 +57,8 @@ would cross it — naming the numbers. Measured live on this box: with the resid
 7900 XTX, RADV reports 0.19 GiB free of 24 GiB and the harness **refused to allocate**, which is the behaviour
 that would have prevented the recorded AMD incident (`docs/AMD_HIP.md`, #380/#377).
 
-**Verified on two Vulkan implementations:** RADV/7900 XTX (subgroup 64) and llvmpipe/CPU (subgroup 8) — 14/14
+**Verified on two Vulkan implementations before the swap:** RADV/7900 XTX (subgroup 64) and llvmpipe/CPU
+(subgroup 8); that run was 14/14, the suite has grown since and prints its own totals.
 each, run automatically by `gates/run_gate.sh`. The Intel ICD is present but has no device on this machine, so
 the arm reports it as no-device; it will run automatically when an Arc card is in the box.
 
@@ -84,7 +85,8 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
   registry. `harness/vk_compute.*` is the seed of the device layer, deliberately host-visible-only memory for
   gate fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.
 * **Anything on Intel hardware.** Zero lines of this port have run on an Arc GPU. No Arc card is attached to
-  this box (the two GPUs here are a 7900 XTX and a Quadro K620), so this could not be changed in this
+  this host (whose discrete GPU is a 7900 XTX, with the Ryzen iGPU beside it - not the "K620" an earlier revision
+  claimed), so this could not be changed in this
   session. The Vulkan code is written to be card-agnostic and the shaders avoid vendor assumes, but "runs on
   Arc" is unverified and is stated as unverified.
 * **The Battlemage stability question** (§4 of the plan): the xe compute wedge is an open driver bug that

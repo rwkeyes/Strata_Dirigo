@@ -29,6 +29,7 @@
 #include <random>
 #include <sys/wait.h>
 
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -52,6 +53,7 @@ using portvk::stack_advisories;
 using portvk::resolve_icd_library;
 using portvk::parse_so_version;
 using portvk::IcdEntry;
+using portvk::firmware_present_in;
 
 namespace {
 
@@ -788,6 +790,32 @@ void case_stack_components(Ctx& ctx) {
     verdict("stack: firmware blobs probed", fw_probed, fw_probed ? 0 : 1, 6, 0.0, "blobs probed");
 }
 
+// Firmware lookups: a real temp directory, both directions.  The bug this guards against was live - the check
+// looked only for the uncompressed name and reported all six blobs absent on a box that ships them as .zst and
+// has every one of them.
+void case_firmware_variants() {
+    const std::string dir = "/tmp/vkport_fwtest/";
+    std::filesystem::create_directories(dir);
+    { std::ofstream f(dir + "test_guc.bin.zst"); f << "compressed placeholder"; }
+    std::string found;
+    const bool compressed_found = firmware_present_in(dir, "test_guc.bin", &found) &&
+                                  found.find(".zst") != std::string::npos;
+    const bool bogus_absent = !firmware_present_in(dir, "no_such_blob_for_this_test.bin", &found);
+    verdict("stack: compressed firmware variant found", compressed_found, compressed_found ? 0 : 1, 1, 0.0,
+            "lookup failures");
+    verdict("stack: absent firmware still reported absent", bogus_absent, bogus_absent ? 0 : 1, 1, 0.0,
+            "false positives");
+    std::remove((dir + "test_guc.bin.zst").c_str());
+
+    // Informational: what the LIVE report says about the blobs for a Battlemage card, on this host.
+    const StackReport s = detect_stack();
+    std::printf("INFO  firmware for a Battlemage card on this host:");
+    for (const auto& f : s.firmware) {
+        if (f.name.find("bmg") != std::string::npos) std::printf(" %s=%s", f.name.c_str(), f.present() ? "present" : "ABSENT");
+    }
+    std::printf("\n");
+}
+
 // THE REST OF THE STACK, part 2: the ICD resolution logic, with BOTH controls.  The first version of this check
 // tested the JSON's library_path as a file path and reported all nine working ICDs as broken - `library_path` is
 // normally a bare soname (`libvulkan_radeon.so`) that the loader resolves through the system library path.  So
@@ -955,6 +983,7 @@ int main(int argc, char** argv) {
     case_compat_rules();
     case_stack_components(ctx);
     case_icd_resolution();
+    case_firmware_variants();
     case_compat_host(ctx);
     case_ledger_rule(ctx);
     case_memory_budget(ctx);

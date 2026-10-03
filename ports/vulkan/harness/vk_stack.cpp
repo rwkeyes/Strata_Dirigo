@@ -80,11 +80,9 @@ StackFile probe_file(const char* name) {
     f.name = name;
     // /lib/firmware and /usr/lib/firmware are both used depending on the distro and how it merged /usr.
     for (const char* root : {"/lib/firmware/", "/usr/lib/firmware/"}) {
-        const std::string p = std::string(root) + name;
-        std::error_code ec;
-        if (fs::exists(p, ec)) {
-            f.found_path = p;
-            f.size = (uint64_t) fs::file_size(p, ec);
+        if (firmware_present_in(root, name, &f.found_path)) {
+            std::error_code ec;
+            f.size = (uint64_t) fs::file_size(f.found_path, ec);
             return f;
         }
     }
@@ -117,6 +115,21 @@ bool parse_dotted_version(const std::string& text, int& maj, int& min, int& pat)
         return false;
     }
     return true;
+}
+
+// The loader accepts .zst/.xz/.gz variants of a firmware name; the uncompressed name is tried FIRST so a host
+// that carries both reports the plain file.
+bool firmware_present_in(const std::string& root, const std::string& name, std::string* found_path) {
+    static const char* kSuffixes[] = {"", ".zst", ".xz", ".gz"};
+    std::error_code ec;
+    for (const char* sfx : kSuffixes) {
+        const std::string p = root + name + sfx;
+        if (fs::exists(p, ec)) {
+            if (found_path) *found_path = p;
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string resolve_icd_library(const std::string& library_path) {
@@ -197,7 +210,7 @@ StackReport detect_stack() {
     // blobs, and a "missing" verdict is only raised when a generation's WHOLE set is absent - a single drifted
     // filename must not be reported as missing firmware.
     for (const char* f : {"xe/bmg_guc_70.bin", "xe/bmg_huc.bin", "i915/bmg_dmc.bin",
-                          "i915/dg2_guc_70.bin", "i915/dg2_huc_70.bin", "i915/dg2_dmc_ver2_08.bin"}) {
+                          "i915/dg2_guc_70.bin", "i915/dg2_huc_gsc.bin", "i915/dg2_dmc_ver2_08.bin"}) {
         s.firmware.push_back(probe_file(f));
     }
 

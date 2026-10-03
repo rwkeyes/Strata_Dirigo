@@ -112,7 +112,8 @@ out ~2x off. It is the same defect class as a hardcoded 32-lane assumption, one 
 on the only implementation the port had ever been run on**.
 
 **Fixed** — the stage now accumulates with a stride (`for (i = lane; i < gl_NumSubgroups; i += gl_SubgroupSize)`),
-which is correct at any ratio. Re-verified: **14/14 on RADV (subgroup 64) and 14/14 on llvmpipe (subgroup 8)**.
+which is correct at any ratio. Re-verified at the time of that audit: **14/14 on RADV (subgroup 64) and 14/14 on
+llvmpipe (subgroup 8)**; the suite has grown since and reports its own totals.
 
 **Root cause of the near-miss: the port had only ever been tested on one Vulkan implementation.** `run_gate.sh`
 now has a cross-implementation arm that runs the gate on **every ICD that reports a device** and fails if any of

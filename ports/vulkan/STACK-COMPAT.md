@@ -3,6 +3,10 @@
 *Renamed from `KERNEL-COMPAT.md`: the kernel is one component among several this port depends on, and the
 others are covered in section 3.5.*
 
+> **Pending hardware change:** this host's 7900 XTX is being replaced by an Intel Arc Pro B70. What that
+> invalidates, and what to do about it, is in [`SWAP-PREFLIGHT.md`](SWAP-PREFLIGHT.md) - including one item that
+> stops the local model service outright.
+
 **For:** whoever ships or runs the Vulkan backend on Intel Arc.
 **Port:** `ports/vulkan/` on branch `vulkan-arc-port`.
 **Revision of this document:** 2026-10-03.
@@ -187,7 +191,9 @@ Two caveats, both sourced:
   `VK_KHR_cooperative_matrix` since Mesa 24.0, but llama.cpp deliberately gates it to Xe2 only for that reason.
   So the plain-FMA ceiling of §4.3b stands on Alchemist even with a matrix-capable toolchain.
 
-**Unverified**: none of this has run on Alchemist silicon (this box has a 7900 XTX and a K620). The floors come
+**Unverified**: none of this has run on Alchemist silicon (this host carries a Radeon RX 7900 XTX and the Ryzen
+iGPU - there is no Intel discrete card here, and no NVIDIA card either: an earlier revision of this document said
+"a 7900 XTX and a K620", which `lspci` does not support). The floors come
 from Intel's tables; the behaviour on the hardware is untested, and the port's rules say so rather than implying
 otherwise.
 
@@ -305,7 +311,9 @@ remedy. That is the shape that filled an RX 6800 driving a desktop (`docs/AMD_HI
 
 ### 6.3 How this is verified
 
-`gates/run_gate.sh` reports **26 passed, 0 failed, 0 skipped** on both implementations present here (RADV and
+`gates/run_gate.sh` reports **36 passed, 0 failed, 0 skipped** on the primary implementation and **34** on the
+software one (`lvp`) at the time of writing; the gate prints its own totals, so a number here that disagrees with
+a run is a stale document, not a result. Implementations present here (RADV and
 llvmpipe), and the Linux-compatibility parts are covered by:
 
 * a **15-case advisory table** with a **three-way boundary discriminator** (below the floor / at the floor on a
@@ -340,7 +348,8 @@ enabling a service, re-check device enumeration after a crash.
 **Verified on this machine:** the port has no kernel-facing interface (inspection + grep); its only enabled
 extension is `VK_EXT_memory_budget`; `DRM_IOCTL_XE_MADVISE` exists in this box's 7.0 headers; this box is
 7.0.0-34 on Ubuntu 24.04, Mesa 25.2.8, `CONFIG_DRM_XE=m` and `CONFIG_DRM_XE_GPUSVM=y`, and
-`CONFIG_DRM_XE_PREEMPT_TIMEOUT=640000`; the gate passes 26/26 on RADV and llvmpipe.
+`CONFIG_DRM_XE_PREEMPT_TIMEOUT=640000`; the gate passes its full suite on the AMD and software implementations
+(once the card is swapped, on the Intel one - see `SWAP-PREFLIGHT.md`).
 
 **From external sources (release notes, forum and press reports), not reproduced here:** release dates and
 per-cycle DRM change lists; Mesa 26.2 release notes; the engine-reset reports; the 6.12 Xe2 claim.

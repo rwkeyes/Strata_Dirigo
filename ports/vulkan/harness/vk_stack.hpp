@@ -68,6 +68,12 @@ bool parse_dotted_version(const std::string& text, int& maj, int& min, int& pat)
 // in the standard library directories and $LD_LIBRARY_PATH, accepting ".N" suffixed variants.
 std::string resolve_icd_library(const std::string& library_path);
 
+// Firmware lookups must try the COMPRESSED variants.  Modern distros ship blobs as .zst (Ubuntu 24.04 does) and
+// the kernel loads them transparently with CONFIG_FW_LOADER_COMPRESS_ZSTD=y, so a check that only tests the
+// uncompressed name reports every blob as missing on a box that has all of them.  Exposed so the gate can prove
+// both directions with real temp files.
+bool firmware_present_in(const std::string& root, const std::string& name, std::string* found_path);
+
 // `device_id` is needed because the firmware blobs are per GENERATION: Battlemage (xe/bmg_*) and Alchemist
 // (i915/dg2_*) load different files, so a missing-blob verdict can only be raised for the generation present.
 std::vector<Advisory> stack_advisories(const StackReport& s, uint32_t vendor_id, uint32_t device_id);
