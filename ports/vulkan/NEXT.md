@@ -12,6 +12,11 @@ done and gated.
   structurally impossible for the CMA path) and the fallback where no CMA config exists (llvmpipe). The engine
   selects by **shape first**, device capability second.
 - `rope_neox.comp` — NEOX partial RoPE, one thread per row, table passed in from the host.
+- `kv_q8_append.comp` — the 8-bit KV append (the storage half of kv_q8). Verified **byte-exact over the whole
+  destination image** against a transcription of the engine's own quantisation formula, so a wrong ROW is as
+  visible as a wrong code: four cases (VRAM page resident; page absent, where a sentinel image must stay
+  untouched; and the host copy in the identity layout, written unconditionally in both table states), covering the
+  all-zero group (scale 0), all-negative, values on ± the group maximum, and a maximum past fp16 range.
 
 ## mrope: SETTLED, by reading the source rather than assuming
 
@@ -53,7 +58,25 @@ Two traps hit while writing it, both worth not repeating:
   differ in the last bits. Split the comparison: exact for the copied tail, err/tol for the arithmetic. The
   shader was correct throughout.
 
-## Next kernel: `kv_q8.cu` (127 lines, quantised KV append)
+## ONE FINDING TO CARRY INTO EVERY fp16-KERNEL PORT: `packHalf2x16` is NOT the engine's conversion
+
+Measured on RADV while porting kv_q8. `packHalf2x16` **saturates to the largest finite half** (0x7BFF) where the
+engine's `f16_from_f32` returns **infinity** (0x7C00), and its tie and subnormal rounding is not the engine's
+nearest-even either. The effect is silent and small: a KV group whose maximum exceeds fp16 range gets a finite
+scale instead of an infinite one, so its codes come out 127 instead of 0 — one group, in a branch normal data
+never reaches. The gate caught it as exactly 73 differing bytes.
+
+Use the port's own `f16_from_f32` (transcribed from `strata/kernels/f16_bits.hpp`, and held bit-exact by the
+`f32_to_f16` case) in every kernel that converts. Reading a half BACK is a pure widening conversion with no
+rounding to get wrong, so `unpackHalf2x16` is exact and stays.
+
+## Next: the second half of kv_q8, then the rest of the wave
+
+`kv_gather_q8` — the dequantising reader (one thread per 4 values, `fp16(code * scale)` into the scratch the
+attention kernels read). With BOTH entry points in place the pair can be tested as a **round trip** (append then
+gather, compared against the original within the 8-bit bound), which is stronger than either half alone.
+
+Then `quantize_act.cu`, `ple.cu`, then the GEMV wave.
 
 Then `quantize_act.cu`, `ple.cu`, then the GEMV wave (`native_bf16.cu`, `s_gemv.cu`, `s2_gemv*.cu`) — that wave
 is where throughput lives and where the interface convention gets its first real test.
