@@ -235,6 +235,10 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     VK_CHECK(vkCreateDevice(phys_, &dci, nullptr, &dev_));
     vkGetDeviceQueue(dev_, queue_family_, 0, &queue_);
 
+    // The Linux compatibility facts.  Collected once, after the device is chosen and before anything is sized.
+    env_ = detect_host_env();
+    fill_driver_info(phys_, env_);
+
     VkCommandPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -317,7 +321,9 @@ void Ctx::query_budget() {
                              "LEDGER (heap total minus this process), not a measurement\n");
     }
     if (forced_budget_bytes_) {
+        // An explicit ceiling is NOT a driver measurement, and the logs must not pretend otherwise.
         budget_.from_driver = true;
+        budget_.from_explicit_limit = true;
         budget_.heap_budget = forced_budget_bytes_;
         budget_.heap_usage = 0;
     }
@@ -327,7 +333,7 @@ void Ctx::configure_display_reserve() {
     const char* noext = std::getenv("STRATA_VK_NO_MEMORY_BUDGET");
     force_no_budget_ext_ = noext != nullptr && *noext && std::strcmp(noext, "0") != 0;
 
-    const char* forced = std::getenv("STRATA_VK_FORCE_BUDGET_MIB");
+    const char* forced = std::getenv("STRATA_VK_MAX_BUDGET_MIB");
     forced_budget_bytes_ = forced ? (uint64_t) std::strtoull(forced, nullptr, 10) << 20 : 0;
 
     // 1024 MiB by default: enough for a compositor plus a browser doing GPU compositing at 4K, and NOT sized
@@ -350,10 +356,45 @@ void Ctx::configure_display_reserve() {
     query_budget();
     reserve_decision_ = compute_desktop_reserve(want_bytes, budget_.heap_total, floor_bytes, 25);
     reserve_bytes_ = reserve_decision_.reserve_bytes;
+
+    // THE LEDGER RULE, and the one place the port refuses on a version/driver combination rather than on a
+    // request.  A free figure that comes from the heap total rather than from the driver says nothing about
+    // what the desktop and other processes hold, and on a discrete display card that is the exact shape that
+    // filled an RX 6800 and cost 11 tok/s (docs/AMD_HIP.md, #380/#377).  So: ledger + discrete + no explicit
+    // ceiling = nothing may be allocated, with the reason and the remedy in the message.
+    ledger_untrusted_ = !budget_.from_driver && looks_discrete(budget_.heap_total, env_.host_ram_bytes) &&
+                        forced_budget_bytes_ == 0;
+
+    advisories_ = compat_advisories(env_, info_.vendor_id, budget_.from_driver);
+    for (const Advisory& a : advisories_) {
+        std::fprintf(stderr, "vk_compat[%s] %s\n", severity_name(a.sev), a.text.c_str());
+    }
+    // The userspace version is printed next to the kernel one on purpose: on Intel it is the Mesa version, not
+    // the kernel, that decides whether VK_EXT_memory_budget gives a real free figure.
+    std::fprintf(stderr, "vk_compat: kernel %s (%s) | driver \"%s\" / \"%s\" | DRM modules: ",
+                 env_.kernel.str().c_str(), env_.kernel.release.c_str(), env_.driver_name.c_str(),
+                 env_.mesa_version.c_str());
+    for (const auto& m : env_.drm_modules) std::fprintf(stderr, "%s ", m.c_str());
+    std::fprintf(stderr, "| host RAM %.1f GiB\n", (double) env_.host_ram_bytes / 1073741824.0);
+
+    // Refuse only where the combination is known to be impossible (today: Battlemage on a kernel that has no
+    // BMG support).  Everything else is reported and left to the operator.
+    if (any_fatal(advisories_)) {
+        std::fprintf(stderr, "vk_compute: refusing to run on this combination (see the FATAL line above)\n");
+        std::exit(4);
+    }
+    if (ledger_untrusted_) {
+        std::fprintf(stderr,
+                     "vk_compute: the free figure is a LEDGER and this is a discrete card, so it cannot be used "
+                     "to size anything (%.2f GiB of %.2f GiB is unreserved, but the desktop's and other "
+                     "processes' usage is not in that number).  Set STRATA_VK_MAX_BUDGET_MIB to the ceiling you "
+                     "want, or install Mesa >= 26.2 for VK_EXT_memory_budget on Intel.\n",
+                     (double) budget_.heap_total / 1073741824.0, (double) budget_.heap_total / 1073741824.0);
+    }
     std::fprintf(stderr,
                  "vk_compute: heap total %.2f GiB | free %s %.2f GiB | desktop reserve %.2f GiB%s%s -> %.2f GiB "
                  "usable\n",
-                 (double) budget_.heap_total / 1073741824.0, budget_.from_driver ? "(driver)" : "(LEDGER)",
+                 (double) budget_.heap_total / 1073741824.0, (budget_.from_explicit_limit ? "(explicit limit)" : (budget_.from_driver ? "(driver)" : "(LEDGER)")),
                  (double) (budget_.from_driver ? (budget_.heap_budget - budget_.heap_usage) : budget_.heap_total) /
                      1073741824.0,
                  (double) reserve_bytes_ / 1073741824.0, reserve_decision_.raised_to_floor ? " (floor)" : "",
@@ -362,6 +403,7 @@ void Ctx::configure_display_reserve() {
 }
 
 uint64_t Ctx::usable_bytes() const {
+    if (ledger_untrusted_) return 0;   // see configure_display_reserve: refuse, never guess
     uint64_t free_b;
     if (budget_.from_driver) {
         free_b = budget_.heap_budget > budget_.heap_usage ? budget_.heap_budget - budget_.heap_usage : 0;
@@ -394,7 +436,7 @@ Buf Ctx::alloc(uint64_t bytes) {
                      "%.2f MiB usable (free %s %.2f GiB, desktop reserve %.2f GiB).  Raise "
                      "STRATA_VK_DESKTOP_RESERVE_MIB only if the desktop can spare it.\n",
                      (double) req.size / 1048576.0, (double) allocated_ / 1048576.0, (double) usable / 1048576.0,
-                     budget_.from_driver ? "(driver)" : "(LEDGER)",
+                     (budget_.from_explicit_limit ? "(explicit limit)" : (budget_.from_driver ? "(driver)" : "(LEDGER)")),
                      (double) (budget_.from_driver ? (budget_.heap_budget - budget_.heap_usage) : budget_.heap_total) /
                          1073741824.0,
                      (double) reserve_bytes_ / 1073741824.0);

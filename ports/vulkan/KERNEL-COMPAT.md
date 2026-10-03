@@ -107,6 +107,36 @@ device spin-wait, smoke-test before enabling a service, re-check device enumerat
 
 ---
 
+## 5b. What the port now ENFORCES (implemented, not just written down)
+
+`harness/vk_compat.{hpp,cpp}` turns the rules above into code: it detects the host (kernel release via `uname`,
+loaded DRM modules via `/sys/module`, host RAM, and the userspace driver identity via
+`VkPhysicalDeviceDriverProperties`) and produces advisories with severities. It still opens no device node — the
+whole Linux compatibility surface is three reads.
+
+| Rule | Severity | Behaviour |
+|---|---|---|
+| Intel + kernel < 6.14 | **Fatal** | refuses to run: no BMG support before 6.14, and 6.8 has none at all |
+| Intel + 6.14 <= kernel < 7.0 | Warn | the recurring xe compute-load crash range: keep submissions bounded, smoke-test first |
+| Intel + 7.1 / 7.2 | Info | the vRAM memory-pressure work is present |
+| Intel + kernel >= 7.3 | Note | TTM eviction is more aggressive: re-verify the reserve, don't assume 7.2 behaviour |
+| Intel + Mesa < 26.2 + no driver figure | Warn | names the Mesa version that added `VK_EXT_memory_budget` support on Intel |
+| any kernel marked `-rc` | Note | a prerelease is not released behaviour |
+| x86 kernel that fails to parse | Warn | the rules cannot be applied, so every caveat stays live |
+
+**The one hard refusal that is not about a version: the ledger rule.** If the free-memory figure comes from the
+heap total rather than the driver (`VK_EXT_memory_budget` absent), and the card is discrete, and no explicit
+ceiling was given, then **nothing may be allocated** — `usable_bytes()` is 0 and the first allocation exits 3
+with the reason and the remedy. That is the shape that filled an RX 6800 driving a desktop (#380/#377). The
+remedy is `STRATA_VK_MAX_BUDGET_MIB=<MiB>` (an explicit ceiling), which is also the honest way to run on Mesa
+< 26.2 on Intel.
+
+Verified by the gate, on both implementations (26 passed, 0 failed): the advisory table with 11 cases plus a
+boundary discriminator, the live kernel/Mesa parse, and three child-process cases for the ledger rule
+(over-budget refused, ledger+discrete+no-ceiling refused, explicit ceiling unblocks it). Both new checks were
+proven able to fail — moving the 6.14 boundary fails 3 of the 12 rule cases, and disabling the ledger rule fails
+the ledger case with **24 GiB reported as usable**, which is precisely the bug.
+
 ## 6. Recommended support statement for the port
 
 | Layer | Requirement | Why |

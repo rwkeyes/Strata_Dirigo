@@ -143,7 +143,11 @@ card and decode fell 41 -> 30 tok/s (#380/#377). A free-memory number that ignor
    two-display KDE/Wayland B580 desktop held **354 MB in kwin_wayland alone**, so 256 MiB was a reserve smaller
    than the compositor it was meant to protect. It composes with the engine's own 700 MiB rather than
    overlapping it, because the engine's planner subtracts that from the figure this layer reports as usable.
-3. **Refuses, loudly, rather than over-allocating.** The check runs against the driver's figure plus the
+3. **Refuses to size from a ledger.** If the driver will not give a real free figure
+   (`VK_EXT_memory_budget` absent — on Intel that means Mesa < 26.2) and the card is discrete, nothing is
+   allocatable until an explicit ceiling is set (`STRATA_VK_MAX_BUDGET_MIB`). A heap total knows nothing about
+   what the desktop holds, which is exactly how the RX 6800 incident happened.
+4. **Refuses, loudly, rather than over-allocating.** The check runs against the driver's figure plus the
    reserve *before* any allocation, and names the numbers. A backend that cannot fit must say so; allocating
    anyway is how the card gets filled and the desktop stops compositing.
 
@@ -161,7 +165,8 @@ Measured on this box as a live example of why the driver figure matters: the res
 7900 XTX, so RADV reports **0.19 GiB free of 24 GiB** and the harness refused to allocate - the exact behaviour
 that would have saved the RX 6800 incident.
 
-**Tunables** (env, engine-side names to follow in stage 6): `STRATA_VK_DESKTOP_RESERVE_MIB` (default 1024),
+**Tunables** (env, engine-side names to follow in stage 6): `STRATA_VK_MAX_BUDGET_MIB` (explicit ceiling;
+required when the driver gives no free figure), `STRATA_VK_DESKTOP_RESERVE_MIB` (default 1024),
 `STRATA_VK_RESERVE_FLOOR_MIB` (default 512; set 0 only for a small correctness harness that must run beside a
 resident model). 512 MiB is the compositor-only floor (measured: 354 MB for a two-display KDE/Wayland session);
 1.5-2 GiB is the number if a browser is compositing.

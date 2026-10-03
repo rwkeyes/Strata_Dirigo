@@ -78,7 +78,8 @@ done
 
 echo "== building the harness (-Werror: hygiene is part of the gate)"
 g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
-    -o "$BUILD/vk_gate" "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_gate.cpp" -lvulkan || exit 1
+    -o "$BUILD/vk_gate" "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" \
+    "$ROOT/harness/vk_gate.cpp" -lvulkan || exit 1
 
 echo "== numeric gate"
 # The gate needs a few MiB of buffers, so it runs with the reserve and its floor at 0: this box's resident local

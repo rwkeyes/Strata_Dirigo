@@ -27,6 +27,10 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 | memory budget: usage tracks an 8 MiB alloc | PASS | the driver's number is a measurement, not a constant |
 | desktop reserve policy (5 cases + 2 controls) | PASS | floor, 25%-of-card clamp, and the in-between case |
 | over-budget allocation REFUSED | PASS | a child process with an 8 MiB card must exit 3 and say why |
+| compat: advisory rules (11 cases + boundary) | PASS | kernel/Mesa/driver combinations, each case discriminating against its neighbour |
+| compat: kernel + Mesa parsed live | PASS | `uname` release and the driver-supplied Mesa string, parsed and checked |
+| ledger + discrete + no ceiling REFUSED | PASS | child process; would report 24 GiB usable if the rule were removed |
+| explicit ceiling unblocks the ledger | PASS | child process; `STRATA_VK_MAX_BUDGET_MIB` is the documented remedy |
 
 The bf16/f16 conversion fixtures deliberately include exact rounding ties at both precisions, subnormals,
 the fp16 overflow point (65504 → 65536), infinities, a signalling NaN pattern and signed zero. The

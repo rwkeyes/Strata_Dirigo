@@ -14,6 +14,8 @@
 // enough to composite - a desktop's need, not a game's.
 #pragma once
 
+#include "vk_compat.hpp"
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -38,6 +40,7 @@ struct Buf {
 // heap's total size and therefore an over-estimate by however much everyone else is using.
 struct MemoryBudget {
     bool from_driver = false;
+    bool from_explicit_limit = false;   // STRATA_VK_MAX_BUDGET_MIB - honest about what the number is
     uint64_t heap_budget = 0;   // driver: bytes this process may still allocate across DEVICE_LOCAL heaps
     uint64_t heap_usage = 0;    // driver: bytes already allocated in those heaps
     uint64_t heap_total = 0;    // sum of DEVICE_LOCAL heap sizes (always available)
@@ -88,11 +91,20 @@ public:
     // The reserve is configured once, after the device is up and before anything is allocated.
     //   STRATA_VK_DESKTOP_RESERVE_MIB  what to hold back for the desktop (default 1024)
     //   STRATA_VK_RESERVE_FLOOR_MIB    the floor under it (default 512)
-    //   STRATA_VK_FORCE_BUDGET_MIB     test hook: pretend the whole heap is this many MiB (refusals must be
-    //                                  demonstrable without filling a real card)
-    //   STRATA_VK_NO_MEMORY_BUDGET     test hook: take the labelled ledger-only fallback
+    //   STRATA_VK_MAX_BUDGET_MIB       an EXPLICIT ceiling on what may be allocated.  Required when the driver
+    //                                  will not give a real free figure on a discrete card (see below), and
+    //                                  useful as a test hook to pose a card state without filling one.
+    //   STRATA_VK_NO_MEMORY_BUDGET     take the labelled ledger-only fallback (the compatibility test uses it)
     void configure_display_reserve();
     const MemoryBudget& budget() const { return budget_; }
+    // What this box is, and what that means.  Detected from uname + /sys/module + the device's driver
+    // properties: the port opens no device node, so this is the whole of its Linux compatibility surface.
+    const HostEnv& host_env() const { return env_; }
+    const std::vector<Advisory>& advisories() const { return advisories_; }
+    // True when the free figure is a ledger and the card is discrete, i.e. when sizing from it would be the
+    // over-allocation that filled an RX 6800 that drives the desktop.  In that state nothing is allocatable
+    // until an explicit STRATA_VK_MAX_BUDGET_MIB is given.
+    bool ledger_untrusted() const { return ledger_untrusted_; }
     uint64_t reserve_bytes() const { return reserve_bytes_; }
     // What the engine may still allocate: the driver's free figure (or the ledger fallback) minus the desktop
     // reserve.  Never negative, and zero means "refuse everything" rather than "underflow".
@@ -135,7 +147,10 @@ private:
     uint64_t reserve_bytes_ = 0;
     uint64_t allocated_ = 0;      // this layer's own ledger, reported alongside the driver's number
     bool force_no_budget_ext_ = false;
-    uint64_t forced_budget_bytes_ = 0;   // 0 = off (test hook)
+    uint64_t forced_budget_bytes_ = 0;   // 0 = off (STRATA_VK_MAX_BUDGET_MIB)
+    bool ledger_untrusted_ = false;      // ledger fallback + discrete card + no explicit limit
+    HostEnv env_{};
+    std::vector<Advisory> advisories_{};
 
     int device_index_ = -1;
     VkInstance instance_ = VK_NULL_HANDLE;
