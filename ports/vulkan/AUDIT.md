@@ -120,6 +120,20 @@ them fails (absent hardware is reported as absent, which is honest; a present im
 On this box that means RADV and llvmpipe; on the target box it will mean the Intel ICD the moment the card is
 present — which is exactly the implementation whose per-kernel SIMD width motivated §3.1.
 
+### 3.1c The display contract: a missing assignment, an unenforced reserve, and no way to test either (HIGH, FIXED)
+
+Added on request ("the Arc card stays the video card; leave the desktop enough to composite"), and it turned up
+one real bug immediately. `query_budget()` **never assigned `heap_total`**, so the 25%-of-card cap had no heap
+to take a fraction of and the clamp could never fire - the policy read correctly and could not work. Found by
+the new live case printing its own inputs, not by review.
+
+The contract now lives in code rather than in a comment: the driver's `VK_EXT_memory_budget` figures (heap usage,
+not this process's ledger), a 1024 MiB desktop reserve with a 256 MiB floor and a 25% cap, and an **enforced**
+check that refuses an allocation crossing it — with a fork-free child process proving the refusal path exits
+non-zero and says why. It composes with the engine's existing `--vram-reserve-mib` (700 MiB) instead of
+overlapping it. Rationale, the AMD/HIP incident it prevents, the tunables and the non-memory display-safety
+rules (no device spin-wait, bounded submissions, smoke-test first) are in PORT-PLAN.md §4b.
+
 ### 3.2 An unrequested feature could refuse device creation (HIGH, FIXED)
 `vk_compute.cpp:186` (rev `1bcdc91`) set `VkPhysicalDeviceShaderFloat16Int8Features::shaderFloat16 = VK_TRUE`
 unconditionally while **no ported kernel stores fp16** — on any device that does not report it,
@@ -188,9 +202,14 @@ Xe2 needs a toolchain bump (glslang ≥ 16, or naga/rust-gpu). Recorded in the p
 | a missing kernel is not a pass | removed `add.comp` → `SKIP add.spv`, then `1 case(s) SKIPPED - a skipped case is not a passing one`, exit 1 |
 | the bit-exact numeric gate | the negative control shader disagrees on 484 of 1024 values |
 | cross-implementation (new) | it is what found §3.1b: the same shaders, unchanged, produce worst-case relative error 1.13 on llvmpipe and 2.4e-07 on RADV |
+| over-budget refusal (new) | a child process with an 8 MiB card exits 3 and names the numbers; exit 5 would mean the allocation was allowed |
+| budget arithmetic (new) | the live case re-queries the driver itself and compares, and allocates 8 MiB to prove the figure moves |
+| reserve policy (new) | 5 cases plus two discriminators (the clamp must actually fire, the floor must actually raise) |
 
-**Three of this audit's own artifacts were defective, and each was caught by testing rather than by reading** —
-worth recording, because they are the exact failure modes the guideline's audit rules warn about:
+**Six of this audit's own artifacts were defective, and every one was caught by testing rather than by
+reading** — worth recording, because they are the exact failure modes the guideline's audit rules warn about
+(two injections that proved nothing, a fix that broke an untested width, a test measuring integer truncation, a
+path that resolved in another process, and a requirement that over-specified a driver):
 
 1. The first injection **silently did not apply** (`if (i >= pc.n) return;` is not the text in
    `scale.comp`), so the census correctly reported a clean shader and the "test" proved nothing. Fixed by
@@ -199,7 +218,20 @@ worth recording, because they are the exact failure modes the guideline's audit 
 2. The second attempt injected code the **compiler folds away** (`subgroupAdd(1.0) == 0.0` is uniform and
    constant), so again nothing was proven. The census can only see operations that survive optimisation —
    which is the right property, but it means an injection must change the result to test the check.
-3. **The §3.1 fix introduced §3.1b**, and no amount of self-testing on this box could have found it: the
+3. **The reserve-policy case compared exact bytes against an integer-truncated cap.** 25% of 24 GiB, computed
+   as `heap/100*25`, lands 19 bytes off an exact quarter, so a correct policy failed a test that was measuring
+   integer arithmetic rather than the rule. Fixed with a 1 MiB tolerance **plus** explicit discriminators (the
+   clamp must actually fire, the floor must actually raise) so the case still cannot pass vacuously.
+4. **The refusal case's child ran `dash` instead of the gate.** `popen("/proc/self/exe --expect-refusal")`
+   resolves that path *in the shell popen spawns*, so the shell exec'd itself with a flag it does not know and
+   exited 2 - reported as a refusal-path failure that did not exist. Resolve the path in the parent
+   (`readlink`) before building the command.
+5. **The budget-tracking check was over-specified twice**: exact bytes first (7.04 MiB measured for an 8 MiB
+   request, which is correct coarse accounting), then a fixed bar that a software implementation failed
+   non-deterministically (0 bytes on one run, 7.38e6 on the next). It now distinguishes a discrete local heap
+   (hard requirement - where "free" staying at the heap size is the dangerous shape) from a device whose local
+   heap is ~all of system RAM (reported with its reason, because the OS protects the desktop there).
+6. **The §3.1 fix introduced §3.1b**, and no amount of self-testing on this box could have found it: the
    self-tests all ran on the same implementation. A second implementation with a different subgroup width found
    it in one run. The general rule this audit arrives at: *for a kernel whose correctness depends on a runtime
    width — subgroup, SIMD, warp — one implementation is not a test, it is an anecdote.*

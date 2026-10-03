@@ -22,6 +22,11 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 | `rms_norm_weighted` (4 shapes, incl. rows=2) | PASS, worst rel **1.79e-07** | vs double reference **and** a NaN-padded tail that fails if the row guard is missing |
 | `silu_inplace` | PASS, worst rel **7.58e-07** | vs the engine's double-precision reference |
 | transcendental probe (`exp`, `log`) | INFO | driver `exp` ≈ 9.1e-07, `log` near 1 ≈ 1.5e-07 abs error |
+| memory budget: independent requery agrees | PASS | the test re-queries `VK_EXT_memory_budget` itself and compares |
+| memory budget: free − reserve == usable | PASS | against the free figure the test computed independently |
+| memory budget: usage tracks an 8 MiB alloc | PASS | the driver's number is a measurement, not a constant |
+| desktop reserve policy (5 cases + 2 controls) | PASS | floor, 25%-of-card clamp, and the in-between case |
+| over-budget allocation REFUSED | PASS | a child process with an 8 MiB card must exit 3 and say why |
 
 The bf16/f16 conversion fixtures deliberately include exact rounding ties at both precisions, subnormals,
 the fp16 overflow point (65504 → 65536), infinities, a signalling NaN pattern and signed zero. The
@@ -41,6 +46,12 @@ five new automated checks added, each proven able to fail — including a CROSS-
 added after the same shaders measured worst-case relative error 1.13 on llvmpipe (subgroup 8) while passing on
 RADV (subgroup 64): a reduction combine stage assumed `gl_NumSubgroups <= gl_SubgroupSize`. Fixed and verified
 green on both implementations.
+
+**Display contract:** the Vulkan layer queries `VK_EXT_memory_budget` (heap usage, not this process's ledger),
+holds back a 1024 MiB desktop reserve (floor 256 MiB, capped at 25% of the card), and refuses an allocation that
+would cross it — naming the numbers. Measured live on this box: with the resident local model holding the
+7900 XTX, RADV reports 0.19 GiB free of 24 GiB and the harness **refused to allocate**, which is the behaviour
+that would have prevented the recorded AMD incident (`docs/AMD_HIP.md`, #380/#377).
 
 **Verified on two Vulkan implementations:** RADV/7900 XTX (subgroup 64) and llvmpipe/CPU (subgroup 8) — 14/14
 each, run automatically by `gates/run_gate.sh`. The Intel ICD is present but has no device on this machine, so

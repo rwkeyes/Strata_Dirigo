@@ -2,8 +2,16 @@
 // a device, host-visible buffers, and "load this SPIR-V, bind these N buffers, push these bytes, dispatch
 // G groups".  Everything the CUDA backend does with cudaMalloc/cudaMemcpy/<<<>>> has an entry point here.
 //
-// Deliberately NOT here yet (stages 3+ of ports/vulkan/plan/PORT-PLAN.md): device-local staging, command-buffer
-// RECORDING (the CUDA-graph replacement), timeline semaphores, VK_EXT_memory_budget, and 8-bit storage.
+// THE DISPLAY CONTRACT (why the memory code below is not optional):
+// The card that runs this is the card that drives the desktop.  On CUDA/HIP the engine learns how much it may
+// use from `cudaMemGetInfo`/`hipMemGetInfo` and then holds back `--vram-reserve-mib` (default 700 MiB) for its
+// own graphs, scratch and head.  Those numbers do NOT subtract what the desktop and other programs hold - the
+// AMD/HIP history records the result: `--expert-cache auto` filled an RX 6800 that drives the desktop and
+// decode fell 41 -> 30 tok/s (docs/AMD_HIP.md, #380/#377).  Vulkan's `VK_EXT_memory_budget` reports usage for
+// the HEAP, not just this process, so it is the correct source; where it is absent the fallback is a heap
+// total, which is a LEDGER, not a measurement, and this layer says so out loud rather than degrading silently.
+// On top of the engine's internal reserve this layer holds back a DESKTOP reserve so the compositor keeps
+// enough to composite - a desktop's need, not a game's.
 #pragma once
 
 #include <vulkan/vulkan.h>
@@ -25,6 +33,25 @@ struct Buf {
     uint64_t bytes = 0;
 };
 
+// What the driver says about this heap.  `from_driver` distinguishes a real answer (VK_EXT_memory_budget:
+// usage is for the whole heap, including the desktop and every other process) from the fallback, which is the
+// heap's total size and therefore an over-estimate by however much everyone else is using.
+struct MemoryBudget {
+    bool from_driver = false;
+    uint64_t heap_budget = 0;   // driver: bytes this process may still allocate across DEVICE_LOCAL heaps
+    uint64_t heap_usage = 0;    // driver: bytes already allocated in those heaps
+    uint64_t heap_total = 0;    // sum of DEVICE_LOCAL heap sizes (always available)
+};
+
+// The desktop reserve, as a pure function so it can be tested without a GPU.
+struct ReserveDecision {
+    uint64_t reserve_bytes = 0;
+    bool clamped_by_cap = false;   // the requested reserve exceeded the fraction cap
+    bool raised_to_floor = false;  // the requested reserve was below the floor
+};
+ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes,
+                                       uint64_t floor_bytes, uint32_t cap_percent_of_heap);
+
 struct DeviceInfo {
     std::string name;
     uint32_t vendor_id = 0, device_id = 0;
@@ -33,11 +60,9 @@ struct DeviceInfo {
     bool shader_int16 = false;
     bool shader_float64 = false;
     uint32_t subgroup_size = 0;
-    // The DEVICE_LOCAL heap total.  **NOT a model-size budget, and on Intel Arc it is actively misleading**:
-    // Arc reports its dedicated VRAM (often 256 MB - 512 MB, or the resizable-BAR window) here, not the
-    // shared system memory the GPU actually allocates from.  A fit calculation built on this number would
-    // refuse models that fit or accept models that do not.  Sizing must come from the driver's own budget
-    // (VK_EXT_memory_budget: heap_budget - heap_usage) plus the driver's memory info.
+    // The DEVICE_LOCAL heap total.  **NOT a model-size budget, and on Intel Arc it is misleading**: Arc
+    // reports its dedicated VRAM or the resizable-BAR window here, while the GPU allocates from shared system
+    // memory.  Sizing comes from MemoryBudget above; this is here to be printed and to clamp the reserve.
     uint64_t heap_device_local_bytes = 0;
 };
 
@@ -53,8 +78,26 @@ public:
 
     const DeviceInfo& info() const { return info_; }
     int device_index() const { return device_index_; }
+    // Exposed so a test can re-derive the budget with its OWN query instead of asking this class for its own
+    // answer back (a test that calls the accessor twice compares the code to itself and passes regardless).
+    VkPhysicalDevice physical_device() const { return phys_; }
 
     static std::vector<DeviceInfo> list_devices();
+
+    // ---- the display contract -------------------------------------------------------------------------
+    // The reserve is configured once, after the device is up and before anything is allocated.
+    //   STRATA_VK_DESKTOP_RESERVE_MIB  what to hold back for the desktop (default 1024)
+    //   STRATA_VK_FORCE_BUDGET_MIB     test hook: pretend the whole heap is this many MiB (refusals must be
+    //                                  demonstrable without filling a real card)
+    //   STRATA_VK_NO_MEMORY_BUDGET     test hook: take the labelled ledger-only fallback
+    void configure_display_reserve();
+    const MemoryBudget& budget() const { return budget_; }
+    uint64_t reserve_bytes() const { return reserve_bytes_; }
+    // What the engine may still allocate: the driver's free figure (or the ledger fallback) minus the desktop
+    // reserve.  Never negative, and zero means "refuse everything" rather than "underflow".
+    uint64_t usable_bytes() const;
+    uint64_t engine_allocated() const { return allocated_; }
+    ReserveDecision reserve_decision() const { return reserve_decision_; }
 
     Buf alloc(uint64_t bytes);
     void free(Buf& b);
@@ -86,6 +129,13 @@ private:
     };
 
     DeviceInfo info_{};
+    MemoryBudget budget_{};
+    ReserveDecision reserve_decision_{};
+    uint64_t reserve_bytes_ = 0;
+    uint64_t allocated_ = 0;      // this layer's own ledger, reported alongside the driver's number
+    bool force_no_budget_ext_ = false;
+    uint64_t forced_budget_bytes_ = 0;   // 0 = off (test hook)
+
     int device_index_ = -1;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -96,6 +146,8 @@ private:
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
     uint32_t mem_type_ = 0;
     std::vector<Pipe> pipes_;
+
+    void query_budget();   // called after device creation, so the extension can be enabled
 };
 
 }  // namespace portvk

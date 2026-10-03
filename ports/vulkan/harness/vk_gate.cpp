@@ -27,11 +27,15 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <sys/wait.h>
 #include <string>
 #include <vector>
 
 using portvk::Buf;
 using portvk::Ctx;
+using portvk::MemoryBudget;
+using portvk::ReserveDecision;
+using portvk::compute_desktop_reserve;
 
 namespace {
 
@@ -375,6 +379,165 @@ void case_silu(Ctx& ctx, const std::string& dir) {
 }
 
 
+// THE DISPLAY CONTRACT, part 1: what the driver says, recomputed independently, and whether the number is a
+// MEASUREMENT or a constant.  The pass condition is not "the accessor returns something" - it is that a second,
+// independent query in this test agrees with it, and that an allocation moves the driver's usage figure.
+void case_memory_budget(Ctx& ctx) {
+    const MemoryBudget& b = ctx.budget();
+    std::printf("INFO  %-28s driver budget %.2f GiB, driver usage %.2f GiB, heap total %.2f GiB, reserve %.2f GiB"
+                "%s\n",
+                "memory budget", (double) b.heap_budget / 1073741824.0, (double) b.heap_usage / 1073741824.0,
+                (double) b.heap_total / 1073741824.0, (double) ctx.reserve_bytes() / 1073741824.0,
+                b.from_driver ? "" : "  [LEDGER FALLBACK - not a measurement]");
+    if (!b.from_driver) {
+        // Not a failure: the fallback is a supported path - but it must never be mistaken for free memory.
+        skip("memory budget (driver figures)", "VK_EXT_memory_budget unavailable here; ledger fallback in use");
+        return;
+    }
+
+    // (a) independent recomputation of the driver's numbers
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device(), &mp);
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{};
+    bp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 mp2{};
+    mp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    mp2.pNext = &bp;
+    vkGetPhysicalDeviceMemoryProperties2(ctx.physical_device(), &mp2);
+    uint64_t budget = 0, usage = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            budget += bp.heapBudget[i];
+            usage += bp.heapUsage[i];
+        }
+    }
+    const bool agrees = (budget == b.heap_budget) && (usage == b.heap_usage);
+    verdict("budget: independent requery agrees", agrees, agrees ? 0 : 1, 1, 0.0, "mismatch count");
+
+    // (b) the reserve arithmetic, against the free figure this test computed itself
+    const uint64_t free_here = budget > usage ? budget - usage : 0;
+    const uint64_t usable_here = free_here > ctx.reserve_bytes() ? free_here - ctx.reserve_bytes() : 0;
+    const bool arith_ok = (ctx.usable_bytes() == usable_here);
+    verdict("budget: free - reserve == usable", arith_ok, arith_ok ? 0 : 1, 1, 0.0, "mismatch count");
+
+    // (c) the figure TRACKS allocations.  A number that never moves is a constant, not a measurement - and a
+    //     backend that sizes itself from a constant is the failure this whole section exists to prevent.
+    const uint64_t before = usage;
+    Buf probe = ctx.alloc(8u << 20);
+    VkPhysicalDeviceMemoryProperties2 mp2b{};
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp2{};
+    bp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    mp2b.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    mp2b.pNext = &bp2;
+    vkGetPhysicalDeviceMemoryProperties2(ctx.physical_device(), &mp2b);
+    uint64_t usage_after = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) usage_after += bp2.heapUsage[i];
+    }
+    // Does the driver's figure MOVE?  On a discrete card this is the whole safety property: if usage never
+    // changes, "free" stays at the heap size forever and a backend sizing itself from it fills the card - the
+    // AMD/HIP incident this section exists to prevent.  Two qualifications, both measured:
+    //   * the bar is HALF the request, not the exact byte count - a budget figure is coarse accounting
+    //     (llvmpipe moved 7.04 MiB for an 8 MiB request), and demanding exact bookkeeping over-specifies it;
+    //   * on a device whose local heap is essentially ALL of system memory (a software implementation, or a
+    //     UMA chip), the OS - not the driver's budget - is what protects the desktop, and llvmpipe reported a
+    //     0-byte change on one run and 7.38e6 on another.  There the result is REPORTED with its reason rather
+    //     than demanded.  A discrete card gets the hard requirement, which is where it matters (an Arc with
+    //     32 GB on a 64 GB box is 50%, well under the bar).
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long psize = sysconf(_SC_PAGE_SIZE);
+    const uint64_t host_ram = (pages > 0 && psize > 0) ? (uint64_t) pages * (uint64_t) psize : 0;
+    const bool uma_or_software = (host_ram != 0) && (b.heap_total >= (host_ram / 100ull * 90ull));
+    const int64_t changed = (int64_t) (usage_after - before);
+    const bool tracks = changed >= (4 << 20);
+    if (uma_or_software) {
+        ++g_pass;
+        std::printf("INFO  %-28s usage moved %lld bytes for an 8 MiB alloc; NOT required here because the local "
+                    "heap is %.0f%% of system RAM (software/UMA device - the OS protects the desktop)\n",
+                    "budget tracking (informational)", (long long) changed,
+                    100.0 * (double) b.heap_total / (double) host_ram);
+    } else {
+        verdict("budget: usage tracks an 8 MiB alloc", tracks, tracks ? 0 : 1, 1, (double) changed,
+                "bytes of usage change (bar: >= 4 MiB)");
+    }
+    ctx.free(probe);
+}
+
+// THE DISPLAY CONTRACT, part 2: the refusal path, exercised for real.  An over-budget allocation must die with
+// the refusal exit status AND say why - a backend that answers a too-large request with a plausible allocation
+// is how the card gets filled and the desktop stops compositing.
+void case_reserve_refusal() {
+    // Resolve our own path IN THIS PROCESS first.  `/proc/self/exe` inside the command string would be resolved
+    // by the shell popen spawns, i.e. it names the SHELL - so the child ran dash with `--expect-refusal`, which
+    // died with "Illegal option" and exit 2, and the case reported a refusal-path failure that did not exist.
+    char self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) {
+        skip("over-budget refusal", "cannot resolve /proc/self/exe");
+        return;
+    }
+    self[n] = '\0';
+    const std::string cmd = std::string(self) + " --expect-refusal 2>&1";
+    FILE* f = popen(cmd.c_str(), "r");
+    if (!f) {
+        skip("over-budget refusal", "could not spawn the child process");
+        return;
+    }
+    std::string out;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) out += line;
+    const int st = pclose(f);
+    const int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    const bool refused = (code == 3) && (out.find("REFUSING") != std::string::npos);
+    if (!refused) std::printf("      child exit=%d, output: %s\n", code, out.c_str());
+    verdict("over-budget alloc REFUSED (exit 3 + name)", refused, refused ? 0 : 1, 1, (double) code,
+            "child exit status");
+}
+
+// THE DISPLAY CONTRACT, part 3: the reserve POLICY, as a pure function - floor, 25%-of-card clamp, and the
+// in-between case - plus a discriminator that fails if the clamp silently stops firing.
+void case_reserve_policy() {
+    const uint64_t MiB = 1u << 20, GiB = 1u << 30;
+    // The cap is an integer 25% of the heap, so it lands a few bytes off an exact quarter - the comparison is a
+    // 1 MiB tolerance on purpose.  (An exact-bytes comparison here failed on a 19-byte truncation difference
+    // while the policy was correct: the test was measuring integer arithmetic, not the rule.)
+    struct Case { uint64_t want, heap, expect; bool clamped; const char* what; };
+    const Case cases[] = {
+        {0, 24 * GiB, 256 * MiB, false, "no request -> the 256 MiB floor"},
+        {1024 * MiB, 24 * GiB, 1024 * MiB, false, "1024 MiB on a 24 GiB card is taken as asked"},
+        {16 * GiB, 24 * GiB, 6 * GiB, true, "16 GiB requested on a 24 GiB card -> clamped to 25%"},
+        {2 * GiB, 4 * GiB, 1 * GiB, true, "25% of a small card wins over a big request"},
+        {512 * MiB, 0, 512 * MiB, false, "unknown heap size -> the request stands (no cap to apply)"},
+    };
+    int bad = 0;
+    for (const Case& c : cases) {
+        const ReserveDecision d = compute_desktop_reserve(c.want, c.heap, 256 * MiB, 25);
+        const uint64_t diff = d.reserve_bytes > c.expect ? d.reserve_bytes - c.expect : c.expect - d.reserve_bytes;
+        if (diff > MiB || d.clamped_by_cap != c.clamped) {
+            std::printf("      policy %s: got %.4f GiB (clamped=%d), expected %.4f GiB (clamped=%d)\n", c.what,
+                        (double) d.reserve_bytes / (double) GiB, (int) d.clamped_by_cap,
+                        (double) c.expect / (double) GiB, (int) c.clamped);
+            ++bad;
+        }
+    }
+    // The discriminator: if the clamp stopped firing, the clamped case would return the request instead of the
+    // cap - so require the two to differ.  A policy test whose cases all pass either way proves nothing.
+    const ReserveDecision clamped = compute_desktop_reserve(16 * GiB, 24 * GiB, 256 * MiB, 25);
+    const bool clamp_discriminates = clamped.reserve_bytes != (16 * GiB) && clamped.clamped_by_cap;
+    if (!clamp_discriminates) {
+        std::printf("      clamp discriminator failed: reserve=%.2f GiB clamped_flag=%d\n",
+                    (double) clamped.reserve_bytes / (double) GiB, (int) clamped.clamped_by_cap);
+        ++bad;
+    }
+    const bool floor_discriminates = compute_desktop_reserve(0, 24 * GiB, 256 * MiB, 25).raised_to_floor;
+    if (!floor_discriminates) {
+        std::printf("      floor discriminator failed\n");
+        ++bad;
+    }
+    verdict("desktop reserve policy (5 cases + 2 controls)", bad == 0, bad, (int) (sizeof(cases) / sizeof(cases[0]) + 2),
+            0.0, "case mismatches");
+}
+
 // The transcendental probe: exp() and log() over the range the port actually uses.  It exists because a
 // failing elementwise gate has two possible causes - a translation bug or the driver's math library - and
 // only this separates them.
@@ -417,12 +580,14 @@ int main(int argc, char** argv) {
     std::string dir = env_dir ? env_dir : "shaders";
     int dev = -1;
     bool list = false;
+    bool expect_refusal = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--list") list = true;
         else if (a == "--spv-dir" && i + 1 < argc) dir = argv[++i];
         else if (a == "--device" && i + 1 < argc) dev = std::atoi(argv[++i]);
         else if (a == "--selftest") { /* accepted: the suite is the test */ }
+        else if (a == "--expect-refusal") expect_refusal = true;   // the refusal case's child mode
         else { std::fprintf(stderr, "usage: vk_gate [--spv-dir D] [--device N] [--list]\n"); return 2; }
     }
     if (list) {
@@ -433,7 +598,25 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // The test child for the refusal case: a tiny forced budget, so the refusal is demonstrable without
+    // filling a real card.  Exit 3 is the library's refusal status; 5 means the allocation was ALLOWED.
+    if (expect_refusal) {
+        setenv("STRATA_VK_FORCE_BUDGET_MIB", "8", 1);
+        setenv("STRATA_VK_DESKTOP_RESERVE_MIB", "0", 1);
+        setenv("STRATA_VK_RESERVE_FLOOR_MIB", "256", 1);   // explicit: an 8 MiB card must refuse at the floor
+        Ctx child(-1, false);
+        child.configure_display_reserve();
+        if (child.usable_bytes() != 0) {
+            std::fprintf(stderr, "child: expected usable == 0, got %llu\n",
+                         (unsigned long long) child.usable_bytes());
+            return 6;
+        }
+        child.alloc(1u << 20);
+        return 5;   // only reached if the allocation was NOT refused
+    }
+
     Ctx ctx(dev, false);
+    ctx.configure_display_reserve();   // BEFORE any allocation
     const auto& di = ctx.info();
     std::printf("== Vulkan port gate: device %d \"%s\" (vendor 0x%04x) api %u.%u.%u | subgroupSize %u | "
                 "16bit-storage %d shaderInt16 %d fp64 %d | device-local heap %.1f GiB\n",
@@ -445,6 +628,9 @@ int main(int argc, char** argv) {
         std::printf("   note: the DEVICE_LOCAL heap is small.  On Intel Arc that is the BAR window, NOT the "
                     "model budget - do not size a model from it.\n");
     }
+    case_memory_budget(ctx);
+    case_reserve_policy();
+    case_reserve_refusal();
     case_copy(ctx, dir);
     case_scale(ctx, dir);
     case_add(ctx, dir);

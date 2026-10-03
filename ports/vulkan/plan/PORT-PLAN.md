@@ -120,6 +120,61 @@ today and needs a toolchain bump (glslang ≥ 16, or naga/rust-gpu) before it ca
 **Alchemist (Xe-HPG)** has none of the xe wedge reports, and SYCL and Vulkan are both described as stable
 there — so Alchemist is the sensible first *hardware* target even though the code port is the same.
 
+## 4b. The display contract: the Arc card stays the video card
+
+**The requirement:** the card that runs Strata is the card that drives the desktop, and Strata must leave the
+desktop enough to composite. Not gaming - a desktop.
+
+**What the engine already promises, which the Vulkan path must match rather than reinvent:**
+`--vram-reserve-mib` (default **700 MiB**, `src/program/generate.cpp`) is the engine's own reserve for its
+graphs, scratch and head, and `docs/AMD_HIP.md` states the AMD path "leaves 1 GiB of VRAM headroom".
+**The reason this is not a formality is in that same file:** on an RX 6800 that drives the desktop,
+`hipMemGetInfo` did not subtract what the desktop and other programs held, so `--expert-cache auto` filled the
+card and decode fell 41 -> 30 tok/s (#380/#377). A free-memory number that ignores everyone else is the bug.
+
+**What the Vulkan backend does instead:**
+
+1. **Asks the driver, not itself.** `VK_EXT_memory_budget` reports usage for the HEAP, not just this process.
+   It adds no entry points (a capability check plus the enabled-extension name is the whole wiring), and where
+   it is absent the fallback is the heap total - which is a **ledger, not a measurement**, and the code says so
+   out loud rather than degrading silently.
+2. **Holds back a desktop reserve**, as a pure function with a floor and a cap: default **1024 MiB**, never
+   below **256 MiB**, never more than **25%** of the card. It composes with the engine's own 700 MiB rather than
+   overlapping it, because the engine's planner subtracts that from the figure this layer reports as usable.
+3. **Refuses, loudly, rather than over-allocating.** The check runs against the driver's figure plus the
+   reserve *before* any allocation, and names the numbers. A backend that cannot fit must say so; allocating
+   anyway is how the card gets filled and the desktop stops compositing.
+
+What that yields, from the real code (`STRATA_VK_FORCE_BUDGET_MIB` used to pose each state):
+
+| State | Free (driver) | Reserve | Usable |
+|---|---|---|---|
+| Arc 32 GiB, desktop default | 32.0 GiB | 1.0 GiB | 31.0 GiB |
+| Arc 32 GiB, browser doing GPU compositing | 32.0 GiB | 2.0 GiB | 30.0 GiB |
+| Headless box (no display) | 32.0 GiB | 0.25 GiB (floor) | 31.75 GiB |
+| Card already busy (e.g. another model resident) | 3.0 GiB | 1.0 GiB | 2.0 GiB |
+| Card nearly full | 0.5 GiB | 1.0 GiB | **0 -> refuses everything** |
+
+Measured on this box as a live example of why the driver figure matters: the resident local model holds the
+7900 XTX, so RADV reports **0.19 GiB free of 24 GiB** and the harness refused to allocate - the exact behaviour
+that would have saved the RX 6800 incident.
+
+**Tunables** (env, engine-side names to follow in stage 6): `STRATA_VK_DESKTOP_RESERVE_MIB` (default 1024),
+`STRATA_VK_RESERVE_FLOOR_MIB` (default 256; set 0 only for a small correctness harness that must run beside a
+resident model). 512 MiB is the compositor-only floor; 1.5-2 GiB is the number if a browser is compositing.
+
+**Display safety beyond memory, which no reserve can buy back:**
+
+* **Do not translate the device spin-wait.** `elementwise.cu`'s doorbell has a kernel spin until the host
+  answers. On the display card a hung compute kernel is a KMD timeout at best, and on Battlemage (§4) a wedge
+  that needs a power cycle - the desktop dying with it. The Vulkan path must use fences/timeline semaphores
+  per step, never a kernel that waits.
+* **Bounded submissions.** Submit and wait per step rather than leaving long-running work queued, so a fault
+  surfaces as one failed request instead of an unresponsive desktop.
+* **Smoke-test before enabling a service**, as the Arc notes already say, and after any hard crash re-check
+  device enumeration order before restarting: a crashed-and-restarted service can silently load a different
+  GPU.
+
 ## 5. Staged plan, with what each stage is worth
 
 | Stage | Content | Verifiable by |

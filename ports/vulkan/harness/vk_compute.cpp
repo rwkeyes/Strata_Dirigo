@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace portvk {
 
@@ -38,6 +40,40 @@ std::vector<uint8_t> read_file(const std::string& path) {
 }
 
 }  // namespace
+
+// The desktop reserve, as a pure function so the policy can be tested without a GPU.  Rules: at least the
+// floor (a compositor needs something, so a caller asking for nothing still gets the floor), at most
+// `cap_percent_of_heap` of the card (a small card must stay usable for the engine at all), and a request in
+// between is taken as given.
+ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes, uint64_t floor_bytes,
+                                       uint32_t cap_percent_of_heap) {
+    ReserveDecision d{};
+    uint64_t r = requested_bytes;
+    if (r < floor_bytes) {
+        r = floor_bytes;
+        d.raised_to_floor = true;
+    }
+    if (heap_total_bytes) {
+        const uint64_t cap = heap_total_bytes / 100ull * (uint64_t) cap_percent_of_heap;
+        if (r > cap) {
+            r = cap;
+            d.clamped_by_cap = true;
+        }
+    }
+    d.reserve_bytes = r;
+    return d;
+}
+
+static bool device_has_extension(VkPhysicalDevice pd, const char* want) {
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> eps(n);
+    if (n) vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, eps.data());
+    for (const auto& e : eps) {
+        if (std::strcmp(e.extensionName, want) == 0) return true;
+    }
+    return false;
+}
 
 static void fill_info(DeviceInfo& di, VkPhysicalDevice pd) {
     VkPhysicalDeviceProperties props{};
@@ -185,11 +221,17 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     f2.pNext = &f16;
     f2.features.shaderInt16 = info_.shader_int16 ? VK_TRUE : VK_FALSE;
 
+    // VK_EXT_memory_budget adds NO entry points: a capability check plus the name in the enabled list is the
+    // whole wiring, and enabling it is what makes the driver report a budget instead of a raw heap size.
+    const char* const kBUDGET_EXT = "VK_EXT_memory_budget";
+    const bool want_budget_ext = device_has_extension(phys_, kBUDGET_EXT);
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = want_budget_ext ? 1u : 0u;
+    dci.ppEnabledExtensionNames = want_budget_ext ? &kBUDGET_EXT : nullptr;
     VK_CHECK(vkCreateDevice(phys_, &dci, nullptr, &dev_));
     vkGetDeviceQueue(dev_, queue_family_, 0, &queue_);
 
@@ -243,6 +285,89 @@ Ctx::~Ctx() {
     if (instance_) vkDestroyInstance(instance_, nullptr);
 }
 
+void Ctx::query_budget() {
+    budget_.heap_total = info_.heap_device_local_bytes;   // the cap needs a heap size to take a fraction of
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+    std::vector<uint32_t> local_heaps;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local_heaps.push_back(i);
+    }
+
+    if (!force_no_budget_ext_) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{};
+        bp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 mp2{};
+        mp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        mp2.pNext = &bp;
+        vkGetPhysicalDeviceMemoryProperties2(phys_, &mp2);
+        uint64_t b = 0, u = 0;
+        for (uint32_t h : local_heaps) {
+            b += bp.heapBudget[h];
+            u += bp.heapUsage[h];
+        }
+        budget_.from_driver = true;
+        budget_.heap_budget = b;
+        budget_.heap_usage = u;
+    } else {
+        // The FALLBACK is a heap size, which knows nothing about who else is using the card - including the
+        // desktop.  It is labelled, never silent: a caller that treats it as free memory will fill the card.
+        budget_.from_driver = false;
+        std::fprintf(stderr, "vk_compute: VK_EXT_memory_budget unavailable (or disabled) - free memory is a "
+                             "LEDGER (heap total minus this process), not a measurement\n");
+    }
+    if (forced_budget_bytes_) {
+        budget_.from_driver = true;
+        budget_.heap_budget = forced_budget_bytes_;
+        budget_.heap_usage = 0;
+    }
+}
+
+void Ctx::configure_display_reserve() {
+    const char* noext = std::getenv("STRATA_VK_NO_MEMORY_BUDGET");
+    force_no_budget_ext_ = noext != nullptr && *noext && std::strcmp(noext, "0") != 0;
+
+    const char* forced = std::getenv("STRATA_VK_FORCE_BUDGET_MIB");
+    forced_budget_bytes_ = forced ? (uint64_t) std::strtoull(forced, nullptr, 10) << 20 : 0;
+
+    // 1024 MiB by default: enough for a compositor plus a browser doing GPU compositing at 4K, and NOT sized
+    // for a game (the engine's own `--vram-reserve-mib` 700 MiB covers its graphs/scratch/head separately, so
+    // the two compose rather than overlapping).
+    uint64_t want_bytes = 1024ull << 20;
+    const char* rsv = std::getenv("STRATA_VK_DESKTOP_RESERVE_MIB");
+    if (rsv && *rsv) want_bytes = (uint64_t) std::strtoull(rsv, nullptr, 10) << 20;
+
+    // 256 MiB floor: a card with nothing to spare still must not be filled to the last byte.  Lowering it to 0
+    // is a TEST hook - the numerical gate needs a few MiB of buffers, and on this box the resident local model
+    // already holds the card, so a 256 MiB floor would (correctly) refuse even the gate.
+    uint64_t floor_bytes = 256ull << 20;
+    const char* flr = std::getenv("STRATA_VK_RESERVE_FLOOR_MIB");
+    if (flr && *flr) floor_bytes = (uint64_t) std::strtoull(flr, nullptr, 10) << 20;
+
+    query_budget();
+    reserve_decision_ = compute_desktop_reserve(want_bytes, budget_.heap_total, floor_bytes, 25);
+    reserve_bytes_ = reserve_decision_.reserve_bytes;
+    std::fprintf(stderr,
+                 "vk_compute: heap total %.2f GiB | free %s %.2f GiB | desktop reserve %.2f GiB%s%s -> %.2f GiB "
+                 "usable\n",
+                 (double) budget_.heap_total / 1073741824.0, budget_.from_driver ? "(driver)" : "(LEDGER)",
+                 (double) (budget_.from_driver ? (budget_.heap_budget - budget_.heap_usage) : budget_.heap_total) /
+                     1073741824.0,
+                 (double) reserve_bytes_ / 1073741824.0, reserve_decision_.raised_to_floor ? " (floor)" : "",
+                 reserve_decision_.clamped_by_cap ? " (clamped to 25% of the card)" : "",
+                 (double) usable_bytes() / 1073741824.0);
+}
+
+uint64_t Ctx::usable_bytes() const {
+    uint64_t free_b;
+    if (budget_.from_driver) {
+        free_b = budget_.heap_budget > budget_.heap_usage ? budget_.heap_budget - budget_.heap_usage : 0;
+    } else {
+        free_b = budget_.heap_total > allocated_ ? budget_.heap_total - allocated_ : 0;
+    }
+    return free_b > reserve_bytes_ ? free_b - reserve_bytes_ : 0;
+}
+
 Buf Ctx::alloc(uint64_t bytes) {
     Buf b;
     b.bytes = bytes ? bytes : 4;
@@ -254,6 +379,26 @@ Buf Ctx::alloc(uint64_t bytes) {
     VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &b.buffer));
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(dev_, b.buffer, &req);
+
+    // THE DISPLAY CONTRACT, ENFORCED.  Checked against the driver's own figure (not this layer's ledger) plus
+    // the reserve, before anything is allocated.  A backend that cannot fit must refuse and name the numbers -
+    // allocating anyway is exactly how the card gets filled and the desktop stops compositing.
+    const uint64_t usable = usable_bytes();
+    if (allocated_ + req.size > usable) {
+        vkDestroyBuffer(dev_, b.buffer, nullptr);
+        std::fprintf(stderr,
+                     "vk_compute: REFUSING a %.2f MiB allocation - %.2f MiB already held by this process, "
+                     "%.2f MiB usable (free %s %.2f GiB, desktop reserve %.2f GiB).  Raise "
+                     "STRATA_VK_DESKTOP_RESERVE_MIB only if the desktop can spare it.\n",
+                     (double) req.size / 1048576.0, (double) allocated_ / 1048576.0, (double) usable / 1048576.0,
+                     budget_.from_driver ? "(driver)" : "(LEDGER)",
+                     (double) (budget_.from_driver ? (budget_.heap_budget - budget_.heap_usage) : budget_.heap_total) /
+                         1073741824.0,
+                     (double) reserve_bytes_ / 1073741824.0);
+        std::exit(3);
+    }
+    allocated_ += req.size;
+
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
@@ -266,6 +411,12 @@ Buf Ctx::alloc(uint64_t bytes) {
 }
 
 void Ctx::free(Buf& b) {
+    // The ledger follows the driver's own allocation size, so the accounting cannot drift from reality.
+    if (b.mem != VK_NULL_HANDLE) {
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(dev_, b.buffer, &req);
+        allocated_ = allocated_ > req.size ? allocated_ - req.size : 0;
+    }
     if (b.mapped) vkUnmapMemory(dev_, b.mem);
     if (b.buffer) vkDestroyBuffer(dev_, b.buffer, nullptr);
     if (b.mem) vkFreeMemory(dev_, b.mem, nullptr);

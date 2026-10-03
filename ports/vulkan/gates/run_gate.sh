@@ -81,6 +81,13 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
     -o "$BUILD/vk_gate" "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_gate.cpp" -lvulkan || exit 1
 
 echo "== numeric gate"
+# The gate needs a few MiB of buffers, so it runs with the reserve and its floor at 0: this box's resident local
+# model already holds the card, and the real policy would (CORRECTLY) refuse to allocate beside it.  The POLICY
+# itself is still verified - case_reserve_policy tests the real defaults (1024 MiB, 256 MiB floor, 25% cap) as a
+# pure function, and case_memory_budget checks the live driver figures - so the escape hatch does not weaken the
+# contract; it only lets a small correctness harness run on a card someone else is using.
+export STRATA_VK_DESKTOP_RESERVE_MIB=0
+export STRATA_VK_RESERVE_FLOOR_MIB=0
 out="$("$BUILD/vk_gate" --spv-dir "$SH" "$@")"
 status=$?
 printf '%s\n' "$out"
