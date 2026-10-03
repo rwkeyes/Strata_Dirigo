@@ -873,6 +873,170 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// kv_q8: the quantisation, transcribed from kv_q8.hpp's own formula -
+//     scale = fp16(max|x| / 127),  code = clamp(rint(x / scale), -127, 127)
+// - including the detail that matters: the scale is rounded to fp16 FIRST and the codes are computed against
+// that STORED value, so they agree with the scale a reader will dequantise with.  Quantising against the
+// unrounded `amax / 127` is off by a step at the boundary and shows only as a small accuracy loss, which is why
+// this oracle is compared BIT-EXACTLY rather than within a tolerance.
+static void kv_q8_quantize_group(const float* x, int n, std::vector<int8_t>& codes, uint16_t& sbits) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) amax = std::max(amax, std::fabs(x[i]));
+    sbits = strata::kernels::f16_from_f32(amax / 127.0f);
+    const float sf = strata::kernels::f32_from_f16(sbits);
+    codes.assign(n, 0);
+    if (sf > 0.0f) {
+        for (int i = 0; i < n; ++i) {
+            const float r = x[i] / sf;                    // a FLOAT divide, as the kernel does
+            int q = (int) std::nearbyint((double) r);     // __float2int_rn: nearest, ties to even
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            codes[i] = (int8_t) q;
+        }
+    }
+}
+
+// 8-bit KV append.  Three properties, each of which a plausible port gets wrong:
+//   * the CODES AND THE SCALE BITS must match the formula exactly (a paraphrase quantises against the unrounded
+//     scale and drifts),
+//   * a block whose page is not resident must leave VRAM COMPLETELY untouched - proven with a sentinel-filled
+//     image compared byte-for-byte, not by trusting the branch,
+//   * the host copy uses a DIFFERENT row formula (the identity layout) and is written unconditionally.
+// The whole destination image is compared, so a wrong row is as visible as a wrong code.
+void case_kv_q8(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "kv_q8_append.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("kv_q8 append", "device lacks storageBuffer8BitAccess - the int8 code path cannot run here");
+        return;
+    }
+    const int kv_heads = 2, head_dim = 256, page_size = 16, pages = 2, groups = head_dim / 64;
+    const int pos = 20;                                   // block 1, offset 4 within the page
+    const int rows = pages * kv_heads * page_size;         // 64
+    const size_t code_bytes = (size_t) rows * head_dim;
+    const size_t scale_bytes = (size_t) rows * groups * 2;
+    const int8_t CODE_SENTINEL = -99;
+    const uint16_t SCALE_SENTINEL = 0x7F7F;
+
+    std::vector<float> kcur((size_t) kv_heads * head_dim), vcur((size_t) kv_heads * head_dim);
+    for (float& v : kcur) v = rndf(1.0f);
+    for (float& v : vcur) v = rndf(1.0f);
+    for (int h = 0; h < kv_heads; ++h) {
+        float* k = &kcur[(size_t) h * head_dim];
+        float* v = &vcur[(size_t) h * head_dim];
+        if (h == 0) {
+            // g=0: all zeros -> sf == 0 -> every code is 0 and the scale bits are 0
+            for (int t = 0; t < 64; ++t) { k[t] = 0.0f; v[t] = 0.0f; }
+            // g=1: all negative, so every code is <= 0
+            for (int t = 0; t < 64; ++t) { k[64 + t] = -0.25f * (float) (t + 1); v[64 + t] = -1.0f - (float) t; }
+            // g=2: values sitting exactly on +/- the group maximum
+            for (int t = 0; t < 64; ++t) { k[128 + t] = (t % 2 == 0) ? 3.5f : -3.5f; v[128 + t] = (t % 2) ? 2.25f : -2.25f; }
+            // g=3: a maximum past fp16 range -> the scale is inf -> every code collapses to 0.  This is real
+            // engine behaviour, not a synthetic trap: it is what the formula does at ~8.3e6.
+            for (int t = 0; t < 64; ++t) { k[192 + t] = 1.0e7f; v[192 + t] = -1.0e7f; }
+        }
+    }
+
+    struct TableCase { int entry; bool resident; const char* what; };
+    const TableCase tables[] = {{0, true, "block resident (the page table maps it to page 0)"},
+                                {-1, false, "block NOT resident - VRAM must be left untouched"}};
+
+    for (const TableCase& tc : tables) {
+        const std::vector<int32_t> table = {tc.entry, tc.entry};
+        const std::vector<int32_t> step = {pos, pos + 1, 0, 1, 0};
+
+        for (int mode = 0; mode < 2; ++mode) {                  // 0 = the VRAM page path, 1 = the host copy
+            const bool host = mode == 1;
+            Buf b_kq = ctx.alloc(code_bytes), b_vq = ctx.alloc(code_bytes);
+            Buf b_ks = ctx.alloc(scale_bytes), b_vs = ctx.alloc(scale_bytes);
+            Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(step.size() * 4);
+            Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+
+            std::vector<int8_t> got_q(code_bytes, CODE_SENTINEL);
+            std::vector<uint16_t> got_s(scale_bytes / 2, SCALE_SENTINEL);
+            ctx.write(b_kq, got_q.data(), code_bytes);
+            ctx.write(b_vq, got_q.data(), code_bytes);
+            ctx.write(b_ks, got_s.data(), scale_bytes);
+            ctx.write(b_vs, got_s.data(), scale_bytes);
+            ctx.write(b_tab, table.data(), table.size() * 4);
+            ctx.write(b_step, step.data(), step.size() * 4);
+            ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+            ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+
+            const uint32_t threads = (uint32_t) (2 * kv_heads * groups);
+            const uint32_t gcount = (threads + kLocalSize - 1) / kLocalSize;
+            VkPipeline p = ctx.pipeline(dir + "/kv_q8_append.spv", 8, 16);
+            struct { int kv_heads, head_dim, page_size, host_layout; } pc{kv_heads, head_dim, page_size, mode};
+            ctx.dispatch(p, {&b_kq, &b_vq, &b_ks, &b_vs, &b_tab, &b_step, &b_kc, &b_vc}, &pc, sizeof(pc), gcount);
+            ctx.read(b_kq, got_q.data(), code_bytes);
+            ctx.read(b_ks, got_s.data(), scale_bytes);
+
+            // The expected image: sentinel everywhere, then exactly the rows the formula names.
+            std::vector<int8_t> want_q(code_bytes, CODE_SENTINEL);
+            std::vector<uint16_t> want_s(scale_bytes / 2, SCALE_SENTINEL);
+            if (tc.resident || host) {
+                for (int h = 0; h < kv_heads; ++h) {
+                    const int row = host ? ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size)
+                                         : (tc.entry * kv_heads + h) * page_size + (pos % page_size);
+                    for (int g = 0; g < groups; ++g) {
+                        const int xbase = h * head_dim + g * 64;
+                        std::vector<int8_t> kc, vc;
+                        uint16_t ks = 0, vs = 0;
+                        kv_q8_quantize_group(&kcur[xbase], 64, kc, ks);
+                        kv_q8_quantize_group(&vcur[xbase], 64, vc, vs);
+                        for (int t = 0; t < 64; ++t) {
+                            want_q[(size_t) row * head_dim + g * 64 + t] = kc[t];
+                        }
+                        want_s[(size_t) row * groups + g] = ks;
+                    }
+                }
+            }
+            int q_bad = 0, s_bad = 0;
+            for (size_t i = 0; i < code_bytes; ++i) {
+                if (got_q[i] != want_q[i]) ++q_bad;
+            }
+            for (size_t i = 0; i < want_s.size(); ++i) {
+                if (got_s[i] != want_s[i]) ++s_bad;
+            }
+            if (q_bad || s_bad) {
+                // Diagnostic: WHERE the image differs, decoded back to (h, g, t), so the cause is visible
+                // rather than inferred from a count.
+                int shown = 0;
+                for (int h = 0; h < kv_heads && shown < 4; ++h) {
+                    const int row = host ? ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size)
+                                         : (tc.entry * kv_heads + h) * page_size + (pos % page_size);
+                    for (int g = 0; g < groups && shown < 4; ++g) {
+                        for (int t = 0; t < 64 && shown < 4; ++t) {
+                            const size_t idx = (size_t) row * head_dim + g * 64 + t;
+                            if (got_q[idx] != want_q[idx]) {
+                                std::printf("        code h=%d g=%d t=%d row=%d: got %d want %d\n", h, g, t, row,
+                                            (int) got_q[idx], (int) want_q[idx]);
+                                ++shown;
+                            }
+                        }
+                    }
+                    if (h < 2) {
+                        std::printf("        scales h=%d row=%d:", h, row);
+                        for (int g = 0; g < groups; ++g) {
+                            const size_t sidx = (size_t) row * groups + g;
+                            std::printf(" g%d got=%04x want=%04x", g, (unsigned) got_s[sidx],
+                                        (unsigned) want_s[sidx]);
+                        }
+                        std::printf("\n");
+                    }
+                }
+            }
+            char label[96];
+            std::snprintf(label, sizeof label, "kv_q8 append %s", host ? "host copy" : (tc.resident ? "vram resident" : "vram absent"));
+            const bool ok = q_bad == 0 && s_bad == 0;
+            const double worst = (double) (q_bad + s_bad);
+            std::printf("      %-34s %s\n", label, tc.what);
+            verdict(label, ok, q_bad + s_bad, (int) (code_bytes + want_s.size()), worst,
+                    ok ? "differing bytes (0 = the whole image matches)" : "differing bytes");
+            ctx.free(b_kq); ctx.free(b_vq); ctx.free(b_ks); ctx.free(b_vs);
+            ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+        }
+    }
+}
+
 // THE HOST-SIDE ORACLE for rope: `build_rope_table`'s own float64 loop, copied rather than paraphrased (it is
 // the thing the port must agree with, so it must not be re-derived from the description of it).  The kernel
 // receives this table, so the ONLY difference left between device and reference is one rotation step in float
@@ -1381,6 +1545,7 @@ int main(int argc, char** argv) {
     case_memory_budget(ctx);
     case_reserve_policy();
     case_reserve_refusal();
+    case_kv_q8(ctx, dir);
     case_rope(ctx, dir);
     case_gemm_fma(ctx, dir);
     case_gemm_shape_contract();

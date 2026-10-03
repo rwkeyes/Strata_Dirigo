@@ -76,6 +76,9 @@ struct DeviceInfo {
     bool cooperative_matrix = false;     // extension + feature present
     bool cm_f16_f32 = false;             // ...and a usable config exists: M16 N16 K16 subgroup, f16/f16 -> f32
     bool shader_int16 = false;
+    // VK_KHR_8bit_storage storageBuffer8BitAccess: kv_q8 stores its codes as int8 in a storage buffer, so this
+    // one is required for that kernel and not merely nice to have (the 16-bit flag covers the scales).
+    bool storage_buffer_8bit = false;
     bool shader_float64 = false;
     uint32_t subgroup_size = 0;
     // The DEVICE_LOCAL heap total.  **NOT a model-size budget, and on Intel Arc it is misleading**: Arc

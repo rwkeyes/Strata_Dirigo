@@ -141,13 +141,17 @@ static void fill_info(DeviceInfo& di, VkPhysicalDevice pd) {
 
     VkPhysicalDeviceFeatures2 f2{};
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDevice8BitStorageFeatures f8q{};
+    f8q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
     VkPhysicalDevice16BitStorageFeatures f16{};
     f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    f16.pNext = &f8q;
     VkPhysicalDeviceSubgroupProperties sg{};
     sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     f2.pNext = &f16;
     vkGetPhysicalDeviceFeatures2(pd, &f2);
     di.storage_buffer_16bit = f16.storageBuffer16BitAccess;
+    di.storage_buffer_8bit = f8q.storageBuffer8BitAccess;
     di.shader_int16 = f2.features.shaderInt16;
     di.shader_float64 = f2.features.shaderFloat64;
 
@@ -278,12 +282,16 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     f16.storageBuffer16BitAccess = info_.storage_buffer_16bit ? VK_TRUE : VK_FALSE;
     f2.pNext = &f16;
+    VkPhysicalDevice8BitStorageFeatures f8feat{};
+    f8feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+    f8feat.storageBuffer8BitAccess = info_.storage_buffer_8bit ? VK_TRUE : VK_FALSE;
+    f16.pNext = &f8feat;
     // A cooperative-matrix pipeline needs BOTH the feature and the extension enabled, and only where the device
     // reported them - the same rule as every other feature here.
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmfeat{};
     cmfeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
     cmfeat.cooperativeMatrix = info_.cooperative_matrix ? VK_TRUE : VK_FALSE;
-    f16.pNext = &cmfeat;
+    f8feat.pNext = &cmfeat;
     f2.features.shaderInt16 = info_.shader_int16 ? VK_TRUE : VK_FALSE;
 
     // VK_EXT_memory_budget adds NO entry points: a capability check plus the name in the enabled list is the
