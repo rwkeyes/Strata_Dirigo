@@ -1,0 +1,69 @@
+// ports/vulkan/shaders/rope_neox.comp - NEOX partial RoPE, ported from src/kernels/cuda/rope.cu.
+//
+// ONE THREAD PER ROW, the same decomposition as the CUDA kernel (which uses 128 threads per block; the port's
+// convention is 256, and the row count is the only thing that sizes the grid).  The CUDA source's comment
+// records why it is not one thread per PAIR: the first version had up to 32 threads writing into the same row
+// with no barrier between the tail copy and the rotation, so a thread's copy could land after another had
+// rotated it - an intermittent wrong answer.  One thread per row removes the ordering question instead of
+// synchronising it, and this port keeps that.
+//
+// THE PAIRING IS NEOX: (i, i + n_rot/2), NOT the adjacent pair (2i, 2i+1).  Choosing the adjacent reading
+// rotates the wrong dimensions together and produces correctly-SHAPED output with scrambled content, which is
+// why the gate compares against the engine's own `rope_neox_pair` arithmetic rather than against "it looks
+// rotated".  The rotation is PARTIAL: only the first n_rot of head_dim are touched (64 of 256 here) and the tail
+// is COPIED verbatim - the gate asserts that copy bit-for-bit, because a port that rotates the whole head_dim
+// looks right on the first n_rot values.
+//
+// THE TABLE COMES IN FROM THE HOST, which is the source's own design: `build_rope_table` computes the angles in
+// float64 on the CPU (device double pow/cos are slow AND not guaranteed to agree with the host's libm), so the
+// kernel is a pure rotation over exactly the reference's values.  A consequence worth banking: because the
+// scaling (linear / YaRN, mscale included) lives in that host loop, ALL THREE scaling modes are this same kernel
+// - only the table differs.  Nothing here needs to know about freq_scale or yarn.
+//
+// mrope: `mrope_pos(tab, pos, pair)` in the engine is `tab ? tab[pos * 3 + pair % 3] : pos` - a NULL table means
+// the position the caller passes IS the rotary position, and a set table makes it a CELL index whose t/h/w
+// sectors (pair % 3) carry that pair's position, which is the vision path.  A Vulkan descriptor cannot be null,
+// so the flag is explicit: `mrope` 0 = use pos[r] directly (text), non-zero = index the table.  The buffer is
+// always bound; when the flag is 0 its contents are never read.  The sector rule is transcribed as `i % 3`,
+// faithful to the source, which is correct for the 32-pair slice the engine uses (n_rot = 64).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Xbuf { float x[]; } XB;
+layout(set = 0, binding = 1, std430) buffer Obuf { float o[]; } OB;
+layout(set = 0, binding = 2, std430) readonly buffer Cbuf { float c[]; } CB;
+layout(set = 0, binding = 3, std430) readonly buffer Sbuf { float s[]; } SB;
+layout(set = 0, binding = 4, std430) readonly buffer Pbuf { int p[]; } PB;
+layout(set = 0, binding = 5, std430) readonly buffer Mbuf { int m[]; } MB;
+
+layout(push_constant) uniform Pc {
+    int rows;
+    int head_dim;
+    int n_rot;
+    int mrope;   // 0 = the positions are rotary positions; non-zero = they are cell indices into the table
+} pc;
+
+void main() {
+    const int r = int(gl_GlobalInvocationID.x);
+    if (r >= pc.rows) return;                    // the grid is rounded up; surplus rows exit
+
+    const int nhalf = pc.n_rot / 2;   // NOT `half`: that is a reserved word in GLSL
+    const int base = r * pc.head_dim;
+
+    // The partial rotation's untouched tail, copied verbatim (the source's own loop).
+    for (int d = pc.n_rot; d < pc.head_dim; ++d) OB.o[base + d] = XB.x[base + d];
+
+    const int row_pos = PB.p[r];
+    for (int i = 0; i < nhalf; ++i) {
+        const int p = (pc.mrope != 0) ? MB.m[row_pos * 3 + (i % 3)] : row_pos;
+        const int toff = p * nhalf + i;
+        // `rope_neox_pair`, verbatim: oa = a*c - b*s, ob = a*s + b*c.
+        const float a = XB.x[base + i];
+        const float b = XB.x[base + nhalf + i];
+        const float c = CB.c[toff];
+        const float s = SB.s[toff];
+        OB.o[base + i] = a * c - b * s;
+        OB.o[base + nhalf + i] = a * s + b * c;
+    }
+}

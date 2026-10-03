@@ -873,6 +873,209 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// THE HOST-SIDE ORACLE for rope: `build_rope_table`'s own float64 loop, copied rather than paraphrased (it is
+// the thing the port must agree with, so it must not be re-derived from the description of it).  The kernel
+// receives this table, so the ONLY difference left between device and reference is one rotation step in float
+// instead of double.
+static void rope_table_host(int n_rot, double theta, int max_pos, std::vector<float>& ct, std::vector<float>& st) {
+    const int half = n_rot / 2;
+    ct.assign((size_t) max_pos * half, 0.0f);
+    st.assign((size_t) max_pos * half, 0.0f);
+    for (int p = 0; p < max_pos; ++p) {
+        for (int i = 0; i < half; ++i) {
+            const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
+            const double ang = (double) p * inv;
+            ct[(size_t) p * half + i] = (float) std::cos(ang);
+            st[(size_t) p * half + i] = (float) std::sin(ang);
+        }
+    }
+}
+
+// NEOX partial RoPE.  Three things this case exists to catch, all of them silent failures in the wild:
+//   * the ADJACENT-pair reading of the rotation (produces correctly-shaped scrambled output),
+//   * rotating the whole head_dim instead of the first n_rot (looks right on the first n_rot values),
+//   * an angle/table mismatch, which a relative-only comparison reports as a transcendental difference.
+// The tail is therefore asserted BIT-EXACT and the rotation uses a near-cancellation tolerance: `a*c - b*s`
+// cancels for some pairs, so a relative-only bound is both too loose where it cancels and too tight where the
+// values are large.  NEXT.md specifies `max(|want| * 2^-7, (|a| + |b|) * 2^-9)`; that constant is for kernels
+// that COMPUTE their angles on device (fast-math sin/cos differ in the last bits).  This port passes the table,
+// so the only error left is float-vs-double in one multiply-add and the bound is tightened to 2^-20 of the same
+// shape - a loose constant here would accept a rotation that is wrong by ~100x.  The worst ratio of
+// error-to-tolerance is printed, so the margin is visible instead of assumed.
+void case_rope(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "rope_neox.spv")) return;
+    const int head_dim = 256, n_rot = 64, half = n_rot / 2;
+    const double theta = 10000.0;
+    const int max_pos = 64;
+    const float TAIL = 1234.5f;   // a sentinel no rotation could produce, used by every case AND the in-place one
+    std::vector<float> ct, st;
+    rope_table_host(n_rot, theta, max_pos, ct, st);
+
+    struct RCase { int rows; std::vector<int> pos; bool mrope; const char* what; };
+    const RCase cases[] = {
+        {3, {0, 1, 7}, false, "position 0 (the identity rotation) beside ordinary positions"},
+        {4, {5, 5, 5, 5}, false, "every row sharing one position"},
+        {2, {63, 62}, false, "the last two table entries"},
+        {2, {0, 1}, true, "the mrope path: cell indices, with t/h/w sectors that differ"},
+    };
+    // The mrope table: cell -> (t, h, w) with distinct values, so a sector mistake cannot pass unnoticed.
+    const int32_t mtab[6] = {0, 1, 2, 3, 4, 5};
+
+    for (const RCase& c : cases) {
+        const int rows = c.rows;
+        const size_t n = (size_t) rows * head_dim;
+        const uint64_t slack = 64;                       // NaN pad after the output: an over-write must show
+        std::vector<float> x(n, 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            for (int d = 0; d < head_dim; ++d) {
+                x[(size_t) r * head_dim + d] = (d < n_rot) ? rndf(1.0f) : TAIL;
+            }
+        }
+        std::vector<float> ref(n, 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            const float* xr = &x[(size_t) r * head_dim];
+            float* rr = &ref[(size_t) r * head_dim];
+            for (int d = n_rot; d < head_dim; ++d) rr[d] = xr[d];
+            for (int i = 0; i < half; ++i) {
+                const int p = c.mrope ? mtab[c.pos[r] * 3 + (i % 3)] : c.pos[r];
+                const int toff = p * half + i;
+                const double a = xr[i], b = xr[half + i];
+                const double cc = ct[toff], ss = st[toff];
+                rr[i] = (float) (a * cc - b * ss);
+                rr[half + i] = (float) (a * ss + b * cc);
+            }
+        }
+        Buf bx = ctx.alloc(n * 4);
+        Buf bo = ctx.alloc((n + slack) * 4);
+        Buf bc = ctx.alloc(ct.size() * 4), bs = ctx.alloc(st.size() * 4);
+        Buf bp = ctx.alloc((uint64_t) rows * 4), bm = ctx.alloc(sizeof(mtab));
+        ctx.write(bx, x.data(), n * 4);
+        std::vector<float> out(n + slack, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(bo, out.data(), out.size() * 4);
+        ctx.write(bc, ct.data(), ct.size() * 4);
+        ctx.write(bs, st.data(), st.size() * 4);
+        ctx.write(bp, c.pos.data(), (uint64_t) rows * 4);
+        ctx.write(bm, mtab, sizeof(mtab));
+
+        const uint32_t groups = (uint32_t) ((rows + kLocalSize - 1) / kLocalSize);
+        VkPipeline p = ctx.pipeline(dir + "/rope_neox.spv", 6, 16);
+        struct { int rows, head_dim, n_rot, mrope; } pc{rows, head_dim, n_rot, c.mrope ? 1 : 0};
+        ctx.dispatch(p, {&bx, &bo, &bc, &bs, &bp, &bm}, &pc, sizeof(pc), groups);
+        ctx.read(bo, out.data(), out.size() * 4);
+
+        int bad = 0, tail_bad = 0, guard_bad = 0;
+        double worst_ratio = 0;
+        for (int r = 0; r < rows; ++r) {
+            const float* xr = &x[(size_t) r * head_dim];
+            for (int i = 0; i < half; ++i) {
+                const double a = xr[i], b = xr[half + i];
+                for (int off : {i, half + i}) {
+                    const double want = ref[(size_t) r * head_dim + off];
+                    const double got = out[(size_t) r * head_dim + off];
+                    const double tol = std::max(std::fabs(want) * 9.5367e-7, (std::fabs(a) + std::fabs(b)) * 9.5367e-7);
+                    const double ratio = std::fabs(got - want) / (tol + 1e-30);
+                    worst_ratio = std::max(worst_ratio, ratio);
+                    if (ratio > 1.0) ++bad;
+                }
+            }
+            // THE TAIL IS BIT-EXACT: zero tolerance, because a copy is exact and "close" would mean the kernel
+            // did arithmetic on values it was supposed to pass through.
+            for (int d = n_rot; d < head_dim; ++d) {
+                if (out[(size_t) r * head_dim + d] != TAIL) ++tail_bad;
+            }
+        }
+        for (uint64_t i = n; i < out.size(); ++i) {
+            if (!std::isnan(out[i])) ++guard_bad;
+        }
+        char label[96];
+        std::snprintf(label, sizeof label, "rope_neox %dx%d %s", rows, head_dim, c.mrope ? "mrope" : "text");
+        const bool ok = bad == 0 && tail_bad == 0 && guard_bad == 0;
+        std::printf("      %-34s %s\n", label, c.what);
+        verdict(label, ok, bad + tail_bad + guard_bad, (int) (rows * head_dim + slack), worst_ratio,
+                ok ? "worst err/tol ratio" : "failures (err/tol ratio shown)");
+        ctx.free(bx);
+        ctx.free(bo);
+        ctx.free(bc);
+        ctx.free(bs);
+        ctx.free(bp);
+        ctx.free(bm);
+    }
+
+    // IN PLACE: binding 1 may alias binding 0, and the kernel is written so that it is safe (each thread reads
+    // both halves of its pair before writing either).  Verified rather than assumed, because the aliasing case
+    // is the one a future edit - reordering the reads and writes - would break.
+    {
+        const int rows = 2;
+        const size_t n = (size_t) rows * head_dim;
+        std::vector<float> x(n, 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            for (int d = 0; d < head_dim; ++d) x[(size_t) r * head_dim + d] = (d < n_rot) ? rndf(1.0f) : TAIL;
+        }
+        std::vector<float> ref(n, 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            const float* xr = &x[(size_t) r * head_dim];
+            float* rr = &ref[(size_t) r * head_dim];
+            for (int d = n_rot; d < head_dim; ++d) rr[d] = xr[d];
+            for (int i = 0; i < half; ++i) {
+                const int toff = (r + 1) * half + i;
+                const double a = xr[i], b = xr[half + i], cc = ct[toff], ss = st[toff];
+                rr[i] = (float) (a * cc - b * ss);
+                rr[half + i] = (float) (a * ss + b * cc);
+            }
+        }
+        Buf bxx = ctx.alloc(n * 4);
+        Buf bc = ctx.alloc(ct.size() * 4), bs = ctx.alloc(st.size() * 4);
+        Buf bp = ctx.alloc((uint64_t) rows * 4), bm = ctx.alloc(sizeof(mtab));
+        ctx.write(bxx, x.data(), n * 4);
+        ctx.write(bc, ct.data(), ct.size() * 4);
+        ctx.write(bs, st.data(), st.size() * 4);
+        const std::vector<int> pos2 = {1, 2};
+        ctx.write(bp, pos2.data(), (uint64_t) rows * 4);
+        ctx.write(bm, mtab, sizeof(mtab));
+        VkPipeline p = ctx.pipeline(dir + "/rope_neox.spv", 6, 16);
+        struct { int rows, head_dim, n_rot, mrope; } pc{rows, head_dim, n_rot, 0};
+        ctx.dispatch(p, {&bxx, &bxx, &bc, &bs, &bp, &bm}, &pc, sizeof(pc), 1);
+        std::vector<float> out(n);
+        ctx.read(bxx, out.data(), n * 4);
+        int bad = 0, rot_bad = 0, tail_bad_ip = 0;
+        double worst_ip = 0;
+        for (int r = 0; r < rows; ++r) {
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t i = (size_t) r * head_dim + d;
+                if (d >= n_rot) {
+                    // a COPY: exact or wrong
+                    if (out[i] != TAIL) ++tail_bad_ip;
+                    continue;
+                }
+                // the rotation: float-vs-double again, so the same near-cancellation bound as the cases above
+                const double a = x[i < (size_t) r * head_dim + half ? i : i - half];
+                const double b = x[(size_t) r * head_dim + (d < half ? half + d : d - half)];
+                const double want = ref[i];
+                const double tol = std::max(std::fabs(want) * 9.5367e-7, (std::fabs(a) + std::fabs(b)) * 9.5367e-7);
+                const double ratio = std::fabs((double) out[i] - want) / (tol + 1e-30);
+                if (ratio > worst_ip) worst_ip = ratio;
+                if (ratio > 1.0) ++rot_bad;
+            }
+        }
+        bad = rot_bad + tail_bad_ip;
+        if (bad) {
+            std::printf("      in-place detail: %d rotation + %d tail mismatches; first row x/got/ref:\n", rot_bad,
+                        tail_bad_ip);
+            for (int d = 0; d < 4; ++d) {
+                std::printf("        [%d] x=%.8g got=%.8g ref=%.8g\n", d, x[d], out[d], ref[d]);
+            }
+            std::printf("        tail[64] x=%.8g got=%.8g ref=%.8g\n", x[64], out[64], ref[64]);
+        }
+        verdict("rope_neox in place (out aliases x)", bad == 0, bad, (int) n, worst_ip,
+                bad ? "failures (rotation + tail)" : "worst err/tol ratio");
+        ctx.free(bxx);
+        ctx.free(bc);
+        ctx.free(bs);
+        ctx.free(bp);
+        ctx.free(bm);
+    }
+}
+
 // THE FALLBACK GEMM.  No shape precondition, no device requirement: this is the path that must work everywhere
 // the CMA path does not - and the shapes the CMA path CANNOT take are the interesting ones here.  M=1 is a
 // single-token decode step; 17x13x5 is every kind of ragged edge at once; K=8 is below one matrix-unit tile.
@@ -1178,6 +1381,7 @@ int main(int argc, char** argv) {
     case_memory_budget(ctx);
     case_reserve_policy();
     case_reserve_refusal();
+    case_rope(ctx, dir);
     case_gemm_fma(ctx, dir);
     case_gemm_shape_contract();
     case_gemm_coopmat(ctx, dir);
