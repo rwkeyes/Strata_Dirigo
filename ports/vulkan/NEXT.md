@@ -180,11 +180,56 @@ Verified: the key/query/normalized reductions sit at 0.19-0.21 of a 1e-6 relativ
 history advance is bit-exact over 92176 floats with the guard past the state untouched. The history advance is
 in place and one thread owns a whole column - which is what makes the shift well-defined without a barrier.
 
-### Next: the GEMV wave
+## The GEMV wave: first two kernels in
 
-`native_bf16.cu`, `s_gemv.cu`, `s2_gemv*.cu` - throughput lives there, and the interface convention (weight
-layouts, not elementwise) gets its first real test. `ple.cu` also calls three things from that wave that are not
-yet ported: `s2_gemv_q8` (the key projection), `bf16_gemv_fp32_mmvf` (the value projection) and `to_bf16`.
+`s2_gemv_q8.comp` (the S2 weight format over a Q8_0 activation - PLE's key projection) and `bf16_mmvf_f32.comp`
+(the single-token BF16 matrix-vector product with an fp32 activation - PLE's value projection, and ssm_alpha/beta
+plus the QSA indexer projections). Both are the source's own shape: one workgroup per output row, the source's
+per-thread accumulator structure, then one workgroup reduction.
+
+**THE FUSED MAC IS NOW A CHECKED PROPERTY, NOT A COMMENT.** `bf16_mmvf_f32` uses `fma()` to match the source's
+`__fmaf_rn`, and the difference between a fused multiply-add and a separate multiply-then-add is *below the
+reduction-order noise* - it cannot be caught numerically. So the gate's census rule now requires
+`OpExtInst ... Fma` in that shader's SPIR-V, the same way it requires a subgroup reduction in the three reducers.
+An FMA emitted as Mul+Add is more accurate, which is exactly why it is the wrong answer: it changes the last bits
+of every term.
+
+Two testing techniques from this wave worth keeping:
+
+* **A layout probe makes a swap VISIBLE.** `bf16_mmvf_f32` reads each weight row as 32-bit pairs (element 2p low,
+  2p+1 high). In a sum over random data, swapping the halves is a rounding-level error and invisible; one row is
+  therefore built with its low halves at ~1e3 and its high halves at ~1e-3, which turns the same swap into a
+  three-orders-of-magnitude error.
+* **A ratio of exactly 0 is either exact agreement or a comparison of zeros.** `s2_gemv_q8` reported
+  `worst err/tol 0` on all rows, and the numbers now printed beside it are what make that a result rather than a
+  suspicion: `y[0] = -46391.4` with `max |y| = 46391.4`. The cases also FAIL a vacuous comparison (all expected
+  values ~0) explicitly.
+
+Also scored: distinct per-group scales and distinct per-block fp16 scales, so a wrong `q >> 4` or `(q*4)/32`
+index is an O(1) error; negative S2 scales; a zero-scale activation block and a large one; every 2-bit code value
+appearing; and the minimum legal geometry (n_in = 64, one S2 group; n_in = 2, a single weight pair).
+
+Tolerances are ranked against the double oracle: the S2 dot products came out at ratio 0 (the dominant terms are
+few and large), the BF16 products at 0.09 and 0.005 of a 1e-5 relative bound.
+
+### THE REST OF THE WAVE - and its size, which is the number that matters
+
+This is the biggest remaining area by a wide margin. Measured source sizes:
+
+| source | bytes | what it is |
+|---|---|---|
+| `iq_kernels.cu` | 76,615 | the IQ-family quants and their dot products |
+| `native_mmvq.cu` | 65,324 | the pinned CUDA quantized matvec (Q2_0/IQ3_XXS/IQ4_XS/Q8_0 paths) |
+| `s2_expert_grouped.cu` | 64,436 | the MoE expert GEMV, grouped by expert |
+| `s_gemv.cu` | 40,810 | the S-family (S2/S4/S8) GEMV and its sub-block variants |
+| `s2_gemv_fast.cu` | 7,297 | the dp4a/fast S2 path (the source itself defers this) |
+| `dequant_bf16.cu` | 12,762 | bf16 dequantisation |
+| `native_bf16.cu` | 8,428 | **partly done** - the multi-row MMVF (1..8 tokens) is not ported |
+
+~275 KB of CUDA in total, against ~40 KB ported so far this wave. **This is a scope decision, not a step**: the
+next natural slice is the multi-row MMVF (small, and the prompt path needs it), then `s_gemv`'s S2/S4/S8 family
+(the expert path), and `native_mmvq`/`iq_kernels` only if the port is meant to serve the quantized experts rather
+than the S-family ones. Worth stating before starting rather than after.
 
 Same shape as every case so far: read the CUDA source first, build the oracle from the engine's own function
 (never from a description of it), sentinel every range the kernel must not touch, and give each branch of the

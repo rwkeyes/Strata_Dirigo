@@ -1,0 +1,85 @@
+// ports/vulkan/shaders/s2_gemv_q8.comp - the S2 GEMV over Q8_0-quantized ACTIVATIONS (s2_gemv_q8.cu).
+//
+//     y[o] = sum over quads q of  sum_{j=0..3} (code_j(byte_q) - 1) * scales[o][q >> 4] * (int8(act) * dx)
+//
+// ONE WORKGROUP PER OUTPUT ROW, which is the source's shape (one CUDA block per `o`, reduced by
+// `threads_per_row`).  Three layout facts that make this kernel what it is:
+//
+//   * THE ACTIVATION IS Q8_0, not fp16.  `ggml_mul_mat` converts src1 to the weight's `vec_dot_type`, which for
+//     Q2_0 is Q8_0, and the CPU expert path already quantizes to int8 - so a fp16-activation kernel here would
+//     compute a different number for the same token.  The source measures that difference at 0.9498% relative.
+//     The block is 34 bytes, so the port can consume `quantize_q8_0`'s output directly.
+//   * THE S2 GROUP IS 64 ELEMENTS and there are 16 quads in it, which is why the scale index is `q >> 4`
+//     (the source writes it as the same shift).  A quad never straddles a group.
+//   * A QUAD NEVER STRADDLES A 32-ELEMENT Q8_0 BLOCK either, so `dx` is loaded once per quad - and the block
+//     index is `(q*4)/32` with the intra-block offset `(q*4)%32`, both of which are what makes the read correct
+//     rather than merely in range.
+//
+// The per-thread structure is the source's: four accumulators (one per code position in the byte) combined as
+// (a0+a1)+(a2+a3), then one workgroup reduction.  The SOURCE's tree is a halving loop over `threads_per_row`
+// (8 in the PLE call); the port reduces over a 256-wide workgroup, so the summation ORDER differs and the last
+// bits differ with it - compared against a double reference, never bit-for-bit.
+//
+// `__dp4a` is NOT used.  The source's own header calls this the correctness version and defers the four-int8-MAC
+// instruction to a later phase "once the numerics are settled", and a fast kernel whose numerics were wrong
+// would be indistinguishable from a correct one.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ACT { uint8_t b[]; } act;
+layout(set = 0, binding = 1, std430) readonly buffer CODES { uint8_t b[]; } codes;
+layout(set = 0, binding = 2, std430) readonly buffer SCALES { float v[]; } scales;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; } pc;
+
+const uint QK_S2 = 64u;
+const uint QK8_0 = 32u;
+const uint QK8_BYTES = 34u;
+
+// SIGN-EXTENDED BY HAND.  A uint8 -> int8 conversion's behaviour is not something to leave implicit in a kernel
+// whose whole job is to reproduce someone else's numbers.
+float act_q8(uint byte_index, float dx) {
+    const int raw = int(act.b[byte_index]);
+    return float(raw > 127 ? raw - 256 : raw) * dx;
+}
+
+void main() {
+    const uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.n_out)) return;                 // workgroup-uniform: the reduction's barriers stay legal
+
+    const uint n_in = uint(pc.n_in);
+    const uint n_quads = n_in / 4u;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint cbase = o * n_quads;
+    const uint sbase = o * (n_in / QK_S2);
+
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    for (uint q = lid; q < n_quads; q += lsize) {
+        const uint byte = uint(codes.b[cbase + q]);
+        const float d = scales.v[sbase + (q >> 4u)];
+        const uint blk = ((q * 4u) / QK8_0) * QK8_BYTES;
+        const uint dbits = uint(act.b[blk]) | (uint(act.b[blk + 1u]) << 8u);
+        const float dx = unpackHalf2x16(dbits).x;    // exact widening; the engine's f32_from_f16 agrees here
+        const uint off = (q * 4u) % QK8_0;
+
+        const float w0 = float(int(byte & 3u) - 1) * d;
+        const float w1 = float(int((byte >> 2u) & 3u) - 1) * d;
+        const float w2 = float(int((byte >> 4u) & 3u) - 1) * d;
+        const float w3 = float(int((byte >> 6u) & 3u) - 1) * d;
+        a0 += w0 * act_q8(blk + 2u + off + 0u, dx);
+        a1 += w1 * act_q8(blk + 2u + off + 1u, dx);
+        a2 += w2 * act_q8(blk + 2u + off + 2u, dx);
+        a3 += w3 * act_q8(blk + 2u + off + 3u, dx);
+    }
+
+    const float total = wg_sum((a0 + a1) + (a2 + a3));
+    if (lid == 0u) y.v[o] = total;
+}

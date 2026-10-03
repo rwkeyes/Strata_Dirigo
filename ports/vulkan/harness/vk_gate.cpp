@@ -873,6 +873,194 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// ---- the GEMV wave's first two kernels, transcribed from their sources ----
+//
+// The wave is where the port stops being elementwise: these are WEIGHT LAYOUTS, and the layout is the contract.
+// Both oracles mirror the source's TERM arithmetic exactly (same f32 term computation, same pair order) and
+// differ only in the SUMMATION, which is where the port's reduction order legitimately differs from CUDA's - so
+// they accumulate in double and the comparison is a tolerance, never bit-equality.
+static double s2_gemv_q8_host_row(const std::vector<uint8_t>& act, const std::vector<uint8_t>& codes,
+                                  const std::vector<float>& scales, int o, int n_in) {
+    const int n_quads = n_in / 4, n_groups = n_in / 64;
+    double sum = 0.0;
+    for (int q = 0; q < n_quads; ++q) {
+        const uint8_t byte = codes[(size_t) o * n_quads + q];
+        const float d = scales[(size_t) o * n_groups + (q >> 4)];
+        const uint8_t* blk = &act[(size_t) ((q * 4) / 32) * 34];
+        const uint16_t dbits = (uint16_t) (blk[0] | (blk[1] << 8));
+        const float dx = strata::kernels::f32_from_f16(dbits);
+        const int8_t* xq = reinterpret_cast<const int8_t*>(blk + 2);
+        const int off = (q * 4) % 32;
+        for (int j = 0; j < 4; ++j) {
+            const float w = (float) (((byte >> (2 * j)) & 3) - 1) * d;
+            const float term = w * ((float) xq[off + j] * dx);   // the device's f32 term, exactly
+            sum += (double) term;                                // summed in double: order differs on device
+        }
+    }
+    return sum;
+}
+
+static double bf16_mmvf_host_row(const std::vector<float>& x, const std::vector<uint16_t>& w, int o, int n_in) {
+    double sum = 0.0;
+    for (int i = 0; i < n_in; i += 2) {
+        const float w0 = strata::kernels::f32_from_bf16(w[(size_t) o * n_in + i]);
+        const float w1 = strata::kernels::f32_from_bf16(w[(size_t) o * n_in + i + 1]);
+        sum += (double) w0 * (double) x[i] + (double) w1 * (double) x[i + 1];
+    }
+    return sum;
+}
+
+// s2_gemv_q8: the S2 weight format over a Q8_0 ACTIVATION.  Two shapes (the PLE geometry and the minimum legal
+// one), and a block set built so that every index in the kernel is falsifiable:
+//   * the scales are DISTINCT PER GROUP, so a wrong group index (`q >> 4`) is an O(1) error rather than a
+//     rounding difference;
+//   * the activation blocks have DISTINCT fp16 scales, so a wrong block index (`(q*4)/32`) or offset is visible
+//     the same way, and one block's scale is ZERO and one is large;
+//   * every code byte covers all four 2-bit fields, i.e. all four code values (-1, 0, 1, 2) appear;
+//   * a few scales are NEGATIVE, which is legal for S2 and flips the sign of that group's contribution.
+void case_s2_gemv_q8(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s2_gemv_q8.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("s2_gemv_q8", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    for (const int shape : {0, 1}) {
+        const int n_in = shape == 0 ? 2560 : 64;
+        const int n_out = shape == 0 ? 8 : 1;
+        const int n_quads = n_in / 4, n_groups = n_in / 64, n_blocks = n_in / 32;
+        std::vector<uint8_t> act((size_t) n_blocks * 34, 0);
+        for (int b = 0; b < n_blocks; ++b) {
+            // distinct scales per block, with a zero and a large one: a misindexed block cannot look right
+            const float d = (b == 1) ? 0.0f : ((b == 2) ? 64.0f : 0.125f * (float) (b + 1));
+            const uint16_t bits = strata::kernels::f16_from_f32(d);
+            act[(size_t) b * 34] = (uint8_t) (bits & 0xFF);
+            act[(size_t) b * 34 + 1] = (uint8_t) (bits >> 8);
+            for (int i = 0; i < 32; ++i) {
+                act[(size_t) b * 34 + 2 + i] = (uint8_t) (int8_t) (((i * 7 + b * 3) % 255) - 127);
+            }
+        }
+        std::vector<uint8_t> codes((size_t) n_out * n_quads, 0);
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) ((i * 37 + 11) & 0xFF);   // all four fields
+        std::vector<float> scales((size_t) n_out * n_groups, 0.0f);
+        for (int o = 0; o < n_out; ++o) {
+            for (int g = 0; g < n_groups; ++g) {
+                const float mag = 0.0625f * (float) (g + 1);
+                scales[(size_t) o * n_groups + g] = ((g % 5) == 3) ? -mag : mag;   // negative groups too
+            }
+        }
+        std::vector<float> want(n_out, 0.0f);
+        for (int o = 0; o < n_out; ++o) {
+            want[o] = (float) s2_gemv_q8_host_row(act, codes, scales, o, n_in);
+        }
+
+        Buf b_act = ctx.alloc(act.size()), b_codes = ctx.alloc(codes.size()), b_scales = ctx.alloc(scales.size() * 4);
+        Buf b_y = ctx.alloc((size_t) n_out * 4 + 64);
+        ctx.write(b_act, act.data(), act.size());
+        ctx.write(b_codes, codes.data(), codes.size());
+        ctx.write(b_scales, scales.data(), scales.size() * 4);
+        std::vector<uint8_t> sink((size_t) n_out * 4 + 64, 0xC3);
+        ctx.write(b_y, sink.data(), sink.size());
+        struct { int n_in; int n_out; } pc{n_in, n_out};
+        VkPipeline p = ctx.pipeline(dir + "/s2_gemv_q8.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_act, &b_codes, &b_scales, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+        std::vector<uint8_t> img((size_t) n_out * 4 + 64);
+        ctx.read(b_y, img.data(), img.size());
+        const float* got = reinterpret_cast<const float*>(img.data());
+        int bad = 0;
+        double worst = 0;
+        for (int o = 0; o < n_out; ++o) {
+            const double dev = std::fabs((double) got[o] - (double) want[o]);
+            const double ratio = dev / (1e-5 * std::fabs((double) want[o]) + 1e-6);
+            worst = std::max(worst, ratio);
+            if (ratio > 1.0) ++bad;
+        }
+        for (size_t i = (size_t) n_out * 4; i < img.size(); ++i) {
+            if (img[i] != 0xC3) ++bad;                       // the guard past the output row
+        }
+        char label[80];
+        std::snprintf(label, sizeof label, "s2_gemv_q8 (n_in=%d, n_out=%d, %s)", n_in, n_out,
+                      shape == 0 ? "PLE key geometry" : "one S2 group");
+        double mass = 0, biggest = 0;
+        for (int o = 0; o < n_out; ++o) {
+            mass += std::fabs((double) want[o]);
+            biggest = std::max(biggest, std::fabs((double) want[o]));
+        }
+        // A ratio of exactly 0 is either exact agreement or a comparison of zeros.  Printing the magnitude and
+        // failing a vacuous one is how the two are told apart - an assertion over an empty input passes.
+        std::printf("      y[0] = %.6g, max |y| = %.6g (worst err/tol %.3g)\n", (double) got[0], biggest, worst);
+        const bool live = mass > 1e-3;
+        if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+        verdict(label, bad == 0 && live, bad, n_out, worst, "rows outside tolerance (worst err/tol)");
+        ctx.free(b_act); ctx.free(b_codes); ctx.free(b_scales); ctx.free(b_y);
+    }
+}
+
+// bf16_mmvf_f32: a BF16 weight against an FP32 activation.
+//
+// The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
+// distinguishable from the reduction-order noise in a numeric comparison.  What the numeric cases check is the
+// LAYOUT: row 1 has its low halves at ~1e3 and its high halves at ~1e-3, so pairing element 2p with the high half
+// instead of the low one is a three-orders-of-magnitude error rather than a rounding difference - and in a sum of
+// random data that swap is otherwise invisible.
+void case_bf16_mmvf(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "bf16_mmvf_f32.spv")) return;
+    for (const int shape : {0, 1}) {
+        const int n_in = shape == 0 ? 2560 : 2;
+        const int n_out = shape == 0 ? 16 : 1;
+        std::vector<float> x(n_in);
+        for (int i = 0; i < n_in; ++i) x[i] = rndf(1.0f);
+        std::vector<uint16_t> w((size_t) n_out * n_in, 0);
+        for (int o = 0; o < n_out; ++o) {
+            for (int i = 0; i < n_in; ++i) {
+                float v = rndf(1.0f);
+                if (o == 1 && shape == 0) v = (i % 2 == 0) ? 1000.0f * (1.0f + 0.25f * rndf(1.0f))
+                                                           : 0.001f * (1.0f + 0.25f * rndf(1.0f));
+                if (o == 2 && shape == 0) v = 0.0f;                      // an all-zero weight row
+                w[(size_t) o * n_in + i] = strata::kernels::bf16_from_f32(v);
+            }
+        }
+        std::vector<float> want(n_out, 0.0f);
+        for (int o = 0; o < n_out; ++o) want[o] = (float) bf16_mmvf_host_row(x, w, o, n_in);
+
+        Buf b_x = ctx.alloc((size_t) n_in * 4);
+        Buf b_w = ctx.alloc((size_t) n_out * n_in * 2);
+        Buf b_y = ctx.alloc((size_t) n_out * 4 + 64);
+        ctx.write(b_x, x.data(), (size_t) n_in * 4);
+        ctx.write(b_w, w.data(), (size_t) n_out * n_in * 2);
+        std::vector<uint8_t> sink((size_t) n_out * 4 + 64, 0x5E);
+        ctx.write(b_y, sink.data(), sink.size());
+        struct { int n_in; int n_out; } pc{n_in, n_out};
+        VkPipeline p = ctx.pipeline(dir + "/bf16_mmvf_f32.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_x, &b_w, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+        std::vector<uint8_t> img((size_t) n_out * 4 + 64);
+        ctx.read(b_y, img.data(), img.size());
+        const float* got = reinterpret_cast<const float*>(img.data());
+        int bad = 0;
+        double worst = 0;
+        for (int o = 0; o < n_out; ++o) {
+            const double dev = std::fabs((double) got[o] - (double) want[o]);
+            const double ratio = dev / (1e-5 * std::fabs((double) want[o]) + 1e-6);
+            worst = std::max(worst, ratio);
+            if (ratio > 1.0) ++bad;
+        }
+        for (size_t i = (size_t) n_out * 4; i < img.size(); ++i) {
+            if (img[i] != 0x5E) ++bad;
+        }
+        char label[80];
+        std::snprintf(label, sizeof label, "bf16_mmvf_f32 (n_in=%d, n_out=%d)", n_in, n_out);
+        double mass = 0;
+        for (int o = 0; o < n_out; ++o) mass += std::fabs((double) want[o]);
+        std::printf("      max |y| = %.6g (worst err/tol %.3g)\n", (double) *std::max_element(want.begin(), want.end(),
+                    [](float a, float b) { return std::fabs(a) < std::fabs(b); }), worst);
+        verdict(label, bad == 0 && mass > 1e-3, bad, n_out, worst, "rows outside tolerance (worst err/tol)");
+        ctx.free(b_x); ctx.free(b_w); ctx.free(b_y);
+    }
+    // the deep/shallow pair split, called out as its own check: row 1 is the adversarial row above
+    {
+        std::printf("      row 1 of the 2560-wide case is the layout probe: low halves ~1e3, high halves ~1e-3\n");
+    }
+}
+
 // ---- the PLE block's non-GEMV half, transcribed from ple.cu ----
 //
 // FROM THE CUDA SOURCE, not from a description of it.  The oracle is a stage-by-stage transcription, so the
@@ -2485,6 +2673,8 @@ int main(int argc, char** argv) {
     case_quantize_q8_0(ctx, dir);
     case_quantize_q8_K(ctx, dir);
     case_ple(ctx, dir);
+    case_s2_gemv_q8(ctx, dir);
+    case_bf16_mmvf(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

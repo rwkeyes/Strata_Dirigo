@@ -1,0 +1,71 @@
+// ports/vulkan/shaders/bf16_mmvf_f32.comp - the single-token BF16 matrix-vector product with an FP32 activation
+// (native_bf16.cu's bf16_f32_mmvf_kernel, adapted there from llama.cpp mmvf.cu).
+//
+//     y[o] = sum_i bf16_to_f32(w[o][i]) * x[i]
+//
+// ONE WORKGROUP PER OUTPUT ROW.  A BF16 weight has no codes and no scales, so none of the `s_gemv` machinery
+// applies; six tensors per layer are in this state (ssm_alpha/beta, the QSA indexer projections, ple_value,
+// ffn_gate_inp).
+//
+// THREE DETAILS THAT ARE NOT STYLE:
+//
+//   * THE FMA IS FUSED.  The source is `acc = __fmaf_rn(w, x, acc)` per element, in that order, and the single
+//     rounding of a fused multiply-add is not the same as a separate multiply and add.  GLSL's `fma()` is
+//     defined as the correctly rounded `a*b+c`, so it is the same operation - but it must be written as `fma`,
+//     not as `acc += w*x`, or the whole kernel drifts by a hair per term.
+//   * THE PAIR ORDER IS (2p, 2p+1), and the activation is read as consecutive PAIRS because the source views
+//     both sides as 2-wide vectors (a uint32 of two bf16 weights, a float2 of two activations).  Reading the
+//     halves in the other order swaps adjacent elements and is invisible in a sum of random data - the gate
+//     checks it with a weight row whose halves differ by orders of magnitude.
+//   * THE ACCUMULATOR ORDER IS PER-THREAD AND STRIDED.  Thread `t` takes pairs `t`, `t+256`, ... - not a
+//     contiguous span - so the partial sums are the source's.  The REDUCTION differs from the source's
+//     shuffle-xor butterfly (32 lanes, steps 16/8/4/2/1, then one more over the warps) because the port cannot
+//     assume a subgroup width; both are correct sums and they differ in the last bits, so the gate compares
+//     against a double reference.
+//
+// WHAT IS NOT PORTED HERE: the multi-row variant (bf16_f32_mmvf_multi_kernel, 1..8 activation rows sharing one
+// pass over the weight row).  It is a separate kernel with its own block-size selection, and the PLE call uses
+// the single-row entry.  Named rather than silently absent.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;
+// read as 32-bit PAIRS, which is the source's own view of the weight row (`const uint32_t* weights2`)
+layout(set = 0, binding = 1, std430) readonly buffer W { uint v[]; } w;
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; } pc;
+
+const uint QK8_BYTES = 34u;
+
+// bf16 -> f32 is a pure widening (`bf16_bits.hpp`'s f32_from_bf16 is `bitcast(h << 16)`), so there is no
+// rounding here to get wrong.
+float bf16_to_f32(uint h) { return uintBitsToFloat(h << 16u); }
+
+void main() {
+    const uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.n_out)) return;
+
+    const uint n_in = uint(pc.n_in);
+    const uint n_pairs = n_in / 2u;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+    // the weight row as 32-bit pairs: element (2p) in the LOW half, (2p+1) in the high half
+    const uint wbase = o * n_pairs;
+
+    float acc = 0.0;
+    for (uint pair = lid; pair < n_pairs; pair += lsize) {
+        const uint packed = w.v[wbase + pair];
+        const float w0 = bf16_to_f32(packed & 0xFFFFu);
+        const float w1 = bf16_to_f32(packed >> 16u);
+        acc = fma(w0, x.v[2u * pair], acc);          // element 2p
+        acc = fma(w1, x.v[2u * pair + 1u], acc);     // element 2p+1
+    }
+
+    const float total = wg_sum(acc);
+    if (lid == 0u) y.v[o] = total;
+}

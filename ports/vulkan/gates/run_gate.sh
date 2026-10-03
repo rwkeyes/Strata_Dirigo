@@ -61,14 +61,24 @@ for f in "${comps[@]}"; do
   # reduction, so any of those appearing in the others is an embellishment (the model-port analogue: a plain
   # gather came back with a subgroup reduction plus an atomicAdd, commented as "safer").
   census="$(spirv-dis "$SH/$name.spv" | grep -oE 'OpGroupNonUniform[A-Za-z]*|OpControlBarrier|OpAtomic[A-Za-z]*' | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"
+  # An FMA that was emitted as a separate multiply and add is the classic silent numeric drift: it is MORE
+  # accurate, so it looks like an improvement, and it changes the last bits of every term.  Where the source
+  # uses __fmaf_rn the SPIR-V must carry the fused operation.
+  fma="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpExtInst .* Fma ')"
   case "$name" in
-    rms_norm|ple_gnorm|ple_gate)
+    rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32)
       grep -q 'OpGroupNonUniformFAdd' <<<"$census" || fail "$name (no subgroup reduction in the SPIR-V - the kernel did not lower its sum)"
       ;;
     *)
       if [ -n "$census" ]; then
         fail "$name (unexpected ops: $census - the CUDA source has no subgroup op, barrier or atomic here)"
       fi
+      ;;
+  esac
+  # a SEPARATE rule, because a kernel can legitimately need both a reduction and a fused MAC
+  case "$name" in
+    bf16_mmvf_f32)
+      [ "$fma" -ge 1 ] || fail "$name (no fused Fma in the SPIR-V - the MAC was emitted as a separate multiply and add)"
       ;;
   esac
   printf '  OK   %-22s %s | census: %s\n' "$name" "$ls_line" "${census:-none}"
