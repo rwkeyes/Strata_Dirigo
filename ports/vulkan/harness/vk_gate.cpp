@@ -53,6 +53,7 @@ using portvk::stack_advisories;
 using portvk::resolve_icd_library;
 using portvk::parse_so_version;
 using portvk::IcdEntry;
+using portvk::gemm_shape_ok;
 using portvk::firmware_present_in;
 
 namespace {
@@ -872,6 +873,29 @@ void case_icd_resolution() {
     std::remove(good.c_str());
 }
 
+// The GEMM's shape precondition, tested in both directions.  The negative controls matter more than the positive
+// ones here: M=1 is the shape a decode step actually produces, and dispatching it silently computes nothing.
+void case_gemm_shape_contract() {
+    struct C { uint32_t m, n, k; bool ok; const char* what; };
+    const C cases[] = {
+        {64, 64, 64, true, "square multiples of 16 rejected"},
+        {32, 16, 48, true, "non-square, K=48 (a multiple of 16) rejected"},
+        {16, 16, 16, true, "the smallest legal shape rejected"},
+        {1, 4096, 4096, false, "M=1 - the decode shape - was ACCEPTED, and the kernel would compute nothing"},
+        {64, 64, 8, false, "K=8 (below one tile) was accepted"},
+        {0, 64, 64, false, "a zero dimension was accepted"},
+        {17, 64, 64, false, "17 (not a multiple of 16) was accepted"},
+    };
+    int bad = 0;
+    for (const C& c : cases) {
+        if (gemm_shape_ok(c.m, c.n, c.k) != c.ok) {
+            std::printf("      %s\n", c.what);
+            ++bad;
+        }
+    }
+    verdict("gemm shape contract (7 cases)", bad == 0, bad, 7, 0.0, "wrong verdicts");
+}
+
 // THE MATRIX-UNIT PATH (VK_KHR_cooperative_matrix).  This is the only case here whose kernel the toolchain can
 // build for ANY device and which still cannot RUN on most of them: the config is hardware, and the driver's own
 // list is the only authority.  Measured on RADV: 14 configs, all M16 N16 K16 subgroup-scope, and the only
@@ -891,6 +915,17 @@ void case_gemm_coopmat(Ctx& ctx, const std::string& dir) {
         return;
     }
     struct Shape { int m, n, k; };
+    // Every shape the case dispatches must satisfy the contract FIRST.  Without this, editing one of them to a
+    // ragged shape would leave the output buffer untouched and the comparison would read that as a numeric
+    // failure at best; with it, the reason is stated.
+    {
+        const Shape contract_shapes[] = {{64, 64, 64}, {32, 16, 48}, {16, 64, 32}};
+        int bad = 0;
+        for (const Shape& sh : contract_shapes) {
+            if (!gemm_shape_ok((uint32_t) sh.m, (uint32_t) sh.n, (uint32_t) sh.k)) ++bad;
+        }
+        verdict("gemm_coopmat test shapes satisfy the contract", bad == 0, bad, 3, 0.0, "invalid shapes");
+    }
     // Three shapes on purpose.  The square one cannot tell the two tile-grid axes apart (transposing the
     // mapping still visits every tile), so one wide and one tall case are required: {32,16,48} caught the
     // transposed row/column mapping that the square case passed with.
@@ -1076,6 +1111,7 @@ int main(int argc, char** argv) {
     case_memory_budget(ctx);
     case_reserve_policy();
     case_reserve_refusal();
+    case_gemm_shape_contract();
     case_gemm_coopmat(ctx, dir);
     case_copy(ctx, dir);
     case_scale(ctx, dir);

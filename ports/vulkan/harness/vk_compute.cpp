@@ -45,6 +45,12 @@ std::vector<uint8_t> read_file(const std::string& path) {
 // floor (a compositor needs something, so a caller asking for nothing still gets the floor), at most
 // `cap_percent_of_heap` of the card (a small card must stay usable for the engine at all), and a request in
 // between is taken as given.
+bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k) {
+    constexpr uint32_t TILE = 16;
+    if (m == 0 || n == 0 || k == 0) return false;
+    return m % TILE == 0 && n % TILE == 0 && k % TILE == 0;
+}
+
 ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes, uint64_t floor_bytes,
                                        uint32_t cap_percent_of_heap) {
     ReserveDecision d{};

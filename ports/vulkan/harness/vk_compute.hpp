@@ -53,6 +53,15 @@ struct ReserveDecision {
     bool clamped_by_cap = false;   // the requested reserve exceeded the fraction cap
     bool raised_to_floor = false;  // the requested reserve was below the floor
 };
+// The GEMM's shape precondition, as a testable predicate rather than a comment in a shader.
+//
+// WHY IT EXISTS: the cooperative-matrix kernel derives `tiles_m = m / 16` and everything returns when the tile
+// count is zero.  An M=1 dispatch (single-token decode) therefore computes NOTHING and leaves the output buffer
+// untouched - the caller reads stale or uninitialised memory and no layer reports a problem.  That is the exact
+// failure this port refuses everywhere else ("refuse, never degrade"), so the precondition is enforced at the
+// boundary instead of documented: all three dimensions must be non-zero multiples of the 16x16 tile.
+bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k);
+
 ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes,
                                        uint64_t floor_bytes, uint32_t cap_percent_of_heap);
 
