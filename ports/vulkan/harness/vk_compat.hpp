@@ -67,6 +67,14 @@ bool parse_mesa_version(const std::string& driver_info, int& major, int& minor, 
 // notes from 6.14), so a vendor-only rule would be wrong for one of them.
 std::vector<Advisory> compat_advisories(const HostEnv& env, uint32_t vendor_id, uint32_t device_id,
                                         bool budget_from_driver);
+// Intel GPU generation, from the PCI device id.  The support rules are PER GENERATION, not per vendor: an
+// Alchemist card is fully supported from kernel 6.2 and a Battlemage one from 6.12, so applying a single line
+// to both would refuse a working card.  Source: Intel's own KMD support tables
+// (dgpu-docs.intel.com/overview/supported-hardware/{i915,xe}-driver-gpus.html).
+enum class IntelGen { Unknown, Alchemist, Battlemage };
+IntelGen intel_generation(uint32_t device_id);
+const char* intel_device_name(uint32_t device_id);   // nullptr when the id is not in the table
+
 bool any_fatal(const std::vector<Advisory>& v);
 
 // True when the device's local heap is small relative to host RAM, i.e. a real discrete card rather than a

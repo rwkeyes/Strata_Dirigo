@@ -582,56 +582,109 @@ void case_reserve_policy() {
 // fails if a boundary moves, rather than passing on prose it merely recognises.
 void case_compat_rules() {
     const uint32_t INTEL = 0x8086, AMD = 0x1002;
-    const uint32_t B580 = 0xe20b, ARC_PRO_B70 = 0xe223;
+    const uint32_t B580 = 0xe20b, ARC_PRO_B70 = 0xe223, ARC_PRO_B50 = 0xe212;
+    const uint32_t A770 = 0x56a0, A770M = 0x5690;    // Alchemist: desktop and mobile parts
     struct Case { const char* rel; uint32_t vendor; uint32_t device; const char* mesa; bool budget;
-                  const char* must_have; const char* must_not; const char* what; };
+                  const char* module; const char* must_have; const char* must_not; const char* must_not2;
+                  const char* what; };
+    // Two distinct refusals and the bands around them, per generation, plus the two "must not warn" checks which
+    // are what catch a rule that leaks one generation's advice onto another.
     const Case cases[] = {
-        {"6.11.0", INTEL, B580, "Mesa 26.2.0", true, "first mainline kernel", "",
-         "6.11 cannot drive an Arc B580 (fatal)"},
-        {"6.12.0", INTEL, B580, "Mesa 26.2.0", true, "compute-load crashes", "first mainline kernel",
-         "6.12 is the B580 floor: runs, but still the crash range"},
-        {"6.13.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "later Battlemage part", "",
+        // --- Battlemage / Xe2 (Intel's table: B580 initial 6.11, full 6.12) ---
+        {"6.10.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "predates the device", "initial-support band", "",
+         "6.10 predates the B580's initial support (fatal)"},
+        {"6.11.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "initial-support band", "predates the device", "",
+         "6.11 is the B580's initial band: it warns, it does not refuse"},
+        {"6.12.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "compute-load crashes", "initial-support band", "",
+         "6.12 reaches full support and lands in the CCS crash range"},
+        {"6.13.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "xe", "predates the device", "", "",
          "the same 6.13 IS fatal for the Arc Pro B70 - the floor is per card"},
-        {"6.14.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "compute-load crashes", "later Battlemage part",
-         "6.14 clears the Arc Pro floor and warns instead"},
-        {"6.19.0", INTEL, B580, "Mesa 26.2.0", true, "compute-load crashes", "", "6.19 is still in the warn range"},
-        {"7.0.0", INTEL, B580, "Mesa 26.2.0", true, "preemption timeout", "compute-load crashes",
-         "7.0 leaves the warn range and carries the preempt-timeout note"},
-        {"7.1.0", INTEL, B580, "Mesa 26.2.0", true, "CONFLICTING", "", "7.1's conflicting performance reports"},
-        {"7.2.0", INTEL, B580, "Mesa 26.2.0", true, "", "CONFLICTING", "7.2 drops the 7.1 performance note"},
-        {"7.2.0", INTEL, B580, "Mesa 26.2.0", true, "", "TTM eviction", "7.2 has no TTM note"},
-        {"7.3.0", INTEL, B580, "Mesa 26.2.0", true, "TTM eviction", "", "7.3 makes TTM eviction aggressive"},
-        {"7.4.0", INTEL, B580, "Mesa 26.2.0", true, "migration queue", "", "7.4 brings the Battlemage bind work"},
-        {"7.0.0", INTEL, B580, "Mesa 25.2.8", false, "26.2", "", "old Mesa + no driver figure -> warn"},
-        {"7.0.0", INTEL, B580, "Mesa 26.2.0", false, "", "predates VK_EXT_memory_budget",
+        {"6.14.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "xe", "compute-load crashes", "predates the device",
+         "", "6.14 clears the Arc Pro floor and warns instead"},
+        {"6.14.0", INTEL, ARC_PRO_B70, "Mesa 26.2.0", true, "xe", "6.17", "", "",
+         "the B70 note records Intel's 6.17 full-support figure against our 6.14 floor"},
+        {"6.11.0", INTEL, ARC_PRO_B50, "Mesa 26.2.0", true, "xe", "initial-support band", "predates the device",
+         "", "the B50 also starts at 6.11 (its full support is 6.14, so 6.12/6.13 warn rather than crash-warn)"},
+        {"6.19.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "compute-load crashes", "", "",
+         "6.19 is still in the crash range"},
+        {"7.0.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "preemption timeout", "compute-load crashes", "",
+         "7.0 leaves the crash range and carries the preempt-timeout note"},
+        {"7.1.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "CONFLICTING", "", "",
+         "7.1's conflicting performance reports"},
+        {"7.2.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "", "CONFLICTING", "", "7.2 drops the 7.1 note"},
+        {"7.2.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "", "TTM eviction", "", "7.2 has no TTM note"},
+        {"7.3.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "TTM eviction", "", "",
+         "7.3 makes TTM eviction aggressive"},
+        {"7.4.0", INTEL, B580, "Mesa 26.2.0", true, "xe", "migration queue", "", "",
+         "7.4 brings the Battlemage bind work"},
+        {"7.0.0", INTEL, B580, "Mesa 25.2.8", false, "xe", "26.2", "", "", "old Mesa + no driver figure -> warn"},
+        {"7.0.0", INTEL, B580, "Mesa 26.2.0", false, "xe", "", "predates VK_EXT_memory_budget", "",
          "Mesa 26.2 silences the same warning"},
-        {"7.0.0", AMD, 0x744c, "Mesa 25.2.8", false, "outside every range", "", "a non-Intel device gets no Intel rules"},
-        {"7.3.0-rc5", INTEL, B580, "Mesa 26.2.0", true, "prerelease", "", "a prerelease kernel is called out"},
+        // --- Alchemist / Xe-HPG (Intel's table: desktop+Pro initial 6.0, full 6.2; mobile initial 5.19) ---
+        {"5.10.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "predates the device", "compute-load crashes", "",
+         "5.10 predates Alchemist support entirely"},
+        {"6.0.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "initial-support band", "predates the device", "",
+         "6.0 is Alchemist's initial-support band"},
+        {"6.2.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "", "initial-support band", "compute-load crashes",
+         "6.2 is Alchemist full support: no kernel advisory and never the Xe2 crash warning"},
+        {"6.6.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "", "predates the device", "compute-load crashes",
+         "6.6 LTS drives an A770 - the rule that refused this was wrong"},
+        {"6.11.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "", "predates the device", "",
+         "PER-GENERATION: the kernel that is the B580's initial band is ordinary for Alchemist"},
+        {"5.19.0", INTEL, A770M, "Mesa 26.2.0", true, "i915", "initial-support band", "predates the device", "",
+         "the mobile Alchemist parts start one release earlier (5.19)"},
+        {"6.2.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "cooperative matrix", "", "",
+         "Alchemist carries the cooperative-matrix-regresses note"},
+        {"6.6.0", INTEL, A770, "Mesa 26.2.0", true, "xe", "no DG2/Alchemist", "", "",
+         "xe on an Alchemist card warns (Intel's Xe table has no DG2 part)"},
+        {"6.6.0", INTEL, A770, "Mesa 26.2.0", true, "i915", "", "preemption timeout", "",
+         "an Alchemist card on i915 gets NO Xe-driver notes (that is the module distinction working)"},
+        {"6.6.0", INTEL, A770, "Mesa 26.2.0", true, "xe", "preemption timeout", "", "",
+         "the same card ON XE does get the Xe-driver notes"},
+        {"6.5.0", INTEL, 0x1234, "Mesa 26.2.0", true, "i915", "not in the generation table", "predates the device",
+         "", "an unrecognised Intel id gets no invented floor"},
+        {"7.0.0", AMD, 0x744c, "Mesa 25.2.8", false, "", "outside every range", "", "",
+         "a non-Intel device gets no Intel rules"},
+        {"7.3.0-rc5", INTEL, B580, "Mesa 26.2.0", true, "xe", "prerelease", "", "",
+         "a prerelease kernel is called out"},
     };
     int bad = 0;
     for (const Case& c : cases) {
         HostEnv e{};
         e.kernel = parse_kernel_release(c.rel);
         e.mesa_version = c.mesa;
+        if (c.module && c.module[0]) e.drm_modules.push_back(c.module);
         const std::vector<Advisory> adv = compat_advisories(e, c.vendor, c.device, c.budget);
         std::string all;
         for (const Advisory& a : adv) all += a.text + "\n";
         const bool have = c.must_have[0] == '\0' || all.find(c.must_have) != std::string::npos;
         const bool avoid = c.must_not[0] == '\0' || all.find(c.must_not) == std::string::npos;
-        if (!have || !avoid) {
-            std::printf("      %s: have=%d want=%d (looked for \"%s\", must not contain \"%s\")\n", c.what,
-                        (int) have, (int) avoid, c.must_have, c.must_not);
+        const bool avoid2 = c.must_not2[0] == '\0' || all.find(c.must_not2) == std::string::npos;
+        if (!have || !avoid || !avoid2) {
+            std::printf("      %s: have=%d avoid=%d avoid2=%d (want \"%s\", must not contain \"%s\" / \"%s\")\n",
+                        c.what, (int) have, (int) avoid, (int) avoid2, c.must_have, c.must_not, c.must_not2);
             ++bad;
         }
     }
-    // The fatality itself must be real on both sides of its boundary.
-    HostEnv below{}; below.kernel = parse_kernel_release("6.11.0");
-    HostEnv at{}; at.kernel = parse_kernel_release("6.12.0");
-    const bool fatal_discriminates = any_fatal(compat_advisories(below, INTEL, B580, true)) &&
-                                     !any_fatal(compat_advisories(at, INTEL, B580, true)) &&
-                                     any_fatal(compat_advisories(at, INTEL, ARC_PRO_B70, true));
-    if (!fatal_discriminates) { std::printf("      fatal boundary does not discriminate\n"); ++bad; }
-    verdict("compat: advisory rules (15 cases + 3-way boundary)", bad == 0, bad,
+    // The refusals must be real on BOTH sides of every boundary, and the two generations must not share one.
+    auto fat = [](const char* rel, uint32_t dev, const char* mod) {
+        HostEnv e{};
+        e.kernel = parse_kernel_release(rel);
+        e.mesa_version = "Mesa 26.2.0";
+        if (mod) e.drm_modules.push_back(mod);
+        return any_fatal(compat_advisories(e, INTEL, dev, true));
+    };
+    const bool fatal_discriminates = fat("5.10.0", A770, "i915") &&   // below Alchemist initial
+                                     !fat("6.0.0", A770, "i915") &&   // Alchemist initial band: no refusal
+                                     !fat("6.6.0", A770, "i915") &&   // a common LTS - the old rule refused this
+                                     fat("5.18.0", A770M, "i915") &&  // mobile Alchemist floor one release lower
+                                     !fat("5.19.0", A770M, "i915") &&
+                                     fat("6.10.0", B580, "xe") &&     // below Battlemage initial
+                                     !fat("6.11.0", B580, "xe") &&    // Battlemage initial band
+                                     fat("6.13.0", ARC_PRO_B70, "xe") &&
+                                     !fat("6.14.0", ARC_PRO_B70, "xe");
+    if (!fatal_discriminates) { std::printf("      a refusal boundary does not discriminate\n"); ++bad; }
+    verdict("compat: advisory rules (29 cases + 9-way boundary)", bad == 0, bad,
             (int) (sizeof(cases) / sizeof(cases[0]) + 1), 0.0, "case mismatches");
 }
 
@@ -731,8 +784,8 @@ void case_stack_components(Ctx& ctx) {
             "unresolved ICDs");
     const bool loader_ok = s.loader_version.empty() || parse_so_version(s.loader_version, *new int, *new int, *new int);
     verdict("stack: loader version readable", loader_ok, loader_ok ? 0 : 1, 1, 0.0, "parse failures");
-    const bool fw_probed = s.firmware.size() == 3;
-    verdict("stack: firmware blobs probed", fw_probed, fw_probed ? 0 : 1, 3, 0.0, "blobs probed");
+    const bool fw_probed = s.firmware.size() == 6;   // x3 Battlemage blobs + x3 Alchemist blobs
+    verdict("stack: firmware blobs probed", fw_probed, fw_probed ? 0 : 1, 6, 0.0, "blobs probed");
 }
 
 // THE REST OF THE STACK, part 2: the ICD resolution logic, with BOTH controls.  The first version of this check
@@ -771,7 +824,7 @@ void case_icd_resolution() {
     }
     setenv("VK_ICD_FILENAMES", stale.c_str(), 1);
     const StackReport s_stale = detect_stack();
-    const std::vector<Advisory> adv_stale = stack_advisories(s_stale, 0x1002);
+    const std::vector<Advisory> adv_stale = stack_advisories(s_stale, 0x1002, 0x744c);
     setenv("VK_ICD_FILENAMES", good.c_str(), 1);
     const StackReport s_good = detect_stack();
     unsetenv("VK_ICD_FILENAMES");
@@ -784,7 +837,7 @@ void case_icd_resolution() {
     };
     const bool stale_flagged = !s_stale.icds.empty() && !s_stale.icds[0].resolves() &&
                                flagged(adv_stale, "does not resolve");
-    const bool good_clean = !s_good.icds.empty() && s_good.icds[0].resolves() && !flagged(stack_advisories(s_good, 0x1002), "does not resolve");
+    const bool good_clean = !s_good.icds.empty() && s_good.icds[0].resolves() && !flagged(stack_advisories(s_good, 0x1002, 0x744c), "does not resolve");
     verdict("stack: stale ICD detected (neg control)", stale_flagged, stale_flagged ? 0 : 1, 1, 0.0, "not flagged");
     verdict("stack: resolvable ICD not flagged (pos control)", good_clean, good_clean ? 0 : 1, 1, 0.0, "false alarm");
     std::remove(stale.c_str());

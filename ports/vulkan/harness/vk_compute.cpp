@@ -372,7 +372,7 @@ void Ctx::configure_display_reserve() {
 
     stack_ = detect_stack();
     advisories_ = compat_advisories(env_, info_.vendor_id, info_.device_id, budget_.from_driver);
-    for (const Advisory& a : stack_advisories(stack_, info_.vendor_id)) advisories_.push_back(a);
+    for (const Advisory& a : stack_advisories(stack_, info_.vendor_id, info_.device_id)) advisories_.push_back(a);
 
     // The stack table, printed whether or not anything is wrong, because "which loader / which ICD / which
     // libdrm" is the first question whenever a GPU is missing from enumeration.
@@ -386,7 +386,7 @@ void Ctx::configure_display_reserve() {
                      e.api_version.c_str(), e.resolves() ? e.resolved.c_str() : "!! UNRESOLVED");
     }
     for (const StackFile& f : stack_.firmware) {
-        std::fprintf(stderr, "vk_stack: firmware %-18s %s\n", f.name.c_str(),
+        std::fprintf(stderr, "vk_stack: firmware %-22s %s\n", f.name.c_str(),
                      f.present() ? f.found_path.c_str() : "(absent)");
     }
     for (const Advisory& a : advisories_) {

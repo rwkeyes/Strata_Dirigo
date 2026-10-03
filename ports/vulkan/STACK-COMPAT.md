@@ -141,6 +141,56 @@ so a stale ICD must be flagged and a resolvable one must not. Second, **an ICD s
 semantics of `VK_DRIVER_FILES`**, or it reports the system's ICDs as "the" ICDs whenever that variable is set,
 which is exactly what made the first negative control inspect the wrong entry.
 
+### 3.6 Generation support: Alchemist and Battlemage
+
+The rules are per **generation**, not per vendor, because the support history differs enormously. Source:
+Intel's own KMD support tables (`dgpu-docs.intel.com/overview/supported-hardware/i915-driver-gpus.html` and
+`.../xe-driver-gpus.html`, read 2026-10-03), which separate *initial support* (available experimentally, may
+require `force_probe=PCI_ID`) from *full support* (enabled by default, validated). The severity rule follows from
+that: **refuse below initial support** (the kernel predates the device), **warn inside the initial band**,
+**silent once full support is reached**.
+
+| Generation | Driver | Cards | Initial | Full | What this port does |
+|---|---|---|---|---|---|
+| **Alchemist** / Xe-HPG | **i915** | A770, A750, A580, A380, A310, Pro A40/A50/A60 | 6.0 | 6.2 | fatal below 6.0; warn in 6.0–6.1; silent from 6.2 |
+| Alchemist mobile | i915 | A770M, A730M, A570M, A550M, A530M, A370M, A350M, Pro A30M/A60M | 5.19 | 6.2 | as above, floor 5.19 |
+| **Battlemage** / Xe2 | **xe** | B580, B570 | 6.11 | 6.12 | fatal below 6.11; warn in 6.11; CCS-reset warning from 6.12 to 7.0 |
+| Battlemage Pro | xe | B50 (6.11/6.14), B60 (–/6.15), B65 and B70 (–/6.17) | per card | | floor from our field notes (6.14) where Intel lists no initial release |
+
+Three consequences worth stating plainly.
+
+1. **A working Arc A770 on kernel 6.6** — a common LTS — must not be refused. The first version of these rules
+   applied the Battlemage line (6.12) to *every* Intel device and would have refused it. Fixed, and the case
+   table now carries the row that would have caught it.
+2. **The Xe2 CCS engine-reset warning is Battlemage's.** Alchemist has none of those reports, so the warning is
+   raised only for Battlemage (or for an Alchemist card that happens to be on xe). Applying it to Alchemist was
+   the second half of the same bug.
+3. **Firmware is per generation**: `xe/bmg_guc_70.bin` for Battlemage, `i915/dg2_guc_70.bin` for Alchemist. A
+   missing-blob verdict is raised only when a generation's whole set is absent, so a drifted filename cannot be
+   reported as missing firmware.
+
+#### Is the port compatible with Alchemist?
+
+**The API and shader layer: yes**, and Alchemist is in one respect the *easier* target. It supports subgroup
+sizes 8/16/32, so a dispatch that assumed a width breaks there; this port's one-workgroup-per-row dispatch with a
+strided stage-2 combine is exactly the fix for that, and the width-8 llvmpipe arm of the gate is the closest
+available proxy until real Alchemist silicon is attached. Nothing in the port uses an Xe2-only feature, and the
+memory-budget rule (Mesa ≥ 26.2) applies to both generations.
+
+Two caveats, both sourced:
+
+- **Alchemist belongs on i915.** Intel's Xe support table lists no DG2/Alchemist part at all — it begins at Lunar
+  Lake and Battlemage. The xe path on DG2 is experimental with open HuC issues, and compute-runtime reports zero
+  OpenCL/Level-Zero platforms on DG2 under xe (`intel/compute-runtime#905`). If xe is driving an Alchemist card,
+  the port says so.
+- **Cooperative matrix is a performance *regression* there**, not a win: ANV has exposed
+  `VK_KHR_cooperative_matrix` since Mesa 24.0, but llama.cpp deliberately gates it to Xe2 only for that reason.
+  So the plain-FMA ceiling of §4.3b stands on Alchemist even with a matrix-capable toolchain.
+
+**Unverified**: none of this has run on Alchemist silicon (this box has a 7900 XTX and a K620). The floors come
+from Intel's tables; the behaviour on the hardware is untested, and the port's rules say so rather than implying
+otherwise.
+
 ---
 
 ## 4. Performance
@@ -313,5 +363,6 @@ Corrections kept here rather than inline, so the body of the document reads as t
 |---|---|
 | 2026-10-03 | **7.4 does not exist.** An earlier revision listed it as a ladder row and put it first in the performance recommendation, on the strength of press coverage of pull requests *targeting* the 7.4 cycle. A patch labelled "for 7.4" is queued for a cycle that has not opened. Recommendations are now restricted to installable kernels, and §1.3 gives the command to check. |
 | 2026-10-03 | **The Battlemage floor is 6.12, per card**, not 6.14 for all Intel. 6.12 is the first mainline kernel with Xe2 out of the box (B580); 6.14 is what our notes record for the Arc Pro B70 (BMG-G31). The rule now keys on the PCI device ID. |
+| 2026-10-03 | **Rules made per-generation (3.6).** Intel's own KMD tables were used to add Alchemist explicitly. The previous version applied the Battlemage full-support line (6.12) to every Intel device, which would have refused a working Arc A770 on kernel 6.6, and raised the Xe2 CCS-reset warning for a generation that has none of those reports. Floors: Alchemist desktop/Pro 6.0 (full 6.2), Alchemist mobile 5.19, Battlemage B580-class 6.11 (full 6.12). Case table 17 -> 30 rows, including the cross-generation discriminator. |
 | 2026-10-03 | **Extended from the kernel to the whole stack** (3.5): the loader, ICD files and their library resolution, libdrm, GPU firmware blobs, the Level-Zero/OpenCL path (labelled as *not* this port), the session type, and the build toolchain's capability probes. The document was renamed to match. The ICD check's first version was wrong in a way worth recording: it treated `library_path` as a file path and declared all nine working ICDs broken. |
 | 2026-10-03 | **The reserve floor is 512 MiB**, not 256, after a field report of a two-display KDE/Wayland session holding 354 MB in `kwin_wayland` alone — the old floor was below the compositor it exists to protect. |

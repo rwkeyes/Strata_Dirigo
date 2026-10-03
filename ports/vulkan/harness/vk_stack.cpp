@@ -2,7 +2,7 @@
 // out, nothing that needs privileges.
 #include "vk_stack.hpp"
 
-#include "vk_compat.hpp"   // Advisory, Severity
+#include "vk_compat.hpp"   // Advisory, Severity, IntelGen, intel_generation
 
 #include <cctype>
 #include <cstdlib>
@@ -192,7 +192,12 @@ StackReport detect_stack() {
 
     // The firmware blobs the xe driver asks for, and the i915 DMC blob.  A missing GuC blob is a driver that
     // fails to probe - the log says `firmware production part check failure` and `probe ... failed with -71`.
-    for (const char* f : {"xe/bmg_guc_70.bin", "xe/bmg_huc.bin", "i915/bmg_dmc.bin"}) {
+    // Both generations' blobs are probed because the file that is loaded depends on the CARD, and this function
+    // has no device yet; the advisory below selects the set that matters.  The Alchemist names are the i915 DG2
+    // blobs, and a "missing" verdict is only raised when a generation's WHOLE set is absent - a single drifted
+    // filename must not be reported as missing firmware.
+    for (const char* f : {"xe/bmg_guc_70.bin", "xe/bmg_huc.bin", "i915/bmg_dmc.bin",
+                          "i915/dg2_guc_70.bin", "i915/dg2_huc_70.bin", "i915/dg2_dmc_ver2_08.bin"}) {
         s.firmware.push_back(probe_file(f));
     }
 
@@ -213,7 +218,7 @@ StackReport detect_stack() {
     return s;
 }
 
-std::vector<Advisory> stack_advisories(const StackReport& s, uint32_t vendor_id) {
+std::vector<Advisory> stack_advisories(const StackReport& s, uint32_t vendor_id, uint32_t device_id) {
     std::vector<Advisory> out;
 
     // An ICD that names a library nobody can find is a real failure mode: the loader skips it, so the GPU
@@ -245,17 +250,34 @@ std::vector<Advisory> stack_advisories(const StackReport& s, uint32_t vendor_id)
         }
     }
 
-    // Firmware: only meaningful on the vendor's hardware.  On a non-Intel host its absence is expected.
-    bool fw_missing = false;
-    for (const StackFile& f : s.firmware) fw_missing = fw_missing || !f.present();
+    // Firmware: the blobs are per generation, so only the set belonging to the card present is judged.  A
+    // missing GuC blob is a driver that FAILS TO PROBE (firmware production part check failure, probe -71), so
+    // this only warns when the whole set for that generation is absent; a partly-present set means the firmware
+    // package is installed and a name has drifted.
+    const IntelGen fw_gen = intel_generation(device_id);
+    const char* fw_want = fw_gen == IntelGen::Alchemist ? "dg2" : "bmg";
+    int fw_have = 0, fw_want_count = 0;
+    for (const StackFile& f : s.firmware) {
+        if (f.name.find(fw_want) == std::string::npos) continue;
+        ++fw_want_count;
+        if (f.present()) ++fw_have;
+    }
     if (vendor_id == 0x8086) {
-        if (fw_missing) {
-            out.push_back({Severity::Warn, "this host presents an Intel GPU but some xe/i915 firmware blobs are "
-                                           "missing (see the firmware lines).  A missing GuC blob is a driver "
-                                           "that fails to probe, not a slow driver."});
+        if (fw_want_count > 0 && fw_have == 0) {
+            out.push_back({Severity::Warn, std::string("this host presents an Intel ") +
+                                               (fw_gen == IntelGen::Alchemist ? "Alchemist" : "Battlemage") +
+                                               " GPU but none of its firmware blobs (" + fw_want +
+                                               "*) are present.  A missing GuC blob is a driver that fails to "
+                                               "PROBE, not a slow driver - check the firmware package before "
+                                               "anything else."});
+        } else if (fw_want_count > 0 && fw_have < fw_want_count) {
+            out.push_back({Severity::Info, std::string("the firmware package is installed (") +
+                                               std::to_string(fw_have) + " of " + std::to_string(fw_want_count) +
+                                               " " + fw_want + " blobs present); a missing name is a naming "
+                                               "difference, not necessarily a missing package."});
         }
-    } else if (fw_missing) {
-        out.push_back({Severity::Info, "no Intel xe/i915 firmware on this host - expected unless an Intel GPU "
+    } else if (fw_have == 0) {
+        out.push_back({Severity::Info, "no Intel GPU firmware on this host - expected unless an Intel GPU "
                                        "is fitted."});
     }
 
