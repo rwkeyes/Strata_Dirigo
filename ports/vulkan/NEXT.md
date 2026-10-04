@@ -1,5 +1,29 @@
 # Start here next session
 
+## RESUME HERE (state as of the last commit)
+
+The branch is GREEN: the gate prints its own totals and they are 120 passed, 0 failed, 0 skipped on RADV
+(112/0/1 on llvmpipe, the skip being the cooperative-matrix case). 40 kernels plus 5 shared includes.
+
+THE ONE OPEN TASK, scoped to a single case re-add:
+
+1. `shaders/pending/` holds four finished, compiling kernels from `s2_expert_grouped.cu` - `s2expert_gu`,
+   `s2expert_swiglu`, `s2expert_down` and the `s2_row_dot` include they share - plus a README with what is
+   established and what is not. They are outside `shaders/*.comp` so the build does not exercise them.
+2. Re-add their case to `harness/vk_gate.cpp` (the shape is in the README) and re-run. `gu` and `swiglu` passed
+   3840/3840 and 1920/1920 against a double reference before the revert; `down` needs its CORRECTED oracle, which
+   reads the QUANTIZER'S OUTPUT rather than the gate/up activation image - that mistake is recorded in the README
+   and it is the third of its kind in this port (an oracle right for the data it was written against and wrong for
+   the data it was run on).
+3. The gate-wide NaN question that blocked that work is SETTLED: it was 0/0 from `gemv_bound` on a zero row, not a
+   kernel. The bound now has a 1e-30 floor and the NaN-safe comparison is in at all six sites.
+
+FILING RULE LEARNED THE HARD WAY, worth keeping: an unverified shader in `shaders/` is one the build exercises
+without evidence, so drafted kernels live in `shaders/pending/` with a README that says exactly why.
+
+THEN the rest of that file (the pair kernels, the activation correction, and the CPU-order parity kernels), and
+after that the port's remaining blocks are listed under "THE REST OF THE WAVE" below.
+
 The gate **prints its own totals** (`bash ports/vulkan/gates/run_gate.sh`) — do not quote a number here, it went
 stale twice in one day. Wave 1 (elementwise / conversions / norm / silu / gdn) and both GEMM paths and rope are
 done and gated.
