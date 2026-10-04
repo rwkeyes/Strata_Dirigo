@@ -1,5 +1,36 @@
 # Start here next session
 
+## STAGE 3: recorded command buffers (the CUDA-graph replacement) - DESIGNED, NOT YET WRITTEN
+
+The engine's decode step is a fixed sequence of dispatches re-issued every token, and a CUDA graph is how the
+engine avoided re-issuing it.  The Vulkan equivalent is ONE command buffer recorded once and RE-SUBMITTED.  What
+this needs, worked out against the code on 2026-10-04 and deliberately NOT written yet (a half-API is worse than
+none - the port's rule that a case must exist is the reason):
+
+* `harness/vk_compute.cpp`'s `dispatch()` (line ~653) allocates a command buffer per call with
+  `ONE_TIME_SUBMIT`, records ONE dispatch, inserts a shader-write -> host-read barrier, submits, waits, frees.
+  That is the gate's shape and it stays the single-shot path.
+* **Refactor**: lift the encoding half (the `pipes_` lookup for layout/set, the descriptor update, the binds, the
+  push constants, `vkCmdDispatch`) into a private `encode_dispatch(cb, pipe, bufs, push, push_bytes, groups,
+  groups_y, chain_barrier)`, and have `dispatch()` call it.  `chain_barrier` adds a compute -> compute barrier,
+  which a multi-dispatch STEP needs (one kernel's output is the next one's input) and a single dispatch does not.
+* **New API on `Ctx`**: `record_begin()`, `record_dispatch(...)`, `record_end_and_submit()`, `replay_recorded()`,
+  `recorded_dispatches()`, `has_recording()`.  Private state: one persistent `rec_cb_` + `rec_fence_` created
+  once, `recorded_`, `recording_`, `have_recording_`.  Two details differ from the single-shot path ON PURPOSE:
+  the buffer is NOT `ONE_TIME_SUBMIT` (it is submitted more than once) and the host-read barrier goes at the END
+  of the recorded step, not after each dispatch.  `replay_recorded()` re-submits the recorded buffer and waits -
+  it must not re-record anything, which is the whole point.
+* **The gate case** (`graph: recorded step replays identically` in `vk_gate.cpp`): chain the harness's own trivial
+  COPY kernel three times (idempotent and byte-exact, which is why it is the right kernel for this).  Record the
+  chain once; run the same three copies through the single-shot `dispatch()` path as the reference; require the
+  two outputs byte-identical.  Then PROVE the replay is the recording rather than a re-record: write NEW bytes
+  into the source buffer on the host, `replay_recorded()`, and require the destination to equal the new source -
+  a re-recording path and a stale recording both fail that, and no HIP device is needed to see it.
+* **Why this oracle and not the plan's**: PORT-PLAN stage 3 says "compare tokens to the HIP path", which this box
+  can no longer produce (see the plan's note).  The single-shot path is the substitute, and it is a stronger
+  oracle for this particular question, because it isolates exactly the thing that changed - the recording - with
+  everything else held equal.
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
