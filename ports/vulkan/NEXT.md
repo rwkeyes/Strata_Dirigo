@@ -1,6 +1,22 @@
 # Start here next session
 
-## STAGE 3: recorded command buffers (the CUDA-graph replacement) - DESIGNED, NOT YET WRITTEN
+## STAGE 3: recorded command buffers (the CUDA-graph replacement) - API WRITTEN AND COMPILING, CASE STILL MISSING
+
+**Written 2026-10-04 (later than the design below).**  The API is in (`harness/vk_compute.{hpp,cpp}`), the
+harness builds clean under `-Werror`, and the whole existing suite is still green (156/0/1) - which is the
+verification that matters for the refactor, because every one of those cases runs through `dispatch()`.  The NEW
+calls are exercised by NO case yet, so by this port's own rule ("a case that only compiles is not evidence") they
+prove nothing until `case_recorded_step` below lands.  Two findings from writing it, worth keeping:
+
+* **A recorded step needs ONE DESCRIPTOR SET PER DISPATCH.**  The host-side `vkUpdateDescriptorSets` happens at
+  RECORD time while the dispatches execute at SUBMIT time, so one shared set leaves every dispatch in the step
+  reading whatever the LAST one bound - silently wrong output, the same class as the grouped-expert wave's single
+  pointer standing in for two buffers.  `encode_dispatch`'s `fresh_set` parameter allocates a set per recorded
+  dispatch (a real backend pools them).
+* **The destructor does not yet destroy `rec_fence_`.**  The command buffer is freed with `cmd_pool_`; the fence is
+  not.  Cosmetic for a gate process that is about to exit, but the backend this becomes has to release it.
+
+The design below is unchanged and still correct; the case is the remaining step, and it is the whole verification.
 
 The engine's decode step is a fixed sequence of dispatches re-issued every token, and a CUDA graph is how the
 engine avoided re-issuing it.  The Vulkan equivalent is ONE command buffer recorded once and RE-SUBMITTED.  What

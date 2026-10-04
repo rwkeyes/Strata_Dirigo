@@ -650,20 +650,36 @@ VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t p
     return pv.pipe;
 }
 
-void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
-                   uint32_t groups, uint32_t groups_y) {
+void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push,
+                          uint32_t push_bytes, uint32_t groups, uint32_t groups_y, bool chain_barrier,
+                          bool fresh_set) {
     // Find the pipeline layout/set that belongs to this pipeline handle.
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     for (const Pipe& p : pipes_) {
         if (p.pipe == pipe) {
             layout = p.layout;
             set = p.set;
+            set_layout = p.set_layout;
         }
     }
     if (!layout) {
         std::fprintf(stderr, "dispatch: unknown pipeline\n");
         std::exit(1);
+    }
+    // ONE DESCRIPTOR SET PER DISPATCH IN A RECORDED STEP.  The host-side update below happens while RECORDING,
+    // but the dispatches execute at SUBMIT time - so a single shared set would leave every dispatch in the step
+    // reading whatever the LAST one bound.  (The same class of trap the grouped-expert wave hit with one buffer
+    // pointer standing in for two.)  A real backend pools these sets; the gate allocates them out of desc_pool_,
+    // which the device destroys with the pool, so a re-recording leaks a handful of sets and nothing else.
+    if (fresh_set) {
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = desc_pool_;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &set_layout;
+        VK_CHECK(vkAllocateDescriptorSets(dev_, &dsai, &set));
     }
 
     std::vector<VkDescriptorBufferInfo> info(bufs.size());
@@ -683,6 +699,24 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     }
     vkUpdateDescriptorSets(dev_, (uint32_t) writes.size(), writes.data(), 0, nullptr);
 
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+    if (push_bytes) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+    vkCmdDispatch(cb, groups, groups_y, 1);
+    if (chain_barrier) {
+        // One kernel's output is the next one's input inside a recorded step.  Compute -> compute, not to host:
+        // the step has exactly one host-read barrier, at its end.
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &mb, 0, nullptr, 0, nullptr);
+    }
+}
+
+void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
+                   uint32_t groups, uint32_t groups_y) {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -694,10 +728,8 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cb, &bi));
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
-    if (push_bytes) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
-    vkCmdDispatch(cb, groups, groups_y, 1);
+    encode_dispatch(cb, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/false,
+                    /*fresh_set=*/false);
     // Shader writes -> host reads.  Vulkan requires this barrier; without it a coherent mapping may still
     // show the pre-dispatch contents, which would read as "the kernel wrote nothing".
     VkMemoryBarrier mb{};
@@ -721,5 +753,71 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     vkDestroyFence(dev_, fence, nullptr);
     vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
 }
+
+// ---- recorded steps: the CUDA-graph replacement (NEXT.md's stage-3 note) -----------------------------------
+// The command buffer and fence live for the life of the Ctx and are re-submitted, never re-recorded by a replay.
+void Ctx::record_begin() {
+    if (rec_cb_ == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = cmd_pool_;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VK_CHECK(vkAllocateCommandBuffers(dev_, &cbai, &rec_cb_));
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VK_CHECK(vkCreateFence(dev_, &fci, nullptr, &rec_fence_));
+    }
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    // NOT ONE_TIME_SUBMIT: this buffer is submitted once per replay, which is the entire point of it.
+    VK_CHECK(vkBeginCommandBuffer(rec_cb_, &bi));
+    recording_ = true;
+    recorded_ = 0;
+}
+
+void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
+                          uint32_t groups, uint32_t groups_y) {
+    if (!recording_) {
+        std::fprintf(stderr, "record_dispatch: not recording (call record_begin)\n");
+        std::exit(1);
+    }
+    encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,
+                    /*fresh_set=*/true);
+    ++recorded_;
+}
+
+void Ctx::record_end_and_submit() {
+    if (!recording_) {
+        std::fprintf(stderr, "record_end_and_submit: not recording\n");
+        std::exit(1);
+    }
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(rec_cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                         nullptr, 0, nullptr);
+    VK_CHECK(vkEndCommandBuffer(rec_cb_));
+    recording_ = false;
+    have_recording_ = true;
+    submit_recorded();
+}
+
+void Ctx::submit_recorded() {
+    if (!have_recording_) {
+        std::fprintf(stderr, "submit_recorded: nothing recorded\n");
+        std::exit(1);
+    }
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &rec_cb_;
+    VK_CHECK(vkResetFences(dev_, 1, &rec_fence_));   // the fence was signalled by the previous submission
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, rec_fence_));
+    VK_CHECK(vkWaitForFences(dev_, 1, &rec_fence_, VK_TRUE, UINT64_MAX));
+}
+
+void Ctx::replay_recorded() { submit_recorded(); }   // re-submits the RECORDING; it never re-records
 
 }  // namespace portvk

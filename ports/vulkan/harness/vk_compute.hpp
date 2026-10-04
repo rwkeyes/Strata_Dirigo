@@ -151,6 +151,20 @@ public:
     void dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                   uint32_t groups, uint32_t groups_y = 1);
 
+    // ---- RECORDED STEPS: the CUDA-graph replacement (see NEXT.md's stage-3 note) ------------------------
+    // The engine's decode step is a fixed sequence of dispatches re-issued every token, and `dispatch()` above
+    // submits and waits per call, so it cannot express that.  These calls record a sequence into ONE persistent
+    // command buffer and then RE-SUBMIT it, which is what a graph was buying.  `record_dispatch` inserts a
+    // compute -> compute barrier (in a step one kernel's output is the next one's input); the host-read barrier
+    // goes once, at the end.  `replay_recorded()` must not re-record - that is the property a case has to prove.
+    void record_begin();
+    void record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
+                         uint32_t groups, uint32_t groups_y = 1);
+    void record_end_and_submit();
+    void replay_recorded();
+    uint32_t recorded_dispatches() const { return recorded_; }
+    bool has_recording() const { return have_recording_; }
+
 private:
     // One pipeline and everything that must be created and destroyed with it.  A key list parallel to a value
     // list is two containers that have to stay the same length by hand; one struct cannot drift.
@@ -185,6 +199,23 @@ private:
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
     uint32_t mem_type_ = 0;
     std::vector<Pipe> pipes_;
+
+    // Shared encoding half of a dispatch: the pipes_ lookup, the descriptor update, the binds, the push constants
+    // and vkCmdDispatch.  `chain_barrier` adds a compute -> compute barrier, which a recorded STEP needs between
+    // its dispatches (one kernel's output is the next one's input); the single-shot path passes false and does
+    // its own host barrier afterwards.  `fresh_set` allocates a descriptor set for THIS dispatch - required for a
+    // recorded step, where every dispatch must keep its own bindings (the host updates happen at record time, the
+    // dispatches run at submit time, so one shared set would leave them all reading the last binding).
+    void encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push,
+                         uint32_t push_bytes, uint32_t groups, uint32_t groups_y, bool chain_barrier,
+                         bool fresh_set);
+    void submit_recorded();   // submit the recorded buffer and wait: used by the first submit AND by every replay
+
+    VkCommandBuffer rec_cb_ = VK_NULL_HANDLE;
+    VkFence rec_fence_ = VK_NULL_HANDLE;
+    uint32_t recorded_ = 0;         // dispatches in the current/last recording
+    bool recording_ = false;        // between record_begin() and record_end_and_submit()
+    bool have_recording_ = false;   // a finished recording exists and may be replayed
 
     void query_budget();   // called after device creation, so the extension can be enabled
 };
