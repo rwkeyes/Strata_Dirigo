@@ -1,27 +1,45 @@
 # Start here next session
 
-## STAGE 3: recorded command buffers (the CUDA-graph replacement) - API WRITTEN AND COMPILING, CASE STILL MISSING
+## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
 
-**Written 2026-10-04 (later than the design below).**  The API is in (`harness/vk_compute.{hpp,cpp}`), the
-harness builds clean under `-Werror`, and the whole existing suite is still green (156/0/1) - which is the
-verification that matters for the refactor, because every one of those cases runs through `dispatch()`.  The NEW
-calls are exercised by NO case yet, so by this port's own rule ("a case that only compiles is not evidence") they
-prove nothing until `case_recorded_step` below lands.  Two findings from writing it, worth keeping:
+**Closed the same day the API was written.**  `case_recorded_step` (`harness/vk_gate.cpp`, six verdicts, one
+commit) now exercises the whole record/replay API, and it was **proven able to fail** before it was trusted - the
+two things this port's own rules ask for ("a case that only compiles is not evidence"; "a case that cannot fail
+is not an oracle"):
+
+| verdict | what it proves | Intel BMG G31 | llvmpipe | RADV (AMD iGPU) |
+|---|---|---|---|---|
+| `record: three dispatches` | `recorded_dispatches() == 3` at the end of the recording, `has_recording()` after `record_end_and_submit()` | PASS | PASS | PASS |
+| `record: chain is byte-exact` | the ORACLE itself: three chained copies through `dispatch()` reproduce the source bit for bit | PASS | PASS | PASS |
+| `record: equals single-shot` | the recorded chain == the same chain through `dispatch()`, 1024/1024 bytes | PASS | PASS | PASS |
+| `record: replay reads new bytes` | new host bytes into the recording's source, then `replay_recorded()` - no re-record, no `dispatch` - produce the new bytes | PASS | PASS | PASS |
+| `record: replay fixture differs` | the control for the arm above: the new source really differs (1024/1024 elements) | PASS | PASS | PASS |
+| `record: replay ignores new binds` | a LATER single-shot dispatch on the SAME pipeline - which rewrites that pipeline's shared descriptor set - does not change what the replay reads | PASS | PASS | PASS |
+
+**FALSIFICATION, which is why arm C is evidence rather than decoration.**  With `record_dispatch`'s `fresh_set`
+flipped to `false` (one shared descriptor set for the whole recorded step - the trap the encoding comment names),
+**three of the six verdicts fail**: `equals single-shot` 0/1024, `replay reads new bytes` 0/1024, `replay ignores
+new binds` 0/1024, totals 162/0/1 -> **159 passed / 3 failed / 1 skipped**.  The flip was reverted; the file is as
+committed.  So the case detects the exact defect the per-dispatch-set rule exists to prevent - and arm C is the
+one that sees a shared set that a re-recording bug would otherwise hide.
+
+One finding from writing the API, worth keeping:
 
 * **A recorded step needs ONE DESCRIPTOR SET PER DISPATCH.**  The host-side `vkUpdateDescriptorSets` happens at
   RECORD time while the dispatches execute at SUBMIT time, so one shared set leaves every dispatch in the step
   reading whatever the LAST one bound - silently wrong output, the same class as the grouped-expert wave's single
   pointer standing in for two buffers.  `encode_dispatch`'s `fresh_set` parameter allocates a set per recorded
   dispatch (a real backend pools them).
-* **The destructor does not yet destroy `rec_fence_`.**  The command buffer is freed with `cmd_pool_`; the fence is
-  not.  Cosmetic for a gate process that is about to exit, but the backend this becomes has to release it.
+* **`rec_fence_` IS DESTROYED BY `~Ctx` now** (it was not, and that was the loose end this block used to name).
+  The command buffer goes with `cmd_pool_`; the fence does not, and a backend that owns a long-lived recording has
+  to release it explicitly.
 
-The design below is unchanged and still correct; the case is the remaining step, and it is the whole verification.
+### The design, as implemented - kept because the REASONS are the useful part
 
 The engine's decode step is a fixed sequence of dispatches re-issued every token, and a CUDA graph is how the
 engine avoided re-issuing it.  The Vulkan equivalent is ONE command buffer recorded once and RE-SUBMITTED.  What
-this needs, worked out against the code on 2026-10-04 and deliberately NOT written yet (a half-API is worse than
-none - the port's rule that a case must exist is the reason):
+this needs, worked out against the code on 2026-10-04 and written the same day (the rule that a case must exist is
+the reason the API and its case landed together rather than a half-API first):
 
 * `harness/vk_compute.cpp`'s `dispatch()` (line ~653) allocates a command buffer per call with
   `ONE_TIME_SUBMIT`, records ONE dispatch, inserts a shader-write -> host-read barrier, submits, waits, frees.
@@ -36,12 +54,16 @@ none - the port's rule that a case must exist is the reason):
   the buffer is NOT `ONE_TIME_SUBMIT` (it is submitted more than once) and the host-read barrier goes at the END
   of the recorded step, not after each dispatch.  `replay_recorded()` re-submits the recorded buffer and waits -
   it must not re-record anything, which is the whole point.
-* **The gate case** (`graph: recorded step replays identically` in `vk_gate.cpp`): chain the harness's own trivial
-  COPY kernel three times (idempotent and byte-exact, which is why it is the right kernel for this).  Record the
-  chain once; run the same three copies through the single-shot `dispatch()` path as the reference; require the
-  two outputs byte-identical.  Then PROVE the replay is the recording rather than a re-record: write NEW bytes
-  into the source buffer on the host, `replay_recorded()`, and require the destination to equal the new source -
-  a re-recording path and a stale recording both fail that, and no HIP device is needed to see it.
+* **The gate case** (`case_recorded_step` in `vk_gate.cpp`; the verdicts are named `record: ...` and the six of
+  them are listed in the table at the top of this file): chain the harness's own trivial COPY kernel three times
+  (idempotent and byte-exact, which is why it is the right kernel for this).  Record the chain once; run the same
+  three copies through the single-shot `dispatch()` path as the reference; require the two outputs byte-identical
+  (and the reference itself byte-exact against the source, so the oracle is checked too).  Then PROVE the replay
+  is the recording rather than a re-record: write NEW bytes into the source buffer on the host, `replay_recorded()`,
+  and require the destination to equal the new source.  The third arm - an interfering single-shot dispatch on the
+  same pipeline between recording and replay - is the one that catches a SHARED descriptor set; flipping
+  `fresh_set` to false was measured to fail 3 of the 6 verdicts, which is what makes the case an oracle rather
+  than an agreement.  No HIP device is needed to see any of it.
 * **Why this oracle and not the plan's**: PORT-PLAN stage 3 says "compare tokens to the HIP path", which this box
   can no longer produce (see the plan's note).  The single-shot path is the substitute, and it is a stronger
   oracle for this particular question, because it isolates exactly the thing that changed - the recording - with
@@ -55,12 +77,24 @@ which compiles every shader from source - and this line has gone stale three tim
 than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 / 0 on RADV and on radeon, 154 /
 0 / 1 on llvmpipe), and, after that card was swapped for an **Arc Pro B70**, this one.
 
-**FIRST RUN ON INTEL HARDWARE (Arc Pro B70 "BMG G31", Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup 32):
-156 passed / 0 failed / 1 skipped**, with llvmpipe 154 / 0 / 1 and the radeon ICD now picking the AMD iGPU (the
-discrete card is gone) at 155 / 1 / 1. The Intel skip is `gemm_coopmat` - no usable M16N16K16 subgroup-scope
-f16->f32 config on this device - and the gate exits non-zero on it by its own rule that a skipped case is not a
-passing one. The iGPU's single failure is `budget: independent requery agrees`, inherent to a device whose free
-memory is system RAM shared with the OS; the budget family passes on the Arc.
+**RUN ON INTEL HARDWARE (Arc Pro B70 "BMG G31", Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup 32), 2026-10-04 after
+stage 3 landed: 162 passed / 0 failed / 1 skipped**, with llvmpipe 160 / 0 / 1 and the radeon ICD (now the AMD
+iGPU, since the discrete card is gone) at 162 / 0 / 1. The six verdicts added by stage 3's case are the only
+difference from the 156/0/1 these ICDs read before it. The Intel skip is `gemm_coopmat` - no usable M16N16K16
+subgroup-scope f16->f32 config on this device. **Read the totals, not an exit code, and say which:** `vk_gate`
+itself returns 0 on a skip-only run (skips are not failures in the binary); it is `run_gate.sh`'s assertion that
+makes a skipped case fail the RUN, which is the port's rule and stays.
+
+**Two things measured about the runner on this box, both worth knowing before quoting it:**
+
+* **`run_gate.sh` used to STOP at the Intel skip and never reach the cross-implementation arm** - so since the Arc
+  swap, two of the three available implementations were silently not being exercised on this box, which is the
+  opposite of what that arm exists for.  The skip now records the failure in `rc` and the arm still runs; the final
+  exit status is unchanged (non-zero).  Any earlier quotation of per-ICD totals came from runs made by hand.
+* **The AMD iGPU's `budget: independent requery agrees` is INTERMITTENT, not deterministic: 1 failure in 3
+  consecutive runs** (161/1/1 and 162/0/1 from the same binary on the same device).  That is consistent with the
+  cause already documented - an integrated device's free figure is system RAM shared with the OS - but it means a
+  single radeon run can read either way.  The budget family passes on the Arc every run.
 
 **THE FIRST DEVICE-SPECIFIC DEFECT THIS PORT HAS FOUND (fixed 2026-10-04).** `quantize_q8_K` was off by one byte
 on the Arc - the low byte of block 5's scale - and the cause was measured rather than argued: printing the

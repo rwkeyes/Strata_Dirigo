@@ -247,6 +247,101 @@ void run_conversion(Ctx& ctx, const std::string& dir, const char* tag, const cha
     ctx.free(y);
 }
 
+// 3. RECORDED STEPS.  One command buffer recorded ONCE and re-submitted, which is what a CUDA graph was buying
+// the engine's decode step.  This is the ONLY exercise of the record/replay API - every other case here goes
+// through the single-shot dispatch() - so it is the whole evidence for stage 3, and the design is written down
+// in NEXT.md's top block.  The kernel is the harness's own copy: byte-exact and idempotent, so a difference
+// between the two paths can only be the RECORDING.  Three arms, each one able to fail on its own:
+//
+//   A. the recorded chain equals the same chain run through dispatch(), and the chain is byte-exact (the
+//      reference is checked too - an oracle that is itself wrong would make arm A agree on garbage).
+//   B. the recording, REPLAYED after the host wrote new bytes into its source, produces the new bytes.  No
+//      re-record call and no dispatch() are involved, so a "replay" that hands back a cached result, or a
+//      re-recording that never re-submitted, keeps the old bytes and fails.
+//   C. the recording survives a LATER single-shot dispatch on the same pipeline.  The single-shot path rewrites
+//      the pipeline's SHARED descriptor set, so if the recorded dispatches had shared one set (the trap
+//      documented in encode_dispatch) the replay would read THAT binding - the wrong buffer - instead of the
+//      recording's own.  The source changes before this arm, so a replay that did nothing at all fails it too.
+void case_recorded_step(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "copy.spv")) return;
+    const uint32_t N = 1024;
+    VkPipeline p = ctx.pipeline(dir + "/copy.spv", 2, 4);
+    struct { int32_t n; } pc{(int32_t) N};
+    const uint32_t groups = groups_for(N);
+
+    // Three chained copies over FOUR buffers - s0 -> t1 -> t2 -> d - so each dispatch reads what the one before
+    // it wrote.  That is what needs the compute -> compute barrier inside the step, and because every dispatch
+    // binds a DIFFERENT pair of buffers it is also what would expose a single shared descriptor set.
+    std::vector<float> a(N), b(N), c(N), e(N);
+    for (auto& v : a) v = (float) (int32_t) rnd() * 1e-6f;
+    for (auto& v : b) v = (float) (int32_t) rnd() * 1e-6f;
+    for (auto& v : c) v = (float) (int32_t) rnd() * 1e-6f;
+    for (auto& v : e) v = (float) (int32_t) rnd() * 1e-6f;
+    Buf s0 = ctx.alloc(N * 4), t1 = ctx.alloc(N * 4), t2 = ctx.alloc(N * 4), d = ctx.alloc(N * 4);
+    Buf s0r = ctx.alloc(N * 4), t1r = ctx.alloc(N * 4), t2r = ctx.alloc(N * 4), dr = ctx.alloc(N * 4);
+    Buf ob = ctx.alloc(N * 4), oe = ctx.alloc(N * 4);
+
+    // ---- the recorded path: three dispatches into ONE buffer, submitted once by record_end_and_submit().
+    ctx.write(s0, a.data(), N * 4);
+    ctx.record_begin();
+    ctx.record_dispatch(p, {&s0, &t1}, &pc, sizeof(pc), groups);
+    ctx.record_dispatch(p, {&t1, &t2}, &pc, sizeof(pc), groups);
+    ctx.record_dispatch(p, {&t2, &d}, &pc, sizeof(pc), groups);
+    const uint32_t counted = ctx.recorded_dispatches();
+    ctx.record_end_and_submit();
+    const bool three = (counted == 3) && ctx.has_recording();
+
+    // ---- the reference: the same three copies through the single-shot path, into its own buffers.
+    ctx.write(s0r, a.data(), N * 4);
+    ctx.dispatch(p, {&s0r, &t1r}, &pc, sizeof(pc), groups);
+    ctx.dispatch(p, {&t1r, &t2r}, &pc, sizeof(pc), groups);
+    ctx.dispatch(p, {&t2r, &dr}, &pc, sizeof(pc), groups);
+
+    // Byte-exact means a BIT comparison: a float compare would call +0 and -0 equal and miss a NaN payload.
+    std::vector<float> got(N), ref(N);
+    ctx.read(d, got.data(), N * 4);
+    ctx.read(dr, ref.data(), N * 4);
+    int bad_ref = 0, bad_rec = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (std::memcmp(&ref[i], &a[i], 4) != 0) ++bad_ref;
+        if (std::memcmp(&got[i], &ref[i], 4) != 0) ++bad_rec;
+    }
+    verdict("record: three dispatches", three, three ? 0 : 3, 3, three ? 0.0 : (double) counted,
+            "dispatches recorded");
+    verdict("record: chain is byte-exact", bad_ref == 0, bad_ref, (int) N, (double) bad_ref, "byte-mismatches");
+    verdict("record: equals single-shot", bad_rec == 0, bad_rec, (int) N, (double) bad_rec, "byte-differences");
+
+    // ---- arm B.  New host bytes into the recorded step's source, then REPLAY: no record_begin, no
+    // record_dispatch, no dispatch.  The fixture must actually differ, or the arm cannot tell a replay from a
+    // stale result - so that is counted and asserted too.
+    int changed = 0;
+    for (uint32_t i = 0; i < N; ++i) changed += (c[i] != a[i]);
+    ctx.write(s0, c.data(), N * 4);
+    ctx.replay_recorded();
+    ctx.read(d, got.data(), N * 4);
+    int bad_b = 0;
+    for (uint32_t i = 0; i < N; ++i) if (std::memcmp(&got[i], &c[i], 4) != 0) ++bad_b;
+    verdict("record: replay reads new bytes", bad_b == 0 && changed == N, bad_b + (changed == N ? 0 : 1),
+            (int) N, (double) bad_b, "byte-mismatches");
+    verdict("record: replay fixture differs", changed == N, changed == N ? 0 : 1, (int) N, (double) changed,
+            "elements changed");
+
+    // ---- arm C.  The source changes AGAIN, then a single-shot dispatch on the SAME pipeline binds two other
+    // buffers - rewriting the pipeline's shared descriptor set - and only then the recording is replayed.
+    ctx.write(s0, e.data(), N * 4);
+    ctx.write(ob, b.data(), N * 4);
+    ctx.dispatch(p, {&ob, &oe}, &pc, sizeof(pc), groups);
+    ctx.replay_recorded();
+    ctx.read(d, got.data(), N * 4);
+    int bad_c = 0;
+    for (uint32_t i = 0; i < N; ++i) if (std::memcmp(&got[i], &e[i], 4) != 0) ++bad_c;
+    verdict("record: replay ignores new binds", bad_c == 0, bad_c, (int) N, (double) bad_c, "byte-mismatches");
+
+    ctx.free(s0); ctx.free(t1); ctx.free(t2); ctx.free(d);
+    ctx.free(s0r); ctx.free(t1r); ctx.free(t2r); ctx.free(dr);
+    ctx.free(ob); ctx.free(oe);
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -5667,6 +5762,7 @@ int main(int argc, char** argv) {
     case_copy(ctx, dir);
     case_scale(ctx, dir);
     case_add(ctx, dir);
+    case_recorded_step(ctx, dir);   // the record/replay API: the ONE case that exercises it (stage 3)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

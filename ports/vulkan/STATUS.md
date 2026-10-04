@@ -8,15 +8,27 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
                                                  # checks each shader's declared local size, then runs the gate
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
-was swapped for an Arc Pro B70, the box's GPU run was 156 passed / 0 failed / 1 skipped on the Intel ICD
-(`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 154 / 0 / 1 on llvmpipe and
-155 / 1 / 1 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone. Before the swap the
-same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three times in two days; read the
-last line of your own run.** 54 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
+was swapped for an Arc Pro B70 and after stage 3's case was added, the box's GPU run was 162 passed / 0 failed /
+1 skipped on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) -
+160 / 0 / 1 on llvmpipe and 162 / 0 / 1 on the radeon ICD, which now picks the AMD iGPU because the discrete card
+is gone. Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three
+times in two days; read the last line of your own run.** All three available implementations are exercised again
+by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
+box after the swap (`NEXT.md`). 54 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
 numbers ever stop reconciling this way, something is wrong with the harness rather than with a kernel.
+
+**Stage 3 of the port plan - recorded command buffers, the CUDA-graph replacement - is DONE and VERIFIED
+(2026-10-04).** The engine's decode step re-issues a fixed sequence of dispatches every token, and a CUDA graph is
+how it avoided that; the Vulkan equivalent is ONE command buffer recorded once and RE-SUBMITTED.
+`Ctx::record_begin` / `record_dispatch` / `record_end_and_submit` / `replay_recorded` are in
+`harness/vk_compute.*`, and `case_recorded_step` in `harness/vk_gate.cpp` is the case that exercises them: **six
+verdicts, all green on the Arc, on llvmpipe and on the Radeon iGPU.** It was proven able to fail before it was
+trusted - flipping `record_dispatch`'s `fresh_set` to false (ONE shared descriptor set for the whole recorded step,
+the trap the encoding comment names) makes three of the six verdicts fail, 162/0/1 -> **159/3/1**. `NEXT.md`'s top
+block carries the arm-by-arm table.
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
 gated the same way and is described where it is defined.
@@ -68,10 +80,13 @@ would cross it — naming the numbers. Measured live on this box: with the resid
 7900 XTX, RADV reports 0.19 GiB free of 24 GiB and the harness **refused to allocate**, which is the behaviour
 that would have prevented the recorded AMD incident (`docs/AMD_HIP.md`, #380/#377).
 
-**Verified on two Vulkan implementations before the swap:** RADV/7900 XTX (subgroup 64) and llvmpipe/CPU
-(subgroup 8); that run was 14/14, the suite has grown since and prints its own totals.
-each, run automatically by `gates/run_gate.sh`. The Intel ICD is present but has no device on this machine, so
-the arm reports it as no-device; it will run automatically when an Arc card is in the box.
+**Verified on three Vulkan implementations, every run:** Intel Arc Pro B70 / ANV (subgroup 32), llvmpipe / CPU
+(subgroup 8) and the AMD iGPU / RADV (subgroup 64) - the discrete Radeon is gone, so the radeon ICD now picks the
+iGPU. Before the swap the arm read 14/14 on RADV/7900 XTX and llvmpipe; the suite has grown since and prints its
+own totals. **Two caveats on this box, both measured 2026-10-04** (`NEXT.md`): `run_gate.sh` used to stop at the
+Intel skip and so never reached this arm at all after the swap, and the iGPU's `budget: independent requery
+agrees` is INTERMITTENT - 1 failure in 3 consecutive runs of the same binary on the same device - rather than the
+deterministic failure it was first documented as.
 
 ## Three defects found by the gate (all real, all fixed, all measured)
 
@@ -118,18 +133,21 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
   (b) are now DONE for the two formats that cover the most layers - `native_gu_iq2s.comp` and
   `native_down_iq4nl.comp`, the shape the expert tier actually launches - with the four other instantiations and
   the `_multi` variants left as mechanical copies (see `NEXT.md`).
-* **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no recorded command buffers, no kernel
-  registry. `harness/vk_compute.*` is the seed of the device layer, deliberately host-visible-only memory for
-  gate fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.
+* **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no kernel registry, and no recorded decode step
+  IN THE ENGINE. `harness/vk_compute.*` is the seed of the device layer and carries both the single-shot `dispatch()`
+  and the recorded-step API (stage 3, verified - see above), but on deliberately host-visible-only memory for gate
+  fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.
 * **Anything on Intel hardware — NO LONGER UNVERIFIED (2026-10-04).** An Arc Pro B70 is now the discrete card in
-  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **156 / 0 / 1**, with
+  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **162 / 0 / 1**, with
   one device-specific defect found and fixed (the folded division in `quantize_q8_K` - NEXT.md's RESUME HERE).
   What stays unverified on Intel is everything the gate does not cover: the engine path, real token shapes, and
   the stability question below.
 * **The budget requery on an INTEGRATED device.** `budget: independent requery agrees` fails on the AMD iGPU and
   passes on the Arc: an iGPU's free-memory figure is system RAM shared with the OS, so two queries can disagree by
   construction. Left red on purpose - the port's rule is to report an implementation that cannot satisfy a check
-  rather than soften the check around it.
+  rather than soften the check around it. **Measured 2026-10-04: it is intermittent, not deterministic** (1 failure
+  in 3 consecutive runs of one binary on one device), so a single radeon run can read 161/1/1 or 162/0/1 - quote
+  the device and the run, not "the radeon ICD always fails one".
 * **The Battlemage stability question (§4 of the plan) — TESTED ON THE CARD, 2026-10-04.** The xe compute wedge is
   an open driver bug this port cannot fix or test around, which is why the plan makes a smoke test the FIRST thing
   to do on Battlemage hardware. Done, with `gates/smoke-arc.sh` (added the same day): **718 rounds of 8 concurrent

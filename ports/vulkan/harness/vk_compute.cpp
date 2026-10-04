@@ -362,6 +362,7 @@ Ctx::~Ctx() {
         if (pv.layout) vkDestroyPipelineLayout(dev_, pv.layout, nullptr);
         if (pv.set_layout) vkDestroyDescriptorSetLayout(dev_, pv.set_layout, nullptr);
     }
+    if (rec_fence_) vkDestroyFence(dev_, rec_fence_, nullptr);   // the recorded step's fence: one fence for every submission
     if (desc_pool_) vkDestroyDescriptorPool(dev_, desc_pool_, nullptr);
     if (cmd_pool_) vkDestroyCommandPool(dev_, cmd_pool_, nullptr);
     if (dev_) vkDestroyDevice(dev_, nullptr);
