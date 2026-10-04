@@ -1,43 +1,49 @@
-# Pending shaders - written, NOT gated, and therefore NOT shipped
+# Pending shaders - written, NOT verified, and therefore NOT shipped
 
-These four files are the resident expert tier (`s2_expert_grouped.cu`): the grouped gate+up projection, the
-SwiGLU, the down projection, and the S2-over-q8_0 row dot they share. They compile and validate, and they are
-moved here rather than committed because their gate case is not passing, and an unverified shader in `shaders/` is
-a shader the build would exercise without evidence.
+Four files from `s2_expert_grouped.cu`: the grouped gate+up projection, the SwiGLU, the down projection, and the
+S2-over-q8_0 row dot they share. They compile and validate. They live here rather than in `shaders/` because an
+unverified shader in the build is one the build exercises without evidence.
 
-**WHAT IS ESTABLISHED.** The `gu` stage passed a full numeric comparison on its first run - 3840/3840 against a
-double reference, which is the check that matters most here because the source records TWO layout traps in this
-exact kernel, both of which produce finite, plausible numbers when wrong:
+## A RETRACTION, first, because the record matters
 
-* the gate/up rows are INTERLEAVED (row-slot `i` is gate row `i/2` when even, up row `(i-1)/2` when odd), and
-* the output is GATE-MAJOR, because `swiglu` and `quantize_q8_0` both walk a contiguous range - a per-hit
-  [gate | up] layout makes them read hit 0's up rows where they wanted hit 1's gate rows. **"With one hit it
-  would have passed"**, which is why the case uses three hits with permuted `slot_index` and gapped `dst_index`.
+An earlier commit and its report claimed **"gu passed 3840/3840 against a double reference on its first run"**.
+**That claim is withdrawn.** It was an artifact of the hole described below: `ratio > 1.0` is false for a NaN, so
+when the kernel produced NaN the comparison reported "0 differ, worst 0" and the case called it a pass.
 
-The `swiglu` stage passed too (1920/1920). The `down` stage did not, and the cause is in the TEST rather than
-demonstrated to be in the kernel: its oracle was reading the wrong activation buffer at first (fixed - it must
-read the quantizer's output, which is what the previous stage actually produced), and after that fix the
-intermediate showed `d = NaN`.
+## The actual state
 
-**THE NaN QUESTION IS SETTLED, AND NO KERNEL WAS EVER WRONG.** `gemv_bound` returned **exactly 0.0** for a row
-whose oracle value AND sum|terms| are both zero - an all-zero weight row, which the bf16 case has on purpose - and
-`|0 - 0| / 0.0` is NaN. The old check (`ratio > 1.0`) is FALSE for a NaN, so that element passed silently; making
-the comparison NaN-safe exposed it, and it then LOOKED like a device producing NaN. Both readings were wrong: the
-kernel was computing exactly the right answer and the line that needed fixing was the bound.
+The `gu` kernel produces **NaN on the device** where the oracle, from the same bytes, produces a finite value:
 
-Fixed in the harness: the bound now carries a 1e-30 floor, and the NaN-safe comparison is adopted at all six sites
-- which is worth having regardless, since a NaN result should never pass a check.
+    gu: worst err/tol 0, |oracle| mass 3.75517e+06 ; got[0] nan (isnan 1)
+                                                     want[0] 1417.59375 (isnan 0), abs_sum[0] 5514.59375
 
-**WHAT REMAINS FOR THIS FILE.** The tier's case was reverted with the rest of that turn's work and has to be
-re-added and re-run now that the bound is fixed; the `gu` and `swiglu` stages passed against it before the revert
-(3840/3840 and 1920/1920), and the `down` stage's own bug - its oracle reading the gate/up activation image
-instead of the quantizer's output - is recorded below and already fixed in the version that was reverted.
-**WHAT IS OPEN, AND IT IS A HOLE IN THE GATE RATHER THAN IN THIS FILE.** Making the comparisons NaN-safe
-(`!(ratio <= 1.0)` instead of `ratio > 1.0`, since a NaN comparison is false and the old form silently ACCEPTED a
-NaN) turns up NaN err/tol ratios in cases that currently report "worst 0" - and in this tier's `gu` stage every
-ratio was NaN while the raw comparison of 3840 values had passed. So either a device output is NaN, or the
-oracle's `sum|terms|` is, or `gemv_bound` is. Until that is settled, `!(ratio <= 1.0)` cannot be adopted
-everywhere, and these kernels cannot be called verified.
+So it is a real defect in the kernel or in how the case drives it, not a test artifact. What has been RULED OUT:
 
-Next session: settle the NaN's provenance (print `isnan` for the device's output, the oracle's value AND the
-oracle's `sum|terms|` separately - the last one was not checked), then re-run this tier's case.
+* the blob and activation bytes are finite - every scale is written from a real value through `f16_from_f32`, and
+  the code bytes are integers masked to two bits, which cannot produce NaN;
+* the offsets agree between the shader and the oracle: `O_D_CODES` 819200, `O_GU_SCALES` 1228800, the down
+  regions ending exactly at `BLOB_BYTES` 1382400, with the row indexing `i*ROW_GU` and `i*SC_GU*2` matching;
+* the integer path cannot overflow - `s` is at most 8*4*3*127 and `hx` at most 32*127.
+
+Not yet ruled out: where the NaN enters. The next probe should dump the first row's eight code bytes, its scale,
+and the activation block **as the device reads them** (a tiny debug output buffer), rather than reasoning about
+which offset is right.
+
+## What was learned from the source while drafting them
+
+Two layout traps in `gu_kernel`, both of which produce FINITE, PLAUSIBLE numbers when wrong, and the second of
+which the source says "with one hit it would have passed":
+
+* the gate/up rows are INTERLEAVED - row-slot `i` is gate row `i/2` when even, up row `(i-1)/2` when odd;
+* the output is GATE-MAJOR, because `swiglu` and `quantize_q8_0` both walk a contiguous range, so a per-hit
+  [gate | up] layout makes them read hit 0's up rows where they wanted hit 1's gate rows.
+
+And the primitive's own trick: the -1 bias is folded into an integer identity,
+`sum((code-1)*x) == sum(code*x) - sum(x)`, so two exact integer sums are computed and subtracted.
+
+## The gate hole this exposed, now closed
+
+`ratio > 1.0` is FALSE for a NaN, so a NaN err/tol ratio passed every comparison in the harness. The NaN-safe form
+`!(ratio <= 1.0)` is now in at all six sites in the shipped cases, and `gemv_bound` carries a 1e-30 floor (a row
+whose oracle value and sum|terms| are both zero made it 0.0, and 0/0 is NaN). Both changes are in the gate and both
+are worth having: a NaN result should never pass a check.
