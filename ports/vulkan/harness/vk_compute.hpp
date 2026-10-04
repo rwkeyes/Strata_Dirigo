@@ -107,12 +107,16 @@ struct ReserveDecision {
 };
 // The GEMM's shape precondition, as a testable predicate rather than a comment in a shader.
 //
-// WHY IT EXISTS: the cooperative-matrix kernel derives `tiles_m = m / 16` and everything returns when the tile
+// WHY IT EXISTS: the cooperative-matrix kernel derives `tiles_m = m / tile_m` and everything returns when the tile
 // count is zero.  An M=1 dispatch (single-token decode) therefore computes NOTHING and leaves the output buffer
 // untouched - the caller reads stale or uninitialised memory and no layer reports a problem.  That is the exact
 // failure this port refuses everywhere else ("refuse, never degrade"), so the precondition is enforced at the
-// boundary instead of documented: all three dimensions must be non-zero multiples of the 16x16 tile.
-bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k);
+// boundary instead of documented: every dimension must be a non-zero multiple of the kernel's tile.
+//
+// `tile_m` is a PARAMETER because the M dimension is the device's, not the port's: 16 on RADV/WMMA and 8 on Intel
+// XMX (measured - see DeviceInfo::cm_m).  n and k are 16 in both, but they are checked against the tile constants
+// the kernel actually declares rather than against 16 by name.
+bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k, uint32_t tile_m = 16, uint32_t tile_n = 16, uint32_t tile_k = 16);
 
 ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes,
                                        uint64_t floor_bytes, uint32_t cap_percent_of_heap);
@@ -126,7 +130,14 @@ struct DeviceInfo {
     // because the second is not implied by the first: on RADV the 14 supported configs are all M16 N16 K16 with
     // subgroup scope and NONE of them takes fp32 operands, so an fp32 GEMM compiles and still cannot run.
     bool cooperative_matrix = false;     // extension + feature present
-    bool cm_f16_f32 = false;             // ...and a usable config exists: M16 N16 K16 subgroup, f16/f16 -> f32
+    bool cm_f16_f32 = false;             // ...and a usable M16 N16 K16 subgroup f16/f16 -> f32 config exists
+    // ...AND THE TILE IS A PROPERTY OF THE DEVICE, NOT A CONSTANT.  Measured on this box (2026-10-04) with
+    // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR: **Intel BMG G31's floating-point config is M8 N16 K16**
+    // (XMX's op is 8 rows wide), while RADV's list is all M16 N16 K16.  A single "is cooperative matrix usable?"
+    // bool therefore gets the Arc wrong - it says no - and the pipeline has to be chosen by shape, which is what
+    // these three fields are for.  They hold the SELECTED config (M16 preferred where a device offers both,
+    // because that is the kernel this port verified on a Radeon); 0/0/0 means no usable config.
+    uint32_t cm_m = 0, cm_n = 0, cm_k = 0;
     bool shader_int16 = false;
     // VK_KHR_8bit_storage storageBuffer8BitAccess: kv_q8 stores its codes as int8 in a storage buffer, so this
     // one is required for that kernel and not merely nice to have (the 16-bit flag covers the scales).

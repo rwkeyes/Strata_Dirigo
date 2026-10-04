@@ -10,11 +10,17 @@
 //     pipeline from the driver's own config list, not from "it compiled".
 //  2. It is not universally an improvement: on Intel it is gated to Xe2 because it REGRESSES on Alchemist, so
 //     selection must be by device property, never by vendor.
-//  3. The tile is 16x16x16, so every dimension must be a non-zero multiple of 16.  There is NO ragged-edge path
-//     here, and a violation is silent rather than loud: `tiles_m = m / 16` is zero for M < 16, every workgroup
+//  3. The tile is 16x16x16 HERE, so every dimension must be a non-zero multiple of 16.  There is NO ragged-edge
+//     path, and a violation is silent rather than loud: `tiles_m = m / 16` is zero for M < 16, every workgroup
 //     returns, and the output buffer is left as it was found.  The caller must therefore gate the dispatch on
-//     portvk::gemm_shape_ok(m, n, k) - a function, not a comment, precisely because an M=1 decode step is a
-//     shape this would otherwise accept and quietly compute nothing for.
+//     portvk::gemm_shape_ok(m, n, k, tile_m, tile_n, tile_k) - a function, not a comment, precisely because an
+//     M=1 decode step is a shape this would otherwise accept and quietly compute nothing for.
+//
+//     AND THE TILE IS THE DEVICE'S, NOT THIS FILE'S.  M16 is what RADV's config list offers; **Intel BMG's is M8
+//     N16 K16** (measured 2026-10-04), which is why `gemm_coopmat_m8.comp` exists and why the case picks the
+//     pipeline from vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR rather than from a constant here.  Forcing
+//     this 16-row kernel onto a device whose op is 8 rows does not fail pipeline creation - it computes WRONG
+//     numbers (measured: 2560 of 4608 elements correct), so the selection is not a performance choice.
 //  4. The extension is NOT the limitation it was believed to be.  `glslc` (shaderc 2023.8 / glslang 14) emits
 //     OpCooperativeMatrixMulAddKHR fine - the earlier "the toolchain cannot do this" verdict came from a probe
 //     shader of mine that was itself broken (missing GL_KHR_memory_scope_semantics, the misspelled

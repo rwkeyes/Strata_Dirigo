@@ -132,6 +132,47 @@ account it refused in.
 
 
 
+## STAGE 5 (started): the matrix path on Intel - **THE ARC'S MATRIX UNITS ARE REACHABLE, AND WERE BEING MISREPORTED**
+
+**The finding, measured with the driver's own property list** (`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`,
+all three implementations, 2026-10-04):
+
+| device | extension | configs | the floating-point one |
+|---|---|---|---|
+| Intel BMG G31 (XMX) | advertised, revision 2, feature true | 6 | **M8 N16 K16**, f16/f16 -> f32, subgroup scope |
+| RADV Raphael (RDNA2) | **not advertised** | (14 returned by an entry point the driver does not advertise) | all M16 N16 K16 |
+| llvmpipe | not advertised | none | - |
+
+So the port's `gemm_coopmat` case demanded **M16** N16 K16 - a rule written against the departed Radeon's list - and
+therefore reported the Arc as having "no usable config", which reads as "the matrix units are unreachable here".
+They are not: **BMG's op is 8 rows wide.** The tile is a property of the DEVICE, per generation, and the port now
+selects the pipeline by shape for exactly that reason.
+
+**What changed.** `shaders/gemm_coopmat_m8.comp` (the sibling of the M16 kernel, 8x16 tile, same dispatch shape and
+bounds guard); `DeviceInfo::cm_m/cm_n/cm_k` hold the SELECTED config (M16 preferred where a device offers both,
+because that is the kernel this port verified on a Radeon, else M8); `gemm_shape_ok` takes the tile as parameters,
+so the precondition is one rule with the device's numbers in it rather than two rules that drift; the case picks
+the pipeline by shape, PRINTS which one it ran, and gained a PROMPT-SHAPED case (128x256x256, a real prefill tile
+grid rather than 64x64).
+
+**Evidence.** Intel: **180 passed / 0 failed / 0 skipped** - the Arc now runs the matrix path and no longer skips
+anything, including all four coopmat shapes against a double-precision reference (worst relative error 0.0101 on
+the prompt-shaped grid, and that is on elements whose absolute error is under the 1e-4 floor - the case prints
+both).  llvmpipe 172 / 0 / 2, RADV 175 / 0 / 1 (both still skip coopmat: their drivers do not advertise the
+extension, and skipping a device that does not advertise an extension is correct - unlike skipping one that does).
+
+**Falsification, and it is the interesting kind.** Forcing the M16 kernel on the Arc - ignoring the device's tile -
+does NOT fail pipeline creation.  It **runs and computes wrong numbers**: 2560/4608 elements correct in the square
+case, 16896/33280 in the prompt-shaped one, 176 passed / 4 failed.  So a wrong tile selection is a silent wrong
+answer on this driver, not a loud one, which is precisely why the pipeline has to come from the property list and
+why the case prints the shape it used.
+
+**What this settles for the rest of stage 5.** The prefill GEMM on the target card has matrix units at **M8 N16
+K16**, so the port's own GEMM tile is an 8-row tile with a plain-FMA fallback for devices with no config (llvmpipe,
+and any driver that does not advertise the extension) - and the selection has to be per device, never per vendor.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
@@ -141,13 +182,14 @@ than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 
 0 / 1 on llvmpipe), and, after that card was swapped for an **Arc Pro B70**, this one.
 
 **RUN ON INTEL HARDWARE (Arc Pro B70 "BMG G31", Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup 32), 2026-10-04 after
-stages 3 and 4 landed: 174 passed / 0 failed / 1 skipped**, with llvmpipe **171 / 0 / 2** and the radeon ICD (now
-the AMD iGPU, since the discrete card is gone) at 174 / 0 / 1 on a good run - **173 / 1 / 1 when the iGPU's
-intermittent requery case fires** (see below; it fired in the last full run).  llvmpipe's SECOND skip is
-stage 4's `stage: vram is not mappable`: that device has one memory type, device-local and mappable at once, so
-there is no unmappable VRAM type to check - a property of the device, reported as a skip.  The 18 verdicts added
-by stages 3 and 4 are the only difference from the 156/0/1 these ICDs read before them. The Intel skip is
-`gemm_coopmat` - no usable M16N16K16 subgroup-scope f16->f32 config on this device. **Read the totals, not an
+stages 3 and 4 plus the M8 matrix path landed: **180 passed / 0 failed / 0 skipped** - the Arc skips nothing now**,
+with llvmpipe **172 / 0 / 2** and the radeon ICD (now the AMD iGPU, since the discrete card is gone) at 175 / 0 / 1
+on a good run - **174 / 1 / 1 when the iGPU's intermittent requery case fires**.  The two implementations that
+still skip do so on cooperative matrix, which their drivers do not advertise - correct, and a different thing from
+the Arc's skip, which was the port's own criterion being written around the departed Radeon's M16 config.  llvmpipe's
+other skip is stage 4's `stage: vram is not mappable`: it has one memory type, device-local and mappable at once,
+so there is no unmappable VRAM type to check.  The verdicts added by stages 3, 4 and the matrix path are the only
+difference from the 156/0/1 these ICDs read before them.  **Read the totals, not an
 exit code, and say which:** `vk_gate` itself returns 0 on a skip-only run (skips are not failures in the binary);
 it is `run_gate.sh`'s assertion that makes a skipped case fail the RUN, which is the port's rule and stays.
 
@@ -382,8 +424,12 @@ done and gated.
 
 ## Done since this file was last written
 
-- `gemm_coopmat.comp` — the cooperative-matrix GEMM (matrix units). Verified on RADV on three shapes; a device
-  without a usable config is a loud SKIP, never a pass.
+- `gemm_coopmat.comp` / `gemm_coopmat_m8.comp` — the cooperative-matrix GEMM (matrix units) at the TWO tile shapes
+  real devices advertise: **M16 N16 K16** (RADV/WMMA, verified on a Radeon) and **M8 N16 K16** (Intel XMX, verified
+  on the Arc 2026-10-04 - see the step-5 block at the top of this file).  The case selects by the device's own
+  property list, prints which pipeline it ran, and SKIPS loudly where no config exists - and since the M8 file
+  landed that is a device property (llvmpipe, and RADV here, which does not advertise the extension), not a port
+  limitation.
 - `gemm_fma.comp` — the plain-FMA GEMM with **no shape precondition**, so it is both the decode path (M=1 is
   structurally impossible for the CMA path) and the fallback where no CMA config exists (llvmpipe). The engine
   selects by **shape first**, device capability second.

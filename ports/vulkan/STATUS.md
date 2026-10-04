@@ -8,15 +8,17 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
                                                  # checks each shader's declared local size, then runs the gate
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
-was swapped for an Arc Pro B70 and after stages 3 and 4 landed, the box's GPU run was 174 passed / 0 failed /
-1 skipped on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) -
-171 / 0 / 2 on llvmpipe (the second skip is stage 4's device-property skip: that device has no unmappable
-device-local memory type) and 174 / 0 / 1 on the radeon ICD, which now picks the AMD iGPU because the discrete
-card is gone - **173 / 1 / 1 when that iGPU's intermittent budget-requery case fires, which it did in the last
-full run.** Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three
-times in two days; read the last line of your own run.** All three available implementations are exercised again
-by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 54 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
+was swapped for an Arc Pro B70 and after stages 3 and 4 plus the matrix path landed, the box's GPU run was
+**180 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan
+1.4.318, subgroup size 32) - 172 / 0 / 2 on llvmpipe and 175 / 0 / 1 on the radeon ICD, which now picks the AMD
+iGPU because the discrete card is gone (both still skip cooperative matrix: their drivers do not advertise the
+extension).  **The Arc has no skips at all**: the last one (`gemm_coopmat`) was the port misreading the device, not
+the device lacking anything - BMG's matrix config is M8 N16 K16, not the M16 the case demanded, so the matrix path
+now RUNS on XMX.  On the iGPU, 174/0/1 becomes 173/1/1 when its intermittent budget-requery case fires.  Before the
+swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three times in two days; read
+the last line of your own run.** All three available implementations are exercised again by `run_gate.sh`: it used
+to stop at the Intel skip, which meant the cross-implementation arm never ran on this box after the swap
+(`NEXT.md`). 55 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -129,6 +131,21 @@ deterministic failure it was first documented as.
    overload of `exp` for SPIR-V. The port ships the f32 shader and **measures** its gap against the double
    reference (7.58e-07) instead of asserting it away. See `shaders/blocked/README.md`.
 
+## One finding that was NOT a kernel defect: the port misread the device (2026-10-04)
+
+`gemm_coopmat` skipped on the Arc with "no usable config: needs M16 N16 K16 subgroup-scope with f16 A/B and an f32
+accumulator", which reads as the device having no matrix units.  Enumerating the driver's own config list showed
+otherwise: **BMG's floating-point config is M8 N16 K16.**  The criterion had been written against the departed
+Radeon's list, where every config is M16, and a tile is a property of the device per generation - so the port was
+reporting a limitation of its own rule as a limitation of the hardware.  `gemm_coopmat_m8.comp` now exists, the
+case selects the pipeline from the property list and prints which one ran, and the Arc reads **180 / 0 / 0** with
+the matrix path exercised on all four shapes including a prompt-shaped 128x256x256 grid.
+
+Two lessons, both general: **a skip message is a claim about the device and has to be derivable from the device**
+(this one was derivable only from RADV); and **the wrong tile is silent** - forcing the M16 kernel on BMG does not
+fail pipeline creation, it computes wrong numbers (2560 of 4608 elements correct in the square case), which is why
+the case prints the shape it selected rather than only PASS.
+
 ## Not done (and how much of the job each is)
 
 * **Waves 2-6 of the kernels** (KV, rope, the GEMVs, attention, MoE, the prefill GEMM): the remaining CUDA
@@ -153,7 +170,9 @@ deterministic failure it was first documented as.
   There is no `setup.py`/`CMakeLists`/`core/device.hpp` change on this branch, so nothing in the engine can call any
   of it yet.
 * **Anything on Intel hardware — NO LONGER UNVERIFIED (2026-10-04).** An Arc Pro B70 is now the discrete card in
-  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **174 / 0 / 1**, with
+  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **180 / 0 / 0** —
+  no skips at all, including the matrix path, which was the port's own criterion misreading the device rather
+  than the device lacking anything (see the M8 finding above), with
   one device-specific defect found and fixed (the folded division in `quantize_q8_K` - NEXT.md's RESUME HERE).
   What stays unverified on Intel is everything the gate does not cover: the engine path, real token shapes, and
   the stability question below.

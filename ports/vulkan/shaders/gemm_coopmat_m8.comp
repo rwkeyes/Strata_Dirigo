@@ -1,0 +1,71 @@
+// ports/vulkan/shaders/gemm_coopmat_m8.comp - C[MxN] = A[MxK] * B[KxN] on the matrix units, at the shape
+// INTEL's XMX advertises.
+//
+// WHY THERE ARE TWO FILES.  The cooperative-matrix config is a property of the DEVICE, and the M dimension
+// differs by generation - measured on this box (2026-10-04) with the driver's own property list:
+//
+//   Intel BMG G31 (Xe2, XMX)   6 configs, the floating-point one M8  N16 K16, A/B f16 -> f32, subgroup scope
+//   RADV Raphael  (RDNA2)      its list is all M16 N16 K16 (f16->f16 and f16->f32) - the 7900 XTX's shape
+//   llvmpipe                   nothing (the extension is not exposed)
+//
+// So the M16 kernel this port shipped skips on the Arc for a reason that is NOT "the hardware has no matrix
+// units": BMG's op is 8 rows wide.  A GLSL `coopmat` is sized at compile time, so one source cannot serve both
+// - the pipeline must be chosen from the device's list, which is what Ctx::info().cm_m is for.
+//
+// Everything below is the M16 kernel with TM = 8; the four notes at the top of gemm_coopmat.comp (the config is
+// not free, it is not universally an improvement, every dimension must be a whole number of tiles, and the
+// extension works) apply here unchanged.  The tile is 8x16, so m must be a multiple of 8 and n, k multiples of
+// 16 - `portvk::gemm_shape_ok(m, n, k, 8)`, again a function rather than a comment.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// gl_SubgroupID / gl_SubgroupSize: core in Vulkan 1.1, but glslang wants the extension declared before it emits
+// them.
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+
+// fp16 storage for the operands (the only floating-point config there is) and fp32 for the accumulator.
+layout(set = 0, binding = 0, std430) coherent readonly buffer Abuf { float16_t a[]; } A;
+layout(set = 0, binding = 1, std430) coherent readonly buffer Bbuf { float16_t b[]; } B;
+layout(set = 0, binding = 2, std430) coherent buffer Cbuf { float c[]; } C;
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+// The device's tile, not a preference: 8 = BMG's M, 16 = its N and K.
+const uint TM = 8u;
+const uint TN = 16u;
+const uint TK = 16u;
+
+void main() {
+    const uint tiles_n = pc.n / TN;
+    const uint tiles_m = pc.m / TM;
+    const uint total = tiles_m * tiles_n;
+    const uint per_wg = max(1u, gl_WorkGroupSize.x / gl_SubgroupSize);
+    const uint tile = gl_WorkGroupID.x * per_wg + gl_SubgroupID;
+    if (tile >= total) return;                     // surplus workgroups exit; no duplicate tile is computed
+
+    const uint tm = (tile / tiles_n) * TM;         // row of the output tile: row-major over the tile grid
+    const uint tn = (tile % tiles_n) * TN;         // column
+
+    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> amat;
+    coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> bmat;
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc;
+    acc = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    // K is walked in TK-column chunks.  RowMajor means elements (row,*) come from buf[element + row*stride], so
+    // the strides are the row pitches of the full matrices and the element offsets are the tile's origin.
+    for (uint kk = 0u; kk < pc.k; kk += TK) {
+        coopMatLoad(amat, A.a, tm * pc.k + kk, pc.k, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(bmat, B.b, kk * pc.n + tn, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(amat, bmat, acc);
+    }
+
+    coopMatStore(acc, C.c, tm * pc.n + tn, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

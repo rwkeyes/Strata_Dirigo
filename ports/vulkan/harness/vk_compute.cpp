@@ -45,10 +45,10 @@ std::vector<uint8_t> read_file(const std::string& path) {
 // floor (a compositor needs something, so a caller asking for nothing still gets the floor), at most
 // `cap_percent_of_heap` of the card (a small card must stay usable for the engine at all), and a request in
 // between is taken as given.
-bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k) {
-    constexpr uint32_t TILE = 16;
+bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k, uint32_t tile_m, uint32_t tile_n, uint32_t tile_k) {
     if (m == 0 || n == 0 || k == 0) return false;
-    return m % TILE == 0 && n % TILE == 0 && k % TILE == 0;
+    if (tile_m == 0 || tile_n == 0 || tile_k == 0) return false;
+    return m % tile_m == 0 && n % tile_n == 0 && k % tile_k == 0;
 }
 
 ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes, uint64_t floor_bytes,
@@ -146,12 +146,27 @@ static void fill_coopmat(VkInstance inst, DeviceInfo& di, VkPhysicalDevice pd) {
         c.pNext = nullptr;
     }
     get_props(pd, &n, props.data());
+    // The tile is the DEVICE's, and the M dimension differs by generation (measured: M16 on RADV/WMMA, M8 on
+    // Intel XMX).  Collect what exists, then select: M16 first, because that is the kernel this port verified on
+    // a Radeon, and M8 as the fallback that makes the Arc's matrix units reachable at all.
+    bool have_m8 = false;
     for (const auto& c : props) {
-        if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 && c.scope == VK_SCOPE_SUBGROUP_KHR &&
-            c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-            c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+        if (c.scope != VK_SCOPE_SUBGROUP_KHR) continue;
+        if (c.AType != VK_COMPONENT_TYPE_FLOAT16_KHR || c.BType != VK_COMPONENT_TYPE_FLOAT16_KHR) continue;
+        if (c.CType != VK_COMPONENT_TYPE_FLOAT32_KHR) continue;
+        if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16) {
             di.cm_f16_f32 = true;
+            di.cm_m = 16;
+            di.cm_n = 16;
+            di.cm_k = 16;
+        } else if (c.MSize == 8 && c.NSize == 16 && c.KSize == 16) {
+            have_m8 = true;
         }
+    }
+    if (!di.cm_f16_f32 && have_m8) {
+        di.cm_m = 8;
+        di.cm_n = 16;
+        di.cm_k = 16;
     }
 }
 

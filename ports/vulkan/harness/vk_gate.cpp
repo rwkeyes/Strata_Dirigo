@@ -5676,6 +5676,7 @@ void case_gemm_fma(Ctx& ctx, const std::string& dir) {
 // ones here: M=1 is the shape a decode step actually produces, and dispatching it silently computes nothing.
 void case_gemm_shape_contract() {
     struct C { uint32_t m, n, k; bool ok; const char* what; };
+    // THE M16 CONTRACT (RADV/WMMA, and the device-agnostic default).
     const C cases[] = {
         {64, 64, 64, true, "square multiples of 16 rejected"},
         {32, 16, 48, true, "non-square, K=48 (a multiple of 16) rejected"},
@@ -5692,7 +5693,28 @@ void case_gemm_shape_contract() {
             ++bad;
         }
     }
-    verdict("gemm shape contract (7 cases)", bad == 0, bad, 7, 0.0, "wrong verdicts");
+    verdict("gemm shape contract M16 (7)", bad == 0, bad, 7, 0.0, "wrong verdicts");
+    // THE M8 CONTRACT - Intel BMG's config, where M is 8 and N/K are still 16.  Separate arms, because the two
+    // contracts disagree by construction on exactly the shapes in between: 8..15 rows is legal on the Arc and
+    // NOT on a Radeon, and a case that only tested the default would let the Arc's tile size drift unnoticed.
+    const C cases8[] = {
+        {64, 64, 64, true, "M8: square multiples of 8 rejected"},
+        {8, 16, 16, true, "M8: the smallest legal shape (one tile) rejected"},
+        {24, 48, 32, true, "M8: 24 rows (three tiles) rejected"},
+        {128, 256, 256, true, "M8: a prompt-shaped tile grid rejected"},
+        {1, 4096, 4096, false, "M8: M=1 was ACCEPTED"},
+        {12, 16, 16, false, "M8: 12 rows (one and a half tiles) was accepted"},
+        {16, 8, 16, false, "M8: N=8 was accepted - N is 16 on both devices"},
+        {8, 16, 8, false, "M8: K=8 was accepted - K is 16 on both devices"},
+    };
+    int bad8 = 0;
+    for (const C& c : cases8) {
+        if (gemm_shape_ok(c.m, c.n, c.k, 8, 16, 16) != c.ok) {
+            std::printf("      %s\n", c.what);
+            ++bad8;
+        }
+    }
+    verdict("gemm shape contract M8 (8)", bad8 == 0, bad8, 8, 0.0, "wrong verdicts");
 }
 
 // THE MATRIX-UNIT PATH (VK_KHR_cooperative_matrix).  This is the only case here whose kernel the toolchain can
@@ -5704,15 +5726,25 @@ void case_gemm_shape_contract() {
 // The reference is built from the fp16-ROUNDED operands, because that is what the kernel receives: comparing
 // against the fp32 originals would charge the kernel for the storage format's own precision.
 void case_gemm_coopmat(Ctx& ctx, const std::string& dir) {
-    if (!have(dir, "gemm_coopmat.spv")) return;
+    if (!have(dir, "gemm_coopmat.spv") || !have(dir, "gemm_coopmat_m8.spv")) return;
     if (!ctx.info().cooperative_matrix) {
         skip("gemm_coopmat", "device exposes no VK_KHR_cooperative_matrix - the matrix units are unreachable here");
         return;
     }
-    if (!ctx.info().cm_f16_f32) {
-        skip("gemm_coopmat", "no usable config: needs M16 N16 K16 subgroup-scope with f16 A/B and an f32 accumulator");
+    // THE TILE IS THE DEVICE'S, AND THE M DIMENSION IS WHERE THE DEVICES DIFFER.  Measured with the driver's own
+    // property list: RADV offers M16 N16 K16, Intel BMG offers M8 N16 K16.  The M16 kernel therefore skipped on
+    // the Arc for a reason that was never the hardware, and "no usable config" read as "no matrix units".  The
+    // pipeline is selected by shape and the run PRINTS which one it used - a bare PASS would hide which of the
+    // two shapes was verified.
+    const uint32_t tm = ctx.info().cm_m, tn = ctx.info().cm_n, tk = ctx.info().cm_k;
+    if (tm == 0) {
+        skip("gemm_coopmat", "no usable config: subgroup scope, f16 A/B and an f32 accumulator");
         return;
     }
+    const char* spv = (tm == 8) ? "gemm_coopmat_m8.spv" : "gemm_coopmat.spv";
+    std::printf("INFO  %-28s %ux%ux%u, pipeline %s%s\n", "gemm_coopmat config", tm, tn, tk, spv,
+                tm == 8 ? " (XMX's M, not the WMMA shape)" : "");
+    std::fflush(stdout);
     struct Shape { int m, n, k; };
     // Every shape the case dispatches must satisfy the contract FIRST.  Without this, editing one of them to a
     // ragged shape would leave the output buffer untouched and the comparison would read that as a numeric
@@ -5721,14 +5753,16 @@ void case_gemm_coopmat(Ctx& ctx, const std::string& dir) {
         const Shape contract_shapes[] = {{64, 64, 64}, {32, 16, 48}, {16, 64, 32}};
         int bad = 0;
         for (const Shape& sh : contract_shapes) {
-            if (!gemm_shape_ok((uint32_t) sh.m, (uint32_t) sh.n, (uint32_t) sh.k)) ++bad;
+            if (!gemm_shape_ok((uint32_t) sh.m, (uint32_t) sh.n, (uint32_t) sh.k, tm, tn, tk)) ++bad;
         }
         verdict("gemm_coopmat test shapes satisfy the contract", bad == 0, bad, 3, 0.0, "invalid shapes");
     }
-    // Three shapes on purpose.  The square one cannot tell the two tile-grid axes apart (transposing the
+    // Four shapes on purpose.  The square one cannot tell the two tile-grid axes apart (transposing the
     // mapping still visits every tile), so one wide and one tall case are required: {32,16,48} caught the
-    // transposed row/column mapping that the square case passed with.
-    const Shape shapes[] = {{64, 64, 64}, {32, 16, 48}, {16, 64, 32}};
+    // transposed row/column mapping that the square case passed with.  The last one is PROMPT-SHAPED - a real
+    // prefill tile count rather than a toy - because a kernel that is right at 64x64 and wrong once the grid is
+    // large is exactly the failure the over-dispatch guard exists for.
+    const Shape shapes[] = {{64, 64, 64}, {32, 16, 48}, {16, 64, 32}, {128, 256, 256}};
     for (const Shape& sh : shapes) {
         const int m = sh.m, n = sh.n, k = sh.k;
         std::vector<float> af((size_t) m * k), bf((size_t) k * n);
@@ -5762,8 +5796,8 @@ void case_gemm_coopmat(Ctx& ctx, const std::string& dir) {
         // the surplus (`tile >= total` returns), and this is what proves it - the guard bytes stay NaN and no
         // tile is computed twice.  Under-dispatch is the direction that silently loses output, so the host
         // always dispatches an upper bound.
-        const uint32_t tiles = (uint32_t) ((m / 16) * (n / 16));
-        VkPipeline p = ctx.pipeline(dir + "/gemm_coopmat.spv", 3, 12);
+        const uint32_t tiles = (uint32_t) ((m / (int) tm) * (n / (int) tn));
+        VkPipeline p = ctx.pipeline(dir + "/" + spv, 3, 12);
         struct { uint32_t m, n, k; } pc{(uint32_t) m, (uint32_t) n, (uint32_t) k};
         ctx.dispatch(p, {&ba, &bb, &bc}, &pc, sizeof(pc), tiles + 8);
         ctx.read(bc, out.data(), out.size() * 4);
@@ -5846,10 +5880,11 @@ int main(int argc, char** argv) {
     }
     if (list) {
         for (auto& d : Ctx::list_devices()) {
-            std::printf("%s (vendor 0x%04x device 0x%04x, api %u.%u.%u, subgroup %u, 16bit-storage %d, fp64 %d, coopmat %d/%d)\n",
+            std::printf("%s (vendor 0x%04x device 0x%04x, api %u.%u.%u, subgroup %u, 16bit-storage %d, fp64 %d, "
+                        "coopmat ext=%d f16f32=%ux%ux%u)\n",
                         d.name.c_str(), d.vendor_id, d.device_id, VK_VERSION_MAJOR(d.api), VK_VERSION_MINOR(d.api),
                         VK_VERSION_PATCH(d.api), d.subgroup_size, (int) d.storage_buffer_16bit, (int) d.shader_float64,
-                        (int) d.cooperative_matrix, (int) d.cm_f16_f32);
+                        (int) d.cooperative_matrix, d.cm_m, d.cm_n, d.cm_k);
         }
         return 0;
     }
