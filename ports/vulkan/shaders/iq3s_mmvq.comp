@@ -1,0 +1,42 @@
+// ports/vulkan/shaders/iq3s_mmvq.comp - ONE IQ3_S WEIGHT ROW against q8_1 activations, one workgroup per row.
+//
+// `mmvq_kernel<21>` with the format baked in.  IQ3_S is the gate/up format of 10 of the resident model's 48
+// layers.  Geometry is the 256-value shape: `Fmt<21>` is { qk 256, ipb 8, step 2 }, so part k of a row is weight
+// block k/8 and activation block k, `iqs` = 2*(k%8).
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) readonly buffer G { uint v[]; } iq3s_grid_b;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+#include "common/iq3s_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+const uint IQ3S_BLOCK = 110u;                    // bytes per 256 values
+const uint IQ3S_PARTS = 8u;                      // the format's ipb; step is 2
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;           // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / 256u;
+    const uint arow_bytes = (uint(pc.n_in) / 32u) * 36u;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint arow = c * arow_bytes;
+        float acc = 0.0;
+        for (uint k = lid; k < nb * IQ3S_PARTS; k += gl_WorkGroupSize.x) {
+            acc += iq3s_dot(wrow + (k / IQ3S_PARTS) * IQ3S_BLOCK, arow + k * 36u, 2u * (k % IQ3S_PARTS));
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}

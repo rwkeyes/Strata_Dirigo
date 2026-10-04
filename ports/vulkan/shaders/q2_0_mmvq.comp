@@ -1,0 +1,44 @@
+// ports/vulkan/shaders/q2_0_mmvq.comp - ONE Q2_0 WEIGHT ROW against q8_1 activations, one workgroup per row.
+//
+// `mmvq_kernel<42>` with the format baked in.  Q2_0 is the DOWN format of 9 of the resident model's 48 layers.
+//
+// THE GEOMETRY: `Fmt<42>` is { qk 64, ipb 2, step 1 }, so a block is 64 values - TWO q8_1 blocks - and takes two
+// 32-value parts.  Part k of a row is weight block k/2 and activation block k (the source's per-block activation
+// offset is `qk/32` = 2 q8_1 blocks), with `iqs` = k%2.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+#include "common/q2_0_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+const uint Q2_0_QK = 64u;                        // values per block
+const uint Q2_0_IPB = 2u;                        // dot calls per block
+const uint Q2_0_BLOCK = 18u;                     // bytes per block
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;           // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / Q2_0_QK;     // Q2_0 blocks per row
+    const uint arow_bytes = (uint(pc.n_in) / 32u) * 36u;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint arow = c * arow_bytes;
+        float acc = 0.0;
+        for (uint k = lid; k < nb * Q2_0_IPB; k += gl_WorkGroupSize.x) {
+            acc += q2_0_dot(wrow + (k / Q2_0_IPB) * Q2_0_BLOCK, arow + k * 36u, k % Q2_0_IPB);
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}

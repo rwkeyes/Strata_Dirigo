@@ -3211,6 +3211,476 @@ void case_iq4nl_mmvq(Ctx& ctx, const std::string& dir) {
     iq4nl_arm(ctx, dir, 32, 1, 1, "one block: the smallest legal shape");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// Q2_0 (type 42, the down format of 9 of 48 layers) - the format whose `__byte_perm` chain hid a byte order.
+//
+// Oracle A transcribes the perm chain's RESULT (the four codes of a byte against four activations).  Oracle B is
+// value-by-value in canonical order: value p of the block is the `p%4`-th 2-bit field of byte `p/4`, against the
+// p-th activation code.  B is what catches A being a plausible-but-wrong gather - this port's first version of the
+// kernel had the fields interleaved, and B is the reference that notices.
+static int q2_0_code_byte_host(uint32_t code) {
+    static const int tbl[4] = {0xFF, 0x00, 0x01, 0x02};
+    return tbl[code & 0x03u];
+}
+
+static int q2_0_codes_of_byte_host(uint32_t byte) {
+    return iq4nl_pack4_host(q2_0_code_byte_host(byte), q2_0_code_byte_host(byte >> 2u),
+                            q2_0_code_byte_host(byte >> 4u), q2_0_code_byte_host(byte >> 6u));
+}
+
+static int q2_0_sumi_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                          size_t ablk, int iqs) {
+    const size_t off = wblk + 2 + (size_t) (8 * iqs);
+    int sumi = 0;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t w0 = w[off + (size_t) (2 * j)];
+        const uint32_t w1 = w[off + (size_t) (2 * j) + 1];
+        const size_t aq = ablk + 4 + (size_t) (8 * j);
+        sumi = iq1m_dp4a(iq2s_rd4(act, aq), q2_0_codes_of_byte_host(w0), sumi);
+        sumi = iq1m_dp4a(iq2s_rd4(act, aq + 4), q2_0_codes_of_byte_host(w1), sumi);
+    }
+    return sumi;
+}
+
+// Oracle B: the 32 values of the part in canonical order, against the 32 activation codes.
+static double q2_0_byvalue_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                                size_t ablk, int iqs) {
+    int sumi = 0;
+    for (int p = 0; p < 32; ++p) {
+        const size_t m = wblk + 2 + (size_t) (8 * iqs + p / 4);
+        const int code = (w[m] >> (2 * (p % 4))) & 0x03;
+        // THE TABLE VALUE IS A SIGNED BYTE: 0xFF is -1, not 255.  Without the (int8_t) cast this oracle counts
+        // every code-0 value as +255 while the dp4a path counts it as -1 - and it is only oracle B that notices,
+        // because A and the kernel both go through dp4a, which sign-extends for free.
+        sumi += (int) (int8_t) q2_0_code_byte_host((uint32_t) code) * (int) (int8_t) act[ablk + 4 + (size_t) p];
+    }
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    return ((double) (float) (dw * da)) * (double) sumi;
+}
+
+static std::vector<uint8_t> q2_0_fill_blob(size_t n_out, int nb, int n_in) {
+    const size_t row_bytes = (size_t) nb * 18;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 18;
+            const float mag = (b % 5 == 0) ? 0.0078125f : 0.25f * (float) (1 + (b % 4));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 3 == 2) ? -mag : mag));
+            for (int i = 0; i < 16; ++i) blk[2 + i] = (uint8_t) ((i * 53 + b * 29 + (int) r * 11 + 7) & 0xFF);
+        }
+    }
+    (void) n_in;
+    return w;
+}
+
+static void q2_0_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 64;
+    const int row_bytes = nb * 18;
+    const std::vector<uint8_t> w = q2_0_fill_blob((size_t) n_out, nb, n_in);
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_alt(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, acc_alt = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 2; ++k) {
+                const size_t wblk = wrow + (size_t) (k / 2) * 18;
+                const size_t ablk = arow + (size_t) k * 36;
+                const int iqs = k % 2;
+                const double dw = (double) strata::kernels::f32_from_f16(
+                    (uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+                const double da = (double) strata::kernels::f32_from_f16(
+                    (uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+                const double s = (double) (float) (dw * da) * (double) q2_0_sumi_host(w, wblk, act, ablk, iqs);
+                acc += s;
+                abs_sum += std::fabs(s);
+                acc_alt += q2_0_byvalue_host(w, wblk, act, ablk, iqs);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_alt[(size_t) c * (size_t) n_out + r] = acc_alt;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+    double oracle_gap = 0.0;
+    int oracle_split = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double rel = std::fabs(want[i] - want_alt[i]) / std::max(std::fabs(want[i]), 1e-30);
+        oracle_gap = std::max(oracle_gap, rel);
+        if (!(rel < 1e-4)) ++oracle_split;
+    }
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/q2_0_mmvq.spv", 3, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[176];
+    std::snprintf(label, sizeof label, "q2_0_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    std::printf("      the two oracles vs each other: worst rel gap %.3g, disagreeing rows %d (must be 0)\n",
+                oracle_gap, oracle_split);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    if (oracle_split != 0 || !live) {
+        verdict(label, false, bad + oracle_split, (int) n_y, oracle_gap, "the two oracles disagree - fix the case");
+    } else {
+        verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    }
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_y);
+}
+
+void case_q2_0_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "q2_0_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("q2_0_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    q2_0_arm(ctx, dir, 2304, 8, 1, "36 blocks: 72 parts < 256 lanes");
+    q2_0_arm(ctx, dir, 4096, 4, 2, "64 blocks: 128 parts, two columns");
+    q2_0_arm(ctx, dir, 64, 1, 1, "one block: the smallest legal shape");
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// IQ3_S (type 21, the gate/up format of 10 of 48 layers) - the last gate/up format but IQ4_XS's single layer.
+//
+// Oracle A transcribes `vec_dot_iq3_s_q8_1` (the packed sign masks over grid words).  Oracle B applies the sign
+// ONE BYTE AT A TIME in canonical order - a different treatment of the same sign bits, and it also checks the
+// byte-to-activation mapping, which A and the kernel share by construction.
+static double iq3s_byvalue_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                                size_t ablk, int iqs) {
+    int sumi = 0;
+    const size_t QS = wblk + 2, QH = wblk + 66, SG = wblk + 74;
+    for (int p = 0; p < 32; ++p) {
+        const int s = p / 8;
+        const int which = (p % 8) / 4;                 // the first or second grid word of this step
+        const int bi = (p % 8) % 4;                    // which byte of that word
+        const uint32_t byte = w[QS + (size_t) (4 * iqs + 2 * s + which)];
+        const uint32_t qh = w[QH + (size_t) (iqs / 2)];
+        const int shift = (which == 0) ? (8 - 2 * s) : (7 - 2 * s);
+        const uint32_t gidx = byte | ((qh << (uint32_t) shift) & 0x100u);
+        const uint32_t word = strata::vkport::kIq3sGrid[gidx];
+        const int sp = w[SG + (size_t) (2 * iqs + s)];
+        const uint32_t signs_pre = (which == 0) ? (((sp & 0x03u) << 7u) | ((sp & 0x0Cu) << 21u))
+                                                : (((sp & 0x30u) << 3u) | ((sp & 0xC0u) << 17u));
+        const int signs = perbyte_ne_zero_host((int) (signs_pre >> 0u));
+        const int flipped = perbyte_sign_flip_host((int) word, signs);
+        sumi += (int) (int8_t) ((flipped >> (8 * bi)) & 0xFF) * (int) (int8_t) act[ablk + 4 + (size_t) p];
+    }
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    const uint32_t sc = w[wblk + 106 + (size_t) (iqs / 4)];
+    const int ls = (int) (1u + 2u * ((sc >> ((uint32_t) (iqs << 1) & 0x04u)) & 0x0Fu));
+    return ((double) (float) (dw * da)) * (double) (sumi * ls);
+}
+
+static int iq3s_sumi_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act, size_t ablk,
+                          int iqs) {
+    const size_t QS = wblk + 2, QH = wblk + 66, SG = wblk + 74;
+    const uint32_t qh = w[QH + (size_t) (iqs / 2)];
+    const int sp0 = iq2s_rd4(w, SG + (size_t) (2 * iqs));
+    int sumi = 0;
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t lo_b = w[QS + (size_t) (4 * iqs + l0)];
+        const uint32_t hi_b = w[QS + (size_t) (4 * iqs + l0) + 1];
+        const int gx = (int) strata::vkport::kIq3sGrid[lo_b | ((qh << (uint32_t) (8 - l0)) & 0x100u)];
+        const int gy = (int) strata::vkport::kIq3sGrid[hi_b | ((qh << (uint32_t) (7 - l0)) & 0x100u)];
+        const int sp = (sp0 >> (8 * (l0 / 2))) & 0xFF;
+        const int signs0 = perbyte_ne_zero_host(((sp & 0x03) << 7) | ((sp & 0x0C) << 21));
+        const int signs1 = perbyte_ne_zero_host(((sp & 0x30) << 3) | ((sp & 0xC0) << 17));
+        const size_t aq = ablk + 4 + (size_t) (4 * l0);
+        sumi = iq1m_dp4a(perbyte_sign_flip_host(gx, signs0), iq2s_rd4(act, aq), sumi);
+        sumi = iq1m_dp4a(perbyte_sign_flip_host(gy, signs1), iq2s_rd4(act, aq + 4), sumi);
+    }
+    const uint32_t sc = w[wblk + 106 + (size_t) (iqs / 4)];
+    return sumi * (int) (1u + 2u * ((sc >> ((uint32_t) (iqs << 1) & 0x04u)) & 0x0Fu));
+}
+
+static std::vector<uint8_t> iq3s_fill_blob(size_t n_out, int nb, int n_in) {
+    const size_t row_bytes = (size_t) nb * 110;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 110;
+            const float mag = (b % 5 == 0) ? 0.0078125f : 0.25f * (float) (1 + (b % 4));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 3 == 1) ? -mag : mag));
+            for (int i = 0; i < 64; ++i) blk[2 + i] = (uint8_t) ((i * 37 + b * 19 + (int) r * 23 + 3) & 0xFF);
+            for (int i = 0; i < 8; ++i) blk[66 + i] = (uint8_t) ((i * 61 + b * 13 + (int) r * 41 + 9) & 0xFF);
+            for (int i = 0; i < 32; ++i) blk[74 + i] = (uint8_t) ((i * 29 + b * 47 + (int) r * 17 + 5) & 0xFF);
+            for (int i = 0; i < 4; ++i) blk[106 + i] = (uint8_t) ((i * 71 + b * 11 + (int) r * 7 + 1) & 0xFF);
+        }
+    }
+    (void) n_in;
+    return w;
+}
+
+static void iq3s_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 110;
+    const std::vector<uint8_t> w = iq3s_fill_blob((size_t) n_out, nb, n_in);
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_alt(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, acc_alt = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 8; ++k) {
+                const size_t wblk = wrow + (size_t) (k / 8) * 110;
+                const size_t ablk = arow + (size_t) k * 36;
+                const int iqs = 2 * (k % 8);
+                const double dw = (double) strata::kernels::f32_from_f16(
+                    (uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+                const double da = (double) strata::kernels::f32_from_f16(
+                    (uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+                const double s = (double) (float) (dw * da) * (double) iq3s_sumi_host(w, wblk, act, ablk, iqs);
+                acc += s;
+                abs_sum += std::fabs(s);
+                acc_alt += iq3s_byvalue_host(w, wblk, act, ablk, iqs);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_alt[(size_t) c * (size_t) n_out + r] = acc_alt;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+    double oracle_gap = 0.0;
+    int oracle_split = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double rel = std::fabs(want[i] - want_alt[i]) / std::max(std::fabs(want[i]), 1e-30);
+        oracle_gap = std::max(oracle_gap, rel);
+        if (!(rel < 1e-4)) ++oracle_split;
+    }
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_g = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_g, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq3s_mmvq.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[176];
+    std::snprintf(label, sizeof label, "iq3s_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    std::printf("      the two oracles vs each other: worst rel gap %.3g, disagreeing rows %d (must be 0)\n",
+                oracle_gap, oracle_split);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    if (oracle_split != 0 || !live) {
+        verdict(label, false, bad + oracle_split, (int) n_y, oracle_gap, "the two oracles disagree - fix the case");
+    } else {
+        verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    }
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y);
+}
+
+void case_iq3s_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq3s_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("iq3s_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    iq3s_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
+    iq3s_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
+    iq3s_arm(ctx, dir, 256, 1, 1, "one block");
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// IQ4_XS (type 23, the gate/up format of ONE layer of 48) - the last format that any layer is waiting on.
+//
+// Same dual-oracle arrangement as Iq4Nl, whose nibble packing it shares: A is the dp4a/nibble form, B is
+// value-by-value in canonical order (value p of a part lives in byte `4*iqs + p%16`, low nibble for p<16 and high
+// for p>=16, against activation code p) - which is the form that would notice a wrong packing or a wrong `iqs`
+// step.  The scale is also checked implicitly: both oracles apply `ls - 32`.
+static double iq4xs_byvalue_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                                 size_t ablk, int iqs) {
+    int sumi = 0;
+    for (int p = 0; p < 32; ++p) {
+        const size_t m = wblk + 8 + (size_t) (4 * iqs + (p % 16));
+        const uint32_t byte = w[m];
+        const uint32_t nib = (p < 16) ? (byte & 0x0Fu) : (byte >> 4u);
+        sumi += iq4nl_value_host(nib) * (int) (int8_t) act[ablk + 4 + (size_t) p];
+    }
+    const uint32_t sl = w[wblk + 4 + (size_t) (iqs / 8)];
+    const uint32_t sh = w[wblk + 2] | ((uint32_t) w[wblk + 3] << 8);
+    const int ls = (int) (((sl >> ((uint32_t) iqs & 0x04u)) & 0x0Fu) | (((sh >> ((uint32_t) iqs / 2u)) & 0x03u) << 4u));
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    return ((double) (float) (dw * da)) * (double) (sumi * (ls - 32));
+}
+
+static int iq4xs_sumi_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act, size_t ablk,
+                           int iqs) {
+    const size_t QS = wblk + 8;
+    int sumi = 0;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t aux = (uint32_t) iq2s_rd4(w, QS + (size_t) (4 * (iqs + j)));
+        const int vx = iq4nl_pack4_host(iq4nl_value_host(aux & 0x0Fu), iq4nl_value_host((aux >> 8u) & 0x0Fu),
+                                        iq4nl_value_host((aux >> 16u) & 0x0Fu), iq4nl_value_host((aux >> 24u) & 0x0Fu));
+        const int vy = iq4nl_pack4_host(iq4nl_value_host((aux >> 4u) & 0x0Fu), iq4nl_value_host((aux >> 12u) & 0x0Fu),
+                                        iq4nl_value_host((aux >> 20u) & 0x0Fu), iq4nl_value_host((aux >> 28u) & 0x0Fu));
+        const size_t aq = ablk + 4 + (size_t) (4 * j);
+        sumi = iq1m_dp4a(vx, iq2s_rd4(act, aq), sumi);
+        sumi = iq1m_dp4a(vy, iq2s_rd4(act, aq + 16), sumi);
+    }
+    const uint32_t sl = w[wblk + 4 + (size_t) (iqs / 8)];
+    const uint32_t sh = w[wblk + 2] | ((uint32_t) w[wblk + 3] << 8);
+    const int ls = (int) (((sl >> ((uint32_t) iqs & 0x04u)) & 0x0Fu) | (((sh >> ((uint32_t) iqs / 2u)) & 0x03u) << 4u));
+    return sumi * (ls - 32);
+}
+
+static std::vector<uint8_t> iq4xs_fill_blob(size_t n_out, int nb, int n_in) {
+    const size_t row_bytes = (size_t) nb * 136;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 136;
+            const float mag = (b % 6 == 0) ? 0.015625f : 0.5f * (float) (1 + (b % 3));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 4 == 1) ? -mag : mag));
+            blk[2] = (uint8_t) ((b * 7 + (int) r * 3 + 1) & 0xFF);      // scales_h, low
+            blk[3] = (uint8_t) ((b * 5 + (int) r * 11 + 2) & 0xFF);     // scales_h, high
+            for (int i = 0; i < 4; ++i) blk[4 + i] = (uint8_t) ((i * 19 + b * 23 + (int) r * 13 + 6) & 0xFF);
+            for (int i = 0; i < 128; ++i) blk[8 + i] = (uint8_t) (((i + b) & 0x0F) | ((15 - ((i * 5 + b) & 0x0F)) << 4));
+        }
+    }
+    (void) n_in;
+    return w;
+}
+
+static void iq4xs_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 136;
+    const std::vector<uint8_t> w = iq4xs_fill_blob((size_t) n_out, nb, n_in);
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_alt(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, acc_alt = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 8; ++k) {
+                const size_t wblk = wrow + (size_t) (k / 8) * 136;
+                const size_t ablk = arow + (size_t) k * 36;
+                const int iqs = 4 * (k % 8);
+                const double dw = (double) strata::kernels::f32_from_f16(
+                    (uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+                const double da = (double) strata::kernels::f32_from_f16(
+                    (uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+                const double s = (double) (float) (dw * da) * (double) iq4xs_sumi_host(w, wblk, act, ablk, iqs);
+                acc += s;
+                abs_sum += std::fabs(s);
+                acc_alt += iq4xs_byvalue_host(w, wblk, act, ablk, iqs);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_alt[(size_t) c * (size_t) n_out + r] = acc_alt;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+    double oracle_gap = 0.0;
+    int oracle_split = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double rel = std::fabs(want[i] - want_alt[i]) / std::max(std::fabs(want[i]), 1e-30);
+        oracle_gap = std::max(oracle_gap, rel);
+        if (!(rel < 1e-4)) ++oracle_split;
+    }
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq4xs_mmvq.spv", 3, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[176];
+    std::snprintf(label, sizeof label, "iq4xs_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    std::printf("      the two oracles vs each other: worst rel gap %.3g, disagreeing rows %d (must be 0)\n",
+                oracle_gap, oracle_split);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    if (oracle_split != 0 || !live) {
+        verdict(label, false, bad + oracle_split, (int) n_y, oracle_gap, "the two oracles disagree - fix the case");
+    } else {
+        verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    }
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_y);
+}
+
+void case_iq4xs_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq4xs_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("iq4xs_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    iq4xs_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
+    iq4xs_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
+    iq4xs_arm(ctx, dir, 256, 1, 1, "one block");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -4903,6 +5373,9 @@ int main(int argc, char** argv) {
     case_iq2s_mmvq(ctx, dir);
     case_iq3xxs_mmvq(ctx, dir);
     case_iq4nl_mmvq(ctx, dir);
+    case_q2_0_mmvq(ctx, dir);
+    case_iq3s_mmvq(ctx, dir);
+    case_iq4xs_mmvq(ctx, dir);
     case_quantize_q8_1(ctx, dir);
     case_swiglu_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);

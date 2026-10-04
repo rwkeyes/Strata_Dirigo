@@ -70,6 +70,7 @@ def render() -> str:
     iq1s = extract_u32("iq1s_grid_gpu", 2048, 8)
     iq2s = extract_u64_as_u32pairs("iq2s_grid", 1024)
     iq3xxs = extract_u32("iq3xxs_grid", 256, 8)
+    iq3s = extract_u32("iq3s_grid", 512, 8)
     lines = [
         "// ports/vulkan/harness/iq_grids.hpp - GENERATED, do not edit.",
         "//",
@@ -94,6 +95,9 @@ def render() -> str:
     emit(lines, iq3xxs, "uint32_t", "kIq3xxsGrid[256]",
          "// iq3xxs_grid: 256 grid points, one uint32 each (IQ3_XXS). Four signed bytes per word.")
     lines.append("inline constexpr int kIq3xxsGridSize = 256;")
+    emit(lines, iq3s, "uint32_t", "kIq3sGrid[512]",
+         "// iq3s_grid: 512 grid points, one uint32 each (IQ3_S). Four signed bytes per word.")
+    lines.append("inline constexpr int kIq3sGridSize = 512;")
     lines += ["", "}  // namespace strata::vkport", ""]
     return "\n".join(lines)
 
@@ -104,7 +108,7 @@ def main() -> int:
         if not OUT.exists() or OUT.read_text() != text:
             print(f"gen-iq-tables: {OUT} is STALE (or missing) - regenerate it", file=sys.stderr)
             return 1
-        print(f"gen-iq-tables: {OUT} is current (iq1s 2048 + iq2s 1024 + iq3xxs 256)")
+        print(f"gen-iq-tables: {OUT} is current (iq1s 2048 + iq2s 1024 + iq3xxs 256 + iq3s 512)")
         return 0
     OUT.write_text(text)
     print(f"gen-iq-tables: wrote {OUT}")
