@@ -20,8 +20,6 @@
 // products are exact in f32 because bf16 has an 8-bit mantissa, so the only error the double accumulator was
 // guarding against is the SUMMATION - which Kahan compensation addresses, and the gate measures the result.
 #version 450
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer X { uint v[]; } xb;

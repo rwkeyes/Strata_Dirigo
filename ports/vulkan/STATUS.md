@@ -7,8 +7,13 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
     bash ports/vulkan/gates/run_gate.sh          # compiles the shaders from source, validates the SPIR-V,
                                                  # checks each shader's declared local size, then runs the gate
 
-**Result: 14 passed, 0 failed, 0 skipped** on the box's GPU
-(`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64).
+**Result: the gate prints its own totals and those are the authority - 126 passed, 0 failed, 0 skipped on the
+box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
+120 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
+last line of your own run.** 43 kernels, 6 shared includes.
+
+The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
+gated the same way and is described where it is defined.
 
 | Case | Verdict | Method |
 |---|---|---|
@@ -62,7 +67,14 @@ that would have prevented the recorded AMD incident (`docs/AMD_HIP.md`, #380/#37
 each, run automatically by `gates/run_gate.sh`. The Intel ICD is present but has no device on this machine, so
 the arm reports it as no-device; it will run automatically when an Arc card is in the box.
 
-## Two defects found by the gate (both real, both fixed, both measured)
+## Three defects found by the gate (all real, all fixed, all measured)
+
+0. **The expert tier's `dx` came from the wrong buffer.** `s2_row_dot`'s `f16_at` takes a byte offset into the
+   EXPERT BLOB; the CUDA's takes a pointer and was reading the ACTIVATION. So with `use_xscales` false every
+   row's multiplier was arbitrary code-byte content, and a code-byte pair decoding as a NaN fp16 turned the row
+   to NaN through all 80 chunks. This is the defect that was misdiagnosed for a day as a masked-wave reduction
+   fault - see `NEXT.md`, and `case_s2expert_tier`, whose six arms were written for the misdiagnosis and found
+   the real one. Fixed by `act_f16_at`.
 
 1. **`gdn_gate` first version: softplus lost 4.3e-05 relative.** The delegated translation wrote
    `log(1.0f + exp(x))`; the source uses `log1pf(expf(x))`. A Kahan-form `log1p` did **not** fix it — the
@@ -78,9 +90,12 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
 
 ## Not done (and how much of the job each is)
 
-* **Waves 2-6 of the kernels** (KV, rope, the GEMVs, attention, MoE, the prefill GEMM): 37 of the 44 CUDA
+* **Waves 2-6 of the kernels** (KV, rope, the GEMVs, attention, MoE, the prefill GEMM): the remaining CUDA
   kernel files, plus the 8 prefill files and the 7 `cuBLASLt` call sites (which have no Vulkan equivalent and
-  must be written by hand). The method and the gate are proven; this is a grind, not an unknown.
+  must be written by hand). The method and the gate are proven; this is a grind, not an unknown. **The resident
+  expert tier - `s2_expert_grouped.cu`'s gate/up, SwiGLU and down - is DONE and gated (2026-10-04).** The next
+  workstream is the quantized-expert wave: 22 shaders from `iq_kernels.cu` and `native_mmvq.cu`, which is what
+  an IQ1_M model needs (see `NEXT.md`).
 * **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no recorded command buffers, no kernel
   registry. `harness/vk_compute.*` is the seed of the device layer, deliberately host-visible-only memory for
   gate fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.

@@ -2,6 +2,45 @@
 
 ## RESUME HERE (state as of the last commit)
 
+**THE EXPERT TIER IS FIXED, IN THE BUILD, AND GATED.** 126 passed / 0 failed / 0 skipped on RADV, 120 / 0 / 1 on
+llvmpipe (the skip is cooperative matrix), 126 / 0 / 0 on the radeon ICD re-run. 43 kernels plus 6 shared
+includes. The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh` - and this line has gone stale
+twice in one day, so run it rather than quote it.
+
+**THE REAL DEFECT WAS A WRONG-BUFFER READ, AND THE "MASKED WAVE" ROOT CAUSE BELOW IS WITHDRAWN.**  In
+`shaders/common/s2_row_dot.glsl`, `dx` (the activation's own fp16 scale) was read with `f16_at(xb)`, and the
+port's `f16_at` takes a byte offset into the EXPERT BLOB whereas the CUDA's takes a pointer and was reading the
+ACTIVATION. So with `use_xscales` false - the GPU path, the one `moe_hit_parity` exercises - every row's
+multiplier was arbitrary code-byte content: code-byte pairs that decode as a NaN or a near-65504 fp16 turn the
+whole row into NaN multiplied through 80 chunks, which is exactly the "same non-canonical NaN in every workgroup"
+signature that was read as a reduction defect. Fixed by `act_f16_at` (reads `act_b`); six new cases cover it.
+
+**The A/B that withdraws the masked-wave claim, measured rather than argued:** with the `dx` fix in place and the
+OLD subgroup reduction restored, all six tier cases pass on RADV (subgroup 64) AND on llvmpipe (subgroup 8), at
+both 80 chunks < 256 lanes and 320 chunks > 256 lanes. There is no configuration in this port where the subgroup
+form was measured to fail. The reduction IS a barrier tree in the shipped tree, but as a **portability choice**
+(Intel picks the subgroup width per kernel) and **not** as a bug fix - the full note and the one-file revert
+recipe are at the top of `shaders/common/wg_reduce.glsl`.
+
+WHAT MADE THE OLD DIAGNOSIS SURVIVE TWO ROUNDS, worth carrying into any future bisection:
+* `probe_gu_reads.comp` verified ITS OWN reads against the host and both agreed. It never exercised `f16_at`, so
+  it could not see the shader's read being from the wrong buffer - a probe that re-derives the offsets is a
+  second copy of the claim, not a check of it.
+* the bisection that "exonerated the dot" showed the raw per-lane dots were FINITE (0.0645924). They were finite
+  and wrong. **Finiteness is not correctness, and a run with no oracle comparison cannot tell the two apart.**
+* initialising the reduction's shared array changed nothing - correctly, because the cause was never shared
+  memory. That non-result was read as "the hypothesis is refuted, so the cause is the caller's mask".
+
+NEXT, in order:
+1. **The quantized-expert wave** (22 shaders from `iq_kernels.cu` / `native_mmvq.cu`) - see "THE NEXT WORKSTREAM"
+   and "SCOPED" below. That is the next workstream; the tier is closed.
+2. The cross-implementation arm can report `budget: independent requery agrees` as a FALSE FAIL while the
+   resident local model holds the card (the driver's own usage moves between Ctx construction and the case).
+   When ONLY that case fails on the radeon re-run, re-run it before believing it - observed once here, green on
+   the two runs either side of it.
+
+### WITHDRAWN: the masked-wave diagnosis (kept because the reasoning is worth seeing fail)
+
 **UPDATE (bisected, not reasoned):** the `gu` NaN is no longer a mystery. The raw dot is correct - 640 of 640 up-row
 dots finite - and `wg_sum` returns the same non-canonical NaN in 640 of 640 gate rows. The dot is exonerated; the
 shared reduction produces it, in the one configuration no shipped caller uses (`n_chunks` 80 with 256 threads). See

@@ -8,8 +8,6 @@
 // One workgroup per row with the shared reduction (the CUDA uses one warp per row); the term arithmetic is
 // identical, so the comparison is against a double reference.
 #version 450
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_8bit_storage : require
 layout(local_size_x = 256) in;

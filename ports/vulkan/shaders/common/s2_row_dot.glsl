@@ -27,6 +27,22 @@ float f16_at(uint byte_off) {
     return unpackHalf2x16(uint(blob_b.b[byte_off]) | (uint(blob_b.b[byte_off + 1u]) << 8u)).x;
 }
 
+// **THE ACTIVATION'S OWN fp16 SCALE, AND IT MUST READ `act_b`.**
+//
+// The CUDA's `f16_at` takes a POINTER, so `f16_at(xb)` there reads the ACTIVATION (xb = x_q8_0 + c*34) while
+// `f16_at(scales + ...)` reads the blob. Collapsing that into a byte offset also collapsed the two buffers into
+// one: `f16_at(xb)` here read the expert's CODE BYTES as an fp16, so with `use_xscales` false - the GPU/cache
+// path, and the one the engine's own `moe_hit_parity` exercises - every row's multiplier was arbitrary blob
+// content. Measured consequence: all 3840 outputs of the gu case NaN, the same payload NaN in every workgroup,
+// while the same kernel with the fp32 x_scales path (which never reads this) was exact. Eight code-byte pairs
+// land on a NaN or near-max fp16 pattern per row, and a NaN multiplied through 80 chunks is a NaN row.
+//
+// The read is a pure widening conversion, so it stays `unpackHalf2x16` (see the packHalf2x16 finding in NEXT.md:
+// only the PACKING direction differs from the engine's converter).
+float act_f16_at(uint byte_off) {
+    return unpackHalf2x16(uint(act_b.b[byte_off]) | (uint(act_b.b[byte_off + 1u]) << 8u)).x;
+}
+
 float s2_row_dot(uint code_off, uint scale_off, uint x_off, uint n_chunks, uint x_scale_off, bool use_xscales) {
     float acc = 0.0;
     const uint lid = gl_LocalInvocationIndex;
@@ -34,7 +50,7 @@ float s2_row_dot(uint code_off, uint scale_off, uint x_off, uint n_chunks, uint 
     for (uint c = lid; c < n_chunks; c += lsize) {
         const uint cb = code_off + c * 8u;              // 8 code bytes = 32 elements
         const uint xb = x_off + c * 34u;                // one block_q8_0
-        const float dx = use_xscales ? xscale_v.v[x_scale_off + c] : f16_at(xb);
+        const float dx = use_xscales ? xscale_v.v[x_scale_off + c] : act_f16_at(xb);
         int s = 0;                                      // sum of code * x
         int hx = 0;                                     // sum of x
         for (uint j = 0u; j < 8u; ++j) {

@@ -23,8 +23,6 @@
 // to run PLE at all, which trades a 1e-7 error for a functional loss.  Points 1 and 2 are honoured exactly,
 // because they cost nothing.
 #version 450
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;

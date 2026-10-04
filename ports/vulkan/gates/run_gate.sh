@@ -66,12 +66,25 @@ for f in "${comps[@]}"; do
   # uses __fmaf_rn the SPIR-V must carry the fused operation.
   fma="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpExtInst .* Fma ')"
   fp64cap="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpCapability Float64')"
+  # GROUP OPS ARE BANNED IN THE REDUCTIONS, AND THE REASON IS PORTABILITY RATHER THAN A MEASURED DEFECT.  An NaN
+  # in the expert tier was once attributed to `subgroupAdd` over a partially executing wave; that attribution was
+  # WITHDRAWN - with the tier's real defect fixed (see case_s2expert_tier and s2_row_dot.glsl) the subgroup form
+  # is green on RADV and llvmpipe at both chunk counts.  The reductions are barrier trees because the TARGET
+  # hardware is Intel, where the driver picks the subgroup width per kernel, and a workgroup-sized tree has no
+  # width to be wrong about.  So this rule enforces a design decision, and it exists because a group op reappearing
+  # would silently undo it.  See shaders/common/wg_reduce.glsl for the full note and the revert recipe.
+  if grep -q 'OpGroupNonUniform' <<<"$census"; then
+    fail "$name (subgroup op in the SPIR-V: $census - the reductions are barrier trees by design; see wg_reduce.glsl)"
+  fi
   case "$name" in
-    router_top10_f64|router_top10_f32|scalar_gate_f64)
-      grep -q 'OpControlBarrier' <<<"$census" || fail "$name (no barrier: the block reductions did not lower)"
-      ;;
-    rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32)
-      grep -q 'OpGroupNonUniformFAdd' <<<"$census" || fail "$name (no subgroup reduction in the SPIR-V - the kernel did not lower its sum)"
+    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down)
+      # A shared-memory exchange needs at least a write barrier and a read barrier; one barrier means the value
+      # was exchanged through something else (a subgroup op, or nothing), which is what this arm exists to catch.
+      # The census prints "N OpName" run-length PAIRS on one line, so the literal appears once - read the COUNT,
+      # not the number of matches (counting matches reported every shader as having one barrier).
+      barriers="$(sed -n 's/.*\([0-9][0-9]*\) OpControlBarrier.*/\1/p' <<<"$census")"
+      : "${barriers:=0}"
+      [ "$barriers" -ge 2 ] || fail "$name (only $barriers barrier(s) - a shared-memory reduction needs >= 2)"
       ;;
     *)
       if [ -n "$census" ]; then

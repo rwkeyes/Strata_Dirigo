@@ -30,8 +30,6 @@
 // grid up and rows 2 and 3 of a 2-row call wrote past the end of their buffer).  Here the dispatch is exact,
 // but the guard stays because it is what makes an over-dispatch harmless rather than destructive, and the
 // gate keeps a NaN-filled tail in the allocation so an over-dispatch is detected instead of tolerated.
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;
 layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } w;

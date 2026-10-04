@@ -1813,6 +1813,362 @@ void case_s2_gemv_q8(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// THE RESIDENT EXPERT TIER (src/kernels/cuda/s2_expert_grouped.cu): the grouped gate/up projection, the SwiGLU
+// and the grouped down projection.
+//
+// WHY THIS CASE EXISTS, AND WHAT IT CAUGHT.  The `gu` kernel's first version produced NaN on EVERY output word -
+// all 3840 of them holding the SAME payload NaN (bit pattern 0x7fdf6000) - while the oracle read 1417.59375 from
+// the same bytes.  The cause was the shared reduction: `subgroupAdd` over a partially executing wave has no
+// defined result for the masked-out lanes.  This kernel distributes H/32 = 80 chunks over 256 lanes, so lanes
+// 80..255 execute no chunk at all, and that configuration is unique to it - every other caller of the reduction
+// has work for every lane, which is why the defect appeared here and nowhere else.  The reduction is now a
+// barrier tree (common/wg_reduce.glsl) and THE SHAPE IS KEPT DELIBERATELY: a chunk count below the workgroup
+// width is exactly what has to stay exercised, and an arm with more chunks than lanes runs the stride loop more
+// than once per lane.
+//
+// THE ORACLE IS TRANSCRIBED FROM `row_dot_s2_q8`, not re-derived, and evaluated in double.  The port is one
+// workgroup per row where the CUDA is one warp per row, so the summation ORDER differs by construction and
+// bit-exactness is not on offer - the comparison is against a double reference with the term-relative bound.
+//
+// THE BLOB'S GEOMETRY is the engine's own, four regions in this order (H = n_embd, FF = n_ff):
+//     [0, O_D_CODES)             gate/up codes, row-SLOT i at i*ROW_GU                    ROW_GU = H/4
+//     [O_D_CODES, O_GU_SCALES)   down codes,     row r at O_D_CODES + r*ROW_D              ROW_D = FF/4
+//     [O_GU_SCALES, O_D_SCALES)  gate/up scales, row-SLOT i at O_GU_SCALES + i*SC_GU*2     SC_GU = H/64
+//     [O_D_SCALES, BLOB_BYTES)   down scales,    row r at O_D_SCALES + r*SC_D*2            SC_D = FF/64
+// At H 2560 / FF 640 that is 819200 / 1228800 / 1331200 / 1382400 bytes, which is what the earlier probe
+// measured - the layout was confirmed against the engine rather than assumed from the names.
+//
+// THE ROWS ARE INTERLEAVED (row-SLOT i is gate row i/2 when even, up row (i-1)/2 when odd) and THE OUTPUT IS
+// GATE-MAJOR.  Both are traps that produce finite, plausible numbers when wrong - the CUDA's first version paired
+// `silu(gate[r])` with the wrong `up[r]` at worst relative error 2.2e+03 - so the blobs below give even and odd
+// row-slots scales three orders of magnitude apart, which turns a mis-pairing into an obvious error rather than
+// a rounding-level difference.  A scrambled `slot_index` makes a wrong expert multiplier visible, and a scrambled
+// `dst_index` does the same for the down projection's output placement.
+struct S2ExpertGeom {
+    int H, FF;
+    size_t row_gu, row_d, sc_gu, sc_d, o_d_codes, o_gu_scales, o_d_scales, blob_bytes;
+};
+
+static S2ExpertGeom s2expert_geom(int H, int FF) {
+    S2ExpertGeom g{};
+    g.H = H;
+    g.FF = FF;
+    g.row_gu = (size_t) H / 4;
+    g.row_d = (size_t) FF / 4;
+    g.sc_gu = (size_t) H / 64;
+    g.sc_d = (size_t) FF / 64;
+    g.o_d_codes = (size_t) (2 * FF) * g.row_gu;
+    g.o_gu_scales = g.o_d_codes + (size_t) H * g.row_d;
+    g.o_d_scales = g.o_gu_scales + (size_t) (2 * FF) * g.sc_gu * 2;
+    g.blob_bytes = g.o_d_scales + (size_t) H * g.sc_d * 2;
+    return g;
+}
+
+static uint16_t s2_le16(const uint8_t* p) { return (uint16_t) (p[0] | ((uint16_t) p[1] << 8)); }
+static void s2_put16(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t) (v & 0xFF);
+    p[1] = (uint8_t) (v >> 8);
+}
+static float s2_f16(const uint8_t* p) { return strata::kernels::f32_from_f16(s2_le16(p)); }
+
+// One S2 row against one q8_0 activation row, in double: `row_dot_s2_q8` with the lane loop replaced by a plain
+// sweep, because the oracle is what the row's SUM is, not what one lane's partial is.
+static double s2_row_dot_host(const uint8_t* blob, size_t codes_off, size_t scales_off, const uint8_t* act,
+                              const float* xscales, bool use_xscales, int n_chunks, double& abs_sum_out) {
+    double acc = 0.0, abs_sum = 0.0;
+    for (int c = 0; c < n_chunks; ++c) {
+        const uint8_t* cb = blob + codes_off + (size_t) c * 8;
+        const uint8_t* xb = act + (size_t) c * 34;
+        const double dx = use_xscales ? (double) xscales[c] : (double) s2_f16(xb);
+        int s = 0, hx = 0;
+        for (int j = 0; j < 8; ++j) {
+            const unsigned cbyte = cb[j];
+            for (int k = 0; k < 4; ++k) {
+                const int code = (int) ((cbyte >> (2 * k)) & 3u);
+                const int raw = (int) xb[2 + 4 * j + k];
+                const int xv = raw > 127 ? raw - 256 : raw;      // the sign extension the shader also writes by hand
+                s += code * xv;
+                hx += xv;
+            }
+        }
+        const double term = (double) s2_f16(blob + scales_off + (size_t) (c >> 1) * 2) * dx * (double) (s - hx);
+        acc += term;
+        abs_sum += std::fabs(term);
+    }
+    abs_sum_out = abs_sum;
+    return acc;
+}
+
+// n_slots expert blobs, every region and row carrying its own values so that a wrong offset reads a DIFFERENT
+// number rather than a plausible one.
+static std::vector<uint8_t> s2expert_blob(size_t n_slots, const S2ExpertGeom& g) {
+    std::vector<uint8_t> blob(n_slots * g.blob_bytes, 0);
+    for (size_t e = 0; e < n_slots; ++e) {
+        uint8_t* base = blob.data() + e * g.blob_bytes;
+        for (size_t i = 0; i < (size_t) (2 * g.FF); ++i) {
+            for (size_t j = 0; j < g.row_gu; ++j) base[i * g.row_gu + j] = (uint8_t) ((e * 31 + i * 17 + j * 5 + 3) & 0xFF);
+            const float mag = 0.03125f * (float) (1 + ((i + e) % 5));
+            const float dw = ((i & 1u) != 0u) ? mag * 1000.0f : mag;   // gate slots large, up slots small
+            for (size_t j = 0; j < g.sc_gu; ++j) {
+                s2_put16(base + g.o_gu_scales + i * g.sc_gu * 2 + j * 2, strata::kernels::f16_from_f32(dw));
+            }
+        }
+        for (size_t r = 0; r < (size_t) g.H; ++r) {
+            for (size_t j = 0; j < g.row_d; ++j) {
+                base[g.o_d_codes + r * g.row_d + j] = (uint8_t) ((e * 7 + r * 23 + j * 11 + 5) & 0xFF);
+            }
+            const float dw = 0.015625f * (float) (1 + ((r + e) % 4));
+            for (size_t j = 0; j < g.sc_d; ++j) {
+                s2_put16(base + g.o_d_scales + r * g.sc_d * 2 + j * 2, strata::kernels::f16_from_f32(dw));
+            }
+        }
+    }
+    return blob;
+}
+
+// block_q8_0 rows: a distinct fp16 scale per block - small, large and NEGATIVE - and codes spanning the signed
+// range, because the `raw > 127 ? raw - 256` extension is a step the shader writes by hand and a case made only
+// of small positive bytes would never exercise it.
+static std::vector<uint8_t> s2expert_q8_0_rows(size_t n_rows, int n_blocks) {
+    std::vector<uint8_t> act(n_rows * (size_t) n_blocks * 34, 0);
+    for (size_t r = 0; r < n_rows; ++r) {
+        for (int b = 0; b < n_blocks; ++b) {
+            uint8_t* blk = act.data() + (r * (size_t) n_blocks + (size_t) b) * 34;
+            const float mag = (b == 0) ? 0.0078125f : ((b == 1) ? 8.0f : 0.125f * (float) (1 + (b % 7)));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b % 3) == 2) ? -mag : mag));
+            for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) (int8_t) (((i * 13 + b * 7 + (int) r) % 255) - 127);
+        }
+    }
+    return act;
+}
+
+// The gate/up arm.  `n_hits` rows-sets of 2*FF words, every word compared against the oracle for the row-slot it
+// belongs to, plus a guard region past the buffer that must survive untouched.
+static void s2expert_gu_arm(Ctx& ctx, const std::string& dir, int H, int FF, int n_hits, bool use_xscales,
+                            const char* what) {
+    const S2ExpertGeom g = s2expert_geom(H, FF);
+    const size_t n_slots = 3;                                  // three experts, so slot_index can be scrambled
+    const std::vector<int32_t> slot_index = (n_hits >= 3) ? std::vector<int32_t>{2, 0, 1}
+                                                         : std::vector<int32_t>{1, 0};
+    const std::vector<uint8_t> blob = s2expert_blob(n_slots, g);
+    const int n_blocks = H / 32;
+    const std::vector<uint8_t> act = s2expert_q8_0_rows(1, n_blocks);
+    std::vector<float> xsc;
+    if (use_xscales) {
+        xsc.resize((size_t) n_blocks);
+        for (int b = 0; b < n_blocks; ++b) {
+            xsc[(size_t) b] = 0.0625f * (float) (1 + (b % 5)) * (((b % 4) == 3) ? -1.0f : 1.0f);
+        }
+    }
+    const size_t n_out = (size_t) n_hits * (size_t) (2 * FF);
+    std::vector<double> want(n_out, std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> want_abs(n_out, 0.0);
+    for (int h = 0; h < n_hits; ++h) {
+        const uint8_t* slot = blob.data() + (size_t) slot_index[(size_t) h] * g.blob_bytes;
+        for (int i = 0; i < 2 * FF; ++i) {
+            double abs_sum = 0.0;
+            const double v = s2_row_dot_host(slot, (size_t) i * g.row_gu, g.o_gu_scales + (size_t) i * g.sc_gu * 2,
+                                             act.data(), xsc.empty() ? nullptr : xsc.data(), use_xscales, n_blocks,
+                                             abs_sum);
+            const size_t base = ((i & 1) != 0) ? ((size_t) n_hits * (size_t) FF + (size_t) h * (size_t) FF)
+                                               : ((size_t) h * (size_t) FF);
+            want[base + ((size_t) i >> 1u)] = v;
+            want_abs[base + ((size_t) i >> 1u)] = abs_sum;
+        }
+    }
+
+    Buf b_blob = ctx.alloc(blob.size());
+    Buf b_act = ctx.alloc(act.size());
+    Buf b_xs = ctx.alloc(xsc.empty() ? 4u : xsc.size() * 4u);
+    Buf b_slot = ctx.alloc(slot_index.size() * 4u);
+    Buf b_gu = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_blob, blob.data(), blob.size());
+    ctx.write(b_act, act.data(), act.size());
+    if (!xsc.empty()) ctx.write(b_xs, xsc.data(), xsc.size() * 4u);
+    ctx.write(b_slot, slot_index.data(), slot_index.size() * 4u);
+    std::vector<uint8_t> sink(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_gu, sink.data(), sink.size());
+    struct { int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales; } pc{
+        n_hits, H, FF, (int) g.blob_bytes, use_xscales ? 1 : 0};
+    VkPipeline p = ctx.pipeline(dir + "/s2expert_gu.spv", 5, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_blob, &b_act, &b_xs, &b_slot, &b_gu}, &pc, sizeof(pc), (uint32_t) (n_hits * 2 * FF));
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_gu, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nan_count = 0, inf_count = 0;
+    double worst = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        const double gv = (double) got[i];
+        if (std::isnan(gv)) ++nan_count;
+        else if (std::isinf(gv)) ++inf_count;
+        if (std::isnan(want[i])) { ++bad; continue; }            // the case itself left this word undefined
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;                              // NaN-safe: `>` alone passes a NaN
+    }
+    for (size_t i = n_out * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;                               // the guard past the last output word
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "s2expert_gu (H=%d FF=%d hits=%d, %s)", H, FF, n_hits, what);
+    std::printf("      got[0] = %.6g (isnan %d), want[0] = %.6g | NaN %d, Inf %d of %d | worst err/tol %.3g\n",
+                (double) got[0], (int) std::isnan((double) got[0]), (double) want[0], nan_count, inf_count,
+                (int) n_out, worst);
+    verdict(label, bad == 0, bad, (int) n_out, worst, "words outside tolerance (worst err/tol)");
+    ctx.free(b_blob); ctx.free(b_act); ctx.free(b_xs); ctx.free(b_slot); ctx.free(b_gu);
+}
+
+// The down arm: `dst_index[h]` is which row of the SHARED output buffer hit `h` fills, so it is scrambled here -
+// a kernel that wrote `h`'s rows at `h` would land two of the three experts in each other's slots.
+static void s2expert_down_arm(Ctx& ctx, const std::string& dir, int H, int FF, int n_hits, bool use_xscales,
+                              const char* what) {
+    const S2ExpertGeom g = s2expert_geom(H, FF);
+    const size_t n_slots = 3;
+    const std::vector<int32_t> slot_index = (n_hits >= 3) ? std::vector<int32_t>{1, 2, 0}
+                                                         : std::vector<int32_t>{2, 0};
+    const std::vector<int32_t> dst_index = (n_hits >= 3) ? std::vector<int32_t>{1, 0, 2}
+                                                        : std::vector<int32_t>{1, 0};
+    const std::vector<uint8_t> blob = s2expert_blob(n_slots, g);
+    const int n_blocks = FF / 32;
+    const std::vector<uint8_t> act = s2expert_q8_0_rows((size_t) n_hits, n_blocks);
+    std::vector<float> xsc;
+    if (use_xscales) {
+        xsc.resize((size_t) n_hits * (size_t) n_blocks);
+        for (size_t i = 0; i < xsc.size(); ++i) xsc[i] = 0.03125f * (float) (1 + (i % 6)) * (((i % 5) == 4) ? -1.0f : 1.0f);
+    }
+    const size_t n_rows = (n_hits >= 3) ? 3u : 2u;              // dst slots {0,1} or {0,1,2} - every row must be written
+    const size_t n_out = n_rows * (size_t) H;
+    std::vector<double> want(n_out, std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> want_abs(n_out, 0.0);
+    for (int h = 0; h < n_hits; ++h) {
+        const uint8_t* slot = blob.data() + (size_t) slot_index[(size_t) h] * g.blob_bytes;
+        const uint8_t* xh = act.data() + (size_t) h * (size_t) n_blocks * 34;
+        const float* xh_s = xsc.empty() ? nullptr : xsc.data() + (size_t) h * (size_t) n_blocks;
+        for (int r = 0; r < H; ++r) {
+            double abs_sum = 0.0;
+            const double v = s2_row_dot_host(slot, g.o_d_codes + (size_t) r * g.row_d,
+                                             g.o_d_scales + (size_t) r * g.sc_d * 2, xh, xh_s, use_xscales, n_blocks,
+                                             abs_sum);
+            const size_t at = (size_t) dst_index[(size_t) h] * (size_t) H + (size_t) r;
+            want[at] = v;
+            want_abs[at] = abs_sum;
+        }
+    }
+
+    Buf b_blob = ctx.alloc(blob.size());
+    Buf b_act = ctx.alloc(act.size());
+    Buf b_xs = ctx.alloc(xsc.empty() ? 4u : xsc.size() * 4u);
+    Buf b_slot = ctx.alloc(slot_index.size() * 4u);
+    Buf b_dst = ctx.alloc(dst_index.size() * 4u);
+    Buf b_out = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_blob, blob.data(), blob.size());
+    ctx.write(b_act, act.data(), act.size());
+    if (!xsc.empty()) ctx.write(b_xs, xsc.data(), xsc.size() * 4u);
+    ctx.write(b_slot, slot_index.data(), slot_index.size() * 4u);
+    ctx.write(b_dst, dst_index.data(), dst_index.size() * 4u);
+    std::vector<uint8_t> sink(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_out, sink.data(), sink.size());
+    struct { int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales; } pc{
+        n_hits, H, FF, (int) g.blob_bytes, use_xscales ? 1 : 0};
+    VkPipeline p = ctx.pipeline(dir + "/s2expert_down.spv", 6, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_blob, &b_act, &b_xs, &b_slot, &b_dst, &b_out}, &pc, sizeof(pc), (uint32_t) (n_hits * H));
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_out, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nan_count = 0, inf_count = 0;
+    double worst = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        const double gv = (double) got[i];
+        if (std::isnan(gv)) ++nan_count;
+        else if (std::isinf(gv)) ++inf_count;
+        if (std::isnan(want[i])) { ++bad; continue; }
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+    }
+    for (size_t i = n_out * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "s2expert_down (H=%d FF=%d hits=%d, %s)", H, FF, n_hits, what);
+    std::printf("      got[0] = %.6g, want[0] = %.6g | NaN %d, Inf %d of %d | worst err/tol %.3g\n",
+                (double) got[0], (double) want[0], nan_count, inf_count, (int) n_out, worst);
+    verdict(label, bad == 0, bad, (int) n_out, worst, "rows outside tolerance (worst err/tol)");
+    ctx.free(b_blob); ctx.free(b_act); ctx.free(b_xs); ctx.free(b_slot); ctx.free(b_dst); ctx.free(b_out);
+}
+
+// The SwiGLU: `silu(gate) * up` over a GATE-MAJOR buffer, in place.  Two properties beyond the values: the UP
+// half must survive bit-for-bit (the kernel writes only the first half), and the gate/up pairing is what the
+// gate-major layout exists for - `[0, n_pairs)` is every hit's gate, `[n_pairs, 2*n_pairs)` its up.
+static void s2expert_swiglu_arm(Ctx& ctx, const std::string& dir, int H, int FF, int n_hits, const char* what) {
+    const size_t n_pairs = (size_t) n_hits * (size_t) FF;
+    const size_t n_all = 2u * n_pairs;
+    std::vector<float> gu(n_all, 0.0f), up_copy(n_pairs, 0.0f);
+    for (size_t i = 0; i < n_pairs; ++i) {
+        const float gv = rndf(2.0f), uv = rndf(2.0f);
+        gu[i] = gv;
+        gu[n_pairs + i] = uv;
+        up_copy[i] = uv;
+    }
+    std::vector<double> want(n_pairs, 0.0);
+    for (size_t i = 0; i < n_pairs; ++i) {
+        const double gv = (double) gu[i], uv = (double) gu[n_pairs + i];
+        want[i] = (gv / (1.0 + std::exp(-gv))) * uv;             // in double: the shader's f32 exp is the variable
+    }
+
+    Buf b_gu = ctx.alloc(n_all * 4u + 64u);
+    ctx.write(b_gu, gu.data(), n_all * 4u);
+    std::vector<uint8_t> guard(64, 0xC3);
+    ctx.write(b_gu, guard.data(), guard.size(), n_all * 4u);
+    struct { int n_pairs; } pc{(int) n_pairs};
+    VkPipeline p = ctx.pipeline(dir + "/s2expert_swiglu.spv", 1, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_gu}, &pc, sizeof(pc), (uint32_t) ((n_pairs + 255u) / 256u));
+
+    std::vector<uint8_t> img(n_all * 4u + 64u, 0);
+    ctx.read(b_gu, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0;
+    double worst = 0;
+    for (size_t i = 0; i < n_pairs; ++i) {
+        // A relative bound on a PRODUCT: the f32 silu is a measured 9.01e-07 from the double form, so 1e-5 is a
+        // decade of headroom over the measurement rather than a fitted number.
+        const double ratio = std::fabs((double) got[i] - want[i]) / gemv_bound(want[i], std::fabs(want[i]), 1e-5);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+    }
+    for (size_t i = 0; i < n_pairs; ++i) {
+        if (got[n_pairs + i] != up_copy[i]) ++bad;               // the UP half must be untouched, bit for bit
+    }
+    for (size_t i = n_all * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "s2expert_swiglu (H=%d FF=%d hits=%d, %s)", H, FF, n_hits, what);
+    std::printf("      got[0] = %.6g, want[0] = %.6g | worst err/tol %.3g\n", (double) got[0], want[0], worst);
+    verdict(label, bad == 0, bad, (int) n_pairs, worst, "rows or untouched up-rows wrong");
+    ctx.free(b_gu);
+}
+
+// The tier's three kernels, at the shapes that matter: the sub-width chunk count that produced the NaN, a
+// chunk count above the workgroup width (the stride loop runs more than once per lane), and the fp32 activation
+// scales the CPU pool uses (which is why the flag exists at all).
+void case_s2expert_tier(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s2expert_gu.spv") || !have(dir, "s2expert_down.spv") || !have(dir, "s2expert_swiglu.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("s2expert tier", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    s2expert_gu_arm(ctx, dir, 2560, 640, 3, false, "80 chunks < 256 lanes: the shape that produced NaN");
+    s2expert_gu_arm(ctx, dir, 10240, 640, 2, false, "320 chunks: more than one per lane");
+    s2expert_gu_arm(ctx, dir, 2560, 640, 2, true, "fp32 activation scales - the CPU pool's path");
+    s2expert_down_arm(ctx, dir, 2560, 640, 3, false, "20 chunks < 256 lanes, scrambled dst_index");
+    s2expert_down_arm(ctx, dir, 10240, 640, 2, false, "H=10240: four times the rows, same 20-chunk config");
+    s2expert_swiglu_arm(ctx, dir, 2560, 640, 3, "gate-major, up half untouched");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -3500,6 +3856,7 @@ int main(int argc, char** argv) {
     case_quantize_q8_0(ctx, dir);
     case_quantize_q8_K(ctx, dir);
     case_ple(ctx, dir);
+    case_s2expert_tier(ctx, dir);
     case_s2_gemv_q8(ctx, dir);
     case_bf16_mmvf(ctx, dir);
     case_bf16_mmvf_multi(ctx, dir);

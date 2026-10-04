@@ -22,8 +22,6 @@
 // several rows with padding (`ldx` even, per the source's own validation).  Reading a token row at `k * n_in`
 // instead of `k * ldx` is silent with compact rows and wrong with padded ones, so the gate runs a padded shape.
 #version 450
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;

@@ -16,8 +16,6 @@
 // The sum is accumulated in f32 here against the source's double (see ple_gnorm.comp for why this deviation is
 // taken deliberately); everything downstream of the sum is bit-for-bit the source's arithmetic.
 #version 450
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer K { float v[]; } key;
