@@ -188,3 +188,26 @@ repro - it should go finite, and if it does not, the difference must be found be
 then change `common/wg_reduce.glsl`, and re-run the WHOLE gate, not this one case, because six passing kernels
 depend on it.
 
+
+## THE INITIALISED COPY DID NOT FIX IT - that hypothesis is refuted
+
+Ran the same case with `gu` calling a differently-named copy of the reduction whose shared state IS defined before
+any read of it (file written, used, deleted - nothing about the shipped helper changed):
+
+    with-init: gate rows NaN 640 | up rows NaN 640 | fill-left 0 | gate[0]=nan (hex 7fdf6000) up[0]=nan
+
+So the initialisation is NOT the answer. Compare with the bisection run two steps back, where the up rows carried
+the RAW dot and were finite 640/640: **the only thing that changes a finite `acc` into this NaN is passing it
+through the reduction.** `wg_sum_init(finite)` returns NaN for this caller, in every workgroup, and the six shipped
+callers of the original return finite values - so the difference is the CALLER, not the shared state.
+
+What that rules out: uninitialised shared memory (this run defined all of it), the dot and its addressing (the
+bisection), the store (the raw-dot run wrote finite values through the same store), and a race between repeated
+calls (this caller reduces once).
+
+What is left is INSIDE the reduction with idle lanes present, and the six passing callers all have every lane doing
+work - this is the only caller with 176 of 256 lanes holding 0.0. The next probe should therefore DUMP THE
+REDUCTION'S INTERNALS rather than reason about them: `sub` per subgroup leader, `rp_partial[0..3]`, `gl_NumSubgroups`,
+`gl_SubgroupSize` and `rp_total`, in one workgroup, against the same values computed on the host. That is the same
+"dump what the device actually reads" move that settled the reads, and it is the only kind of move that has worked
+in this port - reading has been wrong five times, bisecting has been right twice.
