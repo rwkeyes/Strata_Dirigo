@@ -1,0 +1,85 @@
+// ports/vulkan/shaders/pending/probe_gu_reads.comp - WHAT THE DEVICE ACTUALLY READS. Diagnostic, NOT a kernel.
+//
+// The tier's `gu` kernel produces NaN where the host oracle, from the same bytes, produces 1417.59375. Every
+// offset has been checked by hand against the oracle and they agree, which is exactly why the next step is a
+// PROBE rather than another reading of the source: this port has twice already paid for reasoning about what a
+// kernel reads instead of observing it.
+//
+// This shader computes the SAME offsets from the SAME push constants and dumps, for one row-slot:
+//
+//     out[0]        the row-slot it probed and the values of the push constants it was given
+//     out[4..12]    the 8 code bytes   it reads for that row  (as it reads them)
+//     out[12..14]   the 2 scale bytes  it reads
+//     out[14..16]   the activation block's 2 `d` bytes
+//     out[16..24]   the first 8 activation code bytes
+//     out[24]       dx, as the device computes it (the fp16 `d` widened)
+//     out[25]       dw, the scale the row's chunk 0 uses
+//     out[26]       the chunk-0 integer `s`
+//     out[27]       the chunk-0 integer `hx`
+//     out[28]       the chunk-0 term: dw * dx * (float)(s - hx)
+//
+// Compare each against the host's own reading of the same bytes. The first line that disagrees is the bug; if
+// everything agrees, the fault is downstream of the reads (the reduction, or the store) rather than in the
+// addressing.
+//
+// Dispatch: one workgroup, with the tier's own push constants, and an output buffer of 32 uints (cleared first so
+// an unwritten slot is obvious). It is NOT part of any case and NOT in the build - it lives here because it is
+// unrun, and an unrun artifact belongs where the build cannot mistake it for a verified one.
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BLOB { uint8_t b[]; } blob_b;
+layout(set = 0, binding = 1, std430) readonly buffer ACT { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) readonly buffer SLOT { int v[]; } slot_index;
+layout(set = 0, binding = 3, std430) buffer DUMP { uint v[]; } dump;
+
+layout(push_constant, std430) uniform PC {
+    int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales; int probe_slot; int probe_row;
+} pc;
+
+void main() {
+    if (gl_LocalInvocationIndex != 0u) return;
+    const uint H = uint(pc.n_embd), FF = uint(pc.n_ff);
+    const uint ROW_GU = H / 4u, SC_GU = H / 64u;
+    const uint O_D_CODES = 2u * FF * ROW_GU;
+    const uint O_GU_SCALES = O_D_CODES + H * (FF / 4u);
+
+    const uint i = uint(pc.probe_row);
+    // THE FIRST CHUNK ONLY, so the integers are small enough to compare by eye
+    const uint blob = uint(slot_index.v[pc.probe_slot]) * uint(pc.blob_bytes);
+    const uint cb = blob + i * ROW_GU;
+    const uint sb = blob + O_GU_SCALES + i * SC_GU * 2u;
+    const uint xb = 0u;                                   // x_off is 0 for the gate/up stage
+
+    dump.v[0] = slot_index.v[pc.probe_slot];
+    dump.v[1] = i;
+    dump.v[2] = uint(pc.blob_bytes);
+    dump.v[3] = blob;
+    for (uint j = 0u; j < 8u; ++j) dump.v[4u + j] = uint(blob_b.b[cb + j]);
+    dump.v[12] = uint(blob_b.b[sb]);
+    dump.v[13] = uint(blob_b.b[sb + 1u]);
+    dump.v[14] = uint(act_b.b[xb]);
+    dump.v[15] = uint(act_b.b[xb + 1u]);
+    for (uint k = 0u; k < 8u; ++k) dump.v[16u + k] = uint(act_b.b[xb + 2u + k]);
+
+    const float dx = unpackHalf2x16(uint(act_b.b[xb]) | (uint(act_b.b[xb + 1u]) << 8u)).x;
+    const float dw = unpackHalf2x16(uint(blob_b.b[sb]) | (uint(blob_b.b[sb + 1u]) << 8u)).x;
+    int s = 0, hx = 0;
+    for (uint j = 0u; j < 8u; ++j) {
+        const uint cbyte = uint(blob_b.b[cb + j]);
+        for (uint k = 0u; k < 4u; ++k) {
+            const int code = int((cbyte >> (2u * k)) & 3u);
+            const int raw = int(act_b.b[xb + 2u + 4u * j + k]);
+            const int xv = raw > 127 ? raw - 256 : raw;
+            s += code * xv;
+            hx += xv;
+        }
+    }
+    dump.v[24] = uint(floatBitsToInt(dx));
+    dump.v[25] = uint(floatBitsToInt(dw));
+    dump.v[26] = uint(s);
+    dump.v[27] = uint(hx);
+    dump.v[28] = uint(floatBitsToInt(dw * dx * float(s - hx)));
+}

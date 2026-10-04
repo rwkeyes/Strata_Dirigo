@@ -47,3 +47,20 @@ And the primitive's own trick: the -1 bias is folded into an integer identity,
 `!(ratio <= 1.0)` is now in at all six sites in the shipped cases, and `gemv_bound` carries a 1e-30 floor (a row
 whose oracle value and sum|terms| are both zero made it 0.0, and 0/0 is NaN). Both changes are in the gate and both
 are worth having: a NaN result should never pass a check.
+
+## THE FIRST STEP, WRITTEN OUT: `probe_gu_reads.comp`
+
+Dump what the DEVICE reads, not what the source says it reads. `probe_gu_reads.comp` computes the same offsets
+from the same push constants as `s2expert_gu`. It writes, for one row-slot: the 8 code bytes, the 2 scale bytes,
+the activation block's 2 `d` bytes and its first 8 code bytes, then `dx`, `dw`, the chunk-0 integers `s` and `hx`,
+and the chunk-0 term `dw * dx * (float)(s - hx)`.
+
+Invocation: move the three kernels and the include back into `shaders/` (they are compiled only there - the build
+is flat over `shaders/*.comp`), add the census arms for `s2expert_gu` and `s2expert_down` (barrier-only, no
+subgroup ops), compile this one by hand, and dispatch one workgroup with the tier's push constants plus
+`probe_slot`/`probe_row`. Compare each dumped field against the host's own reading of the same bytes. The first
+field that disagrees is the bug.
+
+IT IS UNRUN AND THEREFORE IT IS HERE. A diagnostic in `shaders/` would be exercised by the build as though it were
+a kernel; an unrun artifact belongs where the build cannot mistake it for a verified one - which is the same rule
+that put the four kernels above in this directory.
