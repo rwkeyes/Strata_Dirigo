@@ -1,22 +1,15 @@
-# Blocked shaders (kept, not built)
+# Blocked shaders (now empty of blockers)
 
-## silu_fp64.comp — BLOCKED BY THE TOOLCHAIN, not by the port
+`silu_fp64.comp` used to live here. It was the port's first attempt at a double-precision SiLU, parked because
+glslang has no `exp(double)` and the port recorded it as inexpressible through this toolchain.
 
-`silu_inplace` in `src/kernels/cuda/elementwise.cu` computes `(double)x / (1 + exp(-(double)x))` and casts to
-f32, because `ref/gdn.py`'s numpy does and the reference is the oracle.
+**IT WAS EXPRESSIBLE, so the file is gone rather than kept as a trophy.** `common/double_math.glsl` builds the
+double exp from `roundEven(double)`, `ldexp(double, int)` and an 18-term series with the argument reduced to
+|r| <= ln2/2. `swiglu_f64.comp` is the shipped kernel: gated BIT-EXACT against the host's double reference, and
+demonstrably a different arithmetic from a float silu (665 of 2560 elements differ). The router needed the same
+piece for the same reason - its exponentials are double too.
 
-GLSL has `double` (both the `double` type and double literals compile), but **no double overload of the math
-builtins reaches SPIR-V on this host's glslang**:
-
-    error: 'exp' : no matching overloaded function found
-
-Reproduced with `glslc` (shaderc 2023.8 / glslang 14.0.0) and with `glslangValidator` 15.1.0, with
-`GL_ARB_gpu_shader_fp64` require, `GL_EXT_shader_explicit_arithmetic_types_float64` require, and both
-together.  The double TYPE is fine; the genDType builtin table is what is missing.
-
-The port therefore ships `shaders/silu_f32.comp` and the gate MEASURES its gap against the double reference
-(`vk_gate --selftest` prints `silu_inplace (f32 fallback) ... worst <r>`) rather than asserting it away, which
-is what the engine's own parity test does with the same pair.
-
-To restore the fp64 kernel: a glslang with the double builtins for SPIR-V, naga/rust-gpu, or a hand-written
-double `exp`.  Not a blocker for the first slice — silu is elementwise and its tolerance is visible.
+The lesson generalises past this file: "the toolchain cannot express X" deserves the same scepticism as "the
+hardware cannot do X", and both deserve a test that tries. What actually remains is a CONSTRAINT rather than a
+blocker - a double-precision kernel requires the device's shaderFloat64, which Intel Arc does not have, so
+`swiglu_f32.comp` is what runs there and the gate measures the difference.

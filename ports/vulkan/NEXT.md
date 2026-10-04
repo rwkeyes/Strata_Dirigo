@@ -354,6 +354,46 @@ are semantics, not arithmetic. One behaviour is material and tested: a rank the 
 whatever the output buffer held, and the renormalisation divides those stale values too. That is the source's
 behaviour, not an oversight, and the gate pre-fills the buffer to prove it.
 
+## THE DOUBLE-ARITHMETIC FAMILY, and the port's policy for it
+
+**A PORT-WIDE FINDING, not a per-kernel one.** More than one kernel in this engine computes in DOUBLE, and the
+target hardware has no `shaderFloat64` (Intel support article 000089817). Found so far: the router's exponentials
+and its sum, `moe_combine`'s accumulation, `swiglu`'s silu, and `scalar_gate`'s dot. Each one therefore needs a
+PORTABLE SIBLING, and the port's policy is now explicit:
+
+* the FAITHFUL variant is held to **bit-exactness** against the host's double reference - it claims to be the same
+  arithmetic, so it is required to be;
+* the PORTABLE variant is held to a **bound taken from measurement**, printed on every run, and the gate FAILS if
+  its SPIR-V carries `OpCapability Float64` (it exists for devices that do not have it);
+* where the portable variant's error is a CONDITIONING question (a sum of signed terms: `moe_combine`, the GEMVs)
+  the bound is relative to the TERMS; where it is a product (silu) a relative bound is right.
+
+`common/double_math.glsl` holds the one piece that has to be built by hand - a double `exp` from
+`roundEven(double)`, `ldexp(double,int)` and an 18-term series with the argument reduced to |r| <= ln2/2 - because
+glslang has none. The router and the SwiGLU both use it now.
+
+## `moe_combine` and `swiglu`, in both arithmetic variants - and an unblocking
+
+`moe_combine_f64`/`_f32` (the MoE block's final combination) and `swiglu_f64`/`_f32` (the shared expert's
+activation). Measured on the real geometry (n_embd 2560, k 10):
+
+* `moe_combine_f64` is **bit-exact** against the double reference, both with the shared expert added and without;
+* `moe_combine_f32` differs on 934/2560 (worst 0.07 of the term-relative bound) and 1452/2560 (0.075);
+* `swiglu_f64` is **bit-exact**, and it differs from a plain float silu on **665 of 2560** elements - so the
+  double silu is not a formality, it is a different arithmetic;
+* `swiglu_f32` differs from the double reference on 1040/2560 with a worst relative error of 9.01e-07.
+
+**IT UNBLOCKS A SHADER THE PORT HAD SHELVED.** `shaders/blocked/silu_fp64.comp` was parked early on because
+glslang has no `exp(double)`. It is expressible after all - `common/double_math.glsl` builds one - and the router
+needed the identical piece. A blocked item turned out to be a missing helper rather than a missing capability.
+
+Two semantics that are behaviours rather than numerics, both tested: the shared expert's output is added to the
+routed result **PLAIN** (not router-weighted, not renormalised against the routed sum), and the SwiGLU rounds the
+silu to f32 BEFORE multiplying by `up` - moving that cast changes the value.
+
+THIRD RESERVED-WORD TRAP: **`shared` is a GLSL keyword** (the shared-memory qualifier), so a buffer cannot be
+named `shared` any more than a variable can be named `half` or `out`.
+
 ### THE REST OF THE WAVE - and its size, which is the number that matters
 
 This is the biggest remaining area by a wide margin. Measured source sizes:

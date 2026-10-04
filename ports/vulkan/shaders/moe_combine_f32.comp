@@ -1,0 +1,43 @@
+// ports/vulkan/shaders/moe_combine_f32.comp - the same combination, PORTABLE arithmetic.
+//
+// The engine accumulates the k weighted expert outputs in DOUBLE. A device without shaderFloat64 cannot, and the
+// only device the port is for is one of those (Intel's support article 000089817), so this variant exists and the
+// gate measures what it costs: the same inputs are run through both variants and compared against each other and
+// against a double-precision reference.
+//
+// TWO THINGS IT DOES INSTEAD OF DOUBLE, both of which shrink the gap rather than wave at it:
+//
+//   * `fma` for the term, so `weights[e] * parts[e][j] + acc` has ONE rounding instead of two. That is strictly
+//     closer to the double reference than a separate multiply and add, and it is a single instruction.
+//   * KAHAN compensation on the running sum, so the accumulation error does not grow with k. With ten terms the
+//     residual term is far below the rounding of the final f32 store either way, which is the point: the store is
+//     the only rounding that survives.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PARTS { float v[]; } parts;
+layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } weights;
+// `sh` and not `shared`: `shared` is a GLSL KEYWORD (the shared-memory qualifier), the same class of trap as
+// `half` and `out`.
+layout(set = 0, binding = 2, std430) readonly buffer S { float v[]; } sh;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+layout(push_constant, std430) uniform PC { int n_embd; int k; int has_shared; } pc;
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x;
+    if (j >= uint(pc.n_embd)) return;
+    const uint k = uint(pc.k);
+    float acc = 0.0, comp = 0.0;
+    for (uint e = 0u; e < k; ++e) {
+        const float term = fma(weights.v[e], parts.v[e * uint(pc.n_embd) + j], comp);   // one rounding, not two
+        const float t = acc + term;
+        comp = (t - acc) - term;
+        acc = t;
+    }
+    if (pc.has_shared != 0) {
+        const float t = acc + sh.v[j];
+        acc = t;                                   // the shared output is added PLAIN, exactly as the source adds it
+    }
+    y.v[j] = acc;
+}

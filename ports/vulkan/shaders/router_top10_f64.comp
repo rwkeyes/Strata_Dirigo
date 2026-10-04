@@ -17,8 +17,8 @@
 // target hardware. This variant therefore cannot run there at all; the f32 variant is what the port ships to
 // Arc, and the gate MEASURES the difference between them rather than asserting it is negligible.
 //
-// glslang has no exp(double), so one is BUILD FROM THE PIECES IT HAS: roundEven(double), ldexp(double, int) and
-// a series with the argument reduced to |r| <= ln2/2 (18 terms, and ln2 split so the reduction stays exact).
+// glslang has no exp(double), so one is BUILT in common/double_math.glsl - which the shared expert's SwiGLU now
+// uses too, because its silu is computed in double for the same reason.
 #version 450
 #extension GL_ARB_gpu_shader_fp64 : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -29,23 +29,11 @@ layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float v[]; } logit
 layout(set = 0, binding = 1, std430) buffer IDS { int v[]; } ids;
 layout(set = 0, binding = 2, std430) buffer WEIGHTS { float v[]; } weights;
 
+#include "common/double_math.glsl"
 #include "common/router_select.glsl"
 
 shared double rs_ex[RS_MAX_EXPERTS];
 shared double rs_dsum;
-
-double exp_d(double x) {
-    const double LN2_HI = 0.6931471803691238;
-    const double LN2_LO = 1.9082149292705877e-10;
-    const double k = roundEven(x / 0.6931471805599453);
-    const double r = (x - k * LN2_HI) - k * LN2_LO;
-    double t = 1.0, s = 1.0;
-    for (int i = 1; i <= 18; ++i) {
-        t *= r / double(i);
-        s += t;
-    }
-    return ldexp(s, int(k));
-}
 
 layout(push_constant, std430) uniform PC { int n_tokens; int n_expert; int k; } pc;
 
@@ -61,7 +49,7 @@ void main() {
     mx = rs_max_all(mx, lid, lsize);          // exact and order-independent
 
     for (uint e = lid; e < n_expert; e += lsize) {
-        rs_ex[e] = exp_d(double(logits.v[lbase + e]) - double(mx));
+        rs_ex[e] = double_exp(double(logits.v[lbase + e]) - double(mx));
     }
     barrier();
     // ASCENDING, on ONE invocation, in double: the source's order, kept deliberately. Its own comment says

@@ -83,10 +83,10 @@ for f in "${comps[@]}"; do
   # because Intel Arc has no shaderFloat64; the f32 variant is what runs there, so it must NOT carry the
   # capability, and the f64 variant must.
   case "$name" in
-    router_top10_f64)
+    router_top10_f64|moe_combine_f64|swiglu_f64)
       [ "$fp64cap" -ge 1 ] || fail "$name (no Float64 capability: the faithful variant did not compile its doubles)"
       ;;
-    router_top10_f32)
+    router_top10_f32|moe_combine_f32|swiglu_f32)
       [ "$fp64cap" -eq 0 ] || fail "$name (declares Float64 - this variant exists for devices that do NOT have it)"
       ;;
   esac

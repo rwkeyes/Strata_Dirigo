@@ -928,6 +928,128 @@ static double gemv_bound(double want, double abs_sum, double rtol) {
     return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum;
 }
 
+// moe_combine and swiglu: the MoE block's combination and its activation, in both arithmetic variants.
+//
+// THE POINT OF RUNNING BOTH is that the difference is a number rather than an adjective. Each variant is compared
+// against a host reference computed in double, and the report says how many elements differ and by how much
+// relative - the f32 variant's cost, measured on the real geometry (n_embd 2560, k 10).
+void case_moe_combine(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "moe_combine_f64.spv") || !have(dir, "moe_combine_f32.spv")) return;
+    const int n_embd = 2560, k = 10;
+    std::vector<float> parts((size_t) k * n_embd), w(k), sh(n_embd);
+    for (auto& v : parts) v = rndf(1.0f);
+    for (auto& v : w) v = 0.1f * (1.0f + rndf(1.0f));
+    for (auto& v : sh) v = rndf(1.0f);
+
+    Buf b_parts = ctx.alloc(parts.size() * 4), b_w = ctx.alloc(k * 4), b_sh = ctx.alloc((size_t) n_embd * 4);
+    ctx.write(b_parts, parts.data(), parts.size() * 4);
+    ctx.write(b_w, w.data(), w.size() * 4);
+    ctx.write(b_sh, sh.data(), sh.size() * 4);
+
+    for (int has_shared = 1; has_shared >= 0; --has_shared) {
+        std::vector<float> want(n_embd, 0.0f);
+        std::vector<double> want_abs(n_embd, 0.0);
+        for (int j = 0; j < n_embd; ++j) {
+            double acc = 0.0, mass = 0.0;
+            for (int e = 0; e < k; ++e) {
+                acc += (double) w[e] * (double) parts[(size_t) e * n_embd + j];
+                mass += std::fabs((double) w[e] * (double) parts[(size_t) e * n_embd + j]);
+            }
+            if (has_shared) {
+                acc += (double) sh[j];                             // added PLAIN, not router-weighted
+                mass += std::fabs((double) sh[j]);
+            }
+            want[j] = (float) acc;
+            want_abs[j] = mass;
+        }
+        struct { int n_embd; int k; int has_shared; } pc{n_embd, k, has_shared};
+        const char* names[2] = {"/moe_combine_f64.spv", "/moe_combine_f32.spv"};
+        const char* labels[2] = {"moe_combine_f64 (faithful)", "moe_combine_f32 (portable)"};
+        for (int v = 0; v < 2; ++v) {
+            Buf b_y = ctx.alloc((size_t) n_embd * 4);
+            VkPipeline p = ctx.pipeline(dir + names[v], 4, (int) sizeof(pc));
+            ctx.dispatch(p, {&b_parts, &b_w, &b_sh, &b_y}, &pc, sizeof(pc),
+                         (uint32_t) ((n_embd + kLocalSize - 1) / kLocalSize));
+            std::vector<float> got(n_embd);
+            ctx.read(b_y, got.data(), (size_t) n_embd * 4);
+            int differ = 0, outside = 0;
+            double worst = 0;
+            for (int j = 0; j < n_embd; ++j) {
+                if (got[j] != want[j]) ++differ;
+                // a SUM OF SIGNED TERMS is the same conditioning problem the GEMVs have: the portable variant's
+                // error is bounded by its TERMS, not by its result. The faithful variant is still required to be
+                // bit-exact - it claims to be the same arithmetic, and it is.
+                const double ratio = std::fabs((double) got[j] - (double) want[j]) /
+                                     gemv_bound((double) want[j], want_abs[j], 1e-6);
+                worst = std::max(worst, ratio);
+                if (ratio > 1.0) ++outside;
+            }
+            char label[110];
+            std::snprintf(label, sizeof label, "%s, shared %s", labels[v], has_shared ? "added" : "absent");
+            std::printf("      %s: %d/%d differ from the double reference (worst %.3g of the bound)%s\n", labels[v],
+                        differ, n_embd, worst, v == 0 ? " - the faithful variant must be bit-exact" : "");
+            verdict(label, v == 0 ? differ == 0 : outside == 0, v == 0 ? differ : outside, n_embd, worst,
+                    v == 0 ? "elements differing from the double reference (must be 0)"
+                           : "elements outside the term-relative bound");
+            ctx.free(b_y);
+        }
+    }
+
+    // ---- swiglu, on the shared expert's own geometry ----
+    if (have(dir, "swiglu_f64.spv") && have(dir, "swiglu_f32.spv")) {
+        const int n = 2560;
+        std::vector<float> g(n), u(n);
+        for (int i = 0; i < n; ++i) {
+            // a spread that walks silu's regimes: the saturating tail both ways, zero, and ordinary values
+            g[i] = (i % 5 == 0) ? -12.0f - (float) (i % 7) : (i % 5 == 1) ? 12.0f + (float) (i % 7)
+                   : (i % 5 == 2) ? 0.0f : rndf(1.0f) * 4.0f;
+            u[i] = rndf(1.0f);
+        }
+        std::vector<float> want(n, 0.0f), want32(n, 0.0f);
+        for (int i = 0; i < n; ++i) {
+            const double x = (double) g[i];
+            const float silu = (float) (x / (1.0 + std::exp(-x)));     // the reference: double, then cast
+            want[i] = silu * u[i];
+            want32[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];      // the float expression, for reference
+        }
+        Buf b_g = ctx.alloc((size_t) n * 4), b_u = ctx.alloc((size_t) n * 4);
+        ctx.write(b_g, g.data(), (size_t) n * 4);
+        ctx.write(b_u, u.data(), (size_t) n * 4);
+        struct { int n; } pc{n};
+        const char* names[2] = {"/swiglu_f64.spv", "/swiglu_f32.spv"};
+        const char* labels[2] = {"swiglu_f64 (faithful: double silu)", "swiglu_f32 (portable)"};
+        for (int v = 0; v < 2; ++v) {
+            Buf b_o = ctx.alloc((size_t) n * 4);
+            VkPipeline p = ctx.pipeline(dir + names[v], 3, (int) sizeof(pc));
+            ctx.dispatch(p, {&b_g, &b_u, &b_o}, &pc, sizeof(pc), (uint32_t) ((n + kLocalSize - 1) / kLocalSize));
+            std::vector<float> got(n);
+            ctx.read(b_o, got.data(), (size_t) n * 4);
+            int differ = 0, differ_vs_float = 0;
+            double worst = 0;
+            for (int i = 0; i < n; ++i) {
+                if (got[i] != want[i]) ++differ;
+                if (got[i] != want32[i]) ++differ_vs_float;
+                worst = std::max(worst, std::fabs((double) got[i] - (double) want[i]) /
+                                           (std::fabs((double) want[i]) + 1e-30));
+            }
+            char label[110];
+            std::snprintf(label, sizeof label, "%s", labels[v]);
+            std::printf("      %s: %d/%d differ from the double reference, worst relative %.3g (differences from"
+                        " a plain float silu: %d)\n", labels[v], differ, n, worst, differ_vs_float);
+            // the faithful variant must be bit-exact; the portable one is bounded RELATIVE to the result (a
+            // product has no cancellation) at a tolerance taken from the measurement - GLSL's exp() precision is
+            // implementation-defined, so the number comes from here rather than from a ULP table.
+            verdict(label, v == 0 ? differ == 0 : worst < 1e-5, v == 0 ? differ : (worst < 1e-5 ? 0 : 1), n, worst,
+                    v == 0 ? "elements differing from the double reference (must be 0)"
+                           : "elements outside the relative bound");
+            ctx.free(b_o);
+        }
+        ctx.free(b_g); ctx.free(b_u);
+    }
+    ctx.free(b_parts); ctx.free(b_w); ctx.free(b_sh);
+}
+
+
 // ---- the MoE router, transcribed from router_top10.cu ----
 //
 // The reference form, in the source's order: softmax over ALL experts in double, the sum accumulated ASCENDING on
@@ -3248,6 +3370,7 @@ int main(int argc, char** argv) {
     case_s_gemv_q8_split(ctx, dir);
     case_s_gemv_f16_split(ctx, dir);
     case_router(ctx, dir);
+    case_moe_combine(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

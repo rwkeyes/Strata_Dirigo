@@ -1,0 +1,37 @@
+// ports/vulkan/shaders/moe_combine_f64.comp - the MoE block's final combination, FAITHFUL arithmetic.
+//
+//     y[j] = sum_e weights[e] * parts[e][j]   (+ shared[j] when the shared expert is present)
+//
+// TWO READINGS THE SOURCE SAYS THIS KERNEL EXISTS TO PIN, and both are semantic rather than numeric:
+//
+//   * THE ACCUMULATION IS IN DOUBLE, "in the reference's own order (`for i in range(k): out[t] += w[t,i] *
+//     g[0]`)". Ten terms would be defensible in f32, but the reference is float64 and the source's comment says
+//     so in one line. It is also why this kernel needs a portable sibling (see the f32 variant).
+//   * **THE SHARED OUTPUT IS ADDED PLAIN** - not router-weighted, not renormalised against the routed sum. That is
+//     the difference between "the shared expert's result is added to the routed output" and a weighting scheme,
+//     and getting it wrong produces plausible logits with the wrong magnitude.
+//
+// The shared buffer is ALWAYS bound even when the form has no shared expert, because Vulkan has no null
+// descriptor; `has_shared` decides whether it is read.
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PARTS { float v[]; } parts;
+layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } weights;
+// `sh` and not `shared`: `shared` is a GLSL KEYWORD (the shared-memory qualifier), the same class of trap as
+// `half` and `out`.
+layout(set = 0, binding = 2, std430) readonly buffer S { float v[]; } sh;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+layout(push_constant, std430) uniform PC { int n_embd; int k; int has_shared; } pc;
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x;
+    if (j >= uint(pc.n_embd)) return;
+    const uint k = uint(pc.k);
+    double acc = 0.0;
+    for (uint e = 0u; e < k; ++e) acc += double(weights.v[e]) * double(parts.v[e * uint(pc.n_embd) + j]);
+    if (pc.has_shared != 0) acc += double(sh.v[j]);
+    y.v[j] = float(acc);
+}
