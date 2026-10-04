@@ -484,3 +484,35 @@ than the S-family ones. Worth stating before starting rather than after.
 Same shape as every case so far: read the CUDA source first, build the oracle from the engine's own function
 (never from a description of it), sentinel every range the kernel must not touch, and give each branch of the
 source an adversarial case. Tolerances come from measurement - print the err/tol ratio and keep it visible.
+
+## THE NEXT WORKSTREAM: the quantized experts (decision taken 2026-10-04: port them)
+
+The port is re-based onto upstream v0.1.39 and this branch no longer carries the fork's AVX1 floor (upstream
+shipped it). The next wave is the quantized-expert path, chosen because the resident model is
+`qwen3.8-flash-next-coder-iq1_m` and an IQ1_M model needs exactly these kernels.
+
+CORRECTED SIZES - an earlier note said "~141 KB"; the measured figures are:
+
+    src/kernels/cuda/iq_kernels.cu     136,615 bytes   17 __global__ entry points
+    src/kernels/cuda/native_mmvq.cu     71,856 bytes   11 __global__ entry points
+    ---------------------------------------------------------------------
+    total                              208,471 bytes   28 kernels
+       for comparison, everything ported so far is ~128 KB and 40 shaders
+
+Upstream GREW both files in v0.1.39 (+1095 lines iq_kernels.cu, +130 native_mmvq.cu), which is why the re-base
+had to happen before this work rather than after.
+
+The 28, in file order:
+
+  iq_kernels.cu: mmvq, mmvq_multi, native_gu, native_gu_multi, swiglu_entries, native_down, native_down_multi,
+                 quantize_q8_1, swiglu_q8_1_entries, dequant_flat, dequant_gu, embed_rows, native_gu_amd,
+                 native_down_amd, native_gu_lds, native_down_lds, native_gu_fused
+  native_mmvq.cu: native_quantize_q8_1, native_swiglu_quantize_q8_1, native_q5_k_mmvq, native_q2_0_mmvq,
+                  native_q3_k_mmvq, native_iq4_xs_mmvq, native_q4_k_mmvq, native_q6_k_mmvq, native_small_mmvq,
+                  native_mmvq_multi, native_mmvq_wave
+
+NOT YET SCOPEU: how many of these are actually portable. A quick grep for HIP-isms (`__shfl`, `warpSize`, `LDS`)
+labelled `native_gu_lds_kernel` "portable-looking", which is obviously wrong, so that grep was thrown away rather
+than quoted. The `_amd`, `_lds` and `_fused` families look HIP-specific by name and probably have no Vulkan form;
+the count of shaders to write is therefore somewhere between 20 and 28 and must come from reading the kernels, not
+from a pattern match. DO THAT READ FIRST, before writing any of them.
