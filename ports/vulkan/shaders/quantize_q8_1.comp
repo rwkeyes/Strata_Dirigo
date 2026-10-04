@@ -1,0 +1,38 @@
+// ports/vulkan/shaders/quantize_q8_1.comp - floats to q8_1 blocks, one workgroup per 256 values.
+//
+// `native_quantize_q8_1_kernel` (native_mmvq.cu) with the shape PORTED: the CUDA is one thread per value, 256
+// threads per block, and the block's 32-lane exchange is a warp shuffle; the port is one workgroup of 256 whose
+// eight 32-lane groups each own one q8_1 block, exchanging through shared memory in the shuffle's own order
+// (see common/q8_1_store.glsl - the ORDER is the point, not a reduction).
+//
+// THE TAIL IS HANDLED WITHOUT A DIVERGENT BARRIER.  The CUDA can `return` early because only a whole warp ever
+// does (n_in is a multiple of 32); a workgroup here cannot, because the exchange contains barriers.  So an
+// out-of-range lane takes part with 0.0 and writes nothing, and its BLOCK is never stored - which is safe
+// because a partial block cannot exist: n_in is a multiple of 32, so any out-of-range lane is in a block that is
+// entirely out of range.  Its offset is clamped anyway, so an inactive lane cannot land on the next column's
+// first block.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;
+layout(set = 0, binding = 1, std430) buffer OUTQ { uint8_t b[]; } q8_1_out;
+
+#include "common/f16_bits.glsl"
+#include "common/q8_1_store.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int ncols; } pc;
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    const uint per_col = (uint(pc.n_in) + WG_Q8_1_SIZE - 1u) / WG_Q8_1_SIZE;
+    const uint wg = gl_WorkGroupID.x;
+    const uint c = wg / per_col;
+    const uint i = (wg % per_col) * WG_Q8_1_SIZE + lid;
+    const bool in_range = (c < uint(pc.ncols)) && (i < uint(pc.n_in));
+    const uint ic = min(i, uint(pc.n_in) - 1u);              // never used to write when inactive
+    const float xi = in_range ? x.v[c * uint(pc.n_in) + i] : 0.0;
+    q8_1_store(xi, (c * (uint(pc.n_in) / 32u) + ic / 32u) * 36u, in_range);
+}

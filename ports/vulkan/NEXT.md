@@ -36,12 +36,23 @@ NEXT, in order:
    `iq1m_mmvq.comp` (the IQ1_M row the resident `coder-iq1_m` model's experts are stored in) is in the build and
    gated, with `common/iq1m_dot.glsl`, the grid table generated from the engine by `tools/gen-iq1s-grid.py`
    (the gate now fails if it is stale), and three cases over sub-width and above-width part counts plus two
-   columns. Next in this wave, in this order: (a) the q8_1 quantizer pair `native_quantize_q8_1` /
-   `native_swiglu_quantize_q8_1` - the activation side of every format below, and the only part of the wave
-   whose exactness is byte-for-byte against the engine's own `roundf`-based quantiser; (b) the grouped
-   `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier actually
-   calls, built on the per-format row dot; (c) the remaining formats one shader each (Q5_K, Q2_0, Q3_K, IQ4_XS,
-   Q4_K, Q6_K, and the small Q4_0/Q5_0/Q8_0/IQ4_NL family), which is `native_mmvq.cu`'s own structure.
+   columns. NEXT IN THIS WAVE, in this order:
+   (a) the q8_1 quantizer pair - STARTED: `quantize_q8_1.comp` (the plain one) is in and gated byte-exactly,
+       including the #606 clamps and the tie rule; `native_swiglu_quantize_q8_1_kernel` is the other half and is
+       NOT ported. It differs from the plain one in the SOURCE, not just in its input: it has no `q8_1_finite`
+       clamp on `d` or the sum, and its silu is `__fdividef`/`__expf` (fast-math), so its input values are not
+       reproducible either - it needs the code-disagreement measurement the router case uses, not byte-exactness.
+   (a2) **A DECISION WORTH TAKING DELIBERATELY: which division the quantiser uses.** The port writes the source's
+       `roundf(xi / d)`. MEASURED on RADV: of 2560 codes, 2184 match a correctly rounded division and 120 match
+       `roundf(x*(127/amax))` - i.e. the driver's `/` is not correctly rounded, and the engine's own CPU AVX512
+       path multiplies by a reciprocal too. The case accepts EITHER form (and fails on "neither"), so the port is
+       portable, but the codes it produces for a tie can differ between vendors. Writing the reciprocal form
+       explicitly would make it deterministic everywhere and match the CPU path; it would also stop matching the
+       CUDA source's expression. Unresolved on purpose - it needs a decision, not a default.
+   (b) the grouped `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier
+       actually calls, built on the per-format row dot.
+   (c) the remaining formats one shader each (Q5_K, Q2_0, Q3_K, IQ4_XS, Q4_K, Q6_K, and the small
+       Q4_0/Q5_0/Q8_0/IQ4_NL family), which is `native_mmvq.cu`'s own structure.
 2. The cross-implementation arm's `budget: independent requery agrees` case used to report a FALSE FAIL while
    the resident local model held the card. **FIXED, with the measurement**: the flake was `budget 81920 bytes,
    usage 0 bytes` - 80 KiB of driver budget bookkeeping with usage unchanged - so the discrete-card comparison

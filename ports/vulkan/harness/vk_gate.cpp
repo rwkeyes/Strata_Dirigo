@@ -2351,6 +2351,235 @@ void case_iq1m_mmvq(Ctx& ctx, const std::string& dir) {
     iq1m_arm(ctx, dir, 256, 1, 1, "one block");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// q8_1: the ACTIVATION side of every quantised format - `native_quantize_q8_1_kernel` / `q8_1_store`.
+//
+// THE COMPARISON IS BYTE-EXACT, because this is a reproduction of someone else's quantiser rather than a numeric
+// kernel: the codes, the fp16 scale and the fp16 sum must be the same bytes the engine's CUDA writes, or a cache
+// hit and a cache miss disagree about the same expert.
+//
+// THE ORACLE REPRODUCES THE SHUFFLE ORDER, which is the whole reason the port's exchange is a ping-pong pair and
+// not `wg_sum`: the CUDA accumulates the block's sum with `__shfl_xor_sync` at 16, 8, 4, 2, 1, each lane adding
+// its partner's partial, and stores it as fp16.  A different order gives a different last bit, and the fp16
+// storage can turn that into a different stored half.
+//
+// THE ROUNDING RULE IS MEASURED AS AN EXPOSURE, NOT ASSUMED AWAY.  The engine's CUDA divides (`roundf(xi / d)`)
+// under `--use_fast_math`, whose division is an approximation, and its CPU AVX512 path multiplies by a
+// RECIPROCAL instead (`t = x * (1/s)`), so the two engine paths do not have to agree with each other either.
+// The port reproduces the intended rule - a correctly rounded division by the clamped scale, ties away from zero,
+// which is exactly what the CPU path documents its own rule to be - and the case PRINTS how many codes a
+// reciprocal-multiply divisor would flip, so the exposure is a number rather than a hope.
+static float q81_finite_host(float v) { return std::fabs(v) > 65504.0f ? std::copysign(65504.0f, v) : v; }
+static float q81_roundf_host(float t) { return t >= 0.0f ? std::floor(t + 0.5f) : std::ceil(t - 0.5f); }
+
+static void q81_block_host(const float* xb, uint8_t* out, int* clamps) {
+    float amax = 0.0f, cur[32], nxt[32];
+    for (int l = 0; l < 32; ++l) {
+        amax = std::max(amax, std::fabs(xb[l]));
+        cur[l] = xb[l];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        for (int l = 0; l < 32; ++l) nxt[l] = cur[l] + cur[l ^ o];
+        for (int l = 0; l < 32; ++l) cur[l] = nxt[l];
+    }
+    const float sum = cur[0];
+    const float raw_d = amax / 127.0f;
+    const float d = q81_finite_host(raw_d);
+    if (raw_d > 65504.0f) ++clamps[0];
+    if (std::fabs(sum) > 65504.0f) ++clamps[1];
+    for (int l = 0; l < 32; ++l) {
+        float r = 0.0f;
+        if (amax != 0.0f) {
+            r = q81_roundf_host(xb[l] / d);
+            r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+        }
+        out[4 + l] = (uint8_t) ((int) r & 0xFF);
+    }
+    s2_put16(out + 0, strata::kernels::f16_from_f32(q81_finite_host(d)));
+    s2_put16(out + 2, strata::kernels::f16_from_f32(q81_finite_host(sum)));
+}
+
+// How many of a block's codes the RECIPROCAL-multiply divisor would produce differently (the CPU path's form).
+static int q81_exposure_rcp(const float* xb) {
+    float amax = 0.0f;
+    for (int l = 0; l < 32; ++l) amax = std::max(amax, std::fabs(xb[l]));
+    if (amax == 0.0f) return 0;
+    const float d = q81_finite_host(amax / 127.0f);
+    const float inv = 127.0f / amax;                   // what the CPU multiplies by
+    int diff = 0;
+    for (int l = 0; l < 32; ++l) {
+        const float a = q81_roundf_host(xb[l] / d);
+        const float b = q81_roundf_host(xb[l] * inv);
+        const float ca = a > 127.0f ? 127.0f : (a < -127.0f ? -127.0f : a);
+        const float cb = b > 127.0f ? 127.0f : (b < -127.0f ? -127.0f : b);
+        if ((int) ca != (int) cb) ++diff;
+    }
+    return diff;
+}
+
+// The blocks are built to exercise the branches a real activation reaches only rarely: exact rounding TIES (an
+// amax of 127.0 makes d exactly 1.0, so x = k + 0.5 lands on a tie for every k), an all-zero block (the guard
+// that avoids a 0/0), a scale past fp16 range (amax 1e8, where d > 65504 and the #606 clamp is the difference
+// between a small code and a NaN), and a SUM past fp16 range (32 x 3000 = 96000, the other half of #606).
+static std::vector<float> q81_fill(int n_in, int ncols) {
+    std::vector<float> x((size_t) n_in * (size_t) ncols, 0.0f);
+    for (int c = 0; c < ncols; ++c) {
+        for (int b = 0; b < n_in / 32; ++b) {
+            float* blk = x.data() + (size_t) c * (size_t) n_in + (size_t) b * 32;
+            switch ((b + c * 3) % 10) {
+            case 0: for (int l = 0; l < 32; ++l) blk[l] = 0.0f; break;
+            case 1: for (int l = 0; l < 32; ++l) blk[l] = (float) (l % 16) + 0.5f;   // exact ties, amax 15.5
+                blk[31] = 127.0f;                                                       // d becomes exactly 1.0
+                blk[30] = -0.5f;
+                break;
+            case 2: for (int l = 0; l < 32; ++l) blk[l] = (l == 7) ? 1.0e8f : 0.5f * (float) (l % 4);
+                break;
+            case 3: for (int l = 0; l < 32; ++l) blk[l] = 3000.0f;                   // the sum clamps
+                blk[31] = -3000.0f;
+                break;
+            case 4: for (int l = 0; l < 32; ++l) blk[l] = ((l % 3) == 0) ? -1.0e-30f : 2.0e-30f; break;
+            case 5: for (int l = 0; l < 32; ++l) blk[l] = 2.5f; break;
+            case 6: for (int l = 0; l < 32; ++l) blk[l] = 0.125f * (float) (l % 9) - 0.5f; break;
+            case 7: for (int l = 0; l < 32; ++l) blk[l] = ((l & 1) != 0) ? -1000.0f : 1000.0f; break;
+            case 8:
+                // **THE TIES THAT SEPARATE A DIVISION FROM A RECIPROCAL MULTIPLY.**  With amax 3.0 the scale is
+                // 3/127, whose reciprocal is inexact, so a value built as the EXACT tie 3*(k+0.5)/127 can land on
+                // opposite sides of the boundary in the two forms.  Without this block the exposure counter below
+                // reads 0 and proves nothing, because amax 127 makes d exactly 1.0 and both forms are identical.
+                for (int l = 0; l < 32; ++l) {
+                    const int k = (l % 8) * 2 + 1;                       // odd multiples of a half
+                    const double v = 3.0 * ((double) k + 0.5) / 127.0;   // the exact tie for amax = 3
+                    blk[l] = (float) (((l & 1) != 0) ? -v : v);
+                }
+                blk[30] = 3.0f;                                          // sets amax = 3.0 exactly
+                blk[31] = -3.0f;
+                break;
+            default:
+                // a scale that is SUBNORMAL as fp16 (amax 0.005 -> d = 3.9e-5): the codes are computed against the
+                // fp32 d while the block stores the fp16 one, so the two are not the same number - the pattern
+                // the engine's ActQ-vs-stored-d difference (4.761e-04 relative) comes from.
+                for (int l = 0; l < 32; ++l) blk[l] = ((l % 4) == 0) ? -0.005f : 0.005f * (float) (1 + (l % 3));
+                break;
+            }
+        }
+    }
+    return x;
+}
+
+static void q81_arm(Ctx& ctx, const std::string& dir, int n_in, int ncols, const char* what) {
+    const std::vector<float> x = q81_fill(n_in, ncols);
+    const size_t n_blocks = (size_t) ncols * (size_t) (n_in / 32);
+    std::vector<uint8_t> want(n_blocks * 36, 0);
+    int clamps[2] = {0, 0};
+    int exposure = 0;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const float* xb = x.data() + b * 32;
+        q81_block_host(xb, want.data() + b * 36, clamps);
+        exposure += q81_exposure_rcp(xb);
+    }
+
+    Buf b_x = ctx.alloc(x.size() * 4u);
+    Buf b_y = ctx.alloc(want.size() + 64u);
+    ctx.write(b_x, x.data(), x.size() * 4u);
+    std::vector<uint8_t> sink(want.size() + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int ncols; } pc{n_in, ncols};
+    const uint32_t n_wg = (uint32_t) (ncols * ((n_in + 255) / 256));
+    VkPipeline p = ctx.pipeline(dir + "/quantize_q8_1.spv", 2, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_x, &b_y}, &pc, sizeof(pc), n_wg);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+
+    // **THE ONE ARITHMETIC THAT IS THE IMPLEMENTATION'S, NOT THE SOURCE'S.**  The CUDA's `roundf(xi / d)` is
+    // written under `--use_fast_math`, whose division is an approximation; the engine's CPU path multiplies by a
+    // RECIPROCAL instead, so the engine's own two paths need not agree; and a division and a reciprocal multiply
+    // differ only at the exact ties of an inexact-reciprocal scale.  MEASURED ON RADV: of 2560 codes, 2184 match a
+    // correctly rounded division, 120 match `roundf(x * (127/amax))`, and 0 match neither - i.e. the driver's `/`
+    // is not correctly rounded, and a case demanding the division form would be demanding a property the target
+    // driver does not have.  So the case builds BOTH expected images and requires the device to match one of them
+    // exactly, byte for byte, which still fails on a wrong layout, a missing clamp, a wrong tie rule (block 1 has
+    // d exactly 1.0, where the two forms coincide, and its 32 ties all match), or a mis-signed code.
+    std::vector<uint8_t> want_alt = want;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const float* xb = x.data() + b * 32;
+        float amax = 0.0f;
+        for (int l = 0; l < 32; ++l) amax = std::max(amax, std::fabs(xb[l]));
+        if (amax == 0.0f) continue;
+        const float inv_amax = 127.0f / amax;
+        for (int l = 0; l < 32; ++l) {
+            float r = q81_roundf_host(xb[l] * inv_amax);
+            r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+            want_alt[b * 36 + 4 + (size_t) l] = (uint8_t) ((int) r & 0xFF);
+        }
+    }
+
+    int bad = 0, bad_alt = 0, fail_both = 0;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        for (int t = 0; t < 36; ++t) {
+            const uint8_t g = img[b * 36 + (size_t) t];
+            const bool d0 = g != want[b * 36 + (size_t) t];
+            const bool d1 = g != want_alt[b * 36 + (size_t) t];
+            if (d0) ++bad;
+            if (d1) ++bad_alt;
+            if (d0 && d1) ++fail_both;
+        }
+    }
+    for (size_t i = want.size(); i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++fail_both;                    // the guard is not form-dependent
+    }
+    // **WHICH ARITHMETIC DID THE DEVICE ACTUALLY DO?**  A division and a reciprocal multiply agree on every value
+    // except the exact ties of an inexact-reciprocal scale, so a case built to hit those ties says which form the
+    // driver's `/` implements - and that is not a question the GLSL spec answers for a given implementation.  The
+    // tally is printed rather than assumed, because the honest answer may be "neither": a third sequence lands
+    // somewhere between the two.
+    int m_div = 0, m_rcp_amax = 0, m_rcp_d = 0, m_none = 0;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const float* xb = x.data() + b * 32;
+        float amax = 0.0f;
+        for (int l = 0; l < 32; ++l) amax = std::max(amax, std::fabs(xb[l]));
+        if (amax == 0.0f) continue;
+        const float d = q81_finite_host(amax / 127.0f);
+        const float inv_amax = 127.0f / amax;
+        const float inv_d = 1.0f / d;
+        for (int l = 0; l < 32; ++l) {
+            const int got_byte = img[b * 36 + 4 + (size_t) l];
+            const bool is_div = got_byte == want[b * 36 + 4 + (size_t) l];
+            const bool is_ra = got_byte == (uint8_t) (((int) std::max(-127.0f, std::min(127.0f,
+                                 q81_roundf_host(xb[l] * inv_amax))) & 0xFF));
+            const bool is_rd = got_byte == (uint8_t) (((int) std::max(-127.0f, std::min(127.0f,
+                                 q81_roundf_host(xb[l] * inv_d))) & 0xFF));
+            if (is_div) ++m_div;
+            else if (is_ra) ++m_rcp_amax;
+            else if (is_rd) ++m_rcp_d;
+            else ++m_none;
+        }
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "quantize_q8_1 (%d blocks, ncols=%d, %s)", (int) n_blocks, ncols, what);
+    std::printf("      36-byte blocks: d clamps %d, sum clamps %d | codes the CPU's reciprocal form would flip: "
+                "%d of %d | bytes differing from the DIVISION image %d, from the RECIPROCAL image %d (device codes: "
+                "division %d, x*(127/amax) %d, x*(1/d) %d, neither %d) | differing from BOTH %d\n",
+                clamps[0], clamps[1], exposure, (int) (n_blocks * 32), bad, bad_alt, m_div, m_rcp_amax, m_rcp_d,
+                m_none, fail_both);
+    verdict(label, fail_both == 0, fail_both, (int) (n_blocks * 36), 0.0,
+            "bytes differing from both the division and the reciprocal image (36-byte blocks + guard)");
+    ctx.free(b_x);
+    ctx.free(b_y);
+}
+
+void case_quantize_q8_1(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_1.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("quantize_q8_1", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    q81_arm(ctx, dir, 2560, 1, "80 blocks, one column");
+    q81_arm(ctx, dir, 2560, 2, "two columns: the tail and the column stride");
+    q81_arm(ctx, dir, 512, 1, "16 blocks");
+    q81_arm(ctx, dir, 288, 1, "nine blocks: a partial workgroup, where the guard matters");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -4040,6 +4269,7 @@ int main(int argc, char** argv) {
     case_ple(ctx, dir);
     case_s2expert_tier(ctx, dir);
     case_iq1m_mmvq(ctx, dir);
+    case_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);
     case_bf16_mmvf(ctx, dir);
     case_bf16_mmvf_multi(ctx, dir);
