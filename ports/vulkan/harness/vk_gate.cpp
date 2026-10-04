@@ -3041,6 +3041,176 @@ void case_iq3xxs_mmvq(Ctx& ctx, const std::string& dir) {
     iq3xxs_arm(ctx, dir, 256, 1, 1, "one block");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// IQ4_NL: the DOWN format of 39 of the resident model's 48 layers - the biggest single win in this wave.
+//
+// THIS CASE CARRIES TWO ORACLES ON PURPOSE.  The packing order (low nibble of byte j = value j, high nibble =
+// value j+16) is a choice my kernel and my first oracle SHARE, so that oracle cannot test it.  The second oracle
+// is a different formulation entirely - dequantize the 32 weight values in canonical order, multiply them
+// element by element against the 32 activation codes, sum - so if the packing order is wrong the two references
+// disagree with each other, and the case fails with "the two oracles disagree" rather than passing on a shared
+// mistake.  The first oracle also carries the block geometry (two parts per 32-value block, the +16-byte
+// activation read) which the second one does not exercise.
+static const int kIq4nlValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+static int iq4nl_value_host(uint32_t nib) { return kIq4nlValues[nib & 0x0Fu]; }
+
+static int iq4nl_pack4_host(int b0, int b1, int b2, int b3) {
+    return (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+}
+
+// Oracle A: `vec_dot_iq4_nl_q8_1`, the dp4a structure.  Returns the integer `sumi` of one part (block, iqs).
+static int iq4nl_sumi_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                           size_t ablk, int iqs, double* scale_out) {
+    int sumi = 0;
+    for (int l = 0; l < 2; ++l) {
+        const uint32_t aux = (uint32_t) iq2s_rd4(w, wblk + 2 + (size_t) (4 * (iqs + l)));
+        const int vx = iq4nl_pack4_host(iq4nl_value_host(aux & 0x0Fu), iq4nl_value_host((aux >> 8u) & 0x0Fu),
+                                        iq4nl_value_host((aux >> 16u) & 0x0Fu), iq4nl_value_host((aux >> 24u) & 0x0Fu));
+        const int vy = iq4nl_pack4_host(iq4nl_value_host((aux >> 4u) & 0x0Fu), iq4nl_value_host((aux >> 12u) & 0x0Fu),
+                                        iq4nl_value_host((aux >> 20u) & 0x0Fu), iq4nl_value_host((aux >> 28u) & 0x0Fu));
+        const size_t aq = ablk + 4 + (size_t) (4 * (iqs + l));
+        sumi = iq1m_dp4a(vx, iq2s_rd4(act, aq), sumi);
+        sumi = iq1m_dp4a(vy, iq2s_rd4(act, aq + 16), sumi);
+    }
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    *scale_out = (double) (float) (dw * da);
+    return sumi;
+}
+
+// Oracle B: the same quantity as a value-by-value dot in canonical order - no nibble packing, no dp4a, no
+// de-interleaved activation reads.  It exists to disagree if the packing order above is wrong.
+static double iq4nl_byvalue_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                                 size_t ablk) {
+    int sumi = 0;
+    for (int j = 0; j < 32; ++j) {
+        const uint8_t byte = w[wblk + 2 + (size_t) (j % 16)];
+        const int nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+        const int av = (int) (int8_t) act[ablk + 4 + (size_t) j];
+        sumi += kIq4nlValues[nib] * av;
+    }
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    return ((double) (float) (dw * da)) * (double) sumi;
+}
+
+static std::vector<uint8_t> iq4nl_fill_blob(size_t n_out, int nb, int n_in) {
+    const size_t row_bytes = (size_t) nb * 18;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 18;
+            const float mag = (b % 6 == 0) ? 0.015625f : 0.5f * (float) (1 + (b % 3));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 4 == 3) ? -mag : mag));
+            // every codebook index appears, and both nibble halves of every byte are populated, so a swap of the
+            // low/high nibbles changes the result (the two oracles above are what notices if it does)
+            for (int i = 0; i < 16; ++i) blk[2 + i] = (uint8_t) (((i + b) & 0x0F) | (((15 - ((i * 3 + b) & 0x0F))) << 4));
+        }
+    }
+    (void) n_in;
+    return w;
+}
+
+static void iq4nl_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 32;                    // 32 values per block, two parts each
+    const int row_bytes = nb * 18;
+    const std::vector<uint8_t> w = iq4nl_fill_blob((size_t) n_out, nb, n_in);
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_alt(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, acc_alt = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int b = 0; b < nb; ++b) {
+                const size_t wblk = wrow + (size_t) b * 18;
+                const size_t ablk = arow + (size_t) b * 36;
+                // oracle A is per PART: the block has two of them (the format's ipb), each 16 values
+                for (int part = 0; part < 2; ++part) {
+                    double scale = 0.0;
+                    const int sumi = iq4nl_sumi_host(w, wblk, act, ablk, 2 * part, &scale);
+                    acc += scale * (double) sumi;
+                    abs_sum += std::fabs(scale * (double) sumi);
+                }
+                // oracle B is per BLOCK: the whole 32 values at once.  It must NOT be inside the part loop - the
+                // first version of this case had it there and the two references disagreed by exactly a factor of
+                // two, which the case reported as "the two oracles disagree" instead of as a kernel failure.
+                acc_alt += iq4nl_byvalue_host(w, wblk, act, ablk);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_alt[(size_t) c * (size_t) n_out + r] = acc_alt;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+
+    // the two references must agree with each other FIRST - a disagreement is a defect in the case, not in the
+    // kernel, and it must not be reported as a kernel failure
+    double oracle_gap = 0.0;
+    int oracle_split = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double denom = std::max(std::fabs(want[i]), 1e-30);
+        const double rel = std::fabs(want[i] - want_alt[i]) / denom;
+        oracle_gap = std::max(oracle_gap, rel);
+        if (!(rel < 1e-4)) ++oracle_split;
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq4nl_mmvq.spv", 3, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[176];
+    std::snprintf(label, sizeof label, "iq4nl_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    std::printf("      the two oracles vs each other: worst rel gap %.3g, disagreeing rows %d (must be 0 - this "
+                "guards the NIBBLE PACKING, which both my kernel and oracle A assume)\n",
+                oracle_gap, oracle_split);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    if (oracle_split != 0 || !live) {
+        verdict(label, false, bad + oracle_split, (int) n_y, oracle_gap, "the two oracles disagree - fix the case");
+    } else {
+        verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    }
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_y);
+}
+
+void case_iq4nl_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq4nl_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("iq4nl_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    iq4nl_arm(ctx, dir, 2560, 8, 1, "80 blocks: 160 parts < 256 lanes");
+    iq4nl_arm(ctx, dir, 10240, 4, 2, "320 blocks: 640 parts > 256 lanes, two columns");
+    iq4nl_arm(ctx, dir, 32, 1, 1, "one block: the smallest legal shape");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -4732,6 +4902,7 @@ int main(int argc, char** argv) {
     case_iq1m_mmvq(ctx, dir);
     case_iq2s_mmvq(ctx, dir);
     case_iq3xxs_mmvq(ctx, dir);
+    case_iq4nl_mmvq(ctx, dir);
     case_quantize_q8_1(ctx, dir);
     case_swiglu_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);

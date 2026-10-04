@@ -68,15 +68,28 @@ NEXT, in order:
        outside the envelope. On ordinary data, 0 bytes differ.
    (b) the grouped `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier
        actually calls, built on the per-format row dot.
-   (c) **the remaining formats, one shader each - STARTED 2026-10-04 with IQ2_S, second one IQ3_XXS.** Both are in
-       the build and gated (3 arms each; RADV and radeon green, llvmpipe green):
+   (c) **the remaining formats, one shader each - IQ2_S, IQ3_XXS and IQ4_NL are DONE** (2026-10-04; 3 arms each;
+       RADV and radeon green, llvmpipe green):
        * `iq2s_mmvq.comp` + `common/iq2s_dot.glsl` (type 22, the most common gate/up format at 20 layers);
        * `iq3xxs_mmvq.comp` + `common/iq3xxs_dot.glsl` (type 18, 17 layers), which adds `unpack_ksigns` (parity-fix
          the sign byte, then replicate it into all four bytes - arithmetic, not the `ksigns_iq2xs` table, so
-         nothing extra is uploaded) and two more truncating integer divisions in the tail.
-       Both sit on `harness/iq_grids.hpp`, which now carries THREE tables (`tools/gen-iq-tables.py`): the IQ1_S and
-       IQ3_XXS grids as uint32, the IQ2_S grid as low/high uint32 halves so no shader needs the optional
-       `shaderInt64` feature for a value it only ever reads in halves.
+         nothing extra is uploaded) and two more truncating integer divisions in the tail;
+       * `iq4nl_mmvq.comp` + `common/iq4nl_dot.glsl` (type 20) - **the DOWN format of 39 of 48 layers, and the one
+         that took the model from "0 complete layers" to 29**, since no layer's expert path is whole until gate/up
+         AND down are both ported.  Its geometry differs from the 256-value formats (`Fmt<20>` is { qk 32, ipb 2,
+         step 2 }): part k of a row is weight block k/2 AND activation block k/2, two parts per block, 16 values
+         each.
+       * **THE NIBBLE PACKING IS DE-INTERLEAVED** (low nibble of byte j = value j, high = value j+16) - not the
+         adjacent-pair packing Q4_0/Q4_K use, which is why the source reads the activation at `q8[l]` and
+         `q8[l+4]`.  The port took that order from the engine's CPU AVX-2 kernel (`src/kernels/cpu/iq_avx2.cpp`
+         says `// values 0..15` / `// values 16..31`), NOT from the CUDA's `__byte_perm` chain, which states it
+         only implicitly.
+       * **That order is now cross-checked, not assumed.** The Iq4Nl case carries TWO oracles - the dp4a/nibble
+         form and a value-by-value dequantized dot - and compares them to each other before comparing either to
+         the device (`worst rel gap 0`, printed every run).  The first version of the case accumulated the second
+         one inside the per-part loop, so it counted each block twice; the case reported "the two oracles
+         disagree" (a case defect) rather than blaming the kernel, which is the reporting rule that makes a
+         second oracle worth having.  Written up in the skill.
        * **THE PER-BYTE HELPERS ARE SHARED, DELIBERATELY - AND ONLY THOSE.** `common/perbyte_sign.glsl` holds
          `__vcmpne4`/`__vsub4` because IQ2_S and IQ3_XXS write the IDENTICAL idiom (one rule used twice). The two
          q8_1 quantisers are the same quantity under two DIFFERENT rules and stay separate. The harness keeps its
@@ -85,9 +98,9 @@ NEXT, in order:
          magnitude, and both bad offsets were in my double oracle - the shader was right. `get_int_b2(qs, iqs/2)`
          is FOUR bytes at `2*iqs`, not two bytes at `iqs`. Tiebreaker is the helper's definition, not its name
          (written up in the skill under "Names that lie"). IQ3_XXS then passed its first numeric run.
-       * **NEXT, in the order the pack's own census gives** (`NEXT.md` above): **IQ3_S (10 layers)**, IQ4_XS (1)
-         for gate/up; **IQ4_NL (39)** and Q2_0 (9) for down. Then the K-quants and the small Q4_0/Q5_0/Q8_0 family,
-         then the grouped kernels in (b).
+       * **NEXT, in the order the pack's own census gives**: **Q2_0** (down, 9 layers), then **IQ3_S** (10) and
+         **IQ4_XS** (1).  Those three formats finish every layer of the resident model; after them, the grouped
+         kernels in (b).
 2. The cross-implementation arm's `budget: independent requery agrees` case used to report a FALSE FAIL while
    the resident local model held the card. **FIXED, with the measurement**: the flake was `budget 81920 bytes,
    usage 0 bytes` - 80 KiB of driver budget bookkeeping with usage unchanged - so the discrete-card comparison

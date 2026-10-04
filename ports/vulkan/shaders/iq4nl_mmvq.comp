@@ -1,0 +1,47 @@
+// ports/vulkan/shaders/iq4nl_mmvq.comp - ONE IQ4_NL WEIGHT ROW against q8_1 activations, one workgroup per row.
+//
+// `mmvq_kernel<20>` with the format baked in.  IQ4_NL is the DOWN format of 39 of the resident model's 48 layers:
+// the biggest single win left in this wave.
+//
+// THE GEOMETRY DIFFERS FROM THE 256-VALUE FORMATS, which is the thing to get right here: `Fmt<20>` is
+// { qk 32, ipb 2, step 2 }, so a row's blocks are `n_in/32` of 18 bytes and each block takes TWO parts.  Part k of
+// the row is weight block k/2 AND activation block k/2 (`x + kbx * (qk/32)` in the source, with qk/32 == 1),
+// which is why the activation index below is `(k / 2)` and not `k`.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+#include "common/iq4nl_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+const uint IQ4NL_QK = 32u;                       // values per block
+const uint IQ4NL_IPB = 2u;                       // dot calls per block (the format's `ipb`)
+const uint IQ4NL_BLOCK = 18u;                    // bytes per block
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;           // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / IQ4NL_QK;    // IQ4_NL blocks per row
+    const uint arow_bytes = (uint(pc.n_in) / 32u) * 36u;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint arow = c * arow_bytes;
+        float acc = 0.0;
+        for (uint k = lid; k < nb * IQ4NL_IPB; k += gl_WorkGroupSize.x) {
+            const uint blk = k / IQ4NL_IPB;
+            acc += iq4nl_dot(wrow + blk * IQ4NL_BLOCK, arow + blk * 36u, 2u * (k % IQ4NL_IPB));
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}

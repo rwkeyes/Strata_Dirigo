@@ -7,10 +7,10 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
     bash ports/vulkan/gates/run_gate.sh          # compiles the shaders from source, validates the SPIR-V,
                                                  # checks each shader's declared local size, then runs the gate
 
-**Result: the gate prints its own totals and those are the authority - 143 passed, 0 failed, 0 skipped on the
+**Result: the gate prints its own totals and those are the authority - 146 passed, 0 failed, 0 skipped on the
 box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
-137 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
-last line of your own run.** 48 kernels, 13 shared includes, one generated table file (`harness/iq_grids.hpp`,
+140 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
+last line of your own run.** 50 kernels, 14 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S and IQ3_XXS grids).
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
@@ -106,8 +106,11 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
   RESIDENT MODEL'S OWN PACK, not by its filename**: `coder-iq1_m`'s experts are IQ2_S (20 of 48 layers), IQ3_XXS
   (17), IQ3_S (10), IQ4_XS (1) for gate/up and IQ4_NL (39), Q2_0 (9) for down - see `NEXT.md`, which carries the
   census and the reason the filename misleads. Done so far in this wave: the IQ1_M row dot, the two q8_1
-  quantisers, **IQ2_S** (`iq2s_mmvq.comp`) and **IQ3_XXS** (`iq3xxs_mmvq.comp`, both with their dots in
-  `shaders/common/` and both gated); next is IQ3_S.
+  quantisers, **IQ2_S**, **IQ3_XXS** and **IQ4_NL** (`iq2s_mmvq.comp`, `iq3xxs_mmvq.comp`, `iq4nl_mmvq.comp`, dots
+  in `shaders/common/`, all gated). **Coverage: 5 of the model's 6 expert formats, and 29 of its 48 layers now
+  have BOTH halves of the expert path ported** (the 15 IQ2_S/Q4_NL layers and the 14 IQ3_XXS/IQ4_NL ones - before
+  IQ4_NL that count was zero, because no layer is complete without its down projection). Three formats remain to
+  cover every layer: **Q2_0** (down, 9 layers), then **IQ3_S** (10) and **IQ4_XS** (1) on the gate/up side.
 * **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no recorded command buffers, no kernel
   registry. `harness/vk_compute.*` is the seed of the device layer, deliberately host-visible-only memory for
   gate fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.
