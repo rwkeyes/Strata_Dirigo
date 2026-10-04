@@ -19,6 +19,19 @@ demonstrated to be in the kernel: its oracle was reading the wrong activation bu
 read the quantizer's output, which is what the previous stage actually produced), and after that fix the
 intermediate showed `d = NaN`.
 
+**THE NaN QUESTION IS SETTLED, AND NO KERNEL WAS EVER WRONG.** `gemv_bound` returned **exactly 0.0** for a row
+whose oracle value AND sum|terms| are both zero - an all-zero weight row, which the bf16 case has on purpose - and
+`|0 - 0| / 0.0` is NaN. The old check (`ratio > 1.0`) is FALSE for a NaN, so that element passed silently; making
+the comparison NaN-safe exposed it, and it then LOOKED like a device producing NaN. Both readings were wrong: the
+kernel was computing exactly the right answer and the line that needed fixing was the bound.
+
+Fixed in the harness: the bound now carries a 1e-30 floor, and the NaN-safe comparison is adopted at all six sites
+- which is worth having regardless, since a NaN result should never pass a check.
+
+**WHAT REMAINS FOR THIS FILE.** The tier's case was reverted with the rest of that turn's work and has to be
+re-added and re-run now that the bound is fixed; the `gu` and `swiglu` stages passed against it before the revert
+(3840/3840 and 1920/1920), and the `down` stage's own bug - its oracle reading the gate/up activation image
+instead of the quantizer's output - is recorded below and already fixed in the version that was reverted.
 **WHAT IS OPEN, AND IT IS A HOLE IN THE GATE RATHER THAN IN THIS FILE.** Making the comparisons NaN-safe
 (`!(ratio <= 1.0)` instead of `ratio > 1.0`, since a NaN comparison is false and the old form silently ACCEPTED a
 NaN) turns up NaN err/tol ratios in cases that currently report "worst 0" - and in this tier's `gu` stage every

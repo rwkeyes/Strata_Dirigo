@@ -925,7 +925,13 @@ static const int kIq4nlHost[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 
 const double GEMV_EPS = 1.0 / 16777216.0;                 // 2^-24, the f32 unit roundoff
 const double GEMV_TREE = 16.0;                            // log2(1280) + margin, for the tree depth
 static double gemv_bound(double want, double abs_sum, double rtol) {
-    return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum;
+    // **THE FLOOR IS NOT DECORATION: WITHOUT IT A ZERO ROW MAKES `dev/bound` A 0/0 NaN.** A row whose oracle value
+    // AND sum|terms| are both exactly zero - an all-zero weight row, which the bf16 case has on purpose - gives a
+    // bound of exactly 0.0, and |0 - 0| / 0.0 is NaN. `ratio > 1.0` is FALSE for NaN, so the element passed every
+    // check; only when the comparison was made NaN-safe (`!(ratio <= 1.0)`) did it surface, and then it looked
+    // like a device producing NaN rather than a bound that had gone to zero. Both readings were wrong: the kernel
+    // was computing exactly the right answer, and the thing that needed fixing was this line.
+    return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum + 1e-30;
 }
 
 // scalar_gate and scale_rows: the shared expert's per-token scalar and its application.
@@ -1427,7 +1433,7 @@ void case_s_gemv_f16_split(Ctx& ctx, const std::string& dir) {
             const double ratio = std::fabs((double) got[o] - (double) want[o]) /
                                  gemv_bound((double) want[o], want_abs[o], 1e-6);
             worst = std::max(worst, ratio);
-            if (ratio > 1.0) ++bad;
+            if (!(ratio <= 1.0)) ++bad;   // NaN-safe: a NaN comparison is false, so `>` alone passes a NaN
         }
         for (size_t i = (size_t) f.n_out * 4; i < img.size(); ++i) {
             if (img[i] != 0x9A) ++bad;
@@ -1582,7 +1588,7 @@ void case_s_gemv_q8_split(Ctx& ctx, const std::string& dir) {
             const double ratio = std::fabs((double) got[o] - (double) want[o]) /
                                  gemv_bound((double) want[o], want_abs[o], 1e-6);
             worst = std::max(worst, ratio);
-            if (ratio > 1.0) ++bad;
+            if (!(ratio <= 1.0)) ++bad;   // NaN-safe: a NaN comparison is false, so `>` alone passes a NaN
         }
         for (size_t i = (size_t) f.n_out * 4; i < img.size(); ++i) {
             if (img[i] != 0x6D) ++bad;
@@ -1671,7 +1677,7 @@ void case_bf16_mmvf_multi(Ctx& ctx, const std::string& dir) {
                 const double ratio = std::fabs((double) g - (double) wv) /
                                      gemv_bound((double) wv, want_abs[(size_t) k * sh.n_out + o], 1e-6);
                 worst = std::max(worst, ratio);
-                if (ratio > 1.0) ++bad;
+                if (!(ratio <= 1.0)) ++bad;   // NaN-safe: a NaN comparison is false, so `>` alone passes a NaN
             }
         }
         // the output stride: the pad between rows (and everything past the last row) must be untouched
@@ -1784,7 +1790,7 @@ void case_s2_gemv_q8(Ctx& ctx, const std::string& dir) {
             const double dev = std::fabs((double) got[o] - (double) want[o]);
             const double ratio = dev / gemv_bound((double) want[o], want_abs[o], 1e-6);
             worst = std::max(worst, ratio);
-            if (ratio > 1.0) ++bad;
+            if (!(ratio <= 1.0)) ++bad;   // NaN-safe: a NaN comparison is false, so `>` alone passes a NaN
         }
         for (size_t i = (size_t) n_out * 4; i < img.size(); ++i) {
             if (img[i] != 0xC3) ++bad;                       // the guard past the output row
@@ -1852,9 +1858,17 @@ void case_bf16_mmvf(Ctx& ctx, const std::string& dir) {
         double worst = 0;
         for (int o = 0; o < n_out; ++o) {
             const double dev = std::fabs((double) got[o] - (double) want[o]);
-            const double ratio = dev / gemv_bound((double) want[o], want_abs[o], 1e-6);
+            const double bound = gemv_bound((double) want[o], want_abs[o], 1e-6);
+            // WHICH COMPONENT IS NaN, printed rather than guessed: the device's value, the oracle's value, the
+            // oracle's sum|terms|, and the bound. (`ratio > 1.0` is FALSE for NaN, so before this a NaN here
+            // passed silently - one element of this very case was doing exactly that.)
+            if (std::isnan(dev) || std::isnan(bound) || !(bound > 0.0)) {
+                std::printf("      row %d: got %.9g want %.9g abs_sum %.9g -> dev %.9g bound %.9g\n", o,
+                            (double) got[o], (double) want[o], want_abs[o], dev, bound);
+            }
+            const double ratio = dev / bound;
             worst = std::max(worst, ratio);
-            if (ratio > 1.0) ++bad;
+            if (!(ratio <= 1.0)) ++bad;                  // NaN-safe
         }
         for (size_t i = (size_t) n_out * 4; i < img.size(); ++i) {
             if (img[i] != 0x5E) ++bad;
@@ -2109,7 +2123,7 @@ void case_ple(Ctx& ctx, const std::string& dir) {
                 abs_at_worst = dev;
             }
             worst_abs = std::max(worst_abs, dev);
-            if (ratio > 1.0) ++bad;
+            if (!(ratio <= 1.0)) ++bad;   // NaN-safe: a NaN comparison is false, so `>` alone passes a NaN
         }
         if (bad) {
             // The worst-RATIO element is not necessarily the worst element: a stage whose output can cancel to
@@ -3077,7 +3091,7 @@ void case_rope(Ctx& ctx, const std::string& dir) {
                     const double tol = std::max(std::fabs(want) * 9.5367e-7, (std::fabs(a) + std::fabs(b)) * 9.5367e-7);
                     const double ratio = std::fabs(got - want) / (tol + 1e-30);
                     worst_ratio = std::max(worst_ratio, ratio);
-                    if (ratio > 1.0) ++bad;
+                    if (!(ratio <= 1.0)) ++bad;   // NaN-safe: a NaN comparison is false, so `>` alone passes a NaN
                 }
             }
             // THE TAIL IS BIT-EXACT: zero tolerance, because a copy is exact and "close" would mean the kernel
