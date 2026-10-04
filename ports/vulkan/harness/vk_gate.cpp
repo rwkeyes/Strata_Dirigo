@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>          // getpid: a case that creates and removes a file needs a PER-PROCESS path
 #include <limits>
 #include <random>
 #include <sys/wait.h>
@@ -808,7 +809,11 @@ void case_stack_components(Ctx& ctx) {
 // looked only for the uncompressed name and reported all six blobs absent on a box that ships them as .zst and
 // has every one of them.
 void case_firmware_variants() {
-    const std::string dir = "/tmp/vkport_fwtest/";
+    // PER-PROCESS path: this case CREATES and REMOVES a file, so a fixed name is a race when several gate
+    // instances run at once.  Measured in the 8-way smoke (gates/smoke-arc.sh, 2026-10-04): 2 of 8 jobs failed
+    // `compressed firmware variant found` when one instance's cleanup removed the file another was reading -
+    // and the same case passed 502/502 when the instances ran one at a time.
+    const std::string dir = "/tmp/vkport_fwtest-" + std::to_string((long) ::getpid()) + "/";
     std::filesystem::create_directories(dir);
     { std::ofstream f(dir + "test_guc.bin.zst"); f << "compressed placeholder"; }
     std::string found;
@@ -820,6 +825,7 @@ void case_firmware_variants() {
     verdict("stack: absent firmware still reported absent", bogus_absent, bogus_absent ? 0 : 1, 1, 0.0,
             "false positives");
     std::remove((dir + "test_guc.bin.zst").c_str());
+    std::filesystem::remove_all(dir);            // leave nothing behind for the next run
 
     // Informational: what the LIVE report says about the blobs for a Battlemage card, on this host.
     const StackReport s = detect_stack();
