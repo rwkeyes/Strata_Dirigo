@@ -2,10 +2,32 @@
 
 ## RESUME HERE (state as of the last commit)
 
-**THE EXPERT TIER IS FIXED, IN THE BUILD, AND GATED.** 126 passed / 0 failed / 0 skipped on RADV, 120 / 0 / 1 on
-llvmpipe (the skip is cooperative matrix), 126 / 0 / 0 on the radeon ICD re-run. 43 kernels plus 6 shared
-includes. The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh` - and this line has gone stale
+**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 160 passed / 0 failed / 0 skipped on
+RADV and on the radeon ICD re-run, 154 / 0 / 1 on llvmpipe (the skip is cooperative matrix). 54 kernels, 17 shared
+includes, one generated table file (four IQ grids). The gate prints its own totals -
+`bash ports/vulkan/gates/run_gate.sh`, which compiles every shader from source - and this line has gone stale
 twice in one day, so run it rather than quote it.
+
+WHAT IS DONE, in the expert tier: the per-format row kernels for IQ1_M, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS (gate/up),
+IQ4_NL and Q2_0 (down) - i.e. **every format the resident `coder-iq1_m` model's 48 layers use, so each layer now
+has both halves of its expert path** - plus the two q8_1 quantisers and
+`native_gu_iq2s.comp` / `native_down_iq4nl.comp`, the GROUPED pair the tier actually launches. See section (b)
+and (c) below for what each case checks and the one interface decision the grouped kernels needed.
+
+WHAT IS NOT DONE, stated by name so the next session does not have to re-derive it:
+  * THE OTHER FORMATS THE ENGINE HAS, which this model does not use: the per-format row kernels for IQ2_XXS (type
+    16), IQ2_XS (17), Q4_K (12), Q5_K (13) and the small family Q5_0 (6) / Q5_1 (7) / Q8_0 (8).  Those are what
+    the OTHER packs on the ladder need - the engine's own comment for Q4_K/Q5_K says "Unsloth's UD-Q4_K_XL
+    experts", so `coder-iq3_xxs` and the q4_k_xl pack are the models waiting on them.  Seven kernels, each one
+    file plus a dot include, with seven host oracles and their value-by-value partners.
+  * THE FOUR OTHER GROUPED INSTANTIATIONS (`native_gu_iq3xxs`, `_iq3s`, `_iq4xs`, `native_down_q2_0`) and the
+    `_multi` GRP_NC variants - mechanical copies of the gated pair (see (b)).
+  * `native_mmvq.cu`'s OWN DISPATCHER (`native_iq4_nl_mmvq`, `native_q4_0_mmvq`, ... case 20 etc.), which is a
+    SECOND RULE for types the expert path already has - the port carries the expert-path rule (from
+    `iq_kernels.cu`), because that is what the resident model runs.  Same quantity, two rules; do not merge them.
+  * WAVES 2-6 of the kernels (KV, rope, the remaining GEMVs, attention, MoE, the prefill GEMM) and the engine
+    integration, neither of which this wave touched.  **Nothing has ever run on Intel hardware** - see STATUS.md's
+    last section.
 
 **THE REAL DEFECT WAS A WRONG-BUFFER READ, AND THE "MASKED WAVE" ROOT CAUSE BELOW IS WITHDRAWN.**  In
 `shaders/common/s2_row_dot.glsl`, `dx` (the activation's own fp16 scale) was read with `f16_at(xb)`, and the
@@ -156,8 +178,10 @@ shared reduction produces it, in the one configuration no shipped caller uses (`
 `shaders/pending/README.md`, section "SETTLED BY BISECTION". The two-step fix is now justified, not speculative -
 and it is still two steps, because six passing kernels depend on that helper.
 
-The branch is GREEN: the gate prints its own totals and they are 120 passed, 0 failed, 0 skipped on RADV
-(112/0/1 on llvmpipe, the skip being the cooperative-matrix case). 40 kernels plus 5 shared includes.
+The branch is GREEN: the gate prints its own totals and they were 120 passed, 0 failed, 0 skipped on RADV
+(112/0/1 on llvmpipe, the skip being the cooperative-matrix case), 40 kernels plus 5 shared includes. **[A SNAPSHOT
+FROM WHEN THIS WAS WRITTEN, while the withdrawn diagnosis was still being argued - NOT the current total. The
+current one is in RESUME HERE at the top of this file, or better, in your own run's last line.]**
 
 THE ONE OPEN TASK, scoped to a single case re-add:
 

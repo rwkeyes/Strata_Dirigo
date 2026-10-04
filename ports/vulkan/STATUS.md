@@ -11,7 +11,10 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
 154 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
 last line of your own run.** 54 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
-holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids).
+holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
+the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
+counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
+numbers ever stop reconciling this way, something is wrong with the harness rather than with a kernel.
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
 gated the same way and is described where it is defined.

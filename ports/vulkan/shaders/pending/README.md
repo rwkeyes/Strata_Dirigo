@@ -5,7 +5,8 @@
 `s2expert_gu.comp`, `s2expert_down.comp` and `s2expert_swiglu.comp` are in `shaders/`, and `s2_row_dot.glsl` is in
 `shaders/common/`; `case_s2expert_tier` in `harness/vk_gate.cpp` runs six arms over them (three gate/up, two down,
 one SwiGLU) at the shapes that matter. The gate reports them separately - 126 passed / 0 failed / 0 skipped on
-RADV, 120 / 0 / 1 on llvmpipe.
+RADV, 120 / 0 / 1 on llvmpipe. **[SNAPSHOT at the time the tier landed; the suite has grown since - NEXT.md's
+RESUME HERE carries the current state.]**
 
 The filing rule that put them here still stands: an unverified shader in `shaders/` is one the build exercises as
 though it were evidence, so a kernel stays in this directory until a case covers it. What is left here is

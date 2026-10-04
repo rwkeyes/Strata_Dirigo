@@ -279,7 +279,8 @@ device feature, and the fallback is the kernel that should require nothing but p
 It is a correctness kernel, not a fast one: one invocation per output element, K-loop straight from global memory
 — no shared memory, no barrier, no subgroup op, so it runs anywhere, including the software implementation.
 Verified on **both** implementations present: **46 passed, 0 failed** on RADV and **40 passed, 0 failed, 1 skipped**
-on llvmpipe (the skip is the CMA case, which that device genuinely cannot run). Shapes tested include 1×64×64
+on llvmpipe (the skip is the CMA case, which that device genuinely cannot run). **[THOSE TOTALS ARE A SNAPSHOT
+from when this section was written; the suite has grown since - see NEXT.md's RESUME HERE.]** Shapes tested include 1×64×64
 (decode), 256×1×64, 17×13×5 (ragged in every dimension) and 2×48×96; worst relative error 2.6e-4 — fp32 quality,
 against the CMA path's 4.5e-4 on fp16 operands.
 

@@ -10,7 +10,8 @@ revision `1bcdc91`; the fixes are in the working tree on top of `bf4b0bd`.
 **Auditor date:** 2026-10-03. **Nothing in this audit has been run on Intel hardware** — see §6.
 
 Everything marked FIXED is applied and re-verified: `bash ports/vulkan/gates/run_gate.sh` →
-**14 passed, 0 failed, 0 skipped**, plus the shader checks below.
+**14 passed, 0 failed, 0 skipped**, plus the shader checks below. **[HISTORICAL: 14 cases was this audit's scope
+when it was written. The suite is much larger now - see NEXT.md's RESUME HERE, or run the gate.]**
 
 ---
 
