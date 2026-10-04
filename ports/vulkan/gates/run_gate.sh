@@ -205,7 +205,12 @@ export STRATA_VK_RESERVE_FLOOR_MIB=0
 out="$("$BUILD/vk_gate" --spv-dir "$SH" "$@")"
 status=$?
 printf '%s\n' "$out"
-[ $status -eq 0 ] || exit 1
+# A NON-ZERO DEFAULT RUN NO LONGER ABORTS THE ARM BELOW.  Since the Arc swap this box's default device is Intel,
+# where `gemm_coopmat` skips and the gate therefore exits 1 on every run - so an `exit 1` here meant the
+# cross-implementation arm, the whole reason a second ICD is run at all, never executed here.  The failure is
+# recorded in `rc` instead: the gate still refuses to report SUCCESS, it just no longer refuses to LOOK.  The
+# skip is printed and the final exit status is non-zero, so nothing is being waved through.
+[ $status -eq 0 ] || rc=1
 
 # The gate's own summary is asserted, so that a run which somehow skipped everything cannot come out green
 # even if the binary's exit status were wrong.
@@ -214,7 +219,7 @@ summary="$(grep -E '^== [0-9]+ passed, [0-9]+ failed, [0-9]+ skipped$' <<<"$out"
 passed="$(sed -n 's/^== \([0-9]*\) passed.*/\1/p' <<<"$summary")"
 skipped="$(sed -n 's/.* \([0-9]*\) skipped$/\1/p' <<<"$summary")"
 if [ "${passed:-0}" -eq 0 ]; then echo "== zero cases passed"; exit 1; fi
-if [ "${skipped:-0}" -ne 0 ]; then echo "== $skipped case(s) SKIPPED - a skipped case is not a passing one"; exit 1; fi
+if [ "${skipped:-0}" -ne 0 ]; then echo "== $skipped case(s) SKIPPED - a skipped case is not a passing one"; rc=1; fi
 
 # -----------------------------------------------------------------------------------------------------------
 # CROSS-IMPLEMENTATION ARM.  Every ICD that reports a device is run, because a kernel can be correct on one
@@ -245,6 +250,6 @@ done
 if [ "$impls" -lt 2 ]; then
   echo "  note: only $impls implementation(s) exercised - a width-dependent defect can hide in a single one"
 fi
-[ $rc -eq 0 ] || { echo "== cross-implementation arm FAILED"; exit 1; }
+[ $rc -eq 0 ] || { echo "== this run does NOT report success - see the FAIL/SKIP lines above (a skipped case is not a passing one)"; exit 1; }
 
 echo "== shader checks + numeric gate: $summary ($impls implementation(s))"
