@@ -2,8 +2,10 @@
 
 **Target:** Intel Arc Pro, Battlemage (Xe2, e.g. B60/B70) first, Alchemist (Xe-HPG, A-series) second.
 **Backend chosen:** Vulkan 1.3 compute (Mesa ANV), not SYCL/oneAPI.
-**Status:** stage 1 of 6 complete and verified on a real Vulkan GPU (see `STATUS.md`). Nothing here has run on
-Intel silicon yet.
+**Status:** stage 1 of 6 complete and verified on a real Vulkan GPU. **The kernels ran on Intel silicon for the
+first time on 2026-10-04** (Arc Pro B70, `156 passed / 0 failed / 1 skipped` — see `STATUS.md`), and that card is
+now this box's discrete GPU; the earlier revision of this line ("Nothing here has run on Intel silicon yet") was
+true when written and is kept here as the record of what changed.
 
 ---
 
@@ -195,4 +197,14 @@ resident model). 512 MiB is the compositor-only floor (measured: 354 MB for a tw
 | 6 | engine integration: `STRATA_ENABLE_VULKAN`, the arena, `gpu_arch_problem` for Intel | serve a model and compare output tokens to the HIP build |
 
 **Where it can be measured, and where it cannot.** Stages 1-2 and the numerics of 3-6 are verifiable on any
-Vulkan GPU (this one: RADV, 7900 XTX). Fit, speed and *stability* on Arc need the card.
+Vulkan GPU. As of 2026-10-04 this box carries the Arc Pro B70 as its discrete card, with the Ryzen iGPU and
+llvmpipe as two further implementations in the gate's cross-implementation arm; the 7900 XTX this port was
+written against is gone.
+
+**A verification step that changed with the hardware (2026-10-04).** Stages 3 and 6 both name the HIP path as the
+reference to compare against ("compare tokens to the HIP path" / "compare output tokens to the HIP build"). The
+HIP build has no device on this box at all - measured: `strata generate` dies with
+`cudaMemcpy failed for blk.0.ffn_gate_inp_shexp.weight` after enumerating only the Raphael iGPU (gfx1036) - so a
+HIP reference can no longer be produced here. The substitutes are the engine's own CPU oracle on the same inputs,
+or a token stream captured from the HIP build before the swap, if one was saved. This removes the "verify against
+the other backend" safety net for stage 6, which raises what the gate has to cover rather than lowering it.

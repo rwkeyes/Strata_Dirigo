@@ -130,8 +130,19 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
   passes on the Arc: an iGPU's free-memory figure is system RAM shared with the OS, so two queries can disagree by
   construction. Left red on purpose - the port's rule is to report an implementation that cannot satisfy a check
   rather than soften the check around it.
-* **The Battlemage stability question** (§4 of the plan): the xe compute wedge is an open driver bug that
-  this port cannot fix or test around.
+* **The Battlemage stability question (§4 of the plan) — TESTED ON THE CARD, 2026-10-04.** The xe compute wedge is
+  an open driver bug this port cannot fix or test around, which is why the plan makes a smoke test the FIRST thing
+  to do on Battlemage hardware. Done, with `gates/smoke-arc.sh` (added the same day): **718 rounds of 8 concurrent
+  instances — 5744 suite runs, ~890k case executions — over 480 s: 0 kernel cases failed, 0 hangs, 0 xe errors in
+  the kernel log, slowest round 1 s, no latency creep**, after 502 further runs one instance at a time, likewise
+  clean. The card did not wedge. The honest limit of that claim is the plan's own bar - "an hour of inference" -
+  so what is measured is "has not wedged under 8 minutes of concurrent small-kernel load", not "survives sustained
+  inference"; an inference-shaped arm on the same driver is what would close that gap.
+* **Two test-side defects the smoke run found, both fixed rather than relabelled.** The first concurrent run
+  exposed `case_firmware_variants` writing and deleting a FIXED `/tmp` path, so one instance's cleanup removed the
+  file another was reading (2 of 8 jobs; 502/502 when run one at a time) - now per-process. And the runner learned
+  to CLASSIFY the two checks that read the DRIVER's view of a busy card, because treating them as failures aborted
+  the loop at round 1 and hid the sustained result. Both are in `gates/smoke-arc.sh` and the commit that added it.
 
 ## Estimated remaining cost
 
