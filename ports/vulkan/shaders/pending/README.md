@@ -117,3 +117,44 @@ That is the same discipline this port has needed three times already: an oracle,
 right for the data they were written against and wrong for what they were run on, and in two of those cases the
 "failure" was in the measurement rather than the kernel. A NaN that the arithmetic cannot produce is a claim to
 reproduce before it is a bug to chase.
+
+## THE NAN IS REPRODUCED, AND ITS SIGNATURE POINTS AT THE SHARED REDUCTION - NOT THE ARITHMETIC
+
+Run with the output buffer pre-filled with `0x11111111` so an unwritten word would be visible:
+
+    repro: 3840 words | still the fill pattern 0 | NaN 3840 | Inf 0
+    first 8 words (hex): 7fdf6000 7fdf6000 7fdf6000 7fdf6000 7fdf6000 7fdf6000 7fdf6000 7fdf6000
+    oracle: element 0: want 1417.59375
+
+Three facts, and together they are decisive:
+
+* **every element was written** - not one still holds the fill pattern, so this is not an unwritten buffer;
+* **all 3840 hold the SAME NaN**, bit for bit, `0x7fdf6000` - which is not even the canonical quiet NaN
+  (0x7FC00000), it is a payload that nothing in this kernel's arithmetic computes;
+* and the oracle reads 1417.59375 from the same bytes.
+
+**A value identical across 3840 elements and independent of the data cannot come from arithmetic over finite
+inputs.** The probe already established that every read is in bounds and every chunk-0 term is finite, and every
+scale and activation block in the blob is written from a finite value. So the NaN is not computed - it is READ,
+from a shared-memory location before anything writes it, and shared memory starts with the same contents in every
+workgroup, which is exactly why the value is identical everywhere.
+
+The one location in this path that fits is the reduction's shared state - `rp_partial` / `rp_total` in
+`common/wg_reduce.glsl`. That helper is used by six SHIPPED kernels and all six pass, so what is different here is
+the configuration rather than the code: **`gu` calls it with `n_chunks` (80) smaller than the workgroup width
+(256)**, so most invocations contribute 0.0 and most of the shared array is written by... nothing. Every other
+caller has more work per invocation than invocations, or loops over a whole row.
+
+### THE ONE-LINE EXPERIMENT FOR NEXT SESSION, IN THIS ORDER
+
+1. **Confirm the mechanism without touching the shipped helper:** copy `wg_sum` into `s2_row_dot.glsl` under a
+   different name with `rp_total` and `rp_partial` explicitly written (by invocation 0) before the first barrier,
+   have `s2expert_gu` call the copy, and re-run this repro. If the NaN disappears, the mechanism is confirmed and
+   the fix is the same initialisation in `common/wg_reduce.glsl`.
+2. ONLY THEN change `common/wg_reduce.glsl` - it backs six passing kernels and a change there has to keep them
+   green, which is a re-run of the whole gate rather than this one case.
+3. If the NaN survives the copy, the remaining candidate is the store (`gate_up.v[base + r]`), and the same repro
+   answers it: dump `base`, `r` and `s` for one odd and one even row-slot.
+
+DO NOT "fix" the shipped helper first. Six kernels depend on it and this session ends with it untouched and the
+gate green.
