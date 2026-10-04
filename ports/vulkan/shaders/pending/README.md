@@ -64,3 +64,34 @@ field that disagrees is the bug.
 IT IS UNRUN AND THEREFORE IT IS HERE. A diagnostic in `shaders/` would be exercised by the build as though it were
 a kernel; an unrun artifact belongs where the build cannot mistake it for a verified one - which is the same rule
 that put the four kernels above in this directory.
+
+## THE PROBE RAN - and it eliminates the reads
+
+`probe_gu_reads.comp` was run against the same data the failing case uses. **Every field agrees between the device
+and the host's own reading of the same bytes:**
+
+    code bytes    device 11 94 17 9a 1d a0 23 a6   host 11 94 17 9a 1d a0 23 a6
+    scale bytes   device 00 28                      host 00 28
+    act d bytes   device 00 34                      host 00 34
+    dx device 0.25 host 0.25 ; dw device 0.03125 host 0.03125
+    s device -643 host -643 ; hx device -648 host -648
+    term chunk 0: device 0.0390625 host 0.0390625
+
+So by the rule this probe was built to apply, THE ADDRESSING AND THE TERM ARITHMETIC ARE CORRECT, and the NaN
+enters DOWNSTREAM of the reads: the reduction (`wg_sum`) or the store (`gate_up.v[base + r] = s`).
+
+That is a real narrowing, and it also removes the most expensive hypothesis first - every offset in the tier's
+addressing was hand-checked twice before this and agreed, which is exactly why the useful move was to observe it
+rather than check it a third time.
+
+WHAT THE NEXT PROBE SHOULD DO, in order of cost:
+
+1. Probed fields for chunk 0 only. Extend to all 80 chunks and to `h > 0` (the failing case had n_hits = 3 and
+   the probe had 1) - a row is a sum over 80 chunks and only the first was inspected.
+2. Compare the REDUCED sum against the same sum computed from the per-lane partials, dumped one per invocation.
+   `wg_sum` is used by six shipped kernels that all pass, which argues against it - but it is called here with
+   `n_chunks` (80) SMALLER than the workgroup width (256), a configuration NO SHIPPED KERNEL USES: every other
+   caller has more work per invocation than invocations, or loops over the whole row. That difference is worth
+   ruling out before anything else, and it is the kind of "right for the data it was written against" mismatch
+   this port keeps finding.
+3. If both are clean, the store index `base + r` with `i` odd (`n_hits*FF + h*FF + r`) is the last candidate.
