@@ -211,3 +211,45 @@ REDUCTION'S INTERNALS rather than reason about them: `sub` per subgroup leader, 
 `gl_SubgroupSize` and `rp_total`, in one workgroup, against the same values computed on the host. That is the same
 "dump what the device actually reads" move that settled the reads, and it is the only kind of move that has worked
 in this port - reading has been wrong five times, bisecting has been right twice.
+
+## DUMPED: THE WAVES ARE MASKED AT THE REDUCTION, AND A MASKED LANE'S REGISTER IS GARBAGE
+
+A probe copy of the reduction, recording its own internals into a debug buffer, one dispatch:
+
+    probe: gl_NumSubgroups 4 gl_SubgroupSize 64 | lane0 dot 0.043061614
+    partials: nan  5.21278e+06  0  0
+    stage2 t nan | rp_total nan
+
+Read it against what each piece should be:
+
+* **geometry is correct** - 4 subgroups of 64 lanes for 256 threads, and subgroups 2 and 3 sum to exactly 0, which is
+  right because lanes 128..255 have no chunk to work on.
+* **lane 0's own dot is finite** (0.043) - the ordering that matters: the per-lane value is fine.
+* **subgroup 0's partial is NaN** and **subgroup 1's is 5.2e6**, three orders of magnitude too large for the ~16
+  lanes it covers. Subgroup 0 covers lanes 0..63, subgroup 1 lanes 64..79 - all of them have real work.
+
+A finite per-lane value, a partial that is NaN in one subgroup and wildly wrong in another, and an initialised copy
+that changes nothing: the reduction is consuming lanes that are not executing.
+
+MECHANISM: `s2_row_dot` distributes chunks as `for (c = lid; c < n_chunks; c += lsize)`, so with n_chunks 80 and 256
+threads the loop body never executes for lanes 80..255 and the wave reaches `subgroupAdd` with a PARTIAL EXECUTION
+MASK. A masked-out lane's register is whatever was last in it, and `subgroupAdd` over a masked wave has no defined
+value for those lanes - here a NaN in one subgroup and a huge finite value in another. That is also why the value is
+identical in every workgroup (the same register pattern) and why initialising shared memory changes nothing (the
+garbage is in a register, not in shared memory).
+
+WHY NO SHIPPED CALLER SEES IT: every one of the six kernels that calls `wg_sum` has all of the workgroup's lanes
+doing work, so no wave is ever masked when the reduction runs. This caller is the first with fewer chunks than
+threads.
+
+THE FIX, TWO CANDIDATES, in preference order:
+
+1. **A barrier-based shared reduction, not a subgroup one.** The port already has that shape in
+   `common/wg_reduce_double.glsl` - it works through shared memory and barriers, which do not care about wave masks
+   at all. Using that shape for the expert tier removes the class of defect rather than this instance.
+2. **Make every lane work**, so no wave is masked: a uniform trip count with the bound checked inside the body. This
+   keeps subgroup arithmetic but depends on the driver's reconvergence being where the language says it is - which is
+   the assumption that just failed.
+
+Prefer (1): it is the only one of the two that does not rely on a mask being full.
+
