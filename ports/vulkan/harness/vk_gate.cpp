@@ -56,6 +56,10 @@ using portvk::resolve_icd_library;
 using portvk::parse_so_version;
 using portvk::IcdEntry;
 using portvk::gemm_shape_ok;
+using portvk::MemTypeInfo;
+using portvk::PlanItem;
+using portvk::PlanVerdict;
+using portvk::plan_fit;
 using portvk::firmware_present_in;
 
 namespace {
@@ -340,6 +344,181 @@ void case_recorded_step(Ctx& ctx, const std::string& dir) {
     ctx.free(s0); ctx.free(t1); ctx.free(t2); ctx.free(d);
     ctx.free(s0r); ctx.free(t1r); ctx.free(t2r); ctx.free(dr);
     ctx.free(ob); ctx.free(oe);
+}
+
+// 4. THE ENGINE'S VRAM PLAN, AS A PURE FUNCTION (PORT-PLAN stage 4).  No device needed, so the policy is tested
+// on every implementation AND on a box with no GPU at all - the same reason compute_desktop_reserve is pure.
+// Every expectation below is written out by hand rather than computed by the same arithmetic under test.
+void case_vram_plan() {
+    const uint64_t GiB = 1ull << 30;
+    {
+        const PlanItem plan[] = {{"weights", 4 * GiB, false}, {"kv cache", 1 * GiB, false}};
+        const PlanVerdict v = plan_fit(plan, 2, 8 * GiB);
+        verdict("plan: fits inside budget", v.fits && v.first_overflow == -1 && v.resident == 5 * GiB && v.dropped == 0,
+                (v.fits && v.resident == 5 * GiB) ? 0 : 1, 1, (double) v.resident, "bytes resident");
+    }
+    {
+        // THE BOUNDARY.  A plan that is exactly the budget fits - `<=`, not `<` - because the figure it is
+        // fitted against is already net of the desktop reserve.
+        const PlanItem plan[] = {{"weights", 8 * GiB, false}};
+        const PlanVerdict v = plan_fit(plan, 1, 8 * GiB);
+        verdict("plan: exact fit is a fit", v.fits && v.resident == 8 * GiB, v.fits ? 0 : 1, 1, (double) v.resident,
+                "bytes resident");
+    }
+    {
+        // The item that crosses is NAMED, and the walk stops there: the engine cannot start, so every line after
+        // it is moot.
+        const PlanItem plan[] = {{"weights", 4 * GiB, false}, {"experts", 6 * GiB, false}, {"kv cache", 1 * GiB, false}};
+        const PlanVerdict v = plan_fit(plan, 3, 8 * GiB);
+        const bool ok = !v.fits && v.first_overflow == 1 && v.resident == 4 * GiB && v.dropped == 0;
+        verdict("plan: names crossing item", ok, ok ? 0 : 1, 1, (double) v.first_overflow, "index of the item that does not fit");
+    }
+    {
+        // A DROPPABLE item that does not fit is dropped, not fatal - and the items AFTER it still get their
+        // chance, which is what the engine's own `--expert-cache auto` needs.
+        const PlanItem plan[] = {{"weights", 4 * GiB, false}, {"expert cache", 6 * GiB, true}, {"kv cache", 1 * GiB, false}};
+        const PlanVerdict v = plan_fit(plan, 3, 8 * GiB);
+        const bool ok = v.fits && v.dropped == 6 * GiB && v.dropped_items == 1 && v.resident == 5 * GiB;
+        verdict("plan: drops a droppable cache", ok, ok ? 0 : 1, 1, (double) v.dropped, "bytes dropped");
+    }
+    {
+        // AN EMPTY PLAN DOES NOT FIT, and neither does a plan fitted against nothing.  Both would otherwise be
+        // assertions over an empty input: "everything I asked for fits" is true when you asked for nothing.
+        const PlanItem one[] = {{"weights", 1 * GiB, false}};
+        const PlanVerdict empty = plan_fit(nullptr, 0, 8 * GiB);
+        const PlanVerdict nobudget = plan_fit(one, 1, 0);
+        const bool ok = !empty.fits && !nobudget.fits;
+        verdict("plan: nothing fits in nothing", ok, ok ? 0 : 1, 1, 0.0, "empty plan / zero budget both refuse");
+    }
+}
+
+// 5. DEVICE-LOCAL MEMORY AND STAGING (PORT-PLAN stage 4), on whatever device is running.  The three
+// implementations in this gate differ completely here and the case is written for all three: the Arc has real
+// VRAM (a DEVICE_LOCAL type with no mapping) plus a system heap, llvmpipe has ONE type that is host-visible and
+// device-local at once, and RADV marks its system heap's types device-local.  So the device-local arm SKIPS
+// where there is no such type (a property of the device, reported as such), and the round trips run everywhere.
+void case_device_local_staging(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "copy.spv")) return;
+    const uint32_t N = 1024;
+    VkPipeline p = ctx.pipeline(dir + "/copy.spv", 2, 4);
+    struct { int32_t n; } pc{(int32_t) N};
+    const uint32_t groups = groups_for(N);
+
+    // What the device OFFERS, printed: every assertion below is about one of these numbers, and on this box they
+    // are not what a reader would guess (see the header).
+    {
+        const std::vector<MemTypeInfo>& types = ctx.memory_types();
+        int dl = 0, dl_vis = 0, vis = 0;
+        std::string table;
+        for (const MemTypeInfo& t : types) {
+            dl += t.device_local ? 1 : 0;
+            dl_vis += (t.device_local && t.host_visible) ? 1 : 0;
+            vis += t.host_visible ? 1 : 0;
+            char line[128];
+            std::snprintf(line, sizeof line, "%u:heap%u/%.1fGiB%s%s%s ", t.index, t.heap,
+                          (double) t.heap_bytes / 1073741824.0, t.device_local ? " dev-local" : "",
+                          t.host_visible ? " visible" : " UNMAPPED", t.host_coherent ? "+coherent" : "");
+            table += line;
+        }
+        std::printf("INFO  %-28s %d type(s): %d device-local (%d of them mappable), %d host-visible | %s\n",
+                    "memory types", (int) types.size(), dl, dl_vis, vis, table.c_str());
+        std::fflush(stdout);
+    }
+
+    std::vector<float> a(N), b(N), got(N);
+    for (auto& v : a) v = (float) (int32_t) rnd() * 1e-6f;
+    for (auto& v : b) v = (float) (int32_t) rnd() * 1e-6f;
+    Buf src = ctx.alloc_device(N * 4), dst = ctx.alloc_device(N * 4);
+
+    // ARM A: the allocation really is device-local, and the flags agree with the memory type rather than with
+    // what we asked for (a selection bug would otherwise be invisible to every case below).
+    {
+        const MemTypeInfo& t = ctx.type_of(src);
+        const bool ok = src.device_local && t.device_local && src.mem_type == t.index;
+        verdict("stage: device-local chosen", ok, ok ? 0 : 1, 1, 0.0, "flags vs the memory type");
+    }
+    // ARM B: on a device that HAS an unmappable device-local type, that is the one to use - it is the whole
+    // reason staging exists.  llvmpipe has no such type, so there is nothing to check there and the arm says so.
+    if (!ctx.has_nonvisible_device_local()) {
+        skip("stage: vram is not mappable", "no DEVICE_LOCAL type without HOST_VISIBLE on this device");
+    } else {
+        const bool ok = !src.host_visible && src.mapped == nullptr;
+        verdict("stage: vram is not mappable", ok, ok ? 0 : 1, 1, 0.0, "DEVICE_LOCAL without HOST_VISIBLE");
+    }
+    // ARM C: a staging buffer is mappable (it is memcpy'd into) and is charged by the HEAP it lands in, not by
+    // what it is for: on a device with a system heap a transfer buffer must not spend the VRAM account, and on a
+    // single-heap device there is nowhere else for it to be.
+    {
+        const uint64_t v0 = ctx.allocated_vram_bytes(), h0 = ctx.allocated_host_bytes();
+        Buf s = ctx.alloc_staging(1u << 20);
+        const bool lands_in_vram = ctx.type_of(s).heap_device_local;
+        const uint64_t dv = ctx.allocated_vram_bytes() - v0, dh = ctx.allocated_host_bytes() - h0;
+        const bool mappable = s.mapped != nullptr && ctx.type_of(s).host_visible && ctx.type_of(s).host_coherent;
+        const bool charged = lands_in_vram ? (dv > 0 && dh == 0) : (dh > 0 && dv == 0);
+        verdict("stage: staging is mappable", mappable, mappable ? 0 : 1, 1, 0.0, "HOST_VISIBLE + HOST_COHERENT");
+        verdict("stage: staging charged by heap", charged, charged ? 0 : 1, 1, (double) dv, "bytes charged to VRAM");
+        ctx.free(s);
+    }
+    // ARM D/E: the round trip through the transfer path, in both directions, compared on BITS.  On a device with
+    // real VRAM this is the only path there is; on the others it runs with the staging route FORCED so the
+    // barriers are exercised rather than covered for by a mapping.  What the round trip catches is a wrong
+    // direction, a wrong offset, a missing barrier that IS observable on this driver, and a staging buffer that
+    // is never mapped - not, on every driver, an absent barrier: that one is required by the spec.
+    int bad = 0;
+    ctx.write(src, a.data(), N * 4);                       // stages automatically when there is no mapping
+    ctx.dispatch(p, {&src, &dst}, &pc, sizeof(pc), groups);
+    ctx.read(dst, got.data(), N * 4);
+    for (uint32_t i = 0; i < N; ++i) bad += (std::memcmp(&got[i], &a[i], 4) != 0);
+    verdict("stage: device round trip", bad == 0, bad, (int) N, (double) bad, "byte-mismatches");
+
+    ctx.set_force_staging(true);
+    ctx.write(src, b.data(), N * 4);
+    ctx.dispatch(p, {&src, &dst}, &pc, sizeof(pc), groups);
+    ctx.read(dst, got.data(), N * 4);
+    bad = 0;
+    for (uint32_t i = 0; i < N; ++i) bad += (std::memcmp(&got[i], &b[i], 4) != 0);
+    ctx.set_force_staging(false);
+    verdict("stage: forced-staging trip", bad == 0, bad, (int) N, (double) bad, "byte-mismatches");
+
+    // ARM F: the plan fitted against THIS device's numbers and PRINTED, which is what stage 4 is accepted on
+    // ("the engine's own VRAM plan printed against the driver's numbers").  The item SIZES are the engine's
+    // business - what this layer owes is the fit, the naming and the refusal - and the verdict is cross-checked
+    // by a recount written here, so the case does not simply agree with itself.
+    {
+        const uint64_t budget = ctx.usable_bytes();
+        const PlanItem plan[] = {
+            {"weights resident", budget / 2, false},
+            {"expert cache", budget / 2 + (1ull << 20), true},   // one MiB past the line: droppable, so dropped
+            {"kv cache", budget / 8, false},
+        };
+        const PlanVerdict v = plan_fit(plan, 3, budget);
+        uint64_t run = 0, dropped = 0;
+        int first = -1;
+        for (int i = 0; i < 3; ++i) {
+            if (run + plan[i].bytes <= budget) run += plan[i].bytes;
+            else if (plan[i].droppable) dropped += plan[i].bytes;
+            else { first = i; break; }
+        }
+        const bool recount_says_fits = (first < 0) && (budget != 0);
+        std::printf("INFO  %-28s budget %.2f GiB (%s)\n", "vram plan",
+                    (double) budget / 1073741824.0,
+                    ctx.budget().from_explicit_limit ? "explicit limit"
+                    : (ctx.budget().from_driver ? "driver free minus reserve" : "LEDGER minus reserve"));
+        for (int i = 0; i < 3; ++i) {
+            std::printf("INFO  %-28s   %-18s wanted %6.2f GiB%s\n", "", plan[i].name,
+                        (double) plan[i].bytes / 1073741824.0, plan[i].droppable ? "  (droppable)" : "");
+        }
+        std::printf("INFO  %-28s %s: %.2f GiB resident, %.2f GiB dropped in %d item(s), first overflow %d\n", "",
+                    v.fits ? "FITS" : "REFUSES", (double) v.resident / 1073741824.0, (double) v.dropped / 1073741824.0,
+                    v.dropped_items, v.first_overflow);
+        std::fflush(stdout);
+        const bool ok = v.fits == recount_says_fits && v.first_overflow == first && v.resident == run &&
+                        v.dropped == dropped && v.budget == budget;
+        verdict("plan: verdict vs a recount", ok, ok ? 0 : 1, 1, (double) v.resident, "bytes resident");
+    }
+
+    ctx.free(src);
+    ctx.free(dst);
 }
 
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
@@ -5730,6 +5909,7 @@ int main(int argc, char** argv) {
     // megabytes and the requery legitimately stops agreeing.
     case_memory_budget(ctx);
     case_reserve_policy();
+    case_vram_plan();   // the plan/fit policy, pure: no device needed (PORT-PLAN stage 4)
     case_reserve_refusal();
     case_quantize_q8_0(ctx, dir);
     case_quantize_q8_K(ctx, dir);
@@ -5763,6 +5943,7 @@ int main(int argc, char** argv) {
     case_scale(ctx, dir);
     case_add(ctx, dir);
     case_recorded_step(ctx, dir);   // the record/replay API: the ONE case that exercises it (stage 3)
+    case_device_local_staging(ctx, dir);   // device-local memory + staging + the printed plan (stage 4)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

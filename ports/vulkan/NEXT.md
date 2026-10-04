@@ -69,6 +69,69 @@ the reason the API and its case landed together rather than a half-API first):
   oracle for this particular question, because it isolates exactly the thing that changed - the recording - with
   everything else held equal.
 
+## STAGE 4: device-local memory, staging and fit accounting - **DONE AND VERIFIED 2026-10-04**
+
+**What it was for.** Stage 1-3's layer allocates host-visible coherent memory on purpose (a correctness device:
+staging plus fences would only add ways for the GATE to be wrong).  The engine's backend cannot do that - the
+things that live on the card go in memory with no mapping at all, and every byte in and out goes through a
+staging buffer.  That path now exists, is exercised by the gate, and the engine's VRAM plan is fitted against the
+driver's own numbers instead of being described.
+
+**What the three implementations actually offer**, printed by the case rather than assumed (this is the reason
+the layer enumerates types instead of answering "is there device-local memory?"):
+
+| device | memory types | device-local | of those, UNMAPPABLE | staging lands in |
+|---|---|---|---|---|
+| Arc Pro B70 (ANV) | 7 | 5 | **3** (types 0/1/4 - real VRAM), the other 2 mappable (the BAR) | heap 1, system RAM (34.7 GiB) |
+| AMD iGPU (RADV) | 11 | 6, **all of them on the heap RADV calls device-local** (it flags GTT that way) | **3** (types 0/1/7) | a mappable heap-0 type |
+| llvmpipe | **1** | 1 | **0** - its single type is device-local AND mappable | its one heap (nowhere else exists) |
+
+**The arms, all six on all three implementations** (the totals below are the whole suite):
+
+| verdict | what it proves | Arc | llvmpipe | RADV |
+|---|---|---|---|---|
+| `stage: device-local chosen` | the flags on the buffer match the memory type, not what we asked for | PASS | PASS | PASS |
+| `stage: vram is not mappable` | the chosen VRAM type has NO mapping where the device has one | PASS | **SKIP** (no such type) | PASS |
+| `stage: staging is mappable` | the transfer buffer is HOST_VISIBLE + HOST_COHERENT | PASS | PASS | PASS |
+| `stage: staging charged by heap` | a transfer buffer is charged by the heap it lands in, not by what it is for | PASS (host) | PASS (VRAM: single heap) | PASS |
+| `stage: device round trip` | pattern -> staging -> copy kernel -> staging -> host, byte-exact | PASS | PASS | PASS |
+| `stage: forced-staging trip` | the same with the staging path FORCED, so it runs where a mapping exists | PASS | PASS | PASS |
+
+`plan_fit` is also gated as a PURE function (five arms, no device): fits inside budget, an exact fit is a fit,
+the item that crosses is named and the walk stops, a droppable cache is dropped rather than fatal, and neither an
+empty plan nor a zero-byte budget "fits" (both would be assertions over an empty input).  On the device the plan
+is fitted against the driver's figure, printed, and cross-checked by a recount written in the case:
+
+```
+INFO  vram plan                    budget 28.64 GiB (driver free minus reserve)
+INFO                                 weights resident   wanted  14.32 GiB
+INFO                                 expert cache       wanted  14.32 GiB  (droppable)
+INFO                                 kv cache           wanted   3.58 GiB
+INFO                               FITS: 17.90 GiB resident, 14.32 GiB dropped in 1 item(s), first overflow -1
+```
+
+**FALSIFICATION, and one honest negative.**  A four-byte offset error in the upload's copy (`c.srcOffset = 4`)
+makes BOTH round trips fail (0/1024, 174/0/1 -> 172/2/1), so the round trip is not vacuous.  **Deleting the
+post-copy barrier changes NO verdict on the Arc or on llvmpipe** - measured, not assumed - so the case proves the
+transfer (direction, offsets, mapping, and a barrier whose absence is observable), NOT that each barrier is
+necessary; the barriers are required by the spec and are not gated on these drivers.  Recorded here so the next
+reader does not mistake a green run for coverage of that defect class.
+
+**A bug the new arm caught in the new code, worth keeping as a lesson.**  `has_nonvisible_device_local()` was
+written as "a device-local type exists" and then used to decide whether to assert that the chosen type is
+unmappable.  llvmpipe has exactly one type, it is device-local AND mappable, so the arm FAILED there (171/0/2 ->
+171/1/2) and reported a defect the port did not have.  The accessor now records what the SELECTION did (pass 0 of
+the two-pass choice succeeded).  The general form: an accessor that re-derives a property from the table it was
+chosen out of can disagree with the choice, and the disagreement surfaces as a failure on one implementation only.
+
+**The account rule, stated once** (it is in the header too): every `alloc()`/`alloc_device()` is charged to the
+VRAM account whatever heap the driver puts it in - conservative on purpose, so the refusal rule cannot change with
+which memory type a driver happens to prefer - and a staging buffer is charged by the heap it lands in, because a
+transfer buffer is not model memory.  Stage 4 did not relax the display contract: the refusal now names the
+account it refused in.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
@@ -78,12 +141,15 @@ than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 
 0 / 1 on llvmpipe), and, after that card was swapped for an **Arc Pro B70**, this one.
 
 **RUN ON INTEL HARDWARE (Arc Pro B70 "BMG G31", Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup 32), 2026-10-04 after
-stage 3 landed: 162 passed / 0 failed / 1 skipped**, with llvmpipe 160 / 0 / 1 and the radeon ICD (now the AMD
-iGPU, since the discrete card is gone) at 162 / 0 / 1. The six verdicts added by stage 3's case are the only
-difference from the 156/0/1 these ICDs read before it. The Intel skip is `gemm_coopmat` - no usable M16N16K16
-subgroup-scope f16->f32 config on this device. **Read the totals, not an exit code, and say which:** `vk_gate`
-itself returns 0 on a skip-only run (skips are not failures in the binary); it is `run_gate.sh`'s assertion that
-makes a skipped case fail the RUN, which is the port's rule and stays.
+stages 3 and 4 landed: 174 passed / 0 failed / 1 skipped**, with llvmpipe **171 / 0 / 2** and the radeon ICD (now
+the AMD iGPU, since the discrete card is gone) at 174 / 0 / 1 on a good run - **173 / 1 / 1 when the iGPU's
+intermittent requery case fires** (see below; it fired in the last full run).  llvmpipe's SECOND skip is
+stage 4's `stage: vram is not mappable`: that device has one memory type, device-local and mappable at once, so
+there is no unmappable VRAM type to check - a property of the device, reported as a skip.  The 18 verdicts added
+by stages 3 and 4 are the only difference from the 156/0/1 these ICDs read before them. The Intel skip is
+`gemm_coopmat` - no usable M16N16K16 subgroup-scope f16->f32 config on this device. **Read the totals, not an
+exit code, and say which:** `vk_gate` itself returns 0 on a skip-only run (skips are not failures in the binary);
+it is `run_gate.sh`'s assertion that makes a skipped case fail the RUN, which is the port's rule and stays.
 
 **Two things measured about the runner on this box, both worth knowing before quoting it:**
 

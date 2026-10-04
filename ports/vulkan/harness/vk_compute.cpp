@@ -70,6 +70,30 @@ ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_
     return d;
 }
 
+PlanVerdict plan_fit(const PlanItem* items, size_t n, uint64_t budget_bytes) {
+    PlanVerdict v{};
+    v.budget = budget_bytes;
+    // AN EMPTY PLAN DOES NOT FIT.  There are no weights in it, so there is nothing to run, and answering
+    // "true" would be an assertion over an empty input - the failure mode this port's rules exist for.
+    if (items == nullptr || n == 0) return v;
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t want = items[i].bytes;
+        if (v.resident + want <= budget_bytes) {
+            v.resident += want;
+            continue;
+        }
+        if (items[i].droppable) {
+            v.dropped += want;
+            ++v.dropped_items;
+            continue;
+        }
+        v.first_overflow = (int) i;
+        return v;   // the engine cannot start: everything after this line is moot
+    }
+    v.fits = true;
+    return v;
+}
+
 static bool device_has_extension(VkPhysicalDevice pd, const char* want) {
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
@@ -339,6 +363,20 @@ Ctx::Ctx(int want_device, bool need_16bit) {
 
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+    mem_types_.clear();
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        MemTypeInfo t{};
+        t.index = i;
+        t.heap = mp.memoryTypes[i].heapIndex;
+        t.heap_bytes = mp.memoryHeaps[t.heap].size;
+        t.heap_device_local = (mp.memoryHeaps[t.heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        t.device_local = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        t.host_visible = (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        t.host_coherent = (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        t.host_cached = (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+        mem_types_.push_back(t);
+    }
     mem_type_ = UINT32_MAX;
     const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
@@ -353,6 +391,40 @@ Ctx::Ctx(int want_device, bool need_16bit) {
         std::fprintf(stderr, "no host-visible coherent memory type\n");
         std::exit(1);
     }
+
+    // ---- stage 4's two types, chosen from the table above and then ASSERTED by the gate -----------------
+    // VRAM: DEVICE_LOCAL and, where the device offers it, NOT host-visible - that last part is what makes a
+    // transfer necessary at all, and on a discrete card it is the difference between VRAM and a BAR window.
+    // Two passes rather than one, so a device that has both does not end up on the mappable one by order of
+    // enumeration (which is exactly how the graphics-oriented drivers list them).
+    for (int pass = 0; pass < 2 && vram_type_ == UINT32_MAX; ++pass) {
+        for (const MemTypeInfo& t : mem_types_) {
+            if (!t.device_local) continue;
+            if (pass == 0 && t.host_visible) continue;
+            vram_type_ = t.index;
+            // Pass 0 succeeded => the type we picked has NO mapping.  Recorded here because it is the one place
+            // that knows, and a later `device_local && !host_visible` re-derivation reads the type table again -
+            // which is how llvmpipe (one type, device-local AND mappable) was mistaken for a device with real
+            // VRAM by an earlier version of this accessor.
+            vram_unmappable_ = (pass == 0);
+            break;
+        }
+    }
+    // STAGING: host-visible and coherent first, and preferring a heap that is NOT device-local - a transfer
+    // buffer is not model memory, so on a card with a system heap it must not come out of VRAM.  Where the only
+    // heap is device-local (llvmpipe) there is no choice, and the account rule says so out loud.
+    for (int pass = 0; pass < 2 && staging_type_ == UINT32_MAX; ++pass) {
+        for (const MemTypeInfo& t : mem_types_) {
+            if (!t.host_visible || !t.host_coherent) continue;
+            if (pass == 0 && t.heap_device_local) continue;
+            staging_type_ = t.index;
+            break;
+        }
+    }
+    if (staging_type_ == UINT32_MAX) staging_type_ = mem_type_;
+
+    const char* fs = std::getenv("STRATA_VK_FORCE_STAGING");
+    force_staging_ = fs != nullptr && *fs && std::strcmp(fs, "0") != 0;
 }
 
 Ctx::~Ctx() {
@@ -511,13 +583,19 @@ uint64_t Ctx::usable_bytes() const {
     return free_b > reserve_bytes_ ? free_b - reserve_bytes_ : 0;
 }
 
-Buf Ctx::alloc(uint64_t bytes) {
+Buf Ctx::alloc_impl(uint64_t bytes, uint32_t type_index, bool vram_account, const char* what) {
+    if (type_index == UINT32_MAX || type_index >= mem_types_.size()) {
+        std::fprintf(stderr, "vk_compute: this device has no memory type for a %s\n", what);
+        std::exit(1);
+    }
     Buf b;
     b.bytes = bytes ? bytes : 4;
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = b.bytes;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // TRANSFER_SRC/DST as well as STORAGE: stage 4's path moves bytes with vkCmdCopyBuffer, and a usage flag that
+    // is missing shows up as a validation error at the first transfer rather than as a wrong number.
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &b.buffer));
     VkMemoryRequirements req{};
@@ -525,15 +603,18 @@ Buf Ctx::alloc(uint64_t bytes) {
 
     // THE DISPLAY CONTRACT, ENFORCED.  Checked against the driver's own figure (not this layer's ledger) plus
     // the reserve, before anything is allocated.  A backend that cannot fit must refuse and name the numbers -
-    // allocating anyway is exactly how the card gets filled and the desktop stops compositing.
+    // allocating anyway is exactly how the card gets filled and the desktop stops compositing.  STAGE 4 DID NOT
+    // RELAX THIS: what changed is which account is checked (the VRAM one) and what a staging buffer is charged
+    // to - see the account rule in the header.
     const uint64_t usable = usable_bytes();
-    if (allocated_ + req.size > usable) {
+    if (vram_account && allocated_device_local_ + req.size > usable) {
         vkDestroyBuffer(dev_, b.buffer, nullptr);
         std::fprintf(stderr,
-                     "vk_compute: REFUSING a %.2f MiB allocation - %.2f MiB already held by this process, "
-                     "%.2f MiB usable (free %s %.2f GiB, desktop reserve %.2f GiB).  Raise "
-                     "STRATA_VK_DESKTOP_RESERVE_MIB only if the desktop can spare it.\n",
-                     (double) req.size / 1048576.0, (double) allocated_ / 1048576.0, (double) usable / 1048576.0,
+                     "vk_compute: REFUSING a %.2f MiB %s - %.2f MiB in the VRAM account, %.2f MiB usable "
+                     "(free %s %.2f GiB, desktop reserve %.2f GiB).  Raise STRATA_VK_DESKTOP_RESERVE_MIB only if "
+                     "the desktop can spare it.\n",
+                     (double) req.size / 1048576.0, what, (double) allocated_device_local_ / 1048576.0,
+                     (double) usable / 1048576.0,
                      (budget_.from_explicit_limit ? "(explicit limit)" : (budget_.from_driver ? "(driver)" : "(LEDGER)")),
                      (double) (budget_.from_driver ? (budget_.heap_budget - budget_.heap_usage) : budget_.heap_total) /
                          1073741824.0,
@@ -541,16 +622,45 @@ Buf Ctx::alloc(uint64_t bytes) {
         std::exit(3);
     }
     allocated_ += req.size;
+    if (vram_account) allocated_device_local_ += req.size;
+    else allocated_host_ += req.size;
 
+    const MemTypeInfo& t = mem_types_[type_index];
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
-    mai.memoryTypeIndex = mem_type_;
+    mai.memoryTypeIndex = type_index;
     VK_CHECK(vkAllocateMemory(dev_, &mai, nullptr, &b.mem));
     VK_CHECK(vkBindBufferMemory(dev_, b.buffer, b.mem, 0));
-    VK_CHECK(vkMapMemory(dev_, b.mem, 0, VK_WHOLE_SIZE, 0, &b.mapped));
-    std::memset(b.mapped, 0, (size_t) b.bytes);
+
+    // What the DRIVER gave us, recorded rather than assumed - and it is these fields the gate asserts against.
+    b.mem_type = type_index;
+    b.device_local = t.device_local;
+    b.host_visible = t.host_visible;
+    b.vram_account = vram_account;
+    if (b.host_visible) {
+        VK_CHECK(vkMapMemory(dev_, b.mem, 0, VK_WHOLE_SIZE, 0, &b.mapped));
+        std::memset(b.mapped, 0, (size_t) b.bytes);
+    }
     return b;
+}
+
+Buf Ctx::alloc(uint64_t bytes) {
+    // The gate's path, and the engine arena's: charged to the VRAM account whatever heap the driver puts it in.
+    return alloc_impl(bytes, mem_type_, /*vram_account=*/true, "buffer");
+}
+
+Buf Ctx::alloc_device(uint64_t bytes) {
+    return alloc_impl(bytes, vram_type_, /*vram_account=*/true, "device-local buffer");
+}
+
+Buf Ctx::alloc_staging(uint64_t bytes) {
+    // CHARGED WHERE IT LANDS: on a device with a system heap a transfer buffer is not model memory and does not
+    // spend the VRAM account; where the only heap is device-local (llvmpipe) there is nowhere else for it to be,
+    // so it is charged there - which is the truth about that device rather than a policy.
+    const uint32_t type = staging_type_ == UINT32_MAX ? mem_type_ : staging_type_;
+    const bool vram = type >= mem_types_.size() || mem_types_[type].heap_device_local;
+    return alloc_impl(bytes, type, vram, "staging buffer");
 }
 
 void Ctx::free(Buf& b) {
@@ -559,11 +669,101 @@ void Ctx::free(Buf& b) {
         VkMemoryRequirements req{};
         vkGetBufferMemoryRequirements(dev_, b.buffer, &req);
         allocated_ = allocated_ > req.size ? allocated_ - req.size : 0;
+        uint64_t& acct = b.vram_account ? allocated_device_local_ : allocated_host_;
+        acct = acct > req.size ? acct - req.size : 0;
     }
     if (b.mapped) vkUnmapMemory(dev_, b.mem);
     if (b.buffer) vkDestroyBuffer(dev_, b.buffer, nullptr);
     if (b.mem) vkFreeMemory(dev_, b.mem, nullptr);
     b = Buf{};
+}
+
+VkCommandBuffer Ctx::begin_oneshot() {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = cmd_pool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(dev_, &cbai, &cb));
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+    return cb;
+}
+
+void Ctx::end_oneshot_and_wait(VkCommandBuffer cb) {
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateFence(dev_, &fci, nullptr, &fence));
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence));
+    VK_CHECK(vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX));
+    vkDestroyFence(dev_, fence, nullptr);
+    vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
+}
+
+// ---- the staging transfers (stage 4).  THE BARRIERS ARE THE WHOLE DIFFICULTY ---------------------------------
+// A copy that is submitted and waited on is not automatically visible to the NEXT thing that reads the buffer:
+// the fence orders the SUBMISSIONS, and availability/visibility across stages is what the barriers below are
+// for.  Getting one wrong does not fail a build, and on a coherent host it does not even fail on the machine it
+// was written on - which is why each direction states its own reasoning and the gate round-trips through it.
+void Ctx::stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offset) {
+    Buf st = alloc_staging(bytes ? bytes : 4);
+    std::memcpy(st.mapped, src, (size_t) bytes);   // HOST_COHERENT: no flush, and the submit below needs none
+    VkCommandBuffer cb = begin_oneshot();
+    VkBufferCopy c{};
+    c.srcOffset = 0;
+    c.dstOffset = offset;
+    c.size = bytes;
+    vkCmdCopyBuffer(cb, st.buffer, dst.buffer, 1, &c);
+    // The copy's write must be available to whatever reads the destination NEXT: a shader (the ordinary case -
+    // upload weights, then run a kernel over them) or the host (an upload followed by a read of the same buffer).
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr,
+                         0, nullptr);
+    end_oneshot_and_wait(cb);
+    free(st);
+}
+
+void Ctx::stage_download(const Buf& src, void* dst, uint64_t bytes, uint64_t offset) {
+    Buf st = alloc_staging(bytes ? bytes : 4);
+    VkCommandBuffer cb = begin_oneshot();
+    // The source was written by a shader or by an earlier copy, in an earlier submission the caller fenced and
+    // waited on.  Without this barrier the transfer may read the bytes before they are available to it, which is
+    // the stale-read direction of the same trap.
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkBufferCopy c{};
+    c.srcOffset = offset;
+    c.dstOffset = 0;
+    c.size = bytes;
+    vkCmdCopyBuffer(cb, src.buffer, st.buffer, 1, &c);
+    // ...and the host reads the staging buffer after this submission's fence, which needs the transfer's write
+    // to be available to HOST_READ.
+    VkMemoryBarrier mb2{};
+    mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb2, 0, nullptr, 0,
+                         nullptr);
+    end_oneshot_and_wait(cb);
+    std::memcpy(dst, st.mapped, (size_t) bytes);
+    free(st);
 }
 
 void Ctx::write(Buf& b, const void* src, uint64_t bytes, uint64_t offset) {
@@ -572,7 +772,13 @@ void Ctx::write(Buf& b, const void* src, uint64_t bytes, uint64_t offset) {
                      (unsigned long long) bytes, (unsigned long long) b.bytes);
         std::exit(1);
     }
-    std::memcpy((uint8_t*) b.mapped + offset, src, (size_t) bytes);
+    // THE MAPPING IS THE FAST PATH AND IT IS NOT ALWAYS THERE.  force_staging_ makes the gate take the slow one
+    // on a device that would otherwise take the mapping, so both paths are exercised on every implementation.
+    if (b.mapped != nullptr && !force_staging_) {
+        std::memcpy((uint8_t*) b.mapped + offset, src, (size_t) bytes);
+        return;
+    }
+    stage_upload(b, src, bytes, offset);
 }
 
 void Ctx::read(const Buf& b, void* dst, uint64_t bytes, uint64_t offset) {
@@ -580,7 +786,11 @@ void Ctx::read(const Buf& b, void* dst, uint64_t bytes, uint64_t offset) {
         std::fprintf(stderr, "read past end of buffer\n");
         std::exit(1);
     }
-    std::memcpy(dst, (const uint8_t*) b.mapped + offset, (size_t) bytes);
+    if (b.mapped != nullptr && !force_staging_) {
+        std::memcpy(dst, (const uint8_t*) b.mapped + offset, (size_t) bytes);
+        return;
+    }
+    stage_download(b, dst, bytes, offset);
 }
 
 VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t push_bytes) {
@@ -718,17 +928,7 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
 
 void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                    uint32_t groups, uint32_t groups_y) {
-    VkCommandBuffer cb = VK_NULL_HANDLE;
-    VkCommandBufferAllocateInfo cbai{};
-    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = cmd_pool_;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(dev_, &cbai, &cb));
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+    VkCommandBuffer cb = begin_oneshot();
     encode_dispatch(cb, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/false,
                     /*fresh_set=*/false);
     // Shader writes -> host reads.  Vulkan requires this barrier; without it a coherent mapping may still
@@ -739,20 +939,7 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
-    VK_CHECK(vkEndCommandBuffer(cb));
-
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
-    VkFenceCreateInfo fci{};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkFence fence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(dev_, &fci, nullptr, &fence));
-    VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence));
-    VK_CHECK(vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX));
-    vkDestroyFence(dev_, fence, nullptr);
-    vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
+    end_oneshot_and_wait(cb);
 }
 
 // ---- recorded steps: the CUDA-graph replacement (NEXT.md's stage-3 note) -----------------------------------

@@ -8,10 +8,12 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
                                                  # checks each shader's declared local size, then runs the gate
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
-was swapped for an Arc Pro B70 and after stage 3's case was added, the box's GPU run was 162 passed / 0 failed /
+was swapped for an Arc Pro B70 and after stages 3 and 4 landed, the box's GPU run was 174 passed / 0 failed /
 1 skipped on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) -
-160 / 0 / 1 on llvmpipe and 162 / 0 / 1 on the radeon ICD, which now picks the AMD iGPU because the discrete card
-is gone. Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three
+171 / 0 / 2 on llvmpipe (the second skip is stage 4's device-property skip: that device has no unmappable
+device-local memory type) and 174 / 0 / 1 on the radeon ICD, which now picks the AMD iGPU because the discrete
+card is gone - **173 / 1 / 1 when that iGPU's intermittent budget-requery case fires, which it did in the last
+full run.** Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three
 times in two days; read the last line of your own run.** All three available implementations are exercised again
 by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
 box after the swap (`NEXT.md`). 54 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
@@ -32,6 +34,17 @@ block carries the arm-by-arm table.
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
 gated the same way and is described where it is defined.
+
+**Stage 4 of the port plan - device-local memory, staging and fit accounting - is DONE and VERIFIED (2026-10-04).**
+`Ctx::alloc_device()` allocates memory with NO mapping where the device offers it (real VRAM: 3 of the Arc's 7
+memory types are device-local and unmappable, on llvmpipe there is no such type at all), `Ctx::alloc_staging()` is the host-visible transfer
+buffer, and `write()`/`read()` stage automatically over `vkCmdCopyBuffer` so a case written for stage 1's path runs
+unchanged on the engine's. `plan_fit()` answers the other half - which line of the engine's VRAM plan does not fit,
+by name, and what a droppable cache buys - and the gate fits and PRINTS the plan against the driver's own figure
+(28.64 GiB on the Arc). Six device arms plus five pure-policy arms, green on all three implementations, and the
+round trip was falsified with a four-byte offset error (174/0/1 -> 172/2/1). Full detail, including the ONE defect
+class the round trip does NOT cover (an absent barrier: deleting the post-copy barrier changes no verdict on the
+Arc or llvmpipe) is in `NEXT.md`'s stage-4 block.
 
 | Case | Verdict | Method |
 |---|---|---|
@@ -134,11 +147,13 @@ deterministic failure it was first documented as.
   `native_down_iq4nl.comp`, the shape the expert tier actually launches - with the four other instantiations and
   the `_multi` variants left as mechanical copies (see `NEXT.md`).
 * **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no kernel registry, and no recorded decode step
-  IN THE ENGINE. `harness/vk_compute.*` is the seed of the device layer and carries both the single-shot `dispatch()`
-  and the recorded-step API (stage 3, verified - see above), but on deliberately host-visible-only memory for gate
-  fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.
+  IN THE ENGINE. `harness/vk_compute.*` is the seed of the device layer and now carries the single-shot `dispatch()`,
+  the recorded-step API (stage 3), and the engine-shaped memory path — device-local allocation, staging transfers
+  and `plan_fit` fit accounting (stage 4) — each verified by the gate. What it still is NOT: the engine's backend.
+  There is no `setup.py`/`CMakeLists`/`core/device.hpp` change on this branch, so nothing in the engine can call any
+  of it yet.
 * **Anything on Intel hardware — NO LONGER UNVERIFIED (2026-10-04).** An Arc Pro B70 is now the discrete card in
-  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **162 / 0 / 1**, with
+  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **174 / 0 / 1**, with
   one device-specific defect found and fixed (the folded division in `quantize_q8_K` - NEXT.md's RESUME HERE).
   What stays unverified on Intel is everything the gate does not cover: the engine path, real token shapes, and
   the stability question below.

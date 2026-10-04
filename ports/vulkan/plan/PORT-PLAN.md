@@ -2,10 +2,11 @@
 
 **Target:** Intel Arc Pro, Battlemage (Xe2, e.g. B60/B70) first, Alchemist (Xe-HPG, A-series) second.
 **Backend chosen:** Vulkan 1.3 compute (Mesa ANV), not SYCL/oneAPI.
-**Status:** stage 1 of 6 complete and verified on a real Vulkan GPU. **The kernels ran on Intel silicon for the
-first time on 2026-10-04** (Arc Pro B70, `156 passed / 0 failed / 1 skipped` — see `STATUS.md`), and that card is
-now this box's discrete GPU; the earlier revision of this line ("Nothing here has run on Intel silicon yet") was
-true when written and is kept here as the record of what changed.
+**Status:** stages 1, 3 and 4 of 6 complete and verified on real Vulkan GPUs, on three implementations at once. **The
+kernels ran on Intel silicon for the first time on 2026-10-04** (Arc Pro B70, `156 passed / 0 failed / 1 skipped`
+that day; `174 / 0 / 1` since stages 3 and 4 landed — see `STATUS.md`), and that card is now this box's discrete
+GPU; the earlier revision of this line ("Nothing here has run on Intel silicon yet") was true when written and is
+kept here as the record of what changed.
 
 ---
 
@@ -191,10 +192,15 @@ resident model). 512 MiB is the compositor-only floor (measured: 354 MB for a tw
 |---|---|---|
 | 1 ✅ | Vulkan compute layer + numeric gate for the first kernel wave | `gates/run_gate.sh` → 14/14 on RADV |
 | 2 | kernel registry + kernel waves 2-3, gated as they land | same gate, extended |
-| 3 | recorded command buffers (the graph replacement) + one captured decode step | replay a captured step and compare tokens to the HIP path |
-| 4 | device-local memory + staging + `VK_EXT_memory_budget` fit accounting | the engine's own VRAM plan printed against the driver's numbers |
+| 3 ✅ | recorded command buffers (the graph replacement) + one captured decode step | the recorded step replays and equals the single-shot path, byte for byte, plus the falsification that 3 of its 6 verdicts fail on a shared descriptor set |
+| 4 ✅ | device-local memory + staging + `VK_EXT_memory_budget` fit accounting | the engine's own VRAM plan printed against the driver's numbers, a device-local round trip through staging, and the plan policy as five pure arms |
 | 5 | hand-written GEMM (+ cooperative matrix if the toolchain allows) | prompt-path parity vs the CPU reference |
 | 6 | engine integration: `STRATA_ENABLE_VULKAN`, the arena, `gpu_arch_problem` for Intel | serve a model and compare output tokens to the HIP build |
+
+Stages 3 and 4 changed verifiability rather than only content, so here is what each of their entries means in
+practice: stage 3's HIP comparison is gone with the card (§4 above) and its substitute is the single-shot path,
+which isolates the recording with everything else held equal; stage 4's "the engine's own VRAM plan" is fitted from
+the driver's figure and printed by the gate, with the plan POLICY gated as pure functions that need no device.
 
 **Where it can be measured, and where it cannot.** Stages 1-2 and the numerics of 3-6 are verifiable on any
 Vulkan GPU. As of 2026-10-04 this box carries the Arc Pro B70 as its discrete card, with the Ryzen iGPU and

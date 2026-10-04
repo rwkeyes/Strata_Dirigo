@@ -25,16 +25,68 @@
 
 namespace portvk {
 
-// One buffer, host-visible and host-coherent on purpose: this layer exists to answer "does the ported kernel
-// compute the right numbers", and staging plus fences would only add ways for the GATE to be wrong.  The
-// engine's own backend must use device-local memory + staging (PORT-PLAN.md stage 4) - a coherence-first
-// allocation is a correctness device, not a performance one.
+// A buffer in this layer comes in two flavours, and which one it is comes from the driver, not from us:
+//
+//   * THE GATE'S PATH (alloc()) - host-visible and host-coherent on purpose.  This layer exists to answer "does
+//     the ported kernel compute the right numbers", and staging plus fences would only add ways for the GATE to
+//     be wrong.  A coherence-first allocation is a correctness device, not a performance one.
+//   * THE ENGINE'S PATH (alloc_device() + alloc_staging()) - PORT-PLAN stage 4.  The things that live on the
+//     card (weights, KV cache, arenas) go in DEVICE_LOCAL memory that is NOT mappable, and every byte in and out
+//     goes through a host-visible STAGING buffer over vkCmdCopyBuffer.  write()/read() do that automatically, so
+//     a case written for the first path works unchanged on the second - and the gate exercises the second path
+//     rather than describing it.
+//
+// `mapped` is null exactly when the type is not host-visible, and the gate ASSERTS the recorded flags against
+// what the memory type says, so a bug in the selection cannot hide behind a flag we set ourselves.
 struct Buf {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    void* mapped = nullptr;
+    void* mapped = nullptr;          // null when the type is not host-visible: write/read then STAGE
     uint64_t bytes = 0;
+    uint32_t mem_type = UINT32_MAX;
+    bool device_local = false;       // DEVICE_LOCAL (real VRAM on a discrete card)
+    bool host_visible = false;       // ...and mappable, so no staging is needed
+    bool vram_account = false;       // which account alloc() charged it to (see the account rule below)
 };
+
+// What the device OFFERS, printed rather than assumed, because the three implementations in the gate differ
+// completely: the Arc has three non-visible DEVICE_LOCAL types plus a separate system heap (so staging is
+// real), llvmpipe has ONE type that is host-visible and device-local at once (so it has no staging path at
+// all), and RADV marks its system heap's types device-local.  A single "THERE IS DEVICE-LOCAL MEMORY" bool
+// would be wrong on two of the three.
+struct MemTypeInfo {
+    uint32_t index = 0;
+    uint32_t heap = 0;
+    uint64_t heap_bytes = 0;
+    bool heap_device_local = false;
+    bool device_local = false, host_visible = false, host_coherent = false, host_cached = false;
+};
+
+// ---- THE ENGINE'S VRAM PLAN: fit accounting against the driver's numbers (PORT-PLAN stage 4) --------------
+// The engine's own plan is a list of things it intends to hold ON THE CARD - resident weights, the expert
+// cache, the KV cache, graph and scratch arenas - and the question this layer must answer is which line does
+// not fit, by name, rather than allocating until the desktop stops compositing.  `droppable` is the engine's
+// own notion (an expert cache can be given up to fit; a weight cannot), and it is a property of the ITEM, not
+// of the layer - so it is a field, not a heuristic here.
+struct PlanItem {
+    const char* name = "";
+    uint64_t bytes = 0;
+    bool droppable = false;
+};
+
+struct PlanVerdict {
+    bool fits = false;          // every non-droppable item fitted (AN EMPTY PLAN NEVER FITS: no weights, no run)
+    int first_overflow = -1;    // index of the item that crossed a non-droppable line, -1 if none
+    uint64_t budget = 0;        // what the plan was fitted against
+    uint64_t resident = 0;      // bytes of the items that fit
+    uint64_t dropped = 0;       // bytes of droppable items the plan had to give up
+    int dropped_items = 0;
+};
+
+// Pure, so it can be tested without a GPU (same reason compute_desktop_reserve is): walk the plan IN ORDER,
+// keep what fits, drop what does not fit and is droppable, and fail on the first item that does not fit and is
+// not droppable - stopping there, because the engine cannot start at all.
+PlanVerdict plan_fit(const PlanItem* items, size_t n, uint64_t budget_bytes);
 
 // What the driver says about this heap.  `from_driver` distinguishes a real answer (VK_EXT_memory_budget:
 // usage is for the whole heap, including the desktop and every other process) from the fallback, which is the
@@ -134,9 +186,43 @@ public:
     ReserveDecision reserve_decision() const { return reserve_decision_; }
 
     Buf alloc(uint64_t bytes);
+    // ---- DEVICE-LOCAL MEMORY AND STAGING (PORT-PLAN stage 4) -------------------------------------------
+    // `alloc_device` is the path the ENGINE's backend uses for what lives on the card.  It prefers a
+    // DEVICE_LOCAL memory type that is NOT host-visible (real VRAM on a discrete card) and falls back to a
+    // mappable device-local type only where the device offers nothing else - which is llvmpipe's situation, not
+    // a preference.  `buf.host_visible` then says which happened, and write/read STAGE automatically when there
+    // is no mapping, so a case does not have to know.
+    //
+    // THE ACCOUNT RULE, stated once because the refusal below depends on it: an allocation is charged to the
+    // VRAM account when it is either (a) alloc()/alloc_device(), whatever heap the driver put it in, or (b) a
+    // staging buffer on a device whose only heap is device-local.  Case (a) is CONSERVATIVE on purpose: alloc()
+    // is the path every case and the engine's arena take, and its rule must not change with which memory type a
+    // driver happens to prefer.  It is exact on the Arc (alloc() lands in the device-local heap) and conservative
+    // on the AMD iGPU (it lands in the system heap), and either way it refuses rather than over-commits - which
+    // is the whole point of the display contract.
+    Buf alloc_device(uint64_t bytes);
+    // A TRANSFER buffer: host-visible and coherent, so it can be mapped, memcpy'd and copied from.  NOT model
+    // memory, so it is charged to the host account (unless, as above, the device has nowhere else to put it).
+    Buf alloc_staging(uint64_t bytes);
     void free(Buf& b);
-    // Host -> device and device -> host over the mapping.  HOST_COHERENT, so no flush/invalidate calls and no
-    // staging: correct for a gate, wrong for a benchmark (which is why the engine's backend will not do this).
+    // Every memory type the device offers, with its heap and that heap's size.  Printed by the gate, so the
+    // numbers behind the selection above are visible rather than inferred from its consequences.
+    const std::vector<MemTypeInfo>& memory_types() const { return mem_types_; }
+    const MemTypeInfo& type_of(const Buf& b) const { return mem_types_[b.mem_type]; }
+    // True when this device REQUIRES staging: the VRAM type chosen below is one with NO mapping (real VRAM).
+    // llvmpipe answers false - its single type is host-visible and device-local at once - and that is a property
+    // of the device, reported, not a failure of the port.  The flag is set by the SELECTION rather than derived
+    // from "a device-local type exists": on llvmpipe one does, and it is mappable, and a case that could not
+    // tell those apart reported a failure the port did not have (measured 2026-10-04).
+    bool has_nonvisible_device_local() const { return vram_unmappable_; }
+    // Test hook (STRATA_VK_FORCE_STAGING=1): route write/read through staging even where a mapping exists, so
+    // the staging path is exercised on EVERY implementation instead of only where a driver forces it.
+    void set_force_staging(bool on) { force_staging_ = on; }
+    bool force_staging() const { return force_staging_; }
+    uint64_t allocated_vram_bytes() const { return allocated_device_local_; }
+    uint64_t allocated_host_bytes() const { return allocated_host_; }
+    // Host -> device and device -> host.  Through the mapping when there is one (HOST_COHERENT, so no
+    // flush/invalidate), otherwise through a staging buffer and vkCmdCopyBuffer.
     void write(Buf& b, const void* src, uint64_t bytes, uint64_t offset = 0);
     void read(const Buf& b, void* dst, uint64_t bytes, uint64_t offset = 0);
 
@@ -198,7 +284,31 @@ private:
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
     uint32_t mem_type_ = 0;
+    // The two types stage 4 selects, chosen once at device creation (see the constructor): real VRAM
+    // (DEVICE_LOCAL, no mapping) where the device has one, and a mappable host-visible type for transfers,
+    // preferring a heap that is NOT device-local so staging costs system memory rather than VRAM.
+    uint32_t vram_type_ = UINT32_MAX;
+    bool vram_unmappable_ = false;   // the chosen VRAM type has NO mapping: cheap to know here, invisible later
+    uint32_t staging_type_ = UINT32_MAX;
+    std::vector<MemTypeInfo> mem_types_;
+    uint64_t allocated_device_local_ = 0;   // the VRAM account (see the account rule in the public block)
+    uint64_t allocated_host_ = 0;           // the host account: staging/transfer allocations
+    bool force_staging_ = false;            // STRATA_VK_FORCE_STAGING - exercises the staging path anywhere
     std::vector<Pipe> pipes_;
+
+    // One allocation, shared by all three entry points above so the refusal, the ledger and the printed
+    // message cannot drift between them.  `vram_account` decides which account it is charged to.
+    Buf alloc_impl(uint64_t bytes, uint32_t type_index, bool vram_account, const char* what);
+
+    // ---- staging transfers: a one-shot command buffer and a fence, per transfer -------------------------
+    // A backend pools these (stage 5's problem, not a correctness one) - the same call the descriptor sets and
+    // the recorded step already made.  The barriers are stated in each direction, because they are the part of
+    // a transfer that a gate can get wrong and never see: a copy without a following barrier leaves the
+    // device-local buffer's contents unavailable to the next shader that reads it.
+    VkCommandBuffer begin_oneshot();
+    void end_oneshot_and_wait(VkCommandBuffer cb);
+    void stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offset);
+    void stage_download(const Buf& src, void* dst, uint64_t bytes, uint64_t offset);
 
     // Shared encoding half of a dispatch: the pipes_ lookup, the descriptor update, the binds, the push constants
     // and vkCmdDispatch.  `chain_barrier` adds a compute -> compute barrier, which a recorded STEP needs between
