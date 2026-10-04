@@ -95,3 +95,25 @@ WHAT THE NEXT PROBE SHOULD DO, in order of cost:
    ruling out before anything else, and it is the kind of "right for the data it was written against" mismatch
    this port keeps finding.
 3. If both are clean, the store index `base + r` with `i` odd (`n_hits*FF + h*FF + r`) is the last candidate.
+
+## ALSO RULED OUT: the harness's buffer lifetime
+
+`Buf` is a VALUE type - `Ctx::alloc` returns a struct holding its own `bytes` and `VkBuffer`, by value, and each
+allocation creates its own buffer. So taking `&buf` for a dispatch cannot be invalidated by later allocations, and
+the tier's larger number of allocations is not the cause. (Checked because "the data is finite and the reads are
+correct" left the infrastructure as the last thing that had not been looked at rather than the last thing that had.)
+
+## WHAT THAT LEAVES, AND THE FIRST STEP IS NOW TO REPRODUCE RATHER THAN EXPLAIN
+
+Finite data + correct addressing + a sound harness means the arithmetic in `s2_row_dot` cannot produce a NaN for
+row-slot 0 - every chunk's read is in bounds and every term is finite. So before hunting further, the OBSERVATION
+itself needs reproducing:
+
+    re-run the tier's case and dump, alongside got[0]: the raw uints around that word, the workgroup count, and
+    the first eight outputs. If got[0] is NaN again, print the buffer BEFORE the dispatch too - an unwritten word
+    and a NaN from the kernel look identical at the comparison and are different bugs.
+
+That is the same discipline this port has needed three times already: an oracle, a bound and a gate rule were each
+right for the data they were written against and wrong for what they were run on, and in two of those cases the
+"failure" was in the measurement rather than the kernel. A NaN that the arithmetic cannot produce is a claim to
+reproduce before it is a bug to chase.
