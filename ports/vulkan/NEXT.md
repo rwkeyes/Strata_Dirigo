@@ -2,6 +2,12 @@
 
 ## RESUME HERE (state as of the last commit)
 
+**UPDATE (bisected, not reasoned):** the `gu` NaN is no longer a mystery. The raw dot is correct - 640 of 640 up-row
+dots finite - and `wg_sum` returns the same non-canonical NaN in 640 of 640 gate rows. The dot is exonerated; the
+shared reduction produces it, in the one configuration no shipped caller uses (`n_chunks` 80 with 256 threads). See
+`shaders/pending/README.md`, section "SETTLED BY BISECTION". The two-step fix is now justified, not speculative -
+and it is still two steps, because six passing kernels depend on that helper.
+
 The branch is GREEN: the gate prints its own totals and they are 120 passed, 0 failed, 0 skipped on RADV
 (112/0/1 on llvmpipe, the skip being the cooperative-matrix case). 40 kernels plus 5 shared includes.
 

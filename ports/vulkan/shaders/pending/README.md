@@ -158,3 +158,33 @@ caller has more work per invocation than invocations, or loops over a whole row.
 
 DO NOT "fix" the shipped helper first. Six kernels depend on it and this session ends with it untouched and the
 gate green.
+
+## SETTLED BY BISECTION: the DOT is correct, the REDUCTION produces the NaN
+
+The experiment above ran, but not as first written: deleting `wg_sum` from the shader made the gate's census fail it
+- "no subgroup reduction in the SPIR-V - the kernel did not lower its sum" - and refuse to run the case at all.
+That is the census doing its job. So the experiment was re-shaped to KEEP the reduction: the up rows carry the raw
+per-lane dot, the gate rows carry `wg_sum`'s total, and one dispatch returns both.
+
+    isolate: gate rows (wg_sum) NaN 640 finite 0 | up rows (RAW dot) NaN 0 finite 640
+    first gate nan (hex 7fdf6000)   first up 0.0645924 (hex 3d844908)
+
+**640 of 640 raw dots are finite. 640 of 640 reduced sums are the same non-canonical NaN.**
+
+So `s2_row_dot` is EXONERATED - the addressing, the code/scale/activation reads, the folded-bias integers and the
+term arithmetic are all correct, and the earlier probe's agreement (which covered chunk 0) was extended here to
+whole rows across two row classes. The NaN is produced by `wg_sum`, and it is produced in EVERY workgroup, which is
+why the value is identical in all 3840 outputs.
+
+`wg_sum` backs six SHIPPED kernels that all pass, so this is a CONFIGURATION-dependent defect, and there is exactly
+one configuration here that no shipped caller has: **`gu` calls it with `n_chunks` (80) SMALLER than the workgroup
+width (256)**, so 176 of 256 invocations hold 0.0 and the shared array is written by only 4 subgroup leaders out of
+a workgroup whose width the helper sizes itself from. My own inspection of both halves said they were correct; it
+was wrong, and this is the fifth time in this port that reading has been beaten by observing.
+
+NEXT, WITH THE CAUSE NAMED: the two-step fix is now justified rather than speculative. (1) copy `wg_sum` into a
+differently-named function with its shared state explicitly initialised, have `gu` call the copy, and re-run the
+repro - it should go finite, and if it does not, the difference must be found before the helper is touched. (2) only
+then change `common/wg_reduce.glsl`, and re-run the WHOLE gate, not this one case, because six passing kernels
+depend on it.
+
