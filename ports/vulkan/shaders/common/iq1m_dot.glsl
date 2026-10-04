@@ -32,7 +32,7 @@ const float IQ1M_DELTA = 0.125;                  // third_party/ggml/ggml-common
 // THE INCLUDING SHADER MUST DECLARE, with these names:
 //     w_b      the IQ1_M weight blocks (uint8 storage buffer, rows of `nb * 56` bytes)
 //     act_b    the q8_1 activation blocks (uint8 storage buffer, 36 bytes per 32 values)
-//     grid_b   the IQ1_S grid table (uint32 storage buffer, 2048 entries) - see harness/iq1s_grid.hpp
+//     grid_b   the IQ1_S grid table (uint32 storage buffer, 2048 entries) - see harness/iq_grids.hpp
 // **THE ACTIVATION'S WORDS, AND THE NAME SAYS WHICH BUFFER FOR A REASON.**  This helper used to be called
 // `iq1m_read_int4` and read `w_b`, the WEIGHT buffer, while its only call site passes an ACTIVATION offset - the
 // CUDA's `get_int_b4(bq8_1[iqs].qs, ...)` reads the activation.  Both mistakes compile and both read a legal

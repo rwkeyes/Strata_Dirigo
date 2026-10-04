@@ -7,10 +7,11 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
     bash ports/vulkan/gates/run_gate.sh          # compiles the shaders from source, validates the SPIR-V,
                                                  # checks each shader's declared local size, then runs the gate
 
-**Result: the gate prints its own totals and those are the authority - 137 passed, 0 failed, 0 skipped on the
+**Result: the gate prints its own totals and those are the authority - 140 passed, 0 failed, 0 skipped on the
 box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
-131 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
-last line of your own run.** 47 kernels, 8 shared includes, one generated table.
+134 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
+last line of your own run.** 47 kernels, 11 shared includes, one generated table file (`harness/iq_grids.hpp`,
+holding the IQ1_S and IQ2_S grids).
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
 gated the same way and is described where it is defined.
@@ -101,8 +102,11 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
   kernel files, plus the 8 prefill files and the 7 `cuBLASLt` call sites (which have no Vulkan equivalent and
   must be written by hand). The method and the gate are proven; this is a grind, not an unknown. **The resident
   expert tier - `s2_expert_grouped.cu`'s gate/up, SwiGLU and down - is DONE and gated (2026-10-04).** The next
-  workstream is the quantized-expert wave: 22 shaders from `iq_kernels.cu` and `native_mmvq.cu`, which is what
-  an IQ1_M model needs (see `NEXT.md`).
+  workstream is the quantized-expert wave: 22 shaders from `iq_kernels.cu` and `native_mmvq.cu`. **ORDERED BY THE
+  RESIDENT MODEL'S OWN PACK, not by its filename**: `coder-iq1_m`'s experts are IQ2_S (20 of 48 layers), IQ3_XXS
+  (17), IQ3_S (10), IQ4_XS (1) for gate/up and IQ4_NL (39), Q2_0 (9) for down - see `NEXT.md`, which carries the
+  census and the reason the filename misleads. Done so far in this wave: the IQ1_M row dot, the two q8_1
+  quantisers, and **IQ2_S (`iq2s_mmvq.comp` + `common/iq2s_dot.glsl`, gated)**; next is IQ3_XXS.
 * **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no recorded command buffers, no kernel
   registry. `harness/vk_compute.*` is the seed of the device layer, deliberately host-visible-only memory for
   gate fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.

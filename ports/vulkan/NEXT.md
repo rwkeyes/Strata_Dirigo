@@ -68,8 +68,18 @@ NEXT, in order:
        outside the envelope. On ordinary data, 0 bytes differ.
    (b) the grouped `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier
        actually calls, built on the per-format row dot.
-   (c) the remaining formats one shader each (Q5_K, Q2_0, Q3_K, IQ4_XS, Q4_K, Q6_K, and the small
-       Q4_0/Q5_0/Q8_0/IQ4_NL family), which is `native_mmvq.cu`'s own structure.
+   (c) **the remaining formats, one shader each - STARTED 2026-10-04 with IQ2_S**, the resident model's most common
+       expert gate/up format. `iq2s_mmvq.comp` + `common/iq2s_dot.glsl`, gated (3 arms; RADV and radeon green,
+       llvmpipe green). It is built on `harness/iq_grids.hpp`: the generator now emits BOTH grid tables
+       (`tools/gen-iq-tables.py`, which replaced `gen-iq1s-grid.py`) and stores the IQ2_S grid as low/high uint32
+       halves, so no shader needs the optional `shaderInt64` feature for a value it only ever reads in halves.
+       * **THE CASE CAUGHT THE ORACLE, NOT THE KERNEL.** The first run failed with every row off by a few percent
+         at the same magnitude - and both bad offsets were in my double oracle; the shader was right.
+         `get_int_b2(qs, iqs/2)` is FOUR bytes at `4*iqs/2 = 2*iqs`, not two bytes at `iqs`. The tiebreaker is the
+         helper's DEFINITION, not its name. Written up in the skill under "Names that lie".
+       * **NEXT, in the order the pack's own census gives** (`NEXT.md` above): **IQ3_XXS (17 layers)**, IQ3_S (10),
+         IQ4_XS (1) for gate/up; **IQ4_NL (39)** and Q2_0 (9) for down. Then the K-quants and the small
+         Q4_0/Q5_0/Q8_0 family, then the grouped kernels in (b).
 2. The cross-implementation arm's `budget: independent requery agrees` case used to report a FALSE FAIL while
    the resident local model held the card. **FIXED, with the measurement**: the flake was `budget 81920 bytes,
    usage 0 bytes` - 80 KiB of driver budget bookkeeping with usage unchanged - so the discrete-card comparison
@@ -571,7 +581,20 @@ source an adversarial case. Tolerances come from measurement - print the err/tol
 
 The port is re-based onto upstream v0.1.39 and this branch no longer carries the fork's AVX1 floor (upstream
 shipped it). The next wave is the quantized-expert path, chosen because the resident model is
-`qwen3.8-flash-next-coder-iq1_m` and an IQ1_M model needs exactly these kernels.
+`qwen3.8-flash-next-coder-iq1_m`.
+
+**ITS EXPERTS ARE NOT IQ1_M, AND THE NAME IS WHY THIS WAS WRONG FOR THREE SESSIONS.**  "IQ1_M" is the GGUF the
+model's DENSE weights come from; the experts live in the native pack beside it and the pack states their types
+per layer.  From `Strata-data/packs/coder-iq1_m/native_experts.txt` (48 layers, 256 experts, verified
+2026-10-04), counted over its `gu_type`/`d_type` columns:
+
+    gate/up   IQ2_S (22)  20 layers | IQ3_XXS (18)  17 | IQ3_S (21)  10 | IQ4_XS (23)  1
+    down      IQ4_NL (20) 39 layers | Q2_0 (42)      9
+
+So the port's format order is now IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS (gate/up) and IQ4_NL, Q2_0 (down) - NOT IQ1_M
+first.  The IQ1_M dot already ported stays: it is the format of the OTHER packed models on the ladder, and of the
+IQ1_M GGUF's own expert tensors where a model uses them.  A format census is worth re-running per model rather
+than inferring from a filename; `native_experts.txt`'s first line names its own columns.
 
 CORRECTED SIZES - an earlier note said "~141 KB"; the measured figures are:
 

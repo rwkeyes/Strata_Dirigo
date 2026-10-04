@@ -18,7 +18,7 @@
 // definition of the thing under test: it can drift, and a drift re-points the gate at the wrong reference.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "iq1s_grid.hpp"
+#include "iq_grids.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -2724,6 +2724,170 @@ void case_swiglu_quantize_q8_1(Ctx& ctx, const std::string& dir) {
     swiglu_q81_arm(ctx, dir, 2560, 1, 2, "products on ties: the 1-ulp envelope");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// IQ2_S: the resident `coder-iq1_m` model's most common EXPERT gate/up format (20 of its 48 layers, per the
+// pack's own native_experts.txt - the "IQ1_M" in that model's name is its dense GGUF, not its experts).
+//
+// THE ORACLE IS TRANSCRIBED FROM `vec_dot_iq2_s_q8_1`, in double, with the integer parts integer (they are exact
+// on both sides - `__dp4a`, the per-byte sign flip and the two truncating divisions).  Only the final float
+// multiply can round differently, which is what the bound is for.
+//
+// THE BLOCK'S TWO HALVES OF `qs` ARE DIFFERENT ANIMALS and the case spreads values across both: the first 32
+// bytes are the grid indices (low bits), the last 32 are the sign bytes, and every sign byte is varied so the
+// per-byte conditional negation is exercised on all four byte positions of both halves.
+static int iq2s_rd4(const std::vector<uint8_t>& b, size_t off) {
+    return (int) ((uint32_t) b[off] | ((uint32_t) b[off + 1] << 8) | ((uint32_t) b[off + 2] << 16) |
+                  ((uint32_t) b[off + 3] << 24));
+}
+
+static int iq2s_vcmpne4_zero_host(int t) {
+    int out = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int sh = 8 * i;
+        out |= ((((t >> sh) & 0xFF) != 0) ? 0xFF : 0x00) << sh;
+    }
+    return out;
+}
+
+static int iq2s_sign_flip_host(int g, int s) {
+    int out = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int sh = 8 * i;
+        out |= (((((g >> sh) & 0xFF) ^ ((s >> sh) & 0xFF)) - ((s >> sh) & 0xFF)) & 0xFF) << sh;
+    }
+    return out;
+}
+
+static int iq2s_div_trunc_host(int a, int d) { return (a < 0) ? -(std::abs(a) / d) : (std::abs(a) / d); }
+
+static double iq2s_dot_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                            size_t ablk, int iqs) {
+    const size_t QS = wblk + 2;
+    const size_t QH = wblk + 66;
+    const size_t SC = wblk + 74;
+    const unsigned qs0 = w[QS + 2u * (size_t) iqs], qs1 = w[QS + 2u * (size_t) iqs + 1];
+    const unsigned qs2 = w[QS + 2u * (size_t) iqs + 2], qs3 = w[QS + 2u * (size_t) iqs + 3];
+    const unsigned qh = w[QH + (size_t) (iqs / 2)];
+    // `get_int_b2(qs, QK_K/32 + iqs/2)` is FOUR bytes at 4*(8 + iqs/2) = 32 + 2*iqs: the helper's name says two
+    // bytes and it reads four, at twice the index it is handed.  Reading it at `iqs` instead of `2*iqs` is the
+    // mistake this oracle had first, and the gate caught it because the shader did not have it too.
+    const int signs_packed = iq2s_rd4(w, QS + 32 + 2u * (size_t) iqs);
+    const unsigned sc = w[SC + (size_t) (iqs / 2)];
+    const int ls0 = (int) (sc & 0x0F), ls1 = (int) (sc >> 4);
+    int sumi0 = 0, sumi1 = 0;
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const unsigned qsv = (l0 == 0) ? qs0 : ((l0 == 2) ? qs1 : ((l0 == 4) ? qs2 : qs3));
+        const unsigned gidx = qsv | ((qh << (8 - l0)) & 0x300u);
+        const int grid_lo = (int) strata::vkport::kIq2sGrid[2u * gidx];
+        const int grid_hi = (int) strata::vkport::kIq2sGrid[2u * gidx + 1u];
+        const int sp = (signs_packed >> (8 * (l0 / 2))) & 0xFF;
+        const int signs0 = iq2s_vcmpne4_zero_host(((sp & 0x03) << 7) | ((sp & 0x0C) << 21));
+        const int signs1 = iq2s_vcmpne4_zero_host(((sp & 0x30) << 3) | ((sp & 0xC0) << 17));
+        const int grid_l = iq2s_sign_flip_host(grid_lo, signs0);
+        const int grid_h = iq2s_sign_flip_host(grid_hi, signs1);
+        const size_t ub = ablk + 4 + (size_t) (4 * l0);
+        const int u0 = iq2s_rd4(act, ub), u1 = iq2s_rd4(act, ub + 4);
+        int* acc = (l0 < 4) ? &sumi0 : &sumi1;
+        *acc = iq1m_dp4a(grid_l, u0, *acc);
+        *acc = iq1m_dp4a(grid_h, u1, *acc);
+    }
+    const int sumi = iq2s_div_trunc_host(sumi0 * ls0 + sumi1 * ls1 + iq2s_div_trunc_host(sumi0 + sumi1, 2), 4);
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    return ((double) (float) (dw * da)) * (double) sumi;
+}
+
+static std::vector<uint8_t> iq2s_fill_blob(size_t n_out, int nb, int n_in) {
+    const size_t row_bytes = (size_t) nb * 82;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 82;
+            const float mag = (b % 5 == 0) ? 0.0078125f : 0.25f * (float) (1 + (b % 4));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 3 == 2) ? -mag : mag));
+            for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) ((i * 7 + b * 13 + (int) r * 29 + 3) & 0xFF);   // grid lows
+            for (int i = 0; i < 32; ++i) blk[34 + i] = (uint8_t) ((i * 37 + b * 11 + (int) r * 53 + 5) & 0xFF); // the signs
+            for (int i = 0; i < 8; ++i) blk[66 + i] = (uint8_t) ((i * 23 + b * 17 + (int) r * 41) & 0xFF);       // qh
+            for (int i = 0; i < 8; ++i) blk[74 + i] = (uint8_t) ((i * 61 + b * 7 + (int) r * 19 + 1) & 0xFF);    // scales
+        }
+    }
+    (void) n_in;
+    return w;
+}
+
+static void iq2s_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 82;
+    const std::vector<uint8_t> w = iq2s_fill_blob((size_t) n_out, nb, n_in);
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 8; ++k) {
+                const double v = iq2s_dot_host(w, wrow + (size_t) (k / 8) * 82, act, arow + (size_t) k * 36,
+                                               2 * (k % 8));
+                acc += v;
+                abs_sum += std::fabs(v);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_g = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_g, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq2s_mmvq.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "iq2s_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y);
+}
+
+void case_iq2s_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq2s_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("iq2s_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    iq2s_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
+    iq2s_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
+    iq2s_arm(ctx, dir, 256, 1, 1, "one block");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -4413,6 +4577,7 @@ int main(int argc, char** argv) {
     case_ple(ctx, dir);
     case_s2expert_tier(ctx, dir);
     case_iq1m_mmvq(ctx, dir);
+    case_iq2s_mmvq(ctx, dir);
     case_quantize_q8_1(ctx, dir);
     case_swiglu_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);

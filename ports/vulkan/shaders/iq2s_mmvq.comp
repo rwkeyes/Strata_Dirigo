@@ -1,0 +1,49 @@
+// ports/vulkan/shaders/iq2s_mmvq.comp - ONE IQ2_S WEIGHT ROW against q8_1 activations, one workgroup per row.
+//
+// `mmvq_kernel<22>` (iq_kernels.cu) with the format baked in, as `iq1m_mmvq.comp` is for type 29 - and IQ2_S is
+// the resident model's most common expert gate/up format (20 of its 48 layers).
+//
+// THE SHAPE IS THE PORT'S: the CUDA is one warp per row with a shuffle reduction, the port is one workgroup
+// (256) per row with the shared barrier tree, and each 32-lane group of the workgroup owns one 32-value part.
+// The per-part arithmetic is the source's, which is why the comparison is against a double reference.
+//
+// A part index k of a row IS its activation block index: one 256-value IQ2_S block covers exactly eight 32-value
+// q8_1 blocks, so `k` indexes both (the weight part is `k/8` and the part number inside it `2*(k%8)`, the
+// format's step being 2).
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) readonly buffer G { uint v[]; } iq2s_grid_b;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+#include "common/iq2s_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+const uint IQ2S_BLOCK = 82u;                     // bytes per 256 values
+const uint IQ2S_PARTS = 8u;                      // 32-value parts per block
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;           // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / 256u;        // IQ2_S blocks per row
+    const uint arow_bytes = (uint(pc.n_in) / 32u) * 36u;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint arow = c * arow_bytes;
+        float acc = 0.0;
+        for (uint k = lid; k < nb * IQ2S_PARTS; k += gl_WorkGroupSize.x) {
+            acc += iq2s_dot(wrow + (k / IQ2S_PARTS) * IQ2S_BLOCK, arow + k * 36u, 2u * (k % IQ2S_PARTS));
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}
