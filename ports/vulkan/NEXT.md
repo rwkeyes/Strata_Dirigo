@@ -543,3 +543,36 @@ specialisation is a later, separate decision.
 So: 28 - 6 = 22 shaders to write, and some of those pair up (the `_multi` variants differ by an activation-row
 count, exactly like bf16_mmvf_f32 / bf16_mmvf_f32_multi did here, which the port already folds into one kernel
 with a parameter) - so expect ~18-20 files, not 22.
+
+## THE MASKED-WAVE AUDIT: the defect is in the FAMILY, and one green case is UB
+
+Root cause (see shaders/pending/README.md) is a wave reaching `subgroupAdd` with a partial execution mask, which is
+what happens when the lane-distributed work count is SMALLER than the workgroup width. All 40 shaders declare 256,
+so the test per caller is: can its lane loop's bound be below 256?
+
+Every caller of the shared reduction, with the bound measured from the shader and the case that exercises it:
+
+    caller                lane bound            safe while      verdict
+    rms_norm              cols = n_embd 2560    always          SAFE
+    scalar_gate_f32/f64   n = n_embd 2560       always          SAFE
+    ple_gate              n = hc_dim 10240      always          SAFE
+    ple_gnorm             cols = n_embd 2560    always          SAFE
+    bf16_mmvf_f32         n_pairs = n_in / 2    n_in >= 512     CONDITIONAL
+    bf16_mmvf_f32_multi   n_pairs = n_in / 2    n_in >= 512     CONDITIONAL
+    s2_gemv_q8            n_quads = n_in / 4    n_in >= 1024    CONDITIONAL - AND ITS CASE IS ALREADY UB
+    s_gemv_q8_split       unverified (QE loop)  unverified      UNVERIFIED
+    s_gemv_split          unverified (QE loop)  unverified      UNVERIFIED
+    s2expert_gu           H / 32 = 80           never           BROKEN (this is the NaN)
+
+**The s2_gemv_q8 line is the one that matters.** Its case builds shapes with
+`const int n_in = shape == 0 ? 2560 : 64`, so shape 1 gives n_quads = 16: lanes 16..255 do no work and the wave is
+masked at the reduction - the same undefined behaviour as `gu`, in a case that currently PASSES with error/tol 0.
+That pass is luck about which garbage sat in the masked lanes' registers, not evidence of correctness, and it can
+flip with a recompile (it is the same code path that yields NaN in the expert tier).
+
+So the fix belongs in the reduction or its contract, not only in the expert tier: any caller whose lane bound can
+fall below the workgroup width is exposed, and two of them are already in the build.
+
+NEXT: (1) fix the reduction shape once (a barrier-based reduce removes the class); (2) re-check the two UNVERIFIED
+s_gemv lanes against the same test; (3) leave the s2_gemv_q8 shape-1 case in place but stop reading its pass as
+evidence - or better, keep it as the regression that must still pass AFTER the fix.
