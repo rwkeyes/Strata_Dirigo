@@ -516,3 +516,24 @@ labelled `native_gu_lds_kernel` "portable-looking", which is obviously wrong, so
 than quoted. The `_amd`, `_lds` and `_fused` families look HIP-specific by name and probably have no Vulkan form;
 the count of shaders to write is therefore somewhere between 20 and 28 and must come from reading the kernels, not
 from a pattern match. DO THAT READ FIRST, before writing any of them.
+
+## SCOPED (the read the note above asked for): 28 kernels -> 22 shaders
+
+Read the six suspected ones. They are not HIP-specific by using exotic intrinsics; they are hardcoded to AMD
+WAVEFRONT WIDTHS, which is a different and more decisive problem:
+
+    native_gu_amd_kernel     lane = threadIdx.x masked to 63               wave64
+    native_down_amd_kernel   lane = threadIdx.x masked to 63               wave64
+    native_mmvq_wave_kernel  lane = threadIdx.x masked to 63               wave64
+    native_gu_lds_kernel     lane/warp split at 32 + sgrid/LDS_NT/LDS_RB   wave32 + LDS staging
+    native_down_lds_kernel   lane/warp split at 32 + sh_raw/LDS_RB         wave32 + LDS staging
+    native_gu_fused_kernel   lane/warp split at 32 + LDS across two waves  wave32 + LDS staging
+
+A kernel that hardcodes the lane mask cannot behave the same on an Intel GPU (subgroups of 8/16/32), so these are
+SPECIALISATIONS the engine selects per architecture - not code the port needs to carry. The portable variants
+(`native_gu_kernel`, `native_down_kernel`, `mmvq_kernel`, ...) are what this port targets; a Vulkan
+specialisation is a later, separate decision.
+
+So: 28 - 6 = 22 shaders to write, and some of those pair up (the `_multi` variants differ by an activation-row
+count, exactly like bf16_mmvf_f32 / bf16_mmvf_f32_multi did here, which the port already folds into one kernel
+with a parameter) - so expect ~18-20 files, not 22.
