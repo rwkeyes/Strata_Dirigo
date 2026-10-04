@@ -1,0 +1,84 @@
+// ports/vulkan/shaders/router_top10_f32.comp - the MoE router, PORTABLE arithmetic (router_top10.cu).
+//
+//     p   = softmax(logits) over ALL experts ;  ids = stable argsort(-p)[:k] (ties by ascending index)
+//     w   = gather(p, ids) ;  s = max(sum(w), 2**-14) ;  return ids, w / s
+//
+// The selection and the tie rule live in common/router_select.glsl, shared with the f32 variant, because they are
+// semantic rather than arithmetic.
+//
+// WHY THIS VARIANT EXISTS AT ALL. Intel Arc has no shaderFloat64 - Intel's own support article says so - and the
+// engine's router computes its exponentials AND its sum in DOUBLE. Without this variant the router cannot run on
+// the target hardware at all, so the choice is between a MEASURED deviation and not running. The gate measures it:
+// the same logits are run through both variants and the selected experts and weights are compared, on realistic
+// data and on constructed near-ties (the case where a 1-ULP difference in a probability changes the ORDER, which
+// is the only way these two can disagree about an expert).
+//
+// What is done to keep the gap small: the probabilities are built from a FLOAT exp (there is no double one here)
+// and both sums - the softmax's denominator and the renormalisation's - use KAHAN COMPENSATION rather than a
+// plain float accumulate, because the engine sums 512 doubles and an uncompensated float sum would be this
+// kernel's largest error by a wide margin.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float v[]; } logits;
+layout(set = 0, binding = 1, std430) buffer IDS { int v[]; } ids;
+layout(set = 0, binding = 2, std430) buffer WEIGHTS { float v[]; } weights;
+
+#include "common/router_select.glsl"
+
+shared float rs_exf[RS_MAX_EXPERTS];
+shared float rs_fsum;
+
+layout(push_constant, std430) uniform PC { int n_tokens; int n_expert; int k; } pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= uint(pc.n_tokens)) return;
+    const uint n_expert = uint(pc.n_expert), k = uint(pc.k);
+    const uint lid = gl_LocalInvocationIndex, lsize = gl_WorkGroupSize.x;
+    const uint lbase = t * n_expert;
+
+    float mx = rs_neg_inf();
+    for (uint e = lid; e < n_expert; e += lsize) mx = max(mx, logits.v[lbase + e]);
+    mx = rs_max_all(mx, lid, lsize);          // exact and order-independent
+
+    for (uint e = lid; e < n_expert; e += lsize) rs_exf[e] = exp(logits.v[lbase + e] - mx);
+    barrier();
+    if (lid == 0u) {
+        float s = 0.0, c = 0.0;
+        for (uint e = 0u; e < n_expert; ++e) {
+            const float y = rs_exf[e] - c;
+            const float tt = s + y;
+            c = (tt - s) - y;
+            s = tt;
+        }
+        rs_fsum = s;
+    }
+    barrier();
+    const float inv = 1.0 / rs_fsum;
+    for (uint e = lid; e < n_expert; e += lsize) rs_p[e] = rs_exf[e] * inv;
+
+    rs_clear_taken(n_expert, lid, lsize);
+    for (uint i = 0u; i < k; ++i) {
+        const int ix = rs_rank_max(n_expert, lid, lsize);
+        if (ix < int(n_expert) && lid == 0u) {
+            ids.v[t * k + i] = ix;
+            weights.v[t * k + i] = rs_p[ix];   // the source writes the running max, which IS p[ix]
+            rs_taken[ix] = 1u;
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        float s = 0.0, c = 0.0;
+        for (uint i = 0u; i < k; ++i) {
+            const float y = weights.v[t * k + i] - c;
+            const float tt = s + y;
+            c = (tt - s) - y;
+            s = tt;
+        }
+        const float sc = max(s, 6.103515625e-05);           // 2**-14, ggml's clamp
+        for (uint i = 0u; i < k; ++i) weights.v[t * k + i] = weights.v[t * k + i] / sc;
+    }
+}

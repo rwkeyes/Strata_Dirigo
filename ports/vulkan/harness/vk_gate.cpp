@@ -928,6 +928,150 @@ static double gemv_bound(double want, double abs_sum, double rtol) {
     return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum;
 }
 
+// ---- the MoE router, transcribed from router_top10.cu ----
+//
+// The reference form, in the source's order: softmax over ALL experts in double, the sum accumulated ASCENDING on
+// one thread, `inv = (float)(1.0/sum)`, `p = (float)(exp * inv)`, then k passes of a block argmax with ties to the
+// LOWEST index, then the renormalisation with ggml's 2**-14 clamp over the K RANKS AS THE BUFFER HOLDS THEM -
+// including any rank the selection did not write, which is a behaviour rather than an oversight.
+static void router_host_row(const std::vector<float>& l, int n_expert, int k, std::vector<int>& ids,
+                            std::vector<float>& w, int row) {
+    float mx = -INFINITY;
+    for (int e = 0; e < n_expert; ++e) mx = std::fmax(mx, l[e]);          // fmax, not max: NaN handling matters
+    std::vector<double> ex(n_expert, 0.0);
+    for (int e = 0; e < n_expert; ++e) ex[e] = std::exp((double) l[e] - (double) mx);
+    double sum = 0.0;
+    for (int e = 0; e < n_expert; ++e) sum += ex[e];                      // ascending, one thread, double
+    const float inv = (float) (1.0 / sum);
+    std::vector<float> p(n_expert, 0.0f);
+    for (int e = 0; e < n_expert; ++e) p[e] = (float) (ex[e] * (double) inv);
+    std::vector<char> taken(n_expert, 0);
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int bi = n_expert;                                                // loses to every real index
+        for (int e = 0; e < n_expert; ++e) {
+            if (taken[e]) continue;
+            if (p[e] > bv) { bv = p[e]; bi = e; }                         // STRICT: lowest index wins a tie
+        }
+        if (bi < n_expert) {
+            ids[(size_t) row * k + i] = bi;
+            w[(size_t) row * k + i] = bv;
+            taken[bi] = 1;
+        }
+    }
+    double s = 0.0;
+    for (int i = 0; i < k; ++i) s += (double) w[(size_t) row * k + i];    // the buffer as it stands
+    const double sc = std::fmax(s, 6.103515625e-05);
+    for (int i = 0; i < k; ++i) w[(size_t) row * k + i] = (float) ((double) w[(size_t) row * k + i] / sc);
+}
+
+// router_top10: the MoE router, in its two arithmetic variants.
+//
+// THE FINDING THIS CASE EXISTS TO QUANTIFY. The engine's router computes its exponentials and its sum in DOUBLE,
+// and Intel Arc has no shaderFloat64 (Intel support article 000089817). So on the target hardware the router can
+// only run in float, and the honest question is not "is that close enough" but "how often does it pick a
+// DIFFERENT EXPERT". A probability differing by one ULP can flip the ORDER, and the order is the selection.
+//
+// So the same rows are run through the faithful variant and the portable one and compared against the host's
+// double-precision reference: ids exactly, weights by tolerance, and the f32 variant's DISAGREEMENT RATE is
+// reported. Near-ties are constructed deliberately, at gaps from 1e-8 to 1e-6, because that is where the two can
+// differ at all - realistic logits separate their top experts by orders of magnitude more than that.
+void case_router(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "router_top10_f64.spv") || !have(dir, "router_top10_f32.spv")) return;
+    const int n_expert = 512, k = 10, n_tok = 12;
+    std::vector<float> logits((size_t) n_tok * n_expert, 0.0f);
+    for (int t = 0; t < n_tok; ++t) {
+        float* row = &logits[(size_t) t * n_expert];
+        if (t < 3) {                                    // realistic: an ordinary router head
+            for (int e = 0; e < n_expert; ++e) row[e] = rndf(1.0f) * (t == 0 ? 1.0f : (t == 1 ? 0.25f : 3.0f));
+        } else if (t == 3) {                            // EXACT ties everywhere: the index rule decides
+            for (int e = 0; e < n_expert; ++e) row[e] = 0.5f;
+        } else if (t == 4) {                            // the degenerate row: all -inf
+            for (int e = 0; e < n_expert; ++e) row[e] = -INFINITY;
+        } else {                                        // NEAR-TIES: the top two separated by a chosen gap
+            // both ends of the band: ABOVE the float ULP of p (where the two variants must keep the same order)
+            // and BELOW it (where BOTH round the two probabilities to the same float and both fall back to the
+            // index rule). The only place they can differ is the narrow band between.
+            const double gap = (t == 5) ? 1e-8 : (t == 6) ? 3e-8 : (t == 7) ? 1e-7 : (t == 8) ? 1e-6 :
+                               (t == 9) ? 1e-5 : (t == 10) ? 1e-9 : 1e-10;
+            for (int e = 0; e < n_expert; ++e) row[e] = rndf(1.0f) * 0.5f - 6.0f;
+            row[3] = 5.0f;
+            row[7] = (float) (5.0 + gap);
+        }
+    }
+    const std::vector<int> IDS_FILL((size_t) n_tok * k, -7);          // what the buffer held before
+    std::vector<float> w_fill((size_t) n_tok * k, 0.125f);
+    std::vector<int> want_ids = IDS_FILL;
+    std::vector<float> want_w = w_fill;
+    for (int t = 0; t < n_tok; ++t) {
+        std::vector<float> row(logits.begin() + (size_t) t * n_expert, logits.begin() + (size_t) (t + 1) * n_expert);
+        router_host_row(row, n_expert, k, want_ids, want_w, t);
+    }
+
+    Buf b_logits = ctx.alloc((size_t) n_tok * n_expert * 4);
+    ctx.write(b_logits, logits.data(), logits.size() * 4);
+    struct { int n_tokens; int n_expert; int k; } pc{n_tok, n_expert, k};
+
+    struct Variant { const char* spv; const char* name; bool faithful; };
+    const Variant variants[] = {
+        {"/router_top10_f64.spv", "router_top10_f64 (faithful: double exp + double sum)", true},
+        {"/router_top10_f32.spv", "router_top10_f32 (portable: float exp + Kahan sums)", false},
+    };
+    for (const Variant& v : variants) {
+        if (!v.faithful && !ctx.info().shader_float64) {
+            std::printf("      (note: this device HAS no fp64, which is the case this variant exists for)\n");
+        }
+        Buf b_ids = ctx.alloc((size_t) n_tok * k * 4), b_w = ctx.alloc((size_t) n_tok * k * 4);
+        ctx.write(b_ids, IDS_FILL.data(), IDS_FILL.size() * 4);
+        ctx.write(b_w, w_fill.data(), w_fill.size() * 4);
+        VkPipeline p = ctx.pipeline(dir + v.spv, 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_logits, &b_ids, &b_w}, &pc, sizeof(pc), (uint32_t) n_tok);
+        std::vector<int> got_ids((size_t) n_tok * k);
+        std::vector<float> got_w((size_t) n_tok * k);
+        ctx.read(b_ids, got_ids.data(), got_ids.size() * 4);
+        ctx.read(b_w, got_w.data(), got_w.size() * 4);
+
+        int id_bad = 0, w_bad = 0, first_id = -1;
+        double worst_w = 0, mass = 0;
+        for (size_t i = 0; i < want_ids.size(); ++i) {
+            if (got_ids[i] != want_ids[i]) {
+                if (first_id < 0) first_id = (int) i;
+                ++id_bad;
+            }
+            const double ratio = std::fabs((double) got_w[i] - (double) want_w[i]) /
+                                 (1e-6 * std::fabs((double) want_w[i]) + 1e-9);
+            worst_w = std::max(worst_w, ratio);
+            mass += std::fabs((double) want_w[i]);
+            if (ratio > 1.0) ++w_bad;
+        }
+        if (id_bad) {
+            std::printf("      first id difference at token %d rank %d: got %d, reference %d\n", first_id / k,
+                        first_id % k, got_ids[first_id], want_ids[first_id]);
+        }
+        char label[120];
+        std::snprintf(label, sizeof label, "%s : selected expert ids", v.name);
+        verdict(label, id_bad == 0, id_bad, (int) want_ids.size(), (double) id_bad, "ids differing from the reference");
+        std::snprintf(label, sizeof label, "%s : weights and the renormalisation", v.name);
+        verdict(label, w_bad == 0 && mass > 1e-3, w_bad, (int) want_w.size(), worst_w,
+                "weights outside tolerance (worst err/tol)");
+        ctx.free(b_ids); ctx.free(b_w);
+    }
+    ctx.free(b_logits);
+
+    // the degenerate row, called out: ranks that were never written must keep the buffer's stale values AND be
+    // renormalised, which the reference-fill above already exercises - this states it as its own check
+    {
+        int kept = 0, checked = 0;
+        for (int i = 0; i < k; ++i) {
+            ++checked;
+            if (want_ids[(size_t) 4 * k + i] == -7) ++kept;
+        }
+        verdict("router: an all -inf row writes no rank and renormalises the stale ones", kept == checked, checked - kept,
+                checked, (double) (checked - kept), "ranks that were written when the reference wrote none");
+    }
+}
+
+
 // the fp16-activation sibling of the S-family GEMV: the same decode and the same attribute vector, a different
 // activation loader.  Both are checked against the same kind of double oracle, so the two activation contracts
 // (fp16 and quantized) are compared on equal terms.
@@ -3103,6 +3247,7 @@ int main(int argc, char** argv) {
     case_bf16_mmvf_multi(ctx, dir);
     case_s_gemv_q8_split(ctx, dir);
     case_s_gemv_f16_split(ctx, dir);
+    case_router(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

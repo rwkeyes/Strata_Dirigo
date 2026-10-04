@@ -65,7 +65,11 @@ for f in "${comps[@]}"; do
   # accurate, so it looks like an improvement, and it changes the last bits of every term.  Where the source
   # uses __fmaf_rn the SPIR-V must carry the fused operation.
   fma="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpExtInst .* Fma ')"
+  fp64cap="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpCapability Float64')"
   case "$name" in
+    router_top10_f64|router_top10_f32)
+      grep -q 'OpControlBarrier' <<<"$census" || fail "$name (no barrier: the block reductions did not lower)"
+      ;;
     rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split)
       grep -q 'OpGroupNonUniformFAdd' <<<"$census" || fail "$name (no subgroup reduction in the SPIR-V - the kernel did not lower its sum)"
       ;;
@@ -73,6 +77,17 @@ for f in "${comps[@]}"; do
       if [ -n "$census" ]; then
         fail "$name (unexpected ops: $census - the CUDA source has no subgroup op, barrier or atomic here)"
       fi
+      ;;
+  esac
+  # THE FP64 SPLIT, as a structural rule rather than a comment. The router exists in two arithmetic variants
+  # because Intel Arc has no shaderFloat64; the f32 variant is what runs there, so it must NOT carry the
+  # capability, and the f64 variant must.
+  case "$name" in
+    router_top10_f64)
+      [ "$fp64cap" -ge 1 ] || fail "$name (no Float64 capability: the faithful variant did not compile its doubles)"
+      ;;
+    router_top10_f32)
+      [ "$fp64cap" -eq 0 ] || fail "$name (declares Float64 - this variant exists for devices that do NOT have it)"
       ;;
   esac
   # a SEPARATE rule, because a kernel can legitimately need both a reduction and a fused MAC

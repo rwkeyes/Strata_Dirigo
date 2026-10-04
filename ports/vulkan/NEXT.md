@@ -317,6 +317,43 @@ buys the same cross-check the source has rather than new coverage. Then the host
 forms, and `s2_gemv_fast.cu` (7,297) with `s2_gemv_quads`/`s2_gemv_fast`, which the source itself defers to a
 later phase ("the speed win is `__dp4a` ... and that belongs to Phase 3 once the numerics are settled").
 
+## The MoE router - and a HARDWARE finding that shapes it
+
+TWO ARITHMETIC VARIANTS, because the engine's router computes its exponentials AND its sum in DOUBLE and the
+target hardware does not have double:
+
+* `router_top10_f64.comp` - faithful, requires the device's `shaderFloat64`.
+* `router_top10_f32.comp` - portables, float exp with **Kahan-compensated** sums, and NO `Float64` capability.
+
+**INTEL ARC HAS NO shaderFloat64.** Intel's own support article 000089817: "Integrated GPUs included with 11th Gen
+Intel processors and the upcoming Intel Arc discrete GPUs don't support shaderFloat64." That is the target
+hardware, so the faithful variant cannot run there AT ALL - and this is the router, which by the source's own
+measurement is 3.39 ms of a 289 ms token at 48 layers, **56% of the whole forward pass**. The port's response is
+not to pretend the difference is negligible: the gate RUNS BOTH and measures the disagreement.
+
+The result, MEASURED: over 120 rank selections - random logits at three sharpnesses, a row of exact ties, a
+degenerate all `-inf` row, and near-ties at gaps of 1e-10, 1e-9, 1e-8, 3e-8, 1e-7, 1e-6 and 1e-5 - **the portable
+variant selected the IDENTICAL experts as the host's double-precision reference, and so did the faithful one.**
+The near-ties probe both ends of the band: ABOVE the float ULP of a probability the two variants keep the same
+order, and BELOW it both round the two probabilities to the same float and both fall back to the index rule. The
+band in between is where they could differ, and it is narrower than any realistic router logits produce.
+
+THE FAITHFUL VARIANT NEEDED A DOUBLE `exp` BUILT BY HAND. glslang has no `exp(double)` - the port learned that
+while porting `silu` - but it does have `roundEven(double)` and `ldexp(double, int)`, which with an 18-term series
+and the argument reduced to |r| <= ln2/2 make one. Verified indirectly: the faithful variant's ids and weights
+match the host reference's, and its weights match with 0.109 of a 1e-6 bound.
+
+THE FP64 SPLIT IS NOW A STRUCTURAL GATE RULE, not a comment: `router_top10_f32` FAILS the gate if its SPIR-V
+carries an `OpCapability Float64`, and `router_top10_f64` fails if it does not. The portable variant exists
+precisely for devices without the capability, so its absence from the SPIR-V is the property that keeps it
+runnable there.
+
+Sharing: the semantics (softmax over ALL experts, stable argsort with ties to the ASCENDING index, the
+`2**-14` clamp applied to the gathered weights) live in `common/router_select.glsl`, used by both variants - they
+are semantics, not arithmetic. One behaviour is material and tested: a rank the selection does NOT write keeps
+whatever the output buffer held, and the renormalisation divides those stale values too. That is the source's
+behaviour, not an oversight, and the gate pre-fills the buffer to prove it.
+
 ### THE REST OF THE WAVE - and its size, which is the number that matters
 
 This is the biggest remaining area by a wide margin. Measured source sizes:

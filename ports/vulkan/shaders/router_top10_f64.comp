@@ -1,0 +1,95 @@
+// ports/vulkan/shaders/router_top10_f64.comp - the MoE router, FAITHFUL arithmetic (router_top10.cu).
+//
+//     p   = softmax(logits) over ALL experts ;  ids = stable argsort(-p)[:k] (ties by ascending index)
+//     w   = gather(p, ids) ;  s = max(sum(w), 2**-14) ;  return ids, w / s
+//
+// The selection and the tie rule live in common/router_select.glsl, shared with the f32 variant, because they are
+// semantic rather than arithmetic.
+//
+// WHY THIS VARIANT IS SEPARATE, AND WHY IT IS NOT THE ONE THAT SHIPS TO INTEL. The engine's router computes its
+// exponentials AND its sum in DOUBLE. The router is also, by the source's own measurement, the most expensive
+// kernel in the engine - 3.39 ms of a 289 ms token at 48 layers, 56% of the forward pass - in a kernel that reads
+// 2.6 MB, because all 5,120 of its operations were on one thread while the matvec has thousands. So its arithmetic
+// is not a detail that can be waved through.
+//
+// **INTEL ARC HAS NO shaderFloat64** (Intel's own support article 000089817: "Integrated GPUs included with 11th
+// Gen Intel processors and the upcoming Intel Arc discrete GPUs don't support shaderFloat64"), which is the
+// target hardware. This variant therefore cannot run there at all; the f32 variant is what the port ships to
+// Arc, and the gate MEASURES the difference between them rather than asserting it is negligible.
+//
+// glslang has no exp(double), so one is BUILD FROM THE PIECES IT HAS: roundEven(double), ldexp(double, int) and
+// a series with the argument reduced to |r| <= ln2/2 (18 terms, and ln2 split so the reduction stays exact).
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float v[]; } logits;
+layout(set = 0, binding = 1, std430) buffer IDS { int v[]; } ids;
+layout(set = 0, binding = 2, std430) buffer WEIGHTS { float v[]; } weights;
+
+#include "common/router_select.glsl"
+
+shared double rs_ex[RS_MAX_EXPERTS];
+shared double rs_dsum;
+
+double exp_d(double x) {
+    const double LN2_HI = 0.6931471803691238;
+    const double LN2_LO = 1.9082149292705877e-10;
+    const double k = roundEven(x / 0.6931471805599453);
+    const double r = (x - k * LN2_HI) - k * LN2_LO;
+    double t = 1.0, s = 1.0;
+    for (int i = 1; i <= 18; ++i) {
+        t *= r / double(i);
+        s += t;
+    }
+    return ldexp(s, int(k));
+}
+
+layout(push_constant, std430) uniform PC { int n_tokens; int n_expert; int k; } pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= uint(pc.n_tokens)) return;
+    const uint n_expert = uint(pc.n_expert), k = uint(pc.k);
+    const uint lid = gl_LocalInvocationIndex, lsize = gl_WorkGroupSize.x;
+    const uint lbase = t * n_expert;
+
+    float mx = rs_neg_inf();
+    for (uint e = lid; e < n_expert; e += lsize) mx = max(mx, logits.v[lbase + e]);
+    mx = rs_max_all(mx, lid, lsize);          // exact and order-independent
+
+    for (uint e = lid; e < n_expert; e += lsize) {
+        rs_ex[e] = exp_d(double(logits.v[lbase + e]) - double(mx));
+    }
+    barrier();
+    // ASCENDING, on ONE invocation, in double: the source's order, kept deliberately. Its own comment says
+    // parallelising this would be "a free speedup and a silent change to the values, and the exp was the cost,
+    // not this".
+    if (lid == 0u) {
+        double s = 0.0;
+        for (uint e = 0u; e < n_expert; ++e) s += rs_ex[e];
+        rs_dsum = s;
+    }
+    barrier();
+    const float inv = float(1.0 / rs_dsum);
+    for (uint e = lid; e < n_expert; e += lsize) rs_p[e] = float(rs_ex[e] * double(inv));
+
+    rs_clear_taken(n_expert, lid, lsize);
+    for (uint i = 0u; i < k; ++i) {
+        const int ix = rs_rank_max(n_expert, lid, lsize);
+        if (ix < int(n_expert) && lid == 0u) {
+            ids.v[t * k + i] = ix;
+            weights.v[t * k + i] = rs_p[ix];   // the source writes the running max, which IS p[ix]
+            rs_taken[ix] = 1u;
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        double s = 0.0;
+        for (uint i = 0u; i < k; ++i) s += double(weights.v[t * k + i]);
+        const double sc = max(s, 6.103515625e-05);          // 2**-14, ggml's clamp
+        for (uint i = 0u; i < k; ++i) weights.v[t * k + i] = float(double(weights.v[t * k + i]) / sc);
+    }
+}
