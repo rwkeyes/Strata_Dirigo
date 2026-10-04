@@ -1,0 +1,50 @@
+// ports/vulkan/shaders/iq1m_mmvq.comp - ONE IQ1_M WEIGHT ROW against q8_1 activations, one workgroup per row.
+//
+// This is `mmvq_kernel<29>` (iq_kernels.cu) with the format BAKED IN rather than dispatched: the CUDA is one
+// template over the ggml type with a run-time `Fmt<TY>` table, and the port needs the format the resident model
+// actually uses.  One shader per format is also the shape native_mmvq.cu takes on the CUDA side, so a second
+// format is a second file rather than a growing switch.
+//
+// THE SHAPE IS THE PORT'S, NOT THE CUDA'S, AND THAT IS DELIBERATE: the CUDA is one WARP per row with a shuffle
+// reduction; the port is one WORKGROUP (256) per row with the shared-memory barrier tree (common/wg_reduce.glsl).
+// A host cannot size anything from a device-wide subgroup default - Intel picks the SIMD width per kernel - so
+// nothing here divides by a subgroup width.  The per-part arithmetic is the source's, which is why the
+// comparison is against a double reference rather than bit-for-bit.
+//
+// The row is `nb = n_in / 256` blocks of 56 bytes; part k of the row (k = block * 8 + iqs) reads the activation
+// block k, because one 256-value weight block covers exactly eight 32-value q8_1 blocks.  That is why the
+// activation offset is `k * 36` and not something the dot function has to work out.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) readonly buffer G { uint v[]; } grid_b;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+#include "common/iq1m_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;              // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / 256u;           // IQ1_M blocks per row (256 values each)
+    const uint arow_bytes = (uint(pc.n_in) / 32u) * 36u;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint arow = c * arow_bytes;
+        float acc = 0.0;
+        // lane-strided over the row's parts; a part index k IS the activation block index
+        for (uint k = lid; k < nb * 8u; k += gl_WorkGroupSize.x) {
+            acc += iq1m_dot(wrow + (k / 8u) * 56u, arow + k * 36u, k & 7u);
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}

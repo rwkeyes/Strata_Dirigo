@@ -32,12 +32,21 @@ WHAT MADE THE OLD DIAGNOSIS SURVIVE TWO ROUNDS, worth carrying into any future b
   memory. That non-result was read as "the hypothesis is refuted, so the cause is the caller's mask".
 
 NEXT, in order:
-1. **The quantized-expert wave** (22 shaders from `iq_kernels.cu` / `native_mmvq.cu`) - see "THE NEXT WORKSTREAM"
-   and "SCOPED" below. That is the next workstream; the tier is closed.
-2. The cross-implementation arm can report `budget: independent requery agrees` as a FALSE FAIL while the
-   resident local model holds the card (the driver's own usage moves between Ctx construction and the case).
-   When ONLY that case fails on the radeon re-run, re-run it before believing it - observed once here, green on
-   the two runs either side of it.
+1. **The quantized-expert wave** (22 shaders from `iq_kernels.cu` / `native_mmvq.cu`) - STARTED 2026-10-04:
+   `iq1m_mmvq.comp` (the IQ1_M row the resident `coder-iq1_m` model's experts are stored in) is in the build and
+   gated, with `common/iq1m_dot.glsl`, the grid table generated from the engine by `tools/gen-iq1s-grid.py`
+   (the gate now fails if it is stale), and three cases over sub-width and above-width part counts plus two
+   columns. Next in this wave, in this order: (a) the q8_1 quantizer pair `native_quantize_q8_1` /
+   `native_swiglu_quantize_q8_1` - the activation side of every format below, and the only part of the wave
+   whose exactness is byte-for-byte against the engine's own `roundf`-based quantiser; (b) the grouped
+   `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier actually
+   calls, built on the per-format row dot; (c) the remaining formats one shader each (Q5_K, Q2_0, Q3_K, IQ4_XS,
+   Q4_K, Q6_K, and the small Q4_0/Q5_0/Q8_0/IQ4_NL family), which is `native_mmvq.cu`'s own structure.
+2. The cross-implementation arm's `budget: independent requery agrees` case used to report a FALSE FAIL while
+   the resident local model held the card. **FIXED, with the measurement**: the flake was `budget 81920 bytes,
+   usage 0 bytes` - 80 KiB of driver budget bookkeeping with usage unchanged - so the discrete-card comparison
+   now carries 1 MiB / 0.01%-of-heap tolerance, printed on failure, while case (c) keeps the requirement that
+   the figure moves with an allocation. Do not read a future failure here as automatically environmental.
 
 ### WITHDRAWN: the masked-wave diagnosis (kept because the reasoning is worth seeing fail)
 

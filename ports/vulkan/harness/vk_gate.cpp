@@ -18,6 +18,7 @@
 // definition of the thing under test: it can drift, and a drift re-points the gate at the wrong reference.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "iq1s_grid.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -442,10 +443,22 @@ void case_memory_budget(Ctx& ctx) {
 
     const uint64_t dbudget = budget > b.heap_budget ? budget - b.heap_budget : b.heap_budget - budget;
     const uint64_t dusage = usage > b.heap_usage ? usage - b.heap_usage : b.heap_usage - usage;
+    // **A FOREIGN PROCESS MOVES THE DRIVER'S OWN FIGURES, AND IT IS MEASURED, NOT ASSUMED.**  The resident local
+    // model holds this card, so a requery taken later is legitimately different from the reading at Ctx
+    // construction - observed here as `requery delta: budget 81920 bytes, usage 0 bytes`: 80 KiB of budget with
+    // usage UNCHANGED, which is the driver's own reserve bookkeeping rather than an allocation by anyone.  It
+    // reported a MISMATCH that had nothing to do with this port, in one run of three.
+    //
+    // So the discrete-card comparison carries a tolerance that cannot hide what this case exists to catch: a
+    // misread struct or the WRONG HEAP is off by gigabytes (24.0 GiB against 0.19 GiB on this box), and a figure
+    // that never moves at all is caught by case (c) below, which requires usage to track an 8 MiB allocation.
+    // 1 MiB or 0.01% of the heap, whichever is larger, is 12x the measured drift and four orders of magnitude
+    // under the failure it guards.
+    const uint64_t tol = std::max<uint64_t>(1u << 20, b.heap_total / 10000ull);
     const bool agrees = uma ? (dbudget <= b.heap_budget / 10 && dusage <= b.heap_usage / 10 + (1u << 20))
-                            : (budget == b.heap_budget && usage == b.heap_usage);
-    if (!agrees) std::printf("      requery delta: budget %llu bytes, usage %llu bytes\n",
-                             (unsigned long long) dbudget, (unsigned long long) dusage);
+                            : (dbudget <= tol && dusage <= tol);
+    if (!agrees) std::printf("      requery delta: budget %llu bytes, usage %llu bytes (tolerance %llu)\n",
+                             (unsigned long long) dbudget, (unsigned long long) dusage, (unsigned long long) tol);
     verdict(uma ? "budget: independent requery agrees (10% tol, UMA)" : "budget: independent requery agrees",
             agrees, agrees ? 0 : 1, 1, (double) dusage, uma ? "usage delta (UMA tolerance)" : "mismatch count");
 
@@ -2169,6 +2182,175 @@ void case_s2expert_tier(Ctx& ctx, const std::string& dir) {
     s2expert_swiglu_arm(ctx, dir, 2560, 640, 3, "gate-major, up half untouched");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// IQ1_M: the format the resident `coder-iq1_m` model's experts are stored in (`mmvq_kernel<29>`).
+//
+// THE ORACLE IS TRANSCRIBED FROM `vec_dot_iq1_m_q8_1`, in double, and the parts that are integer on the device
+// are integer here too (`__dp4a` is exact, so the two must agree exactly on sumi and sumy; only the final float
+// expression can round differently, which is what the bound is for).
+//
+// THE BLOCK SCALE IS CONSTRUCTED, NOT RANDOM, AND THAT IS THE POINT OF THE BUILDER BELOW.  An IQ1_M block's
+// fp16 scale is assembled from the HIGH NIBBLE of scales[1], [3], [5] and [7], while the eight sub-scale pairs
+// are read out of those same bytes as uint16 - so any random fill assembles an arbitrary 16-bit pattern, which
+// is as likely to be an inf or a NaN as a usable scale, and the case would then be measuring that instead of the
+// dot.  The two uses do not overlap, so both can be set deliberately: random bytes for the sub-scales, then the
+// four high nibbles overwritten with the bits of a chosen fp16 value.
+//
+// The activation's `s` field (the second half of `ds`) is filled with the fp16 of 1000.0 - a SENTINEL, because
+// this dot reads `d` only.  If a port read the wrong one of the two fields the results would differ by ~1e4.
+static int iq1m_rd_int4(const std::vector<uint8_t>& b, size_t off) {
+    return (int) ((uint32_t) b[off] | ((uint32_t) b[off + 1] << 8) | ((uint32_t) b[off + 2] << 16) |
+                  ((uint32_t) b[off + 3] << 24));
+}
+
+// `__dp4a`: signed bytes, int32 accumulate - the same arithmetic the shader writes out by hand.
+static int iq1m_dp4a(int a, int b, int c) {
+    return c + (int8_t) (a & 0xFF) * (int8_t) (b & 0xFF) + (int8_t) ((a >> 8) & 0xFF) * (int8_t) ((b >> 8) & 0xFF) +
+           (int8_t) ((a >> 16) & 0xFF) * (int8_t) ((b >> 16) & 0xFF) +
+           (int8_t) ((a >> 24) & 0xFF) * (int8_t) ((b >> 24) & 0xFF);
+}
+
+static double iq1m_dot_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                            size_t ablk, int iqs) {
+    int sumi[2] = {0, 0};
+    double sumf[2] = {0.0, 0.0};
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int h = l0 / 4;
+        const unsigned qh = w[wblk + 32 + (size_t) (2 * iqs + l0 / 4)];
+        const unsigned qhl = qh >> (4 * ((l0 / 2) % 2));
+        const unsigned g = strata::vkport::kIq1sGrid[w[wblk + (size_t) (4 * iqs + l0 / 2)] | ((qhl & 7u) << 8)];
+        const int grid0 = (int) ((g >> 0) & 0x0F0F0F0Fu);
+        const int grid1 = (int) ((g >> 4) & 0x0F0F0F0Fu);
+        const size_t ub = ablk + 4 + (size_t) (4 * l0);
+        const int u0 = iq1m_rd_int4(act, ub), u1 = iq1m_rd_int4(act, ub + 4);
+        sumi[h] = iq1m_dp4a(grid0, u0, sumi[h]);
+        sumi[h] = iq1m_dp4a(grid1, u1, sumi[h]);
+        const double delta = -1.0 + 0.125 - (double) (qhl & 0x08u) * (2.0 * 0.125 / 8.0);
+        int sumy = 0;
+        sumy = iq1m_dp4a(u0, 0x01010101, sumy);
+        sumy = iq1m_dp4a(u1, 0x01010101, sumy);
+        sumf[h] += delta * (double) sumy;
+    }
+    const size_t so = wblk + 48;
+    const unsigned sc0 = (unsigned) (w[so + 0] | ((unsigned) w[so + 1] << 8));
+    const unsigned sc1 = (unsigned) (w[so + 2] | ((unsigned) w[so + 3] << 8));
+    const unsigned sc2 = (unsigned) (w[so + 4] | ((unsigned) w[so + 5] << 8));
+    const unsigned sc3 = (unsigned) (w[so + 6] | ((unsigned) w[so + 7] << 8));
+    const unsigned scale_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+    const double dscale = (double) strata::kernels::f32_from_f16((uint16_t) scale_u16);
+    const double dact = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    const unsigned sci =
+        (unsigned) (w[so + (size_t) (iqs >> 1)] | ((unsigned) w[so + (size_t) (iqs >> 1) + 1] << 8));
+    const unsigned tmp = sci >> (6u * (unsigned) (iqs % 2));
+    const int sc_a = 2 * (int) (tmp & 7u) + 1;
+    const int sc_b = 2 * (int) ((tmp >> 3) & 7u) + 1;
+    return (dscale * dact) * (((double) sumi[0] + sumf[0]) * (double) sc_a +
+                              ((double) sumi[1] + sumf[1]) * (double) sc_b);
+}
+
+static void iq1m_fill_row(std::vector<uint8_t>& w, size_t row_off, int nb, int row, float scale) {
+    const uint16_t bits = strata::kernels::f16_from_f32(scale);
+    for (int b = 0; b < nb; ++b) {
+        uint8_t* blk = w.data() + row_off + (size_t) b * 56;
+        for (int i = 0; i < 32; ++i) blk[i] = (uint8_t) ((i * 7 + b * 13 + row * 29 + 3) & 0xFF);
+        for (int i = 0; i < 16; ++i) blk[32 + i] = (uint8_t) ((i * 11 + b * 5 + row * 3) & 0xFF);
+        for (int i = 0; i < 8; ++i) blk[48 + i] = (uint8_t) ((i * 23 + b * 17 + row * 41 + 7) & 0xFF);
+        // the fp16 scale's four nibbles, into the high nibbles of bytes 1, 3, 5, 7 (see iq1m_dot.glsl)
+        blk[49] = (uint8_t) ((blk[49] & 0x0F) | ((uint8_t) ((bits >> 0) & 0xF) << 4));
+        blk[51] = (uint8_t) ((blk[51] & 0x0F) | ((uint8_t) ((bits >> 4) & 0xF) << 4));
+        blk[53] = (uint8_t) ((blk[53] & 0x0F) | ((uint8_t) ((bits >> 8) & 0xF) << 4));
+        blk[55] = (uint8_t) ((blk[55] & 0x0F) | ((uint8_t) ((bits >> 12) & 0xF) << 4));
+    }
+}
+
+static std::vector<uint8_t> iq1m_fill_act(int n_blocks) {
+    std::vector<uint8_t> a((size_t) n_blocks * 36, 0);
+    for (int b = 0; b < n_blocks; ++b) {
+        uint8_t* blk = a.data() + (size_t) b * 36;
+        const float mag = (b % 7 == 0) ? 0.0078125f : ((b % 7 == 1) ? 4.0f : 0.125f * (float) (1 + (b % 5)));
+        s2_put16(blk, strata::kernels::f16_from_f32(((b % 3) == 2) ? -mag : mag));
+        s2_put16(blk + 2, strata::kernels::f16_from_f32(1000.0f));      // the sentinel `s`
+        for (int i = 0; i < 32; ++i) blk[4 + i] = (uint8_t) (int8_t) (((i * 13 + b * 7) % 255) - 127);
+    }
+    return a;
+}
+
+static void iq1m_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 56;
+    std::vector<uint8_t> w((size_t) n_out * (size_t) row_bytes, 0);
+    const float scales[3] = {0.03125f, 0.5f, -0.25f};           // a negative block scale is a real case
+    for (int r = 0; r < n_out; ++r) {
+        iq1m_fill_row(w, (size_t) r * (size_t) row_bytes, nb, r, scales[r % 3]);
+    }
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 8; ++k) {
+                const double v = iq1m_dot_host(w, wrow + (size_t) (k / 8) * 56, act, arow + (size_t) k * 36, k % 8);
+                acc += v;
+                abs_sum += std::fabs(v);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_g = ctx.alloc(sizeof(strata::vkport::kIq1sGrid));
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_g, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq1m_mmvq.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;                              // NaN-safe: `>` alone passes a NaN
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "iq1m_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    const bool live = mass > 1e-3;                               // a comparison of zeros proves nothing
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y);
+}
+
+void case_iq1m_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq1m_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("iq1m_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    iq1m_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
+    iq1m_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
+    iq1m_arm(ctx, dir, 256, 1, 1, "one block");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -3857,6 +4039,7 @@ int main(int argc, char** argv) {
     case_quantize_q8_K(ctx, dir);
     case_ple(ctx, dir);
     case_s2expert_tier(ctx, dir);
+    case_iq1m_mmvq(ctx, dir);
     case_s2_gemv_q8(ctx, dir);
     case_bf16_mmvf(ctx, dir);
     case_bf16_mmvf_multi(ctx, dir);

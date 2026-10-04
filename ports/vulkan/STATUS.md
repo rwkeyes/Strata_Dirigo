@@ -7,10 +7,10 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
     bash ports/vulkan/gates/run_gate.sh          # compiles the shaders from source, validates the SPIR-V,
                                                  # checks each shader's declared local size, then runs the gate
 
-**Result: the gate prints its own totals and those are the authority - 126 passed, 0 failed, 0 skipped on the
+**Result: the gate prints its own totals and those are the authority - 129 passed, 0 failed, 0 skipped on the
 box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
-120 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
-last line of your own run.** 43 kernels, 6 shared includes.
+123 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
+last line of your own run.** 44 kernels, 7 shared includes, one generated table.
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
 gated the same way and is described where it is defined.
@@ -75,6 +75,13 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
    to NaN through all 80 chunks. This is the defect that was misdiagnosed for a day as a masked-wave reduction
    fault - see `NEXT.md`, and `case_s2expert_tier`, whose six arms were written for the misdiagnosis and found
    the real one. Fixed by `act_f16_at`.
+0b. **The same class recurred in the IQ1_M port and the new case caught it in one run.** `iq1m_read_int4` read
+   `w_b` (the weights) while its only call site passed an ACTIVATION offset, so the activation words came out of
+   the weight buffer. The case's diagnostic identified it in a single comparison: oracle part 0 `0.440796`
+   against device `-0.395386`. Fixed by renaming the helper after the buffer it reads (`iq1m_act_int4`), which is
+   the rule this port now applies to every CUDA pointer-taking accessor: the buffer belongs in the name, because
+   both mistakes compile and both read a legal address. **A CUDA helper that takes a pointer loses its argument
+   when the port makes it a byte offset, and nothing but a case with an oracle notices.**
 
 1. **`gdn_gate` first version: softplus lost 4.3e-05 relative.** The delegated translation wrote
    `log(1.0f + exp(x))`; the source uses `log1pf(expf(x))`. A Kahan-form `log1p` did **not** fix it — the

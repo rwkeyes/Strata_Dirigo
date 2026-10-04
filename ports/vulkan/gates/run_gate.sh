@@ -77,7 +77,7 @@ for f in "${comps[@]}"; do
     fail "$name (subgroup op in the SPIR-V: $census - the reductions are barrier trees by design; see wg_reduce.glsl)"
   fi
   case "$name" in
-    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down)
+    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down|iq1m_mmvq)
       # A shared-memory exchange needs at least a write barrier and a read barrier; one barrier means the value
       # was exchanged through something else (a subgroup op, or nothing), which is what this arm exists to catch.
       # The census prints "N OpName" run-length PAIRS on one line, so the literal appears once - read the COUNT,
@@ -113,6 +113,18 @@ for f in "${comps[@]}"; do
 done
 
 [ $rc -eq 0 ] || { echo "== shader checks FAILED"; exit 1; }
+
+# THE GENERATED TABLES MUST BE CURRENT.  `iq1s_grid.hpp` is derived from the engine's own ggml-common.h (see
+# tools/gen-iq1s-grid.py); a table that has drifted from the engine is a wrong answer with the same shape as a
+# right one, and nothing else in this gate would notice.  Missing python3 is reported, not silently skipped.
+if command -v python3 >/dev/null; then
+  if ! python3 "$ROOT/tools/gen-iq1s-grid.py" --check; then
+    fail "iq1s_grid.hpp is stale - regenerate with tools/gen-iq1s-grid.py"
+    echo "== generated-table check FAILED"; exit 1
+  fi
+else
+  echo "  note: python3 absent - the generated iq1s grid table was NOT checked against the engine"
+fi
 
 # -----------------------------------------------------------------------------------------------------------
 # TOOLCHAIN PROBES.  These do not decide whether the port RUNS - they decide what it CAN do, and every one of
