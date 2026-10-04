@@ -34,5 +34,5 @@ void main() {
     const bool in_range = (c < uint(pc.ncols)) && (i < uint(pc.n_in));
     const uint ic = min(i, uint(pc.n_in) - 1u);              // never used to write when inactive
     const float xi = in_range ? x.v[c * uint(pc.n_in) + i] : 0.0;
-    q8_1_store(xi, (c * (uint(pc.n_in) / 32u) + ic / 32u) * 36u, in_range);
+    q8_1_store(xi, (c * (uint(pc.n_in) / 32u) + ic / 32u) * 36u, in_range, true);
 }

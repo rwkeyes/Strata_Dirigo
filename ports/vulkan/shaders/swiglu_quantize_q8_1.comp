@@ -1,0 +1,52 @@
+// ports/vulkan/shaders/swiglu_quantize_q8_1.comp - `silu(gate) * up` straight into q8_1 blocks.
+//
+// `native_swiglu_quantize_q8_1_kernel` (native_mmvq.cu), which the SHARED expert path calls
+// (src/kernels/cuda/shared_expert.cu, two sites).  The CUDA fuses what would be two kernels - the SwiGLU and the
+// activation quantiser - so the product never goes through memory.
+//
+// TWO THINGS THIS KERNEL DOES THAT THE PLAIN QUANTISER DOES NOT, both from the source rather than from taste:
+//
+//   * **NO #606 CLAMP.**  It stores `make_half2(d, sum)` raw, while `q8_1_store` - the quantiser the IQ expert
+//     path uses - clamps both to the largest finite half.  So one path protects a large-activation block from
+//     becoming inf and the other does not.  The port carries the source's rule (`clamp_606 = false`) and the
+//     gate measures what it does to a block whose sum exceeds 65504; the case says what that costs.
+//   * **A FAST-MATH SILU.**  The source is `__fmul_rn(__fdividef(gi, __fadd_rn(1.0f, __expf(-gi))), up[i])`:
+//     an APPROXIMATE division, a FAST exponential, and a rounded multiply.  Neither approximation is
+//     reproducible off the CUDA hardware, so the port computes the same FORM with the accurate builtins and a
+//     `precise` multiply (which is the port's `__fmul_rn`: taken as a separate rounded multiply, never contracted
+//     into the division).  That difference is a last-ulp difference in the PRODUCT, and it can flip a code whose
+//     quotient sits on a rounding boundary - which is why the gate measures the flip rate on tie-critical data
+//     instead of asserting zero.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GATE { float v[]; } gate;
+layout(set = 0, binding = 1, std430) readonly buffer UP { float v[]; } up;
+layout(set = 0, binding = 2, std430) buffer OUTQ { uint8_t b[]; } q8_1_out;
+
+#include "common/f16_bits.glsl"
+#include "common/q8_1_store.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int ncols; } pc;
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    const uint per_col = (uint(pc.n_in) + WG_Q8_1_SIZE - 1u) / WG_Q8_1_SIZE;
+    const uint wg = gl_WorkGroupID.x;
+    const uint c = wg / per_col;
+    const uint i = (wg % per_col) * WG_Q8_1_SIZE + lid;
+    const bool in_range = (c < uint(pc.ncols)) && (i < uint(pc.n_in));
+    const uint ic = min(i, uint(pc.n_in) - 1u);
+    const uint at = c * uint(pc.n_in) + ic;
+    float xi = 0.0;
+    if (in_range) {
+        const float g = gate.v[at];
+        const float s = g / (1.0 + exp(-g));          // silu(gate): the source's fast-math form, computed exactly
+        precise float p = s * up.v[at];               // __fmul_rn: one rounded multiply, never contracted
+        xi = p;
+    }
+    q8_1_store(xi, (c * (uint(pc.n_in) / 32u) + ic / 32u) * 36u, in_range, false);
+}

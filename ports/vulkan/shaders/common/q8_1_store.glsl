@@ -40,11 +40,18 @@ float q8_1_roundf(float t) {
     return (t >= 0.0) ? floor(t + 0.5) : ceil(t - 0.5);
 }
 
-// `in_range` exists so a workgroup whose last 32-lane block is out of range can still take part in the exchange
-// (a barrier is workgroup-wide) while writing nothing; an out-of-range lane must not have its offset used to
-// write, because the block it would land on belongs to the NEXT column.  It is NOT named `active`: that is a GLSL
-// reserved word, and the failure is a parse error pointing at the declaration rather than at the name.
-void q8_1_store(float xi, uint out_off, bool in_range) {
+// THE CLAMP IS A PARAMETER BECAUSE THE ENGINE HAS BOTH RULES, AND THAT IS A FINDING RATHER THAN A CONVENIENCE.
+// `q8_1_store` (iq_kernels.cu) clamps `d` and the sum to the largest finite half - #606 - and the kernels that
+// use it are the IQ expert path's (`quantize_q8_1_kernel`, `swiglu_q8_1_entries_kernel`).
+// `native_swiglu_quantize_q8_1_kernel` (native_mmvq.cu) stores `make_half2(d, sum)` RAW, and it is what the
+// SHARED expert path calls (src/kernels/cuda/shared_expert.cu, two sites).  So the engine has one activation
+// quantiser that protects a large-activation block from becoming inf and one that does not, on two different
+// paths.  The port carries both rules as the source has them, with the difference visible at the call site, and
+// the swiglu case measures what the unclamped rule does to a block whose sum exceeds 65504.
+//
+// AN OUT-OF-RANGE LANE STILL PARTICIPATES: `in_range` gates the writes only, because the exchange's barriers are
+// workgroup-wide.
+void q8_1_store(float xi, uint out_off, bool in_range, bool clamp_606) {
     const uint lid = gl_LocalInvocationIndex;
     q81_amax[0][lid] = abs(xi);
     q81_sum[0][lid] = xi;
@@ -63,19 +70,21 @@ void q8_1_store(float xi, uint out_off, bool in_range) {
     const float sum = q81_sum[cur][lid];
     if (in_range) {
         // `amax == 0` is an all-zero block: the CUDA returns a zero code and never divides
-        const float d = q8_1_finite(amax / 127.0);
+        const float d = clamp_606 ? q8_1_finite(amax / 127.0) : (amax / 127.0);
         const float r = q8_1_roundf((amax == 0.0) ? 0.0 : (xi / d));
         const float c = (r > 127.0) ? 127.0 : ((r < -127.0) ? -127.0 : r);
         const int q = (amax == 0.0) ? 0 : int(c);
         const uint elem = lid & 31u;
         q8_1_out.b[out_off + 4u + elem] = uint8_t(uint(q) & 0xFFu);
         if (elem == 0u) {
-            const uint16_t dh = f16_from_f32_port(q8_1_finite(d));
-            const uint16_t sh = f16_from_f32_port(q8_1_finite(sum));
-            q8_1_out.b[out_off + 0u] = uint8_t(uint(dh) & 0xFFu);
-            q8_1_out.b[out_off + 1u] = uint8_t((uint(dh) >> 8u) & 0xFFu);
-            q8_1_out.b[out_off + 2u] = uint8_t(uint(sh) & 0xFFu);
-            q8_1_out.b[out_off + 3u] = uint8_t((uint(sh) >> 8u) & 0xFFu);
+            const float dh = clamp_606 ? q8_1_finite(d) : d;
+            const float sh = clamp_606 ? q8_1_finite(sum) : sum;
+            const uint16_t dh16 = f16_from_f32_port(dh);
+            const uint16_t sh16 = f16_from_f32_port(sh);
+            q8_1_out.b[out_off + 0u] = uint8_t(uint(dh16) & 0xFFu);
+            q8_1_out.b[out_off + 1u] = uint8_t((uint(dh16) >> 8u) & 0xFFu);
+            q8_1_out.b[out_off + 2u] = uint8_t(uint(sh16) & 0xFFu);
+            q8_1_out.b[out_off + 3u] = uint8_t((uint(sh16) >> 8u) & 0xFFu);
         }
     }
     // the shared arrays are reused by the next call in the same invocation, so this must be the last act

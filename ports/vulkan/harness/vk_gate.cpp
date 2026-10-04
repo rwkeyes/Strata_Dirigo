@@ -2372,11 +2372,11 @@ void case_iq1m_mmvq(Ctx& ctx, const std::string& dir) {
 static float q81_finite_host(float v) { return std::fabs(v) > 65504.0f ? std::copysign(65504.0f, v) : v; }
 static float q81_roundf_host(float t) { return t >= 0.0f ? std::floor(t + 0.5f) : std::ceil(t - 0.5f); }
 
-static void q81_block_host(const float* xb, uint8_t* out, int* clamps) {
+static void q81_block_from_xi(const float* xi, uint8_t* out, int* clamps, bool clamp606) {
     float amax = 0.0f, cur[32], nxt[32];
     for (int l = 0; l < 32; ++l) {
-        amax = std::max(amax, std::fabs(xb[l]));
-        cur[l] = xb[l];
+        amax = std::max(amax, std::fabs(xi[l]));
+        cur[l] = xi[l];
     }
     for (int o = 16; o > 0; o >>= 1) {
         for (int l = 0; l < 32; ++l) nxt[l] = cur[l] + cur[l ^ o];
@@ -2384,19 +2384,23 @@ static void q81_block_host(const float* xb, uint8_t* out, int* clamps) {
     }
     const float sum = cur[0];
     const float raw_d = amax / 127.0f;
-    const float d = q81_finite_host(raw_d);
+    const float d = clamp606 ? q81_finite_host(raw_d) : raw_d;
     if (raw_d > 65504.0f) ++clamps[0];
     if (std::fabs(sum) > 65504.0f) ++clamps[1];
     for (int l = 0; l < 32; ++l) {
         float r = 0.0f;
         if (amax != 0.0f) {
-            r = q81_roundf_host(xb[l] / d);
+            r = q81_roundf_host(xi[l] / d);
             r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
         }
         out[4 + l] = (uint8_t) ((int) r & 0xFF);
     }
-    s2_put16(out + 0, strata::kernels::f16_from_f32(q81_finite_host(d)));
-    s2_put16(out + 2, strata::kernels::f16_from_f32(q81_finite_host(sum)));
+    s2_put16(out + 0, strata::kernels::f16_from_f32(clamp606 ? q81_finite_host(d) : d));
+    s2_put16(out + 2, strata::kernels::f16_from_f32(clamp606 ? q81_finite_host(sum) : sum));
+}
+
+static void q81_block_host(const float* xb, uint8_t* out, int* clamps) {
+    q81_block_from_xi(xb, out, clamps, true);
 }
 
 // How many of a block's codes the RECIPROCAL-multiply divisor would produce differently (the CPU path's form).
@@ -2578,6 +2582,146 @@ void case_quantize_q8_1(Ctx& ctx, const std::string& dir) {
     q81_arm(ctx, dir, 2560, 2, "two columns: the tail and the column stride");
     q81_arm(ctx, dir, 512, 1, "16 blocks");
     q81_arm(ctx, dir, 288, 1, "nine blocks: a partial workgroup, where the guard matters");
+}
+
+// ---- THE FUSED SwiGLU + q8_1 QUANTISER (`native_swiglu_quantize_q8_1_kernel`), the SHARED expert path's.
+//
+// **THIS ONE CANNOT BE BYTE-EXACT AGAINST THE SOURCE'S OWN FORM, and the reason is in the source**: its silu is
+// `__fdividef(gi, 1 + __expf(-gi))` - an approximate division and a FAST exponential - then `__fmul_rn`.  The
+// port computes the same form with the accurate builtins and a `precise` multiply, so its product differs from
+// the CUDA's in the last ulp, and a product one ulp from a rounding boundary flips a code.  So the case does two
+// separate things:
+//
+//   1. ORDINARY data - nothing near a tie - must match a host oracle BYTE FOR BYTE.  That is what verifies the
+//      layout, the butterfly order, the tie rule, and above all the fact that this kernel does NOT clamp:
+//      `native_mmvq.cu`'s swiglu quantiser stores `make_half2(d, sum)` raw while `q8_1_store` - the IQ path's
+//      quantiser - clamps both.  A block whose products are 3000.0 each has a scale past fp16 range AND a sum
+//      past it, so the two rules store visibly different bytes: inf against 65504.
+//   2. TIE-CRITICAL data must fall inside a ONE-ULP ENVELOPE: every device code has to equal the oracle's code
+//      for the unperturbed product, or for that product moved by one ulp in either direction.  That is a real
+//      check - a wrong butterfly order, a missing clamp switch or a different tie rule breaks it - and it is the
+//      strongest claim available without reproducing a hardware exponential.
+static float swiglu_host(float g, float u) {
+    const float s = g / (1.0f + std::exp(-g));
+    return s * u;
+}
+
+static void q81_codes_unclamped(const float* xi, int* codes) {
+    float amax = 0.0f;
+    for (int l = 0; l < 32; ++l) amax = std::max(amax, std::fabs(xi[l]));
+    for (int l = 0; l < 32; ++l) {
+        if (amax == 0.0f) {
+            codes[l] = 0;
+            continue;
+        }
+        float r = q81_roundf_host(xi[l] / (amax / 127.0f));
+        r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+        codes[l] = (int) r;
+    }
+}
+
+static void swiglu_q81_arm(Ctx& ctx, const std::string& dir, int n_in, int ncols, int pattern, const char* what) {
+    const size_t n = (size_t) n_in * (size_t) ncols;
+    std::vector<float> gate_(n), up_(n);
+    for (size_t i = 0; i < n; ++i) {
+        const int b = (int) (i / 32), l = (int) (i % 32);
+        if (pattern == 0) {                                     // ordinary
+            gate_[i] = 0.5f * (float) (l % 7) - 1.5f;
+            up_[i] = 0.25f * (float) (1 + (l % 5)) * (((l % 3) == 0) ? -1.0f : 1.0f);
+        } else if (pattern == 1) {                              // both the scale and the sum past fp16 range
+            gate_[i] = 3000.0f;
+            up_[i] = 3000.0f;
+        } else {                                                // products engineered to sit on ties
+            const float target = (l == 0) ? 30.0f : (30.0f * ((float) (l % 15) + 0.5f) / 127.0f);
+            const float g = 0.25f * (float) (1 + (l % 6));
+            gate_[i] = g;
+            up_[i] = (target / swiglu_host(g, 1.0f)) * (float) (1 + (b % 2));
+        }
+    }
+    std::vector<float> xi(n);
+    for (size_t i = 0; i < n; ++i) xi[i] = swiglu_host(gate_[i], up_[i]);
+
+    const size_t n_blocks = (size_t) ncols * (size_t) (n_in / 32);
+    std::vector<uint8_t> want(n_blocks * 36, 0);
+    int clamps[2] = {0, 0};
+    for (size_t b = 0; b < n_blocks; ++b) {
+        q81_block_from_xi(xi.data() + b * 32, want.data() + b * 36, clamps, /*clamp606=*/false);
+    }
+
+    Buf b_g = ctx.alloc(gate_.size() * 4u), b_u = ctx.alloc(up_.size() * 4u);
+    Buf b_y = ctx.alloc(want.size() + 64u);
+    ctx.write(b_g, gate_.data(), gate_.size() * 4u);
+    ctx.write(b_u, up_.data(), up_.size() * 4u);
+    std::vector<uint8_t> sink(want.size() + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int ncols; } pc{n_in, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/swiglu_quantize_q8_1.spv", 3, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_g, &b_u, &b_y}, &pc, sizeof(pc), (uint32_t) (ncols * ((n_in + 255) / 256)));
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    int bad = 0, guard_bad = 0;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        for (int t = 0; t < 36; ++t) {
+            if (img[b * 36 + (size_t) t] != want[b * 36 + (size_t) t]) ++bad;
+        }
+    }
+    for (size_t i = want.size(); i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++guard_bad;
+    }
+    int env_viol = 0, flips = 0;
+    std::vector<float> up1(32), dn1(32);
+    std::vector<int> c0(32), cp(32), cm(32);
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const float* xb = xi.data() + b * 32;
+        q81_codes_unclamped(xb, c0.data());
+        for (int l = 0; l < 32; ++l) {
+            for (int j = 0; j < 32; ++j) {
+                up1[(size_t) j] = xb[j];
+                dn1[(size_t) j] = xb[j];
+            }
+            up1[(size_t) l] = std::nextafter(xb[l], INFINITY);
+            dn1[(size_t) l] = std::nextafter(xb[l], -INFINITY);
+            q81_codes_unclamped(up1.data(), cp.data());
+            q81_codes_unclamped(dn1.data(), cm.data());
+            const int got = (int) (int8_t) img[b * 36 + 4 + (size_t) l];
+            if (got != c0[(size_t) l]) ++flips;
+            if (got != c0[(size_t) l] && got != cp[(size_t) l] && got != cm[(size_t) l]) ++env_viol;
+        }
+    }
+    char label[160];
+    switch (pattern) {
+    case 1: std::snprintf(label, sizeof label, "swiglu_quantize_q8_1 (%d blocks, %s)", (int) n_blocks, what); break;
+    default: std::snprintf(label, sizeof label, "swiglu_quantize_q8_1 n_in=%d ncols=%d (%s)", n_in, ncols, what); break;
+    }
+    if (pattern == 2) {
+        std::printf("      tie data: codes differing from the unperturbed oracle %d of %d, codes outside the "
+                    "1-ulp envelope %d | blocks whose scale/sum passed fp16 range %d/%d\n",
+                    flips, (int) (n_blocks * 32), env_viol, clamps[0], clamps[1]);
+        verdict(label, env_viol == 0 && guard_bad == 0, env_viol + guard_bad, (int) (n_blocks * 32), 0.0,
+                "codes outside the 1-ulp envelope (or guard bytes moved)");
+    } else {
+        std::printf("      blocks whose scale/sum passed fp16 range: %d/%d (this kernel stores them RAW - no "
+                    "#606 clamp; the IQ path's quantiser would store 65504) | differing bytes %d\n",
+                    clamps[0], clamps[1], bad);
+        verdict(label, bad == 0 && guard_bad == 0, bad + guard_bad, (int) (n_blocks * 36), 0.0,
+                "differing bytes (36-byte blocks + guard)");
+    }
+    ctx.free(b_g);
+    ctx.free(b_u);
+    ctx.free(b_y);
+}
+
+void case_swiglu_quantize_q8_1(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "swiglu_quantize_q8_1.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("swiglu_quantize_q8_1", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    swiglu_q81_arm(ctx, dir, 2560, 1, 0, "ordinary data, byte-exact");
+    swiglu_q81_arm(ctx, dir, 288, 1, 0, "a partial workgroup");
+    swiglu_q81_arm(ctx, dir, 2560, 2, 1, "products past fp16 range: the unclamped store");
+    swiglu_q81_arm(ctx, dir, 2560, 1, 2, "products on ties: the 1-ulp envelope");
 }
 
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
@@ -4270,6 +4414,7 @@ int main(int argc, char** argv) {
     case_s2expert_tier(ctx, dir);
     case_iq1m_mmvq(ctx, dir);
     case_quantize_q8_1(ctx, dir);
+    case_swiglu_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);
     case_bf16_mmvf(ctx, dir);
     case_bf16_mmvf_multi(ctx, dir);

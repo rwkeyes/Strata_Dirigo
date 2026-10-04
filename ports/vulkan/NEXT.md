@@ -37,11 +37,18 @@ NEXT, in order:
    gated, with `common/iq1m_dot.glsl`, the grid table generated from the engine by `tools/gen-iq1s-grid.py`
    (the gate now fails if it is stale), and three cases over sub-width and above-width part counts plus two
    columns. NEXT IN THIS WAVE, in this order:
-   (a) the q8_1 quantizer pair - STARTED: `quantize_q8_1.comp` (the plain one) is in and gated byte-exactly,
-       including the #606 clamps and the tie rule; `native_swiglu_quantize_q8_1_kernel` is the other half and is
-       NOT ported. It differs from the plain one in the SOURCE, not just in its input: it has no `q8_1_finite`
-       clamp on `d` or the sum, and its silu is `__fdividef`/`__expf` (fast-math), so its input values are not
-       reproducible either - it needs the code-disagreement measurement the router case uses, not byte-exactness.
+   (a) the q8_1 quantizer pair - **DONE**: `quantize_q8_1.comp` (the IQ path's, clamped) and
+       `swiglu_quantize_q8_1.comp` (the shared expert path's, fused silu+quantize) are both in the build and gated.
+       TWO FINDINGS FROM IT, both about the ENGINE rather than the port:
+       * **THE ENGINE HAS ONE ACTIVATION QUANTISER THAT CLAMPS AND ONE THAT DOES NOT.**  `q8_1_store`
+         (iq_kernels.cu, used by `quantize_q8_1_kernel` and `swiglu_q8_1_entries_kernel`) clamps `d` and the sum
+         to the largest finite half - #606 - while `native_swiglu_quantize_q8_1_kernel` (native_mmvq.cu) stores
+         `make_half2(d, sum)` RAW, and IT IS THE ONE THE SHARED EXPERT PATH CALLS (src/kernels/cuda/shared_expert.cu,
+         two sites).  So a shared-expert block whose scale or sum passes fp16 range stores inf where the IQ path
+         stores 65504, and the dot that reads it then computes inf * 0.  The port carries both rules as the source
+         has them, with the difference at the call site (`clamp_606`), and the case measures a block that hits it
+         (products of 3000.0: both the scale and the sum past range).  Worth an upstream question.
+       * **THE DIVISION IS THE DRIVER'S.**  See (a2) - measured, and still unresolved.
    (a2) **A DECISION WORTH TAKING DELIBERATELY: which division the quantiser uses.** The port writes the source's
        `roundf(xi / d)`. MEASURED on RADV: of 2560 codes, 2184 match a correctly rounded division and 120 match
        `roundf(x*(127/amax))` - i.e. the driver's `/` is not correctly rounded, and the engine's own CPU AVX512
@@ -49,6 +56,10 @@ NEXT, in order:
        portable, but the codes it produces for a tie can differ between vendors. Writing the reciprocal form
        explicitly would make it deterministic everywhere and match the CPU path; it would also stop matching the
        CUDA source's expression. Unresolved on purpose - it needs a decision, not a default.
+   (a3) The swiglu quantiser's silu is `__fdividef`/`__expf` in the source and cannot be reproduced off the CUDA
+       hardware, so its case verifies byte-exactness on ordinary data and a **1-ulp envelope** on tie-critical
+       data. Measured with every product on a tie: 640 of 2560 codes differ from the unperturbed oracle, 0 fall
+       outside the envelope. On ordinary data, 0 bytes differ.
    (b) the grouped `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier
        actually calls, built on the per-format row dot.
    (c) the remaining formats one shader each (Q5_K, Q2_0, Q3_K, IQ4_XS, Q4_K, Q6_K, and the small
