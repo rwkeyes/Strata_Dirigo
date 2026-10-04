@@ -1,0 +1,85 @@
+// ports/vulkan/shaders/native_gu_iq2s.comp - the GROUPED expert gate/up, one format (IQ2_S) instantiated.
+//
+// `native_gu_kernel<TG>` (src/kernels/cuda/iq_kernels.cu:1069), the shape the expert tier actually launches: a
+// list of GROUPS (distinct experts hit by this batch), each with a range of ENTRIES (which token hit it), and the
+// weights of each group read in place from the pack.  IQ2_S is the resident model's most common gate/up format
+// (20 of 48 layers); the other five are this file with a different dot include and three constants.
+//
+// THE ONE INTERFACE DECISION, and it is the reason this file is not a transcription:
+//
+//     the source passes `grp_ptr` - an array of DEVICE POINTERS (`const unsigned long long*`), one per group,
+//     each pointing at that expert's weights inside the pack.
+//
+// Vulkan has no device pointers.  The options were (a) one weights storage buffer plus a per-group byte OFFSET
+// table, or (b) `VK_EXT_descriptor_indexing` with one descriptor per expert.  The port takes (a): it needs no
+// optional device feature, it works on every Vulkan 1.1 driver, and it is one extra `uint` per group in a buffer
+// the caller builds anyway.  (b) buys nothing here - the buffer is the same size either way - and would spend a
+// device-extension requirement on it, which is the kind of trade this port has refused everywhere else (no
+// `shaderInt64`, no subgroup ops in reductions, no vendor intrinsics).
+//
+// `grp_off[g] + off` is therefore `grp_ptr[g] + off` verbatim, and everything else is the source's:
+//   * rows are 2*n_ff (the first n_ff are gate, the rest up);
+//   * a group's weights are at `(is_up ? up_off : 0) + r*gu_row` inside that group's blob;
+//   * `grp_start[g] .. grp_start[g+1]` is that group's entry range and `ent_tok[e]` the token of entry e, so the
+//     activation row is `ent_tok[e] * (n_embd/32)` q8_1 blocks;
+//   * outputs are entry-major: `gate[e*n_ff + r]` / `up[e*n_ff + r]`.
+//
+// THE GROUP COUNT IS A DEVICE VALUE, so the grid cannot be sized to it: the source strides
+// (`for (g = blockIdx.y; g < ng; g += gridDim.y)`) and so does this, with the caller free to launch fewer blocks
+// in y than there are groups.  A workgroup (not a warp) owns a row here, which is the port's shape everywhere;
+// the entry loop is inside the group loop, and its bounds are workgroup-uniform, so the reduction's barriers stay
+// legal.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;        // the expert weights
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;      // the activation blocks
+layout(set = 0, binding = 2, std430) readonly buffer G { uint v[]; } iq2s_grid_b;
+layout(set = 0, binding = 3, std430) readonly buffer GO { uint v[]; } grp_off;      // per-group byte offset
+layout(set = 0, binding = 4, std430) readonly buffer GS { int v[]; } grp_start;     // n_groups + 1 entries
+layout(set = 0, binding = 5, std430) readonly buffer NG { int v[]; } n_groups;
+layout(set = 0, binding = 6, std430) readonly buffer ET { int v[]; } ent_tok;
+layout(set = 0, binding = 7, std430) buffer OG { float v[]; } gate;
+layout(set = 0, binding = 8, std430) buffer OU { float v[]; } up;
+
+#include "common/wg_reduce.glsl"
+#include "common/iq2s_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_embd; int n_ff; int gu_row; int up_off; } pc;
+
+const uint IQ2S_BLOCK = 82u;                     // bytes per 256 values
+const uint IQ2S_PARTS = 8u;
+
+void main() {
+    const uint n_ff = uint(pc.n_ff);
+    const uint row = gl_WorkGroupID.x;
+    if (row >= 2u * n_ff) return;                // workgroup-uniform: the barriers stay legal
+    const bool is_up = row >= n_ff;
+    const uint r = is_up ? row - n_ff : row;
+    const uint off = (is_up ? uint(pc.up_off) : 0u) + r * uint(pc.gu_row);
+    const uint nb = uint(pc.n_embd) / 256u;      // IQ2_S blocks per row
+    const uint xb = uint(pc.n_embd) / 32u;       // q8_1 blocks per token
+    const uint lid = gl_LocalInvocationIndex;
+    const uint ng = uint(n_groups.v[0]);
+
+    for (uint g = gl_WorkGroupID.y; g < ng; g += gl_NumWorkGroups.y) {
+        const uint wrow = grp_off.v[g] + off;
+        const int e0 = grp_start.v[g], e1 = grp_start.v[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const uint arow = uint(ent_tok.v[e]) * xb * 36u;
+            float acc = 0.0;
+            for (uint k = lid; k < nb * IQ2S_PARTS; k += gl_WorkGroupSize.x) {
+                acc += iq2s_dot(wrow + (k / IQ2S_PARTS) * IQ2S_BLOCK, arow + k * 36u, 2u * (k % IQ2S_PARTS));
+            }
+            const float s = wg_sum(acc);
+            if (lid == 0u) {
+                const uint idx = uint(e) * n_ff + r;
+                if (is_up) up.v[idx] = s;
+                else gate.v[idx] = s;
+            }
+        }
+    }
+}

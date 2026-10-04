@@ -3681,6 +3681,238 @@ void case_iq4xs_mmvq(Ctx& ctx, const std::string& dir) {
     iq4xs_arm(ctx, dir, 256, 1, 1, "one block");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// THE GROUPED EXPERT KERNELS: `native_gu_kernel<TG>` and `native_down_kernel<TD>` - the shape the expert tier
+// actually launches, and the last workstream of this wave.
+//
+// What these cases test is the GROUPING, not the dots: the per-format dots were already gated by their own cases,
+// so the oracles here call those same host functions and the comparison isolates
+//   * the group/entry walk (`grp_start[g] .. grp_start[g+1]`, including an EMPTY group and the grid-y stride),
+//   * the per-group weight offset (the port's `grp_off[g]` replacing the source's `grp_ptr[g]` device pointer),
+//   * the row addressing inside a blob (`r*gu_row` for gate, `up_off + r*gu_row` for up) and the entry-major
+//     output indexing (`gate[e*n_ff + r]`, `up[e*n_ff + r]`),
+//   * for the down side, that the activation row is the ENTRY index (hq, one row per entry) while the output row
+//     is `ent_dst[e]` (a token) - two different indices that are easy to swap.
+//
+// THE ARMS DELIBERATELY INCLUDE A STRIDE CASE.  The group count lives on the device, so the source launches fewer
+// blocks in y than there are groups and strides - a case with `grid.y == n_groups` cannot tell whether the stride
+// is implemented, and the empty group (grp_start[g] == grp_start[g+1]) cannot either.
+struct NativeGroupedCase {
+    int n_embd, n_ff;
+    std::vector<int> grp_start;      // n_groups + 1 entries
+    std::vector<int> ent;            // entries -> token (gu) / token (down: the DESTINATION)
+};
+
+static void native_gu_arm(Ctx& ctx, const std::string& dir, const NativeGroupedCase& c, int n_tok, int grid_y,
+                          const char* what) {
+    const int nb = c.n_embd / 256;
+    const int gu_row = nb * 82;
+    const int up_off = c.n_ff * gu_row;
+    const int blob = 2 * c.n_ff * gu_row;
+    const int n_groups = (int) c.grp_start.size() - 1;
+
+    std::vector<uint8_t> w((size_t) n_groups * (size_t) blob, 0);
+    for (int g = 0; g < n_groups; ++g) {
+        std::vector<uint8_t> one = iq2s_fill_blob((size_t) (2 * c.n_ff), nb, c.n_embd);
+        std::memcpy(w.data() + (size_t) g * (size_t) blob, one.data(), one.size());
+    }
+    const int blocks_per_tok = c.n_embd / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(n_tok * blocks_per_tok);
+
+    std::vector<uint32_t> grp_off((size_t) n_groups);
+    for (int g = 0; g < n_groups; ++g) grp_off[(size_t) g] = (uint32_t) g * (uint32_t) blob;
+
+    const size_t n_out = (size_t) c.grp_start.back() * (size_t) c.n_ff;
+    std::vector<double> want_gate(n_out, 0.0), want_up(n_out, 0.0), abs_gate(n_out, 0.0), abs_up(n_out, 0.0);
+    for (int g = 0; g < n_groups; ++g) {
+        for (int e = c.grp_start[(size_t) g]; e < c.grp_start[(size_t) g + 1]; ++e) {
+            const size_t arow = (size_t) c.ent[(size_t) e] * (size_t) blocks_per_tok * 36u;
+            for (int r = 0; r < c.n_ff; ++r) {
+                double gacc = 0.0, uacc = 0.0, gabs = 0.0, uabs = 0.0;
+                for (int k = 0; k < nb * 8; ++k) {
+                    const size_t ablk = arow + (size_t) k * 36u;
+                    const int iqs = 2 * (k % 8);
+                    const double gv = iq2s_dot_host(w, (size_t) g * (size_t) blob + (size_t) r * (size_t) gu_row +
+                                                           (size_t) (k / 8) * 82, act, ablk, iqs);
+                    const double uv = iq2s_dot_host(w, (size_t) g * (size_t) blob + (size_t) up_off +
+                                                           (size_t) r * (size_t) gu_row + (size_t) (k / 8) * 82,
+                                                    act, ablk, iqs);
+                    gacc += gv;
+                    uacc += uv;
+                    gabs += std::fabs(gv);
+                    uabs += std::fabs(uv);
+                }
+                const size_t idx = (size_t) e * (size_t) c.n_ff + (size_t) r;
+                want_gate[idx] = gacc;
+                want_up[idx] = uacc;
+                abs_gate[idx] = gabs;
+                abs_up[idx] = uabs;
+            }
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_o = ctx.alloc(grp_off.size() * 4u);
+    Buf b_s = ctx.alloc(c.grp_start.size() * 4u);
+    Buf b_ng = ctx.alloc(4u);
+    Buf b_e = ctx.alloc(c.ent.size() * 4u);
+    Buf b_g = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_og = ctx.alloc(n_out * 4u + 64u), b_ou = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_o, grp_off.data(), grp_off.size() * 4u);
+    ctx.write(b_s, c.grp_start.data(), c.grp_start.size() * 4u);
+    const int ngv = n_groups;
+    ctx.write(b_ng, &ngv, 4u);
+    ctx.write(b_e, c.ent.data(), c.ent.size() * 4u);
+    ctx.write(b_g, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    std::vector<uint8_t> sink(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_og, sink.data(), sink.size());
+    ctx.write(b_ou, sink.data(), sink.size());
+    struct { int n_embd; int n_ff; int gu_row; int up_off; } pc{c.n_embd, c.n_ff, gu_row, up_off};
+    VkPipeline p = ctx.pipeline(dir + "/native_gu_iq2s.spv", 9, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_o, &b_s, &b_ng, &b_e, &b_og, &b_ou}, &pc, sizeof(pc),
+                 (uint32_t) (2 * c.n_ff), (uint32_t) grid_y);
+
+    std::vector<uint8_t> img_g(sink.size(), 0), img_u(sink.size(), 0);
+    ctx.read(b_og, img_g.data(), img_g.size());
+    ctx.read(b_ou, img_u.data(), img_u.size());
+    const float* gg = reinterpret_cast<const float*>(img_g.data());
+    const float* uu = reinterpret_cast<const float*>(img_u.data());
+    int bad = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        const double rg = std::fabs((double) gg[i] - want_gate[i]) / gemv_bound(want_gate[i], abs_gate[i], 1e-6);
+        const double ru = std::fabs((double) uu[i] - want_up[i]) / gemv_bound(want_up[i], abs_up[i], 1e-6);
+        worst = std::max(worst, std::max(rg, ru));
+        if (!(rg <= 1.0) || !(ru <= 1.0)) ++bad;
+        mass += std::fabs(want_gate[i]) + std::fabs(want_up[i]);
+    }
+    for (size_t i = n_out * 4u; i < img_g.size(); ++i) {
+        if (img_g[i] != 0xC3 || img_u[i] != 0xC3) ++bad;
+    }
+    char label[192];
+    std::snprintf(label, sizeof label, "native_gu_iq2s (groups=%d, entries=%d, n_ff=%d, grid.y=%d, %s)", n_groups,
+                  c.grp_start.back(), c.n_ff, grid_y, what);
+    std::printf("      gate[0] = %.6g (want %.6g) | up[0] = %.6g (want %.6g) | worst err/tol %.3g | mass %.6g\n",
+                (double) gg[0], want_gate[0], (double) uu[0], want_up[0], worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live, bad, (int) n_out * 2, worst, "values outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_o); ctx.free(b_s); ctx.free(b_ng); ctx.free(b_e); ctx.free(b_g);
+    ctx.free(b_og); ctx.free(b_ou);
+}
+
+static void native_down_arm(Ctx& ctx, const std::string& dir, const NativeGroupedCase& c, int grid_y,
+                            const char* what) {
+    const int nb = c.n_ff / 32;
+    const int d_row = nb * 18;
+    const int blob = d_row * c.n_embd;
+    const int n_groups = (int) c.grp_start.size() - 1;
+    const int n_entries = c.grp_start.back();
+    const int n_dst = 1 + *std::max_element(c.ent.begin(), c.ent.begin() + n_entries);
+
+    std::vector<uint8_t> w((size_t) n_groups * (size_t) blob, 0);
+    for (int g = 0; g < n_groups; ++g) {
+        std::vector<uint8_t> one = iq4nl_fill_blob((size_t) c.n_embd, nb, c.n_ff);
+        std::memcpy(w.data() + (size_t) g * (size_t) blob, one.data(), one.size());
+    }
+    std::vector<uint8_t> hq = iq1m_fill_act((size_t) n_entries * (size_t) nb);
+    std::vector<uint32_t> grp_off((size_t) n_groups);
+    for (int g = 0; g < n_groups; ++g) grp_off[(size_t) g] = (uint32_t) g * (uint32_t) blob;
+
+    const size_t n_out = (size_t) n_dst * (size_t) c.n_embd;
+    std::vector<double> want(n_out, 0.0), abs_w(n_out, 0.0);
+    for (int g = 0; g < n_groups; ++g) {
+        for (int e = c.grp_start[(size_t) g]; e < c.grp_start[(size_t) g + 1]; ++e) {
+            const size_t arow = (size_t) e * (size_t) nb * 36u;
+            for (int r = 0; r < c.n_embd; ++r) {
+                double acc = 0.0, a = 0.0;
+                for (int k = 0; k < nb * 2; ++k) {
+                    const size_t blk = (size_t) (k / 2);
+                    double scale = 0.0;
+                    const int sumi = iq4nl_sumi_host(w, (size_t) g * (size_t) blob + (size_t) r * (size_t) d_row +
+                                                            blk * 18, hq, arow + blk * 36, 2 * (k % 2), &scale);
+                    const double v = scale * (double) sumi;
+                    acc += v;
+                    a += std::fabs(v);
+                }
+                const size_t idx = (size_t) c.ent[(size_t) e] * (size_t) c.n_embd + (size_t) r;
+                want[idx] = acc;
+                abs_w[idx] = a;
+            }
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(hq.size());
+    Buf b_o = ctx.alloc(grp_off.size() * 4u);
+    Buf b_s = ctx.alloc(c.grp_start.size() * 4u);
+    Buf b_ng = ctx.alloc(4u);
+    Buf b_e = ctx.alloc(c.ent.size() * 4u);
+    Buf b_y = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, hq.data(), hq.size());
+    ctx.write(b_o, grp_off.data(), grp_off.size() * 4u);
+    ctx.write(b_s, c.grp_start.data(), c.grp_start.size() * 4u);
+    const int ngv = n_groups;
+    ctx.write(b_ng, &ngv, 4u);
+    ctx.write(b_e, c.ent.data(), c.ent.size() * 4u);
+    std::vector<uint8_t> sink(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_embd; int n_ff; int d_row; int down_off; } pc{c.n_embd, c.n_ff, d_row, 0};
+    VkPipeline p = ctx.pipeline(dir + "/native_down_iq4nl.spv", 7, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_o, &b_s, &b_ng, &b_e, &b_y}, &pc, sizeof(pc), (uint32_t) c.n_embd,
+                 (uint32_t) grid_y);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        const double ratio = std::fabs((double) got[i] - want[i]) / gemv_bound(want[i], abs_w[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_out * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[192];
+    std::snprintf(label, sizeof label, "native_down_iq4nl (groups=%d, entries=%d, n_embd=%d, grid.y=%d, %s)",
+                  n_groups, n_entries, c.n_embd, grid_y, what);
+    std::printf("      out[0] = %.6g (want %.6g) | worst err/tol %.3g | mass %.6g\n", (double) got[0], want[0],
+                worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live, bad, (int) n_out, worst, "values outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_o); ctx.free(b_s); ctx.free(b_ng); ctx.free(b_e); ctx.free(b_y);
+}
+
+void case_native_grouped(Ctx& ctx, const std::string& dir) {
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("native_grouped", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    // three groups, the last one with NO entries (the empty range case), and a token hit by two different groups
+    NativeGroupedCase gu{2560, 8, {0, 2, 5, 5}, {0, 1, 3, 3, 2}};
+    if (have(dir, "native_gu_iq2s.spv")) {
+        native_gu_arm(ctx, dir, gu, 4, 3, "grid.y equals the group count");
+        native_gu_arm(ctx, dir, gu, 4, 1, "grid.y BELOW the group count: the stride is what is under test");
+        native_gu_arm(ctx, dir, gu, 4, 8, "grid.y above the group count");
+    } else {
+        skip("native_gu_iq2s", "shader absent from this build");
+    }
+    // n_embd 8 output rows, n_ff 2560 input: entries 0..4, and two entries writing the SAME token
+    NativeGroupedCase dn{8, 2560, {0, 2, 5, 5}, {0, 1, 3, 3, 2}};
+    if (have(dir, "native_down_iq4nl.spv")) {
+        native_down_arm(ctx, dir, dn, 3, "grid.y equals the group count");
+        native_down_arm(ctx, dir, dn, 1, "grid.y BELOW the group count: the stride");
+    } else {
+        skip("native_down_iq4nl", "shader absent from this build");
+    }
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -5376,6 +5608,7 @@ int main(int argc, char** argv) {
     case_q2_0_mmvq(ctx, dir);
     case_iq3s_mmvq(ctx, dir);
     case_iq4xs_mmvq(ctx, dir);
+    case_native_grouped(ctx, dir);
     case_quantize_q8_1(ctx, dir);
     case_swiglu_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);

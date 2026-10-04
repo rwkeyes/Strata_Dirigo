@@ -66,8 +66,41 @@ NEXT, in order:
        hardware, so its case verifies byte-exactness on ordinary data and a **1-ulp envelope** on tie-critical
        data. Measured with every product on a tie: 640 of 2560 codes differ from the unperturbed oracle, 0 fall
        outside the envelope. On ordinary data, 0 bytes differ.
-   (b) the grouped `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier
-       actually calls, built on the per-format row dot.
+   (b) **the grouped `native_gu` / `native_down` - DONE for the two formats that cover the most layers**
+       (2026-10-04; 5 arms; RADV and radeon green, llvmpipe green).  This is the shape the expert tier actually
+       launches: a list of GROUPS (the experts this batch hit), each with a range of ENTRIES (which token hit it).
+       * `shaders/native_gu_iq2s.comp` (`native_gu_kernel<TG>` with IQ2_S, the model's most common gate/up format
+         at 20 layers) and `shaders/native_down_iq4nl.comp` (`native_down_kernel<TD>` with IQ4_NL, the down format
+         of 39).  The other four instantiations are the same file with a different dot include and three
+         constants, exactly as the six per-format row kernels are.
+       * **THE ONE INTERFACE DECISION: `grp_ptr` IS AN ARRAY OF DEVICE POINTERS AND VULKAN HAS NONE.** The port
+         takes one weights storage buffer plus a per-group BYTE OFFSET table (`grp_off[g]`), so `grp_ptr[g] + off`
+         becomes `grp_off[g] + off` and nothing else changes.  The alternative, `VK_EXT_descriptor_indexing` with
+         one descriptor per expert, buys nothing here (the buffer is the same size) and would spend a
+         device-extension requirement on it - the trade this port has refused everywhere else (no `shaderInt64`,
+         no subgroup ops in reductions, no vendor intrinsics).  Recorded at the top of `native_gu_iq2s.comp`.
+       * **THE GROUP COUNT IS A DEVICE VALUE, so the grid cannot be sized to it**: the source strides
+         (`for (g = blockIdx.y; g < ng; g += gridDim.y)`) and so does the port, which needed one harness change -
+         `Ctx::dispatch` grew an optional `groups_y` (it was x-only, "the y/z dims are 1"), used by these two
+         kernels and nothing else.  THE CASES ARM THE STRIDE THREE WAYS (grid.y = n_groups, below it, above it),
+         plus an EMPTY GROUP, because a case that only launches grid.y == n_groups cannot tell whether the stride
+         works at all.
+       * **What the cases test is the GROUPING, not the dots**: their oracles call the already-gated per-format
+         host dots, so a failure points at the group/entry walk, the per-group offset, the `r*gu_row` /
+         `up_off + r*gu_row` row addressing, the entry-major output indexing, or - on the down side - the fact
+         that the activation row is the ENTRY index (`hq`) while the destination row is `ent_dst[e]`, a TOKEN.
+         That last swap is the one worth a case: both indices are small integers and either compiles.
+       * **`swiglu_entries_kernel` NEEDS NO NEW SHADER.** The expert tier's non-fused silu is the port's existing
+         `swiglu_f32` (`(x / (1 + exp(-x))) * up`) applied to a flat entries x n_ff buffer - the same formula, and
+         its case is already gated against a double reference.  For the record the engine has THREE silu spellings
+         in this area - `swiglu_kernel` (double), `native_swiglu_kernel` (`__fdividef` + `__expf`), and
+         `swiglu_entries_kernel` (plain `/` + `__expf`) - and the port carries the double one (`swiglu_f64`) plus
+         the float one (`swiglu_f32`), both from wave 1.
+       * **WHAT REMAINS IN THIS WAVE, and it is mechanical**: the four other grouped instantiations
+         (`native_gu_iq3xxs`, `_iq3s`, `_iq4xs`, `native_down_q2_0`) and the `_multi` variants
+         (`native_gu_multi_kernel` / `native_down_multi_kernel`), which take GRP_NC entries per pass with the
+         activations staged in shared memory - the same numbers as the non-multi kernels, so the port should gate
+         them for EQUALITY against their non-multi siblings rather than against a new oracle.
    (c) **the remaining formats, one shader each - ALL SIX THAT THE RESIDENT MODEL USES ARE DONE** (2026-10-04;
        3 arms each; RADV and radeon green, llvmpipe green).  Every one of the model's 48 layers now has both
        halves of its expert path ported, format by format:

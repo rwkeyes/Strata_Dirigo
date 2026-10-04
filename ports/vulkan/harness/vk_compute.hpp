@@ -144,11 +144,12 @@ public:
     // and a push-constant block of `push_bytes` (0 = none).  Cached per (path, nbufs, push_bytes).
     VkPipeline pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t push_bytes);
 
-    // One dispatch.  `groups` is the x-dimension; the y/z dims are 1 and `local_size_x` comes from the
-    // shader's own layout() (the engine's kernels are all 1-D grids).  Submits, waits, and leaves the
-    // results visible to the host.
+    // One dispatch.  `groups` is the x-dimension and `groups_y` the y (`local_size_x` comes from the shader's
+    // own layout()).  The y dimension exists for ONE family of kernels: the grouped expert pair strides over
+    // groups in y because the group COUNT lives on the device (`for (g = blockIdx.y; g < ng; g += gridDim.y)`),
+    // so the launch cannot be sized to it - see native_gu_iq2s.comp.  Every other kernel here keeps y at 1.
     void dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
-                  uint32_t groups);
+                  uint32_t groups, uint32_t groups_y = 1);
 
 private:
     // One pipeline and everything that must be created and destroyed with it.  A key list parallel to a value

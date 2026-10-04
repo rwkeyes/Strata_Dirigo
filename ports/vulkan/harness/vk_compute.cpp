@@ -651,7 +651,7 @@ VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t p
 }
 
 void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
-                   uint32_t groups) {
+                   uint32_t groups, uint32_t groups_y) {
     // Find the pipeline layout/set that belongs to this pipeline handle.
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -697,7 +697,7 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
     if (push_bytes) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
-    vkCmdDispatch(cb, groups, 1, 1);
+    vkCmdDispatch(cb, groups, groups_y, 1);
     // Shader writes -> host reads.  Vulkan requires this barrier; without it a coherent mapping may still
     // show the pre-dispatch contents, which would read as "the kernel wrote nothing".
     VkMemoryBarrier mb{};

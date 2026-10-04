@@ -1,0 +1,62 @@
+// ports/vulkan/shaders/native_down_iq4nl.comp - the GROUPED expert down projection, one format (IQ4_NL).
+//
+// `native_down_kernel<TD>` (src/kernels/cuda/iq_kernels.cu:1155), the down half of the grouped pair.  IQ4_NL is
+// the resident model's down format on 39 of 48 layers.  Same interface decision as `native_gu_iq2s.comp` (per-group
+// byte offsets into one weights buffer instead of `grp_ptr` device pointers - see the long note there).
+//
+// WHAT DIFFERS FROM THE GATE/UP SIDE, all of it the source's:
+//   * rows are `n_embd` (the OUTPUT width) and each row is a row of the down matrix, at
+//     `down_off + r*d_row` inside the group's blob;
+//   * the row it multiplies comes from a DIFFERENT buffer - `hq`, the hidden states the SwiGLU produced, one
+//     row per ENTRY (not per token), so the activation row index is `e` itself and not `ent_tok[e]`;
+//   * the destination row is `ent_dst[e]` - the entry's token - because several entries can write the same token
+//     and their contributions are accumulated by the caller, so this kernel writes rather than adds and the
+//     output is indexed by token, not by entry.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;        // the expert weights
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;      // hq: the hidden states
+layout(set = 0, binding = 2, std430) readonly buffer GO { uint v[]; } grp_off;
+layout(set = 0, binding = 3, std430) readonly buffer GS { int v[]; } grp_start;
+layout(set = 0, binding = 4, std430) readonly buffer NG { int v[]; } n_groups;
+layout(set = 0, binding = 5, std430) readonly buffer ED { int v[]; } ent_dst;
+layout(set = 0, binding = 6, std430) buffer OO { float v[]; } y;   // NOT `out`: that is a GLSL keyword
+
+#include "common/wg_reduce.glsl"
+#include "common/iq4nl_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_embd; int n_ff; int d_row; int down_off; } pc;
+
+const uint IQ4NL_QK = 32u;
+const uint IQ4NL_IPB = 2u;
+const uint IQ4NL_BLOCK = 18u;
+
+void main() {
+    const uint n_embd = uint(pc.n_embd);
+    const uint row = gl_WorkGroupID.x;
+    if (row >= n_embd) return;                   // workgroup-uniform: the barriers stay legal
+    const uint off = uint(pc.down_off) + row * uint(pc.d_row);
+    const uint nb = uint(pc.n_ff) / IQ4NL_QK;    // IQ4_NL blocks per row (n_ff is the input width here)
+    const uint hb = uint(pc.n_ff) / 32u;         // q8_1 blocks per entry of hq
+    const uint lid = gl_LocalInvocationIndex;
+    const uint ng = uint(n_groups.v[0]);
+
+    for (uint g = gl_WorkGroupID.y; g < ng; g += gl_NumWorkGroups.y) {
+        const uint wrow = grp_off.v[g] + off;
+        const int e0 = grp_start.v[g], e1 = grp_start.v[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const uint arow = uint(e) * hb * 36u;
+            float acc = 0.0;
+            for (uint k = lid; k < nb * IQ4NL_IPB; k += gl_WorkGroupSize.x) {
+                const uint blk = k / IQ4NL_IPB;
+                acc += iq4nl_dot(wrow + blk * IQ4NL_BLOCK, arow + blk * 36u, 2u * (k % IQ4NL_IPB));
+            }
+            const float s = wg_sum(acc);
+            if (lid == 0u) y.v[uint(ent_dst.v[e]) * n_embd + row] = s;
+        }
+    }
+}
