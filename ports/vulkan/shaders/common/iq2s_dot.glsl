@@ -51,29 +51,14 @@ int iq2s_dp4a(int a, int b, int c) {
            ((a << 8) >> 24) * ((b << 8) >> 24) + (a >> 24) * (b >> 24);
 }
 
-// __vcmpne4(t, 0): 0xFF in every byte of `t` that is non-zero, 0x00 where it is zero - no carry, no sign.
-// (`out` is a GLSL KEYWORD - it is a parameter qualifier - so no local may be called that.  Same trap as `active`
-// in q8_1_store.glsl; the shaders in this port avoid the reserved words entirely.)
-int iq2s_vcmpne4_zero(int t) {
-    int mask = 0;
-    for (int b = 0; b < 4; ++b) {
-        const int shift = 8 * b;
-        mask |= ((((t >> shift) & 0xFF) != 0) ? 0xFF : 0x00) << shift;
-    }
-    return mask;
-}
-
-// __vsub4(a, b) used as a per-byte conditional negation: (g ^ s) - s with s = 0xFF (negate) or 0x00 (keep).
-int iq2s_sign_flip(int g, int s) {
-    int flipped = 0;
-    for (int b = 0; b < 4; ++b) {
-        const int shift = 8 * b;
-        const int gb = (g >> shift) & 0xFF;
-        const int sb = (s >> shift) & 0xFF;
-        flipped |= (((gb ^ sb) - sb) & 0xFF) << shift;
-    }
-    return flipped;
-}
+// __vcmpne4 / __vsub4 - the per-byte sign mask and the conditional negation - live in common/perbyte_sign.glsl,
+// because IQ3_XXS writes the identical idiom. Do not merge anything else: the two q8_1 quantisers are the same
+// quantity under two different rules and stay separate.
+// ------------------------------------------------------------------------------------------------
+// NOTE ON THE PATH: this file is inside shaders/common/, and glslc resolves an include RELATIVE TO THE
+// INCLUDING FILE - so a sibling here is named bare ("perbyte_sign.glsl"), not "common/perbyte_sign.glsl".
+// The full-relative form only works from shaders/*.comp, which is where the dotes are included from.
+#include "perbyte_sign.glsl"
 
 // C's signed division: truncate toward zero, with a positive divisor.  Written out because SPIR-V does not
 // promise the driver's OpSDiv rounds that way, and these operands are negative about half the time.
@@ -104,10 +89,10 @@ float iq2s_dot(uint wblk, uint ablk, uint iqs) {
         const int grid_lo = int(iq2s_grid_b.v[2u * gidx]);          // the low 32 bits of the grid point
         const int grid_hi = int(iq2s_grid_b.v[2u * gidx + 1u]);     // its high 32 bits
         const int sp = (signs_packed >> (8 * (l0 / 2))) & 0xFF;
-        const int signs0 = iq2s_vcmpne4_zero(((sp & 0x03) << 7) | ((sp & 0x0C) << 21));
-        const int signs1 = iq2s_vcmpne4_zero(((sp & 0x30) << 3) | ((sp & 0xC0) << 17));
-        const int grid_l = iq2s_sign_flip(grid_lo, signs0);
-        const int grid_h = iq2s_sign_flip(grid_hi, signs1);
+        const int signs0 = perbyte_ne_zero(((sp & 0x03) << 7) | ((sp & 0x0C) << 21));
+        const int signs1 = perbyte_ne_zero(((sp & 0x30) << 3) | ((sp & 0xC0) << 17));
+        const int grid_l = perbyte_sign_flip(grid_lo, signs0);
+        const int grid_h = perbyte_sign_flip(grid_hi, signs1);
         const uint ub = ablk + 4u + 4u * uint(l0);
         const int u0 = iq2s_act_int4(ub);
         const int u1 = iq2s_act_int4(ub + 4u);

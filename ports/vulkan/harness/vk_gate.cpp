@@ -2888,6 +2888,159 @@ void case_iq2s_mmvq(Ctx& ctx, const std::string& dir) {
     iq2s_arm(ctx, dir, 256, 1, 1, "one block");
 }
 
+// -----------------------------------------------------------------------------------------------------------
+// IQ3_XXS: the resident model's SECOND most common expert gate/up format (17 of 48 layers, behind IQ2_S's 20).
+//
+// The oracle transcribes `vec_dot_iq3_xxs_q8_1`.  It carries its OWN copy of the two per-byte helpers (the
+// kernel's live in common/perbyte_sign.glsl): an oracle that shares a helper with the thing it checks agrees with
+// it when the helper is wrong, which is the one failure the case exists to catch.
+//
+// `unpack_ksigns` is the interesting step and the case is built to exercise it: the byte is made EVEN-parity
+// before its bits are read as signs, so the blob's aux words are spread across both parities and all four
+// 7-bit-shifted positions.
+static int iq3xxs_unpack_ksigns_host(uint8_t v) {
+    const uint32_t parity = (uint32_t) (__builtin_popcount((unsigned) v) & 1);
+    const uint32_t s = (uint32_t) v ^ (parity << 7);
+    return (int) (s * 0x01010101u);
+}
+
+static int perbyte_ne_zero_host(int t) {
+    int mask = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int sh = 8 * i;
+        mask |= ((((t >> sh) & 0xFF) != 0) ? 0xFF : 0x00) << sh;
+    }
+    return mask;
+}
+
+static int perbyte_sign_flip_host(int g, int s) {
+    int flipped = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int sh = 8 * i;
+        const int gb = (g >> sh) & 0xFF;
+        const int sb = (s >> sh) & 0xFF;
+        flipped |= (((gb ^ sb) - sb) & 0xFF) << sh;
+    }
+    return flipped;
+}
+
+static double iq3xxs_dot_host(const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                              size_t ablk, int iqs) {
+    const size_t QS = wblk + 2;
+    uint8_t q3[8];
+    for (int i = 0; i < 8; ++i) q3[i] = w[QS + (size_t) (4 * iqs) + (size_t) i];
+    const uint32_t aux32 = (uint32_t) iq2s_rd4(w, QS + 64 + (size_t) (2 * iqs));
+    int sumi = 0;
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int gx = (int) strata::vkport::kIq3xxsGrid[q3[l0 + 0]];
+        const int gy = (int) strata::vkport::kIq3xxsGrid[q3[l0 + 1]];
+        const int ks = iq3xxs_unpack_ksigns_host((uint8_t) (aux32 >> (7 * l0 / 2)));
+        const int grid_l = perbyte_sign_flip_host(gx, perbyte_ne_zero_host(ks & 0x08040201));
+        const int grid_h = perbyte_sign_flip_host(gy, perbyte_ne_zero_host(ks & 0x80402010));
+        const size_t ub = ablk + 4 + (size_t) (4 * l0);
+        const int u0 = iq2s_rd4(act, ub), u1 = iq2s_rd4(act, ub + 4);
+        sumi = iq1m_dp4a(grid_l, u0, sumi);
+        sumi = iq1m_dp4a(grid_h, u1, sumi);
+    }
+    const int ls = (int) (aux32 >> 28);
+    sumi = iq2s_div_trunc_host(ls * sumi + iq2s_div_trunc_host(sumi, 2), 2);
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    return ((double) (float) (dw * da)) * (double) sumi;
+}
+
+static std::vector<uint8_t> iq3xxs_fill_blob(size_t n_out, int nb, int n_in) {
+    const size_t row_bytes = (size_t) nb * 98;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 98;
+            const float mag = (b % 4 == 0) ? 0.00390625f : 0.125f * (float) (1 + (b % 3));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 3 == 1) ? -mag : mag));
+            // qs[0..63]: the grid index bytes, eight per part at 4*iqs
+            for (int i = 0; i < 64; ++i) blk[2 + i] = (uint8_t) ((i * 29 + b * 17 + (int) r * 7 + 11) & 0xFF);
+            // qs[64..95]: the aux words, four bytes per part at 64 + 2*iqs - top nibble is the sub-scale, the rest
+            // carries the signs, so these are left to vary freely (both parities, every mask bit)
+            for (int i = 0; i < 32; ++i) blk[66 + i] = (uint8_t) ((i * 43 + b * 23 + (int) r * 31 + 5) & 0xFF);
+        }
+    }
+    (void) n_in;
+    return w;
+}
+
+static void iq3xxs_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 98;
+    const std::vector<uint8_t> w = iq3xxs_fill_blob((size_t) n_out, nb, n_in);
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 8; ++k) {
+                const double v = iq3xxs_dot_host(w, wrow + (size_t) (k / 8) * 98, act, arow + (size_t) k * 36,
+                                                 2 * (k % 8));
+                acc += v;
+                abs_sum += std::fabs(v);
+            }
+            want[(size_t) c * (size_t) n_out + r] = acc;
+            want_abs[(size_t) c * (size_t) n_out + r] = abs_sum;
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_g = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_g, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq3xxs_mmvq.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "iq3xxs_mmvq (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live, bad, (int) n_y, worst, "rows outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y);
+}
+
+void case_iq3xxs_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq3xxs_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("iq3xxs_mmvq", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    iq3xxs_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
+    iq3xxs_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
+    iq3xxs_arm(ctx, dir, 256, 1, 1, "one block");
+}
+
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
 //
 // The FUSION is checked structurally in the gate's census (the SPIR-V must carry a fused Fma) because it is not
@@ -4578,6 +4731,7 @@ int main(int argc, char** argv) {
     case_s2expert_tier(ctx, dir);
     case_iq1m_mmvq(ctx, dir);
     case_iq2s_mmvq(ctx, dir);
+    case_iq3xxs_mmvq(ctx, dir);
     case_quantize_q8_1(ctx, dir);
     case_swiglu_quantize_q8_1(ctx, dir);
     case_s2_gemv_q8(ctx, dir);

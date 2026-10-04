@@ -68,18 +68,26 @@ NEXT, in order:
        outside the envelope. On ordinary data, 0 bytes differ.
    (b) the grouped `native_gu` / `native_down` (`grp_ptr` + `grp_start` + `ent_tok`), which is what the expert tier
        actually calls, built on the per-format row dot.
-   (c) **the remaining formats, one shader each - STARTED 2026-10-04 with IQ2_S**, the resident model's most common
-       expert gate/up format. `iq2s_mmvq.comp` + `common/iq2s_dot.glsl`, gated (3 arms; RADV and radeon green,
-       llvmpipe green). It is built on `harness/iq_grids.hpp`: the generator now emits BOTH grid tables
-       (`tools/gen-iq-tables.py`, which replaced `gen-iq1s-grid.py`) and stores the IQ2_S grid as low/high uint32
-       halves, so no shader needs the optional `shaderInt64` feature for a value it only ever reads in halves.
-       * **THE CASE CAUGHT THE ORACLE, NOT THE KERNEL.** The first run failed with every row off by a few percent
-         at the same magnitude - and both bad offsets were in my double oracle; the shader was right.
-         `get_int_b2(qs, iqs/2)` is FOUR bytes at `4*iqs/2 = 2*iqs`, not two bytes at `iqs`. The tiebreaker is the
-         helper's DEFINITION, not its name. Written up in the skill under "Names that lie".
-       * **NEXT, in the order the pack's own census gives** (`NEXT.md` above): **IQ3_XXS (17 layers)**, IQ3_S (10),
-         IQ4_XS (1) for gate/up; **IQ4_NL (39)** and Q2_0 (9) for down. Then the K-quants and the small
-         Q4_0/Q5_0/Q8_0 family, then the grouped kernels in (b).
+   (c) **the remaining formats, one shader each - STARTED 2026-10-04 with IQ2_S, second one IQ3_XXS.** Both are in
+       the build and gated (3 arms each; RADV and radeon green, llvmpipe green):
+       * `iq2s_mmvq.comp` + `common/iq2s_dot.glsl` (type 22, the most common gate/up format at 20 layers);
+       * `iq3xxs_mmvq.comp` + `common/iq3xxs_dot.glsl` (type 18, 17 layers), which adds `unpack_ksigns` (parity-fix
+         the sign byte, then replicate it into all four bytes - arithmetic, not the `ksigns_iq2xs` table, so
+         nothing extra is uploaded) and two more truncating integer divisions in the tail.
+       Both sit on `harness/iq_grids.hpp`, which now carries THREE tables (`tools/gen-iq-tables.py`): the IQ1_S and
+       IQ3_XXS grids as uint32, the IQ2_S grid as low/high uint32 halves so no shader needs the optional
+       `shaderInt64` feature for a value it only ever reads in halves.
+       * **THE PER-BYTE HELPERS ARE SHARED, DELIBERATELY - AND ONLY THOSE.** `common/perbyte_sign.glsl` holds
+         `__vcmpne4`/`__vsub4` because IQ2_S and IQ3_XXS write the IDENTICAL idiom (one rule used twice). The two
+         q8_1 quantisers are the same quantity under two DIFFERENT rules and stay separate. The harness keeps its
+         OWN copies: an oracle that shares a helper with the kernel cannot catch a wrong helper.
+       * **THE ORACLE IS THE SUSPECT TOO.** IQ2_S's first run failed with every row off by percent at the right
+         magnitude, and both bad offsets were in my double oracle - the shader was right. `get_int_b2(qs, iqs/2)`
+         is FOUR bytes at `2*iqs`, not two bytes at `iqs`. Tiebreaker is the helper's definition, not its name
+         (written up in the skill under "Names that lie"). IQ3_XXS then passed its first numeric run.
+       * **NEXT, in the order the pack's own census gives** (`NEXT.md` above): **IQ3_S (10 layers)**, IQ4_XS (1)
+         for gate/up; **IQ4_NL (39)** and Q2_0 (9) for down. Then the K-quants and the small Q4_0/Q5_0/Q8_0 family,
+         then the grouped kernels in (b).
 2. The cross-implementation arm's `budget: independent requery agrees` case used to report a FALSE FAIL while
    the resident local model held the card. **FIXED, with the measurement**: the flake was `budget 81920 bytes,
    usage 0 bytes` - 80 KiB of driver budget bookkeeping with usage unchanged - so the discrete-card comparison
