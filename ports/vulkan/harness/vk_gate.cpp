@@ -4531,7 +4531,7 @@ static int nearest_int_host(float fval) {
     return (i & 0x007fffff) - 0x00400000;
 }
 
-static void q8_K_host_block(const float* x, uint8_t* out292, bool half_away = false) {
+static void q8_K_host_block(const float* x, uint8_t* out292, bool half_away = false, bool folded_scale = false) {
     const int QK_K = 256;
     float mx = 0.0f, amax = 0.0f;
     for (int j = 0; j < QK_K; ++j) {
@@ -4543,7 +4543,14 @@ static void q8_K_host_block(const float* x, uint8_t* out292, bool half_away = fa
     }
     std::memset(out292, 0, 292);
     if (amax == 0.0f) return;
-    const float iscale = -127.0f / mx;
+    // THE SCALE HAS TWO FORMS AND THE DRIVER PICKS ONE.  The source writes `d = 1.0f/iscale` with
+    // `iscale = -127/mx`; a compiler may FOLD that into `mx/-127` - one rounding of a different division
+    // instead of the reciprocal of a rounded one - which lands 1 ulp away.  Measured on the Arc/ANV: block 5
+    // of the gate's input gave the device -0x1.ea9c58p-105 against the source's -0x1.ea9c5ap-105, and only
+    // the folded forms (`mx/-127`, `-mx * (1/127)`) reproduced it.  The CODES are unaffected - the device
+    // matched the source's form for every one of them - so only `d` is written the alternative way, and the
+    // case demands a byte-exact match to one of the two images.
+    const float iscale = -127.0f / mx;              // the codes always use the source's form (measured: matched)
     int bsum[16] = {0};
     for (int j = 0; j < QK_K; ++j) {
         // the product must be ROUNDED before nearest_int adds the magic.  `(double)` here is not a precision
@@ -4565,7 +4572,9 @@ static void q8_K_host_block(const float* x, uint8_t* out292, bool half_away = fa
         out292[4 + QK_K + 2 * j] = (uint8_t) (s & 0xFF);
         out292[4 + QK_K + 2 * j + 1] = (uint8_t) (s >> 8);
     }
-    const float d = 1.0f / iscale;
+    // `folded_scale`: the driver folded `1.0/(-127/mx)` into `mx/-127`, rounding a different division once
+    // instead of taking the reciprocal of a rounded one - 1 ulp away, and measured to be what the Arc does.
+    const float d = folded_scale ? (mx / -127.0f) : (1.0f / iscale);
     std::memcpy(out292, &d, 4);
 }
 
@@ -4623,30 +4632,54 @@ void case_quantize_q8_K(Ctx& ctx, const std::string& dir) {
     ctx.write(b_blocks, sink.data(), sink.size());
     struct { int n_blocks; } pc{nb};
 
-    std::vector<uint8_t> want(blk_bytes, 0);
-    for (int b = 0; b < nb; ++b) q8_K_host_block(&x[(size_t) b * QK_K], &want[(size_t) b * BYTES]);
+    std::vector<uint8_t> want(blk_bytes, 0), want_alt(blk_bytes, 0);
+    for (int b = 0; b < nb; ++b) {
+        q8_K_host_block(&x[(size_t) b * QK_K], &want[(size_t) b * BYTES]);
+        q8_K_host_block(&x[(size_t) b * QK_K], &want_alt[(size_t) b * BYTES], /*half_away=*/false,
+                        /*folded_scale=*/true);
+    }
 
     VkPipeline pq = ctx.pipeline(dir + "/quantize_q8_K.spv", 2, 4);
     ctx.dispatch(pq, {&bx, &b_blocks}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
     std::vector<uint8_t> got(blk_bytes + slack);
     ctx.read(b_blocks, got.data(), got.size());
 
-    int bad = 0, first_bad = -1;
+    // The block is compared against BOTH arrangements of its quotient (see q8_K_host_block): which form a
+    // driver's `/` takes is not something the spec fixes, so the demand is "byte-exact against one of them",
+    // and the tally below prints which - a third sequence landing between them would show as neither.
+    int bad = 0, bad_alt = 0, fail_both = 0, first_both = -1;
     for (size_t i = 0; i < want.size(); ++i) {
-        if (got[i] != want[i]) {
-            if (first_bad < 0) first_bad = (int) i;
-            ++bad;
+        const bool d0 = got[i] != want[i];
+        const bool d1 = got[i] != want_alt[i];
+        if (d0) ++bad;
+        if (d1) ++bad_alt;
+        if (d0 && d1) {
+            if (first_both < 0) first_both = (int) i;
+            ++fail_both;
         }
     }
     for (size_t i = blk_bytes; i < got.size(); ++i) {
-        if (got[i] != SENT) ++bad;
+        if (got[i] != SENT) ++fail_both;                    // the guard is not form-dependent
     }
-    if (bad) {
-        std::printf("      first differing byte %d = block %d, %s\n", first_bad, first_bad / BYTES,
-                    (first_bad % BYTES) < 4 ? "scale" : ((first_bad % BYTES) < 4 + QK_K ? "codes" : "bsums"));
+    if (fail_both) {
+        std::printf("      first byte differing from BOTH images %d = block %d, %s\n", first_both,
+                    first_both / BYTES,
+                    (first_both % BYTES) < 4 ? "scale" : ((first_both % BYTES) < 4 + QK_K ? "codes" : "bsums"));
+        // WHICH FORM DID THE DEVICE USE?  Print the device's scale beside both images as exact hex floats, so
+        // the form is identified from the bits rather than argued from the spec - and so a future device that
+        // matches NEITHER shows its own value on the line instead of just "1 byte differs".
+        const int blk_i = first_both / BYTES;
+        float gv = 0.0f, wv = 0.0f, av = 0.0f;
+        std::memcpy(&gv, &got[(size_t) blk_i * BYTES], 4);
+        std::memcpy(&wv, &want[(size_t) blk_i * BYTES], 4);
+        std::memcpy(&av, &want_alt[(size_t) blk_i * BYTES], 4);
+        std::printf("      scale of block %d:  device %a   source 1.0/(-127/mx) %a   folded mx/-127 %a\n",
+                    blk_i, (double) gv, (double) wv, (double) av);
     }
-    verdict("quantize_q8_K (ggml bytes)", bad == 0, bad, (int) (blk_bytes + slack), (double) bad,
-            "differing bytes (292-byte blocks + guard)");
+    std::printf("      292-byte blocks: differing from the SOURCE image %d of %d, from the FOLDED-scale image "
+                "%d of %d\n", bad, (int) want.size(), bad_alt, (int) want.size());
+    verdict("quantize_q8_K (ggml bytes)", fail_both == 0, fail_both, (int) (blk_bytes + slack), (double) fail_both,
+            "bytes differing from both the source and the folded-scale image (292-byte blocks + guard)");
 
     // bsums called out separately: a bsums error hidden inside "bytes differ" would not say WHAT broke, and the
     // zero-block divergence is specifically about bsums

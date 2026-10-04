@@ -119,8 +119,10 @@ llvmpipe (subgroup 8)**; the suite has grown since and reports its own totals.
 **Root cause of the near-miss: the port had only ever been tested on one Vulkan implementation.** `run_gate.sh`
 now has a cross-implementation arm that runs the gate on **every ICD that reports a device** and fails if any of
 them fails (absent hardware is reported as absent, which is honest; a present implementation is never skipped).
-On this box that means RADV and llvmpipe; on the target box it will mean the Intel ICD the moment the card is
-present — which is exactly the implementation whose per-kernel SIMD width motivated §3.1.
+On this box that meant RADV and llvmpipe until 2026-10-04; with the Arc Pro B70 installed it now means RADV (the
+AMD iGPU), llvmpipe and the Intel ICD together - which is exactly the implementation whose per-kernel SIMD width
+motivated §3.1, and it earned its keep immediately: the Intel arm found a folded-division defect in
+`quantize_q8_K` that RADV and llvmpipe had both missed (NEXT.md's RESUME HERE).
 
 ### 3.1c The display contract: a missing assignment, an unenforced reserve, and no way to test either (HIGH, FIXED)
 

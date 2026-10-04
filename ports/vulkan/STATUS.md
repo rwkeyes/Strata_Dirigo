@@ -7,9 +7,11 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
     bash ports/vulkan/gates/run_gate.sh          # compiles the shaders from source, validates the SPIR-V,
                                                  # checks each shader's declared local size, then runs the gate
 
-**Result: the gate prints its own totals and those are the authority - 160 passed, 0 failed, 0 skipped on the
-box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
-154 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
+**Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
+was swapped for an Arc Pro B70, the box's GPU run was 156 passed / 0 failed / 1 skipped on the Intel ICD
+(`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 154 / 0 / 1 on llvmpipe and
+155 / 1 / 1 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone. Before the swap the
+same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three times in two days; read the
 last line of your own run.** 54 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
@@ -119,11 +121,15 @@ the arm reports it as no-device; it will run automatically when an Arc card is i
 * **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no recorded command buffers, no kernel
   registry. `harness/vk_compute.*` is the seed of the device layer, deliberately host-visible-only memory for
   gate fidelity — a real backend needs device-local memory + staging and `VK_EXT_memory_budget`.
-* **Anything on Intel hardware.** Zero lines of this port have run on an Arc GPU. No Arc card is attached to
-  this host (whose discrete GPU is a 7900 XTX, with the Ryzen iGPU beside it - not the "K620" an earlier revision
-  claimed), so this could not be changed in this
-  session. The Vulkan code is written to be card-agnostic and the shaders avoid vendor assumes, but "runs on
-  Arc" is unverified and is stated as unverified.
+* **Anything on Intel hardware — NO LONGER UNVERIFIED (2026-10-04).** An Arc Pro B70 is now the discrete card in
+  this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **156 / 0 / 1**, with
+  one device-specific defect found and fixed (the folded division in `quantize_q8_K` - NEXT.md's RESUME HERE).
+  What stays unverified on Intel is everything the gate does not cover: the engine path, real token shapes, and
+  the stability question below.
+* **The budget requery on an INTEGRATED device.** `budget: independent requery agrees` fails on the AMD iGPU and
+  passes on the Arc: an iGPU's free-memory figure is system RAM shared with the OS, so two queries can disagree by
+  construction. Left red on purpose - the port's rule is to report an implementation that cannot satisfy a check
+  rather than soften the check around it.
 * **The Battlemage stability question** (§4 of the plan): the xe compute wedge is an open driver bug that
   this port cannot fix or test around.
 

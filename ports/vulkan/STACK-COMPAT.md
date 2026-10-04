@@ -191,11 +191,13 @@ Two caveats, both sourced:
   `VK_KHR_cooperative_matrix` since Mesa 24.0, but llama.cpp deliberately gates it to Xe2 only for that reason.
   So the plain-FMA ceiling of §4.3b stands on Alchemist even with a matrix-capable toolchain.
 
-**Unverified**: none of this has run on Alchemist silicon (this host carries a Radeon RX 7900 XTX and the Ryzen
-iGPU - there is no Intel discrete card here, and no NVIDIA card either: an earlier revision of this document said
-"a 7900 XTX and a K620", which `lspci` does not support). The floors come
-from Intel's tables; the behaviour on the hardware is untested, and the port's rules say so rather than implying
-otherwise.
+**Unverified on Alchemist, partly measured on Battlemage.** None of this has run on A-series silicon. As of
+2026-10-04 this host carries an **Arc Pro B70 (Battlemage, BMG G31)** in place of the Radeon RX 7900 XTX, with the
+Ryzen iGPU driving the display, and the gate ran on it for the first time (156 / 0 / 1 - NEXT.md's RESUME HERE).
+So the floors below still come from Intel's tables and the Alchemist rows remain untested; the Battlemage row now
+has one measured data point, which is that the kernels run and the cooperative-matrix path is unavailable on this
+device. An earlier revision of this document said the host had "a 7900 XTX and a K620", which `lspci` never
+supported.
 
 ---
 

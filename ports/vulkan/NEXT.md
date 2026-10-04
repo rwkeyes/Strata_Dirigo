@@ -2,11 +2,26 @@
 
 ## RESUME HERE (state as of the last commit)
 
-**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 160 passed / 0 failed / 0 skipped on
-RADV and on the radeon ICD re-run, 154 / 0 / 1 on llvmpipe (the skip is cooperative matrix). 54 kernels, 17 shared
-includes, one generated table file (four IQ grids). The gate prints its own totals -
-`bash ports/vulkan/gates/run_gate.sh`, which compiles every shader from source - and this line has gone stale
-twice in one day, so run it rather than quote it.
+**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
+generated table file (four IQ grids). The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh`,
+which compiles every shader from source - and this line has gone stale three times in two days, so run it rather
+than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 / 0 on RADV and on radeon, 154 /
+0 / 1 on llvmpipe), and, after that card was swapped for an **Arc Pro B70**, this one.
+
+**FIRST RUN ON INTEL HARDWARE (Arc Pro B70 "BMG G31", Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup 32):
+156 passed / 0 failed / 1 skipped**, with llvmpipe 154 / 0 / 1 and the radeon ICD now picking the AMD iGPU (the
+discrete card is gone) at 155 / 1 / 1. The Intel skip is `gemm_coopmat` - no usable M16N16K16 subgroup-scope
+f16->f32 config on this device - and the gate exits non-zero on it by its own rule that a skipped case is not a
+passing one. The iGPU's single failure is `budget: independent requery agrees`, inherent to a device whose free
+memory is system RAM shared with the OS; the budget family passes on the Arc.
+
+**THE FIRST DEVICE-SPECIFIC DEFECT THIS PORT HAS FOUND (fixed 2026-10-04).** `quantize_q8_K` was off by one byte
+on the Arc - the low byte of block 5's scale - and the cause was measured rather than argued: printing the
+device's value as a hex float beside the candidates gave `-0x1.ea9c58p-105` where the source's `1.0f/(-127/mx)`
+gives `-0x1.ea9c5ap-105`, i.e. the driver FOLDS the division into `mx/-127` and rounds that. The codes were never
+wrong. The case now carries both forms as images (the treatment `quantize_q8_1` already had for its codes),
+demands a byte-exact match to one, and prints which: **Arc -> folded (0 of 1752 differing), iGPU -> source (0 of
+1752)**. Both forms are real, on hardware in one box - one image was never going to be enough.
 
 WHAT IS DONE, in the expert tier: the per-format row kernels for IQ1_M, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS (gate/up),
 IQ4_NL and Q2_0 (down) - i.e. **every format the resident `coder-iq1_m` model's 48 layers use, so each layer now
@@ -26,8 +41,9 @@ WHAT IS NOT DONE, stated by name so the next session does not have to re-derive 
     SECOND RULE for types the expert path already has - the port carries the expert-path rule (from
     `iq_kernels.cu`), because that is what the resident model runs.  Same quantity, two rules; do not merge them.
   * WAVES 2-6 of the kernels (KV, rope, the remaining GEMVs, attention, MoE, the prefill GEMM) and the engine
-    integration, neither of which this wave touched.  **Nothing has ever run on Intel hardware** - see STATUS.md's
-    last section.
+    integration, neither of which this wave touched.  **The kernels ran on Intel silicon for the first time on
+    2026-10-04** (the Arc run in RESUME HERE above) - but nothing has run through the ENGINE on any device, and
+    the port has no engine integration at all.  See STATUS.md's last section.
 
 **THE REAL DEFECT WAS A WRONG-BUFFER READ, AND THE "MASKED WAVE" ROOT CAUSE BELOW IS WITHDRAWN.**  In
 `shaders/common/s2_row_dot.glsl`, `dx` (the activation's own fp16 scale) was read with `f16_at(xb)`, and the
