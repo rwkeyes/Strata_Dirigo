@@ -1,14 +1,17 @@
-// src/kernels/cpu/kq_avx1.cpp - this fork: the AVX1 floor's router dot (see kq_avx1.hpp).
+// src/kernels/cpu/kq_avx1.cpp - the AVX1 router dot for older CPUs (see kq_avx1.hpp).  From rwkeyes' Strata_Dirigo
+// fork (MIT), its AVX1 floor.
 //
 // Measured on the hardware this exists for (Xeon E5-2665, 2x8 cores, AVX only) for one layer's router
 // [512 experts x 5120 embeddings]: the scalar std::fma fallback it replaces took 362 ms/layer, a scalar
 // mul+add 4.9 ms, and this kernel 2.6 ms - 137x, with no extra memory (the weights stay bf16).
 //
-// Compiled with -mavx -msse4.2 (CMakeLists.txt sets that per source); it is only ever called behind
+// Compiled for AVX (/arch:AVX, -mavx; CMakeLists.txt sets that per source); it is only ever called behind
 // cpu_avx1_ok(), so no CPU that lacks AVX can reach it.
 #include "strata/kernels/cpu/kq_avx1.hpp"
 
 #include <immintrin.h>
+
+#include <cstring>
 
 #if !defined(__AVX__)
 #error "kq_avx1.cpp must be compiled with AVX enabled (see the per-source flags in CMakeLists.txt)"
@@ -57,7 +60,7 @@ void bf16_rows_dot_multi_avx1(const uint16_t* w, int rows, int cols, const float
             float s = hsum_float_8_avx1(acc[t]);
             for (; c < cols; ++c) {                                      // cols % 8 != 0 tail (cols % 8 == 0 today)
                 const uint32_t bits = (uint32_t) wr[c] << 16;
-                float wf; __builtin_memcpy(&wf, &bits, sizeof wf);
+                float wf; std::memcpy(&wf, &bits, sizeof wf);
                 s += wf * x[(size_t) t * (size_t) cols + c];
             }
             out[(size_t) t * (size_t) rows + r] = s;

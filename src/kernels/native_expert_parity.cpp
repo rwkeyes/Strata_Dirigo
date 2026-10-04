@@ -94,7 +94,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             ffp[k] = ff[k].data();
         }
         cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
-        if (cpu::iq512_supported(f.gu_type)) {
+        // either multi-token kernel: IQ4_XS has an AVX-2 one and no AVX-512 one, so the gate cannot be
+        // iq512_supported alone - that would leave the format untested on every CPU.
+        if (cpu::iq512_supported(f.gu_type) || cpu::iq256_supported(f.gu_type)) {
             // ggml's own vec_dot, same Q8_K activations: the reference for both multi-token kernels
             // (float-order differences only)
             const auto* tc = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
@@ -143,8 +145,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                             tag, us1, 2.0 * f.up_off / us1 / 1e3, usg, 2.0 * f.up_off / usg / 1e3);
                 std::printf("          gate+up %d tokens one thread: %s %.0f us vs ggml %d x %.0f us\n", NT, tag, usn, NT, usg);
             };
-            if (cpu::cpu_avx512_ok()) check("avx512", true);   // guarded: the binary runs on AVX-2 CPUs too
-            check("avx2", false);
+            // guarded: the binary runs on AVX-2 CPUs too, and IQ4_XS has no AVX-512 kernel (an empty switch)
+            if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) check("avx512", true);
+            if (cpu::cpu_avx2_ok() && cpu::iq256_supported(f.gu_type)) check("avx2", false);   // no AVX2: ggml-cpu only
         }
         for (int k = 0; k < NT; ++k) {
             cpu::native_quant_h(f, ff[k].data(), hq[k].data());
@@ -177,7 +180,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         // BIT FOR BIT, for 1..8 tokens; then the time of 4 tokens (a verify window) both ways
         for (int role = 0; role < 2; ++role) {
             const int type = role == 0 ? f.gu_type : f.d_type;
-            if (!cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
+            if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
             const int n = role == 0 ? (int) H : (int) FF, rows = role == 0 ? (int) FF : (int) H;
             const size_t rb = role == 0 ? f.gu_row : f.d_row;
             const uint8_t* w = blob.data() + (role == 0 ? 0 : f.down_off);
@@ -220,7 +223,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                         role == 0 ? "gate" : "down", differ, us_k, us_g, us_g / us_k);
             if (differ) ++failures;
         }
-        if (f.d_type == 42) {
+        if (cpu::q2_native_kernels(f.d_type)) {
             // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections - the AVX-512 one
             // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512
             // kernel unconditionally faults on a Zen 2/3 CPU.
@@ -237,7 +240,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             std::printf("          q2_0 %s down vs ggml down: rel %.2e\n",
                         cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
         }
-        if (f.d_type == 20) {
+        if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
@@ -531,17 +534,6 @@ int main(int argc, char** argv) {
                              "       native_expert_parity --bf16-embd\n");
         return 2;
     }
-    // check_blob compares the AVX2 kernels (iq256_*, kq256_*) against the float reference.  On a CPU without
-    // AVX2 there is nothing to compare, and calling them anyway executes an instruction the CPU does not have:
-    // SIGILL in q4k_dot's vpbroadcastq, seen on an AVX-only Xeon E5 v2.  The AVX-512 call below is guarded for
-    // the same reason ("the binary runs on AVX-2 CPUs too"); the AVX2 ones were not.
-    // Deliberately NOT an early return: --synthetic q6_K/q8_0 must stay reachable so native_expert_supported
-    // still refuses it (native_expert_parity_refuses_q6_K is WILL_FAIL and needs a non-zero exit).
-    const bool have_avx2 = cpu::cpu_avx2_ok();
-    if (!have_avx2) {
-        std::printf("SKIPPED: this CPU has no AVX2; the kernels under test (iq256_*, kq256_*) are compiled for "
-                    "AVX2 and the engine refuses to use them here.\n");
-    }
     // #152's width check tests the opt-in rule (the multi-token kernels from one token on)
     if (std::getenv("STRATA_IQ_MT_MIN") == nullptr) {
 #ifdef _WIN32
@@ -572,7 +564,7 @@ int main(int argc, char** argv) {
                 ++failures;
                 continue;
             }
-            if (have_avx2) failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
+            failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
         }
     } else {
         const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
@@ -599,7 +591,7 @@ int main(int argc, char** argv) {
             std::memcpy(blob.data() + f.up_off, data[1] + (size_t) E * f.up_off, f.up_off);
             std::memcpy(blob.data() + f.down_off, data[2] + (size_t) E * (f.bytes - f.down_off),
                         f.bytes - f.down_off);
-            if (have_avx2) failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
+            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
         }
     }
     std::printf("native_expert_parity: %d failures\n", failures);

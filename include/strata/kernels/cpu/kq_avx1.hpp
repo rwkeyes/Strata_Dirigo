@@ -1,4 +1,4 @@
-// src/kernels/cpu/kq_avx1.hpp - this fork: the AVX1 floor's router dot.
+// include/strata/kernels/cpu/kq_avx1.hpp - the AVX1 router dot for older CPUs (from the Strata_Dirigo fork).
 //
 // bf16_rows_dot_multi (kq_avx2.cpp) is compiled with -mavx2 and uses instructions an AVX-only CPU does
 // not have (`vpmovzxwd`, `vfmadd`), so an AVX-only host cannot call it at all.  This is the same
