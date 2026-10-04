@@ -10,7 +10,7 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 **Result: the gate prints its own totals and those are the authority - 146 passed, 0 failed, 0 skipped on the
 box's GPU (`AMD Radeon RX 7900 XTX (RADV NAVI31)`, Vulkan 1.4.318, subgroup size 64) at the time of writing, and
 140 / 0 / 1 on llvmpipe (the skip is cooperative matrix). That count has gone stale twice in one day; read the
-last line of your own run.** 50 kernels, 14 shared includes, one generated table file (`harness/iq_grids.hpp`,
+last line of your own run.** 49 kernels, 14 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S and IQ3_XXS grids).
 
 The table below is the original wave-1 set and has not been re-listed as the suite grew - every case since is
