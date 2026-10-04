@@ -47,7 +47,13 @@ NEXT, in order:
          two sites).  So a shared-expert block whose scale or sum passes fp16 range stores inf where the IQ path
          stores 65504, and the dot that reads it then computes inf * 0.  The port carries both rules as the source
          has them, with the difference at the call site (`clamp_606`), and the case measures a block that hits it
-         (products of 3000.0: both the scale and the sum past range).  Worth an upstream question.
+         (products of 3000.0: both the scale and the sum past range).  **ASKED UPSTREAM on 2026-10-04:**
+         [Niko1221/Strata#606 comment 5982766696](https://github.com/Niko1221/Strata/issues/606#issuecomment-5982766696)
+         - the maintainer's own 0.1.39 note names "both q8_1 activation quantizers (iq_kernels.cu and
+         native_mmvq.cu)"; this is the third, and it is in that same file.  FOLLOW-UP DUTY: when it is fixed,
+         comment on THAT thread (not a new issue), report what changed empirically, and flip this port's
+         `q8_1_store(..., clamp_606)` to true on both paths - the swiglu case's "products past fp16 range" arm
+         then expects 65504 where it now expects inf.
        * **THE DIVISION IS THE DRIVER'S.**  See (a2) - measured, and still unresolved.
    (a2) **A DECISION WORTH TAKING DELIBERATELY: which division the quantiser uses.** The port writes the source's
        `roundf(xi / d)`. MEASURED on RADV: of 2560 codes, 2184 match a correctly rounded division and 120 match
