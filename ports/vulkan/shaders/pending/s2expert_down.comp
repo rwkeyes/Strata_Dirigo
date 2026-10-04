@@ -1,0 +1,53 @@
+// ports/vulkan/shaders/s2expert_down.comp - the grouped down projection: one row of `n_embd` per hit, reading the
+// quantized intermediate the caller produced.
+//
+// `dst_index[h]` is WHICH ROW OF THE SHARED OUTPUT BUFFER hit `h` FILLS - the router's slot, not `h`. The two
+// differ on every layer where some experts are resident and some are not, and that difference is the whole reason
+// the tier can coexist with the CPU pool.
+//
+// One workgroup per row with the shared reduction (the CUDA uses one warp per row); the term arithmetic is
+// identical, so the comparison is against a double reference.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BLOB { uint8_t b[]; } blob_b;
+layout(set = 0, binding = 1, std430) readonly buffer ACT { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) readonly buffer XS { float v[]; } xscale_v;
+layout(set = 0, binding = 3, std430) readonly buffer SLOT { int v[]; } slot_index;
+layout(set = 0, binding = 4, std430) readonly buffer DST { int v[]; } dst_index;
+layout(set = 0, binding = 5, std430) buffer OUT { float v[]; } out_;
+
+#include "common/s2_row_dot.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC {
+    int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales;
+} pc;
+
+void main() {
+    const uint H = uint(pc.n_embd), FF = uint(pc.n_ff);
+    const uint ROW_GU = H / 4u, ROW_D = FF / 4u;
+    const uint SC_GU = H / 64u, SC_D = FF / 64u;
+    const uint O_D_CODES = 2u * FF * ROW_GU;
+    const uint O_GU_SCALES = O_D_CODES + H * (FF / 4u);
+    const uint O_D_SCALES = O_GU_SCALES + 2u * FF * SC_GU * 2u;
+
+    const uint row = gl_WorkGroupID.x;
+    const uint total = uint(pc.n_hits) * H;
+    if (row >= total) return;
+    const uint h = row / H;
+    const uint r = row % H;
+
+    const uint blob = uint(slot_index.v[h]) * uint(pc.blob_bytes);
+    // the intermediate is one block_q8_0 row per hit: FF/32 blocks of 34 bytes
+    const uint x_off = h * (FF / 32u) * 34u;
+    const uint x_scale_off = h * (FF / 32u);
+    const float acc = s2_row_dot(blob + O_D_CODES + r * ROW_D, blob + O_D_SCALES + r * SC_D * 2u, x_off,
+                                FF / 32u, x_scale_off, pc.use_xscales != 0);
+    const float s = wg_sum(acc);
+    if (gl_LocalInvocationIndex == 0u) out_.v[uint(dst_index.v[h]) * H + r] = s;
+}

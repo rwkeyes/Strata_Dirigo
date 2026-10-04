@@ -1,0 +1,70 @@
+// ports/vulkan/shaders/s2expert_gu.comp - the grouped gate+up projection of the resident expert tier.
+//
+// FOUR LAUNCHES PER LAYER, NOT FIVE PER EXPERT. A layer routes ten experts; looping over hits with a per-matrix
+// kernel is ~1,550 launches per token at ~3.6 us = 5.6 ms, which is most of the 10.4 ms the tier exists to save.
+// So the hits are grouped: one launch for gate+up, one for SwiGLU, the existing quantizer, one for down.
+//
+// TWO LAYOUT TRAPS, BOTH OF WHICH PRODUCED FINITE, PLAUSIBLE NUMBERS WHEN THE SOURCE GOT THEM WRONG:
+//
+//   * THE ROWS ARE INTERLEAVED. Row-SLOT `i` of the 2*FF gate/up rows is gate row `i/2` when `i` is even and up
+//     row `(i-1)/2` when it is odd. The first version decoded the right code row and then wrote it to output slot
+//     `i` of a [gate | up] per-hit layout, pairing `silu(gate[r])` with the WRONG `up` for every row - "finite,
+//     plausible numbers", caught by the parity test at worst relative error 2.2e+03.
+//   * THE OUTPUT IS GATE-MAJOR: every hit's gate rows are contiguous from 0 and every hit's up rows contiguous
+//     from `n_hits * FF`. A per-hit [gate | up] layout breaks the two CONSUMERS instead - `swiglu` and
+//     `quantize_q8_0` both walk a contiguous range, so with more than one hit they read hit 0's up rows where
+//     they wanted hit 1's gate rows. With ONE hit it would have passed.
+//
+// `dst_index` is what lets the two halves meet: a layer's ten experts are routed in the router's order and only
+// some are resident, so the CPU produces the misses at their ROUTED indices while the GPU produces the hits in
+// whatever order the cache holds them. Writing hits sequentially would land them on the misses' rows.
+//
+// The port dispatches ONE WORKGROUP per row-slot with the shared reduction, where the CUDA uses one WARP per
+// row-slot - the same shape the other GEMV ports use, for the same reason (a host cannot size anything from a
+// device-wide subgroup default). The term arithmetic is the source's, so the comparison is against a double
+// reference rather than bit-for-bit.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BLOB { uint8_t b[]; } blob_b;
+layout(set = 0, binding = 1, std430) readonly buffer ACT { uint8_t b[]; } act_b;
+layout(set = 0, binding = 2, std430) readonly buffer XS { float v[]; } xscale_v;
+layout(set = 0, binding = 3, std430) readonly buffer SLOT { int v[]; } slot_index;
+layout(set = 0, binding = 4, std430) buffer GU { float v[]; } gate_up;
+
+#include "common/s2_row_dot.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC {
+    int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales;
+} pc;
+
+void main() {
+    // the blob's internal offsets, derived exactly as the source derives them
+    const uint H = uint(pc.n_embd), FF = uint(pc.n_ff);
+    const uint ROW_GU = H / 4u;                 // 2 bits per element
+    const uint SC_GU = H / 64u;                 // one fp16 scale per 64 elements
+    const uint O_D_CODES = 2u * FF * ROW_GU;
+    const uint O_GU_SCALES = O_D_CODES + H * (FF / 4u);
+    const uint rows_per_hit = 2u * FF;
+
+    const uint slot = gl_WorkGroupID.x;
+    const uint total = uint(pc.n_hits) * rows_per_hit;
+    if (slot >= total) return;                  // workgroup-uniform: the reduction's barriers stay legal
+    const uint h = slot / rows_per_hit;
+    const uint i = slot % rows_per_hit;
+
+    const uint blob = uint(slot_index.v[h]) * uint(pc.blob_bytes);
+    const float acc = s2_row_dot(blob + i * ROW_GU, blob + O_GU_SCALES + i * SC_GU * 2u, 0u, H / 32u, 0u,
+                                pc.use_xscales != 0);
+    const float s = wg_sum(acc);
+    if (gl_LocalInvocationIndex != 0u) return;
+    // slot i -> gate row (i/2) when even, up row ((i-1)/2) when odd; gate-major output
+    const uint r = i >> 1u;
+    const uint base = ((i & 1u) != 0u) ? (uint(pc.n_hits) * FF + h * FF) : (h * FF);
+    gate_up.v[base + r] = s;
+}

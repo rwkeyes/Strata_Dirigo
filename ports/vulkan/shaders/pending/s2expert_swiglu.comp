@@ -1,0 +1,22 @@
+// ports/vulkan/shaders/s2expert_swiglu.comp - `silu(gate) * up` in place over a GATE-MAJOR buffer.
+//
+// `[0, n_pairs)` holds every hit's gate rows and `[n_pairs, 2*n_pairs)` its up rows, so hit `h`'s row `r` meets
+// itself at `h*FF + r` - which is exactly why the gate-major layout is load-bearing rather than cosmetic.
+//
+// SiLU is on the GATE and multiplied by up. The other way round is also finite, which is what makes it worth
+// stating.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer GU { float v[]; } gate_up;
+
+layout(push_constant, std430) uniform PC { int n_pairs; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n_pairs)) return;
+    const uint np = uint(pc.n_pairs);
+    const float g = gate_up.v[i];
+    const float u = gate_up.v[np + i];
+    gate_up.v[i] = (g / (1.0 + exp(-g))) * u;
+}
