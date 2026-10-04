@@ -67,10 +67,10 @@ for f in "${comps[@]}"; do
   fma="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpExtInst .* Fma ')"
   fp64cap="$(spirv-dis "$SH/$name.spv" | grep -cE 'OpCapability Float64')"
   case "$name" in
-    router_top10_f64|router_top10_f32)
+    router_top10_f64|router_top10_f32|scalar_gate_f64)
       grep -q 'OpControlBarrier' <<<"$census" || fail "$name (no barrier: the block reductions did not lower)"
       ;;
-    rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split)
+    rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32)
       grep -q 'OpGroupNonUniformFAdd' <<<"$census" || fail "$name (no subgroup reduction in the SPIR-V - the kernel did not lower its sum)"
       ;;
     *)
@@ -83,10 +83,10 @@ for f in "${comps[@]}"; do
   # because Intel Arc has no shaderFloat64; the f32 variant is what runs there, so it must NOT carry the
   # capability, and the f64 variant must.
   case "$name" in
-    router_top10_f64|moe_combine_f64|swiglu_f64)
+    router_top10_f64|moe_combine_f64|swiglu_f64|scalar_gate_f64)
       [ "$fp64cap" -ge 1 ] || fail "$name (no Float64 capability: the faithful variant did not compile its doubles)"
       ;;
-    router_top10_f32|moe_combine_f32|swiglu_f32)
+    router_top10_f32|moe_combine_f32|swiglu_f32|scalar_gate_f32)
       [ "$fp64cap" -eq 0 ] || fail "$name (declares Float64 - this variant exists for devices that do NOT have it)"
       ;;
   esac

@@ -1,0 +1,53 @@
+// ports/vulkan/shaders/scalar_gate_f64.comp - the shared expert's per-token scalar gate, FAITHFUL arithmetic.
+//
+//     g = sigmoid(dot(x_bf16, w_bf16))          w = `ffn_gate_inp_shexp`, one SCALAR per token
+//
+// **ONE THREAD WAS THE LARGEST SINGLE KERNEL IN THE MODEL.** The source's own comment records the defence it had -
+// "n_embd is 2560, so this is a short serial loop" - and why it was wrong: 2560 iterations is not short when each
+// is a DOUBLE multiply-add, and this card's double rate is 1/64 of its float rate, so the loop was a 2560-long
+// dependency chain through a 1/64-rate unit. Measured, `shared_expert` was 0.2374 ms of a 0.8883 ms block, 26.7%
+// of it, for three projections whose memory floor is 0.009 ms. The fix is ten terms per thread plus a tree.
+//
+// THE DOUBLE ACCUMULATOR IS KEPT, for the source's reason: the reference reduces in float64, the summation order
+// of a tree is not the reference's, and "the defence is enough precision that the order stops mattering". Through
+// a sigmoid, a 1e-16 relative difference in the dot is not a difference.
+//
+// **A WRONG SCALAR HERE IS THE QUIET FAILURE MODE**: sigmoid bounds the damage to [0,1], so a gate that should be
+// 0.5 and reads 1.0 scales the shared expert's output by 2x and produces perfectly finite, perfectly plausible
+// logits. The source's first symptom of a 5120-byte over-read was 2560 non-finite outputs, not a wrong scalar.
+//
+// This file requires the device's shaderFloat64; `scalar_gate_f32.comp` is the sibling for devices without it
+// (Intel Arc - Intel support article 000089817).
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { uint v[]; } xb;
+layout(set = 0, binding = 1, std430) readonly buffer W { uint v[]; } wb;
+layout(set = 0, binding = 2, std430) buffer OUT { float v[]; } out_;
+
+#include "common/bf16.glsl"
+#include "common/double_math.glsl"
+#include "common/wg_reduce_double.glsl"
+
+layout(push_constant, std430) uniform PC { int n_tokens; int n_embd; } pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= uint(pc.n_tokens)) return;
+    const uint n = uint(pc.n_embd);
+    const uint lid = gl_LocalInvocationIndex, lsize = gl_WorkGroupSize.x;
+    const uint xbase = t * (n / 2u);                 // the activation is bf16, read as 32-bit pairs
+    double acc = 0.0;
+    for (uint i = lid; i < n; i += lsize) {
+        const uint hx = ((i & 1u) == 0u) ? (xb.v[xbase + (i >> 1u)] & 0xFFFFu) : (xb.v[xbase + (i >> 1u)] >> 16u);
+        const uint hw = ((i & 1u) == 0u) ? (wb.v[i >> 1u] & 0xFFFFu) : (wb.v[i >> 1u] >> 16u);
+        // BOTH OPERANDS ARE BF16 AND THAT IS THE CONTRACT: `gate_inp_shexp` is a bf16 weight, so ggml converts the
+        // activation to bf16 too. The products are exact in f32; accumulating in double is the reference's choice.
+        acc += double(bf16_to_f32(hx)) * double(bf16_to_f32(hw));
+    }
+    const double total = wg_sum_d(acc);
+    if (lid == 0u) out_.v[t] = float(1.0 / (1.0 + double_exp(-total)));
+}

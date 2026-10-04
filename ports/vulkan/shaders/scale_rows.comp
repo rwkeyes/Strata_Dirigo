@@ -1,0 +1,25 @@
+// ports/vulkan/shaders/scale_rows.comp - `out[t][i] *= g[t]`, the per-token scale (shared_expert.cu's
+// scale_rows_kernel).
+//
+// The MoE's shared expert produces one row per token and one gate scalar per token, so the scale is per ROW -
+// unlike `scale.comp`, which multiplies everything by `g[0]` because the router's weights apply to a single row.
+//
+// WHY THIS IS ONE WORKGROUP PER TOKEN rather than the CUDA's `blockIdx.y = token` grid: the port's dispatch is
+// one-dimensional by design ("groups is the x-dimension; the y/z dims are 1"), and this shape gets the same thing
+// without a 2D grid - the scale is loaded ONCE per row into a register instead of once per element, which is
+// what the CUDA's per-block read does too.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer O { float v[]; } out_;
+layout(set = 0, binding = 1, std430) readonly buffer G { float v[]; } g;
+
+layout(push_constant, std430) uniform PC { int n_tokens; int n; } pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= uint(pc.n_tokens)) return;
+    const uint n = uint(pc.n);
+    const float s = g.v[t];
+    for (uint i = gl_LocalInvocationIndex; i < n; i += gl_WorkGroupSize.x) out_.v[t * n + i] *= s;
+}

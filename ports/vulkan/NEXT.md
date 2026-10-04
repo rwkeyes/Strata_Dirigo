@@ -394,6 +394,39 @@ silu to f32 BEFORE multiplying by `up` - moving that cast changes the value.
 THIRD RESERVED-WORD TRAP: **`shared` is a GLSL keyword** (the shared-memory qualifier), so a buffer cannot be
 named `shared` any more than a variable can be named `half` or `out`.
 
+## The shared expert is complete on the GPU side (`scalar_gate`, `scale_rows`)
+
+`scalar_gate_f64`/`_f32` (the per-token gate: sigmoid of a bf16 dot in double) and `scale_rows` (the per-token
+scale). With `moe_combine`, `swiglu` and these, every kernel `shared_expert.cu` needs is ported - what remains
+there is the host orchestration, which belongs to integration.
+
+`scale_kernel` needed no work: the port's wave-1 `scale.comp` does the same multiply, with the scalar arriving as
+a push constant instead of a `g[0]` buffer read. Same value, same rounding.
+
+THE SCALAR GATE'S FAILURE MODE IS QUIET and that is why it gets its own case: sigmoid bounds the output to [0,1],
+so a gate that should be 0.5 and reads 1.0 scales the shared expert by 2x and produces finite, plausible logits.
+The zero-dot row cannot hide anything - the answer there is exactly 0.5 - so it is its own check, and the
+saturated row (a gate of exactly 1.0, or exactly 0.0 on the other side) is another.
+
+### A SUBNORMAL BOUNDARY IS NOT A CORRECTNESS BOUNDARY, and the first run of this case failed on exactly that
+
+With full-range inputs the dot is ~+-30, so the sigmoid returns values like **2.8e-45** - the smallest SUBNORMAL
+floats - and the faithful variant produced 0 where the reference produced 2.8e-45. Both are "zero" in any
+meaningful sense; the difference is that at the subnormal boundary the LAST BIT OF THE DOUBLE decides the float's
+step. Scaling the activation so the gates land in the normal range made the faithful variant **bit-exact 4/4**,
+which is the experiment that identifies the cause.
+
+So the case's data is deliberately scaled out of that regime, and the note says why: requiring bit-exactness in a
+regime where the answer is subnormal is requiring the double's last bit, not the arithmetic. The f32 variant's gap
+over the same rows is 0.254 of the bound.
+
+Two bugs of my own found here, both the same shape - a reference that was right for the data it was written
+against and wrong for the data it was run on:
+
+* the oracle was computed once for the random weight set and then reused for the all-zero and large-weight runs,
+  which reported 0/4 and 2/4 for the two runs that should be the easiest to get right;
+* and the subnormal regime above.
+
 ### THE REST OF THE WAVE - and its size, which is the number that matters
 
 This is the biggest remaining area by a wide margin. Measured source sizes:

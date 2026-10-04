@@ -928,6 +928,128 @@ static double gemv_bound(double want, double abs_sum, double rtol) {
     return rtol * std::fabs(want) + GEMV_TREE * GEMV_EPS * abs_sum;
 }
 
+// scalar_gate and scale_rows: the shared expert's per-token scalar and its application.
+//
+// THE SCALAR GATE'S FAILURE MODE IS QUIET, which is why it gets its own case: sigmoid bounds the output to [0,1],
+// so a gate that should be 0.5 and reads 1.0 scales the shared expert by 2x and produces finite, plausible
+// logits. The source's own history has the version of this that reads 2560 floats out of a 5120-byte buffer and
+// reports non-finite outputs rather than a wrong scalar - and the row where the dot is ZERO is the one that
+// cannot hide anything, because the answer there is exactly 0.5.
+void case_scalar_gate(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "scalar_gate_f64.spv") || !have(dir, "scalar_gate_f32.spv")) return;
+    const int n_embd = 2560, n_tok = 4;
+    std::vector<uint16_t> w(n_embd, 0), x((size_t) n_tok * n_embd, 0);
+    for (int i = 0; i < n_embd; ++i) w[i] = strata::kernels::bf16_from_f32(rndf(1.0f));
+    // SCALED SO THE GATES STAY IN THE NORMAL RANGE. With full-range inputs the dot is ~+-30 and the sigmoid
+    // returns values like 2.8e-45 - the smallest SUBNORMAL floats - where a one-bit difference in the double
+    // decides the float's subnormal step. That is a property of the cast, not of the arithmetic, and it made the
+    // faithful variant look wrong on a token whose true gate is "zero either way".
+    for (size_t i = 0; i < x.size(); ++i) x[i] = strata::kernels::bf16_from_f32(0.05f * rndf(1.0f));
+    // THE ORACLE IS A FUNCTION OF THE WEIGHT VECTOR, so it is computed per weight set - the first version of this
+    // case computed it once and then compared the all-zero and large-weight runs against the RANDOM weights'
+    // gates, which reported 0/4 and 2/4 for the two runs that should have been the easiest to get right.
+    auto oracle = [&](const std::vector<uint16_t>& wv, std::vector<float>& out) {
+        out.assign(n_tok, 0.0f);
+        for (int t = 0; t < n_tok; ++t) {
+            double acc = 0.0;
+            for (int i = 0; i < n_embd; ++i) {
+                acc += (double) strata::kernels::f32_from_bf16(x[(size_t) t * n_embd + i]) *
+                       (double) strata::kernels::f32_from_bf16(wv[i]);
+            }
+            out[t] = (float) (1.0 / (1.0 + std::exp(-acc)));      // the reference: double, then cast
+        }
+    };
+    std::vector<float> want;
+    // the degenerate rows, where the answer cannot hide: an all-zero weight gives a dot of exactly 0 and a gate of
+    // exactly 0.5, and a huge one saturates the sigmoid to 1.0
+    std::vector<uint16_t> w_zero(n_embd, strata::kernels::bf16_from_f32(0.0f));
+    std::vector<uint16_t> w_big(n_embd, strata::kernels::bf16_from_f32(64.0f));
+
+    Buf b_x = ctx.alloc(x.size() * 2), b_w = ctx.alloc((size_t) n_embd * 2), b_out = ctx.alloc((size_t) n_tok * 4);
+    ctx.write(b_x, x.data(), x.size() * 2);
+    struct { int n_tokens; int n_embd; } pc{n_tok, n_embd};
+    const char* names[2] = {"/scalar_gate_f64.spv", "/scalar_gate_f32.spv"};
+    const char* labels[2] = {"scalar_gate_f64 (faithful: double dot and double sigmoid)",
+                             "scalar_gate_f32 (portable: Kahan dot, float sigmoid)"};
+    for (const std::vector<uint16_t>* wv : {&w, &w_zero, &w_big}) {
+        const char* which = (wv == &w) ? "random weights" : (wv == &w_zero) ? "ALL-ZERO weights (gate must be exactly 0.5)"
+                                                                           : "large weights (sigmoid saturation)";
+        ctx.write(b_w, wv->data(), (size_t) n_embd * 2);
+        oracle(*wv, want);
+        for (int v = 0; v < 2; ++v) {
+            VkPipeline p = ctx.pipeline(dir + names[v], 3, (int) sizeof(pc));
+            ctx.dispatch(p, {&b_x, &b_w, &b_out}, &pc, sizeof(pc), (uint32_t) n_tok);
+            std::vector<float> got(n_tok);
+            ctx.read(b_out, got.data(), (size_t) n_tok * 4);
+            int bad = 0;
+            double worst = 0, mass = 0;
+            for (int t = 0; t < n_tok; ++t) {
+                mass += std::fabs((double) want[t]);
+                const double ratio = std::fabs((double) got[t] - (double) want[t]) /
+                                     (1e-6 * std::fabs((double) want[t]) + 1e-9);
+                worst = std::max(worst, ratio);
+                if (v == 0 && got[t] != want[t]) ++bad;              // the faithful variant must be bit-exact
+                if (v == 1 && ratio > 1.0) ++bad;
+            }
+            char label[130];
+            std::snprintf(label, sizeof label, "%s, %s", labels[v], which);
+            std::printf("      %s:", (v == 0) ? "f64" : "f32");
+            for (int t = 0; t < n_tok; ++t) {
+                std::printf(" got %.9g / want %.9g%s", (double) got[t], (double) want[t],
+                            (got[t] == want[t]) ? "" : " <-- DIFFERS");
+            }
+            std::printf(" | worst err/tol %.3g\n", worst);
+            verdict(label, bad == 0, bad, n_tok, worst,
+                    v == 0 ? "gates differing from the double reference (must be 0)"
+                           : "gates outside the relative bound");
+        }
+    }
+    // the zero-weight row, called out on its own: 0.5 exactly is the one answer the sigmoid cannot soften
+    {
+        ctx.write(b_w, w_zero.data(), (size_t) n_embd * 2);
+        VkPipeline p = ctx.pipeline(dir + "/scalar_gate_f64.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_x, &b_w, &b_out}, &pc, sizeof(pc), (uint32_t) n_tok);
+        std::vector<float> got(n_tok);
+        ctx.read(b_out, got.data(), (size_t) n_tok * 4);
+        int bad = 0;
+        for (int t = 0; t < n_tok; ++t) {
+            if (got[t] != 0.5f) ++bad;
+        }
+        if (bad) std::printf("      a zero dot produced %g, not 0.5\n", (double) got[0]);
+        verdict("scalar_gate: a zero dot is exactly sigmoid(0) = 0.5", bad == 0, bad, n_tok, (double) bad,
+                "tokens whose zero dot did not give exactly 0.5");
+    }
+    ctx.free(b_x); ctx.free(b_w); ctx.free(b_out);
+
+    // ---- scale_rows: per-token scaling, exact by construction ----
+    if (have(dir, "scale_rows.spv")) {
+        const int n = 2560;
+        std::vector<float> o((size_t) n_tok * n), gv(n_tok, 0.0f), want_o;
+        for (auto& v : o) v = rndf(1.0f);
+        for (int t = 0; t < n_tok; ++t) gv[t] = (t == 1) ? 0.0f : 1.0f + 0.5f * rndf(1.0f);
+        want_o = o;
+        for (int t = 0; t < n_tok; ++t) {
+            for (int i = 0; i < n; ++i) want_o[(size_t) t * n + i] *= gv[t];
+        }
+        Buf b_o = ctx.alloc((size_t) n_tok * n * 4), b_g = ctx.alloc((size_t) n_tok * 4);
+        ctx.write(b_o, o.data(), o.size() * 4);
+        ctx.write(b_g, gv.data(), gv.size() * 4);
+        struct { int n_tokens; int n; } pc{n_tok, n};
+        VkPipeline p = ctx.pipeline(dir + "/scale_rows.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_o, &b_g}, &pc, sizeof(pc), (uint32_t) n_tok);   // one workgroup per token
+        std::vector<float> got((size_t) n_tok * n);
+        ctx.read(b_o, got.data(), got.size() * 4);
+        int bad = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i] != want_o[i]) ++bad;                       // a single multiply: exact
+        }
+        verdict("scale_rows (per token, one row each)", bad == 0, bad, (int) got.size(), (double) bad,
+                "elements differing from the exact product");
+        ctx.free(b_o); ctx.free(b_g);
+    }
+}
+
+
 // moe_combine and swiglu: the MoE block's combination and its activation, in both arithmetic variants.
 //
 // THE POINT OF RUNNING BOTH is that the difference is a number rather than an adjective. Each variant is compared
@@ -3371,6 +3493,7 @@ int main(int argc, char** argv) {
     case_s_gemv_f16_split(ctx, dir);
     case_router(ctx, dir);
     case_moe_combine(ctx, dir);
+    case_scalar_gate(ctx, dir);
     case_kv_q8(ctx, dir);
     case_kv_q8_gather(ctx, dir);
     case_rope(ctx, dir);

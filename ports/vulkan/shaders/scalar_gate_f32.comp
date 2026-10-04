@@ -1,0 +1,55 @@
+// ports/vulkan/shaders/scalar_gate_f32.comp - the shared expert's per-token scalar gate, PORTABLE arithmetic.
+//
+//     g = sigmoid(dot(x_bf16, w_bf16))          w = `ffn_gate_inp_shexp`, one SCALAR per token
+//
+// **ONE THREAD WAS THE LARGEST SINGLE KERNEL IN THE MODEL.** The source's own comment records the defence it had -
+// "n_embd is 2560, so this is a short serial loop" - and why it was wrong: 2560 iterations is not short when each
+// is a DOUBLE multiply-add, and this card's double rate is 1/64 of its float rate, so the loop was a 2560-long
+// dependency chain through a 1/64-rate unit. Measured, `shared_expert` was 0.2374 ms of a 0.8883 ms block, 26.7%
+// of it, for three projections whose memory floor is 0.009 ms. The fix is ten terms per thread plus a tree.
+//
+// THE DOUBLE ACCUMULATOR IS KEPT, for the source's reason: the reference reduces in float64, the summation order
+// of a tree is not the reference's, and "the defence is enough precision that the order stops mattering". Through
+// a sigmoid, a 1e-16 relative difference in the dot is not a difference.
+//
+// **A WRONG SCALAR HERE IS THE QUIET FAILURE MODE**: sigmoid bounds the damage to [0,1], so a gate that should be
+// 0.5 and reads 1.0 scales the shared expert's output by 2x and produces perfectly finite, perfectly plausible
+// logits. The source's first symptom of a 5120-byte over-read was 2560 non-finite outputs, not a wrong scalar.
+//
+// THE PORTABLE SIBLING, for devices without shaderFloat64 (Intel Arc - Intel support article 000089817). The
+// products are exact in f32 because bf16 has an 8-bit mantissa, so the only error the double accumulator was
+// guarding against is the SUMMATION - which Kahan compensation addresses, and the gate measures the result.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { uint v[]; } xb;
+layout(set = 0, binding = 1, std430) readonly buffer W { uint v[]; } wb;
+layout(set = 0, binding = 2, std430) buffer OUT { float v[]; } out_;
+
+#include "common/bf16.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_tokens; int n_embd; } pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= uint(pc.n_tokens)) return;
+    const uint n = uint(pc.n_embd);
+    const uint lid = gl_LocalInvocationIndex, lsize = gl_WorkGroupSize.x;
+    const uint xbase = t * (n / 2u);                 // the activation is bf16, read as 32-bit pairs
+    float acc = 0.0, comp = 0.0;
+    for (uint i = lid; i < n; i += lsize) {
+        const uint hx = ((i & 1u) == 0u) ? (xb.v[xbase + (i >> 1u)] & 0xFFFFu) : (xb.v[xbase + (i >> 1u)] >> 16u);
+        const uint hw = ((i & 1u) == 0u) ? (wb.v[i >> 1u] & 0xFFFFu) : (wb.v[i >> 1u] >> 16u);
+        // bf16 x bf16 is EXACT in f32 (8-bit mantissas), so the only error is the accumulation: Kahan, since the
+        // engine sums 2560 of these in double.
+        const float term = bf16_to_f32(hx) * bf16_to_f32(hw) - comp;
+        const float tt = acc + term;
+        comp = (tt - acc) - term;
+        acc = tt;
+    }
+    const float total = wg_sum(acc);
+    if (lid == 0u) out_.v[t] = 1.0 / (1.0 + exp(-total));
+}
