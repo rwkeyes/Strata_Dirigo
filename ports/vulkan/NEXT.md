@@ -10,11 +10,22 @@ THE ONE OPEN TASK, scoped to a single case re-add:
 1. `shaders/pending/` holds four finished, compiling kernels from `s2_expert_grouped.cu` - `s2expert_gu`,
    `s2expert_swiglu`, `s2expert_down` and the `s2_row_dot` include they share - plus a README with what is
    established and what is not. They are outside `shaders/*.comp` so the build does not exercise them.
-2. Re-add their case to `harness/vk_gate.cpp` (the shape is in the README) and re-run. `gu` and `swiglu` passed
-   3840/3840 and 1920/1920 against a double reference before the revert; `down` needs its CORRECTED oracle, which
-   reads the QUANTIZER'S OUTPUT rather than the gate/up activation image - that mistake is recorded in the README
-   and it is the third of its kind in this port (an oracle right for the data it was written against and wrong for
-   the data it was run on).
+2. **THE BLOCKER IS A DEVICE NaN IN `gu`, AND AN EARLIER "PASSED 3840/3840" WAS RETRACTED.** The gu kernel
+   produces NaN where the oracle reads 1417.59375 from the same bytes:
+
+       gu: got[0] nan (isnan 1)   want[0] 1417.59375 (isnan 0)   abs_sum[0] 5514.59375
+
+   The old comparison (`ratio > 1.0`, false for NaN) reported that as "0 differ, worst 0" and the case called it a
+   pass - so the claim is withdrawn and the NaN-safe comparison is now in the gate at all six sites.
+
+   FIRST STEP, and it is a probe rather than a re-read: dump the first row's eight code bytes, its scale and its
+   activation block AS THE DEVICE READS THEM (a small debug output buffer). Reasoning about which offset is right
+   has already failed twice in this port. Ruled out already, in the README: the data is finite, the offsets agree
+   between shader and oracle, and the integer path cannot overflow.
+
+   THEN the `down` stage, whose own oracle bug is recorded (it must read the QUANTIZER'S OUTPUT, not the gate/up
+   activation image - the third instance in this port of an oracle right for the data it was written against and
+   wrong for the data it was run on).
 3. The gate-wide NaN question that blocked that work is SETTLED: it was 0/0 from `gemv_bound` on a zero row, not a
    kernel. The bound now has a 1e-30 floor and the NaN-safe comparison is in at all six sites.
 
