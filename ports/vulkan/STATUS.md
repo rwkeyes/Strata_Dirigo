@@ -11,8 +11,8 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
 short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
 Walsh-Hadamard rotation), the hybrid K8V4 mode, descriptor OFFSETS and the first SAMPLER kernel landed, the box's GPU
-run was **281 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
-Vulkan 1.4.318, subgroup size 32) - 269 / 0 / 3 on llvmpipe and 272 / 0 / 2 on the radeon ICD, which now picks the AMD
+run was **284 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
+Vulkan 1.4.318, subgroup size 32) - 272 / 0 / 3 on llvmpipe and 275 / 0 / 2 on the radeon ICD, which now picks the AMD
 iGPU because the discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
@@ -36,7 +36,8 @@ numbers ever stop reconciling this way, something is wrong with the harness rath
 ten `todo` symbols were ordered by (a) where the decode step meets them and (b) what each depends on.  The three
 with NO unported precondition come first, in the order a decode step reaches them - `cvec_apply` (every layer,
 `block_layer_post`), `gather_rows` (the MTP draft head's token subset), `scatter_rows_f32` (the peer experts'
-write-back) - and **`cvec_apply` and `gather_rows`** are landed (2 of the ten).  `cvec_apply.comp` reproduces the
+write-back) - and **all three - `cvec_apply`, `gather_rows` and `scatter_rows_f32` - are landed** (3 of the ten).
+`cvec_apply.comp` reproduces the
 engine's OWN test
 (`src/kernels/cvec_parity.cpp`) arm for arm: the projections at the engine's 1e-4 against a double oracle, the
 add and BOTH untouched cases bitwise, and the pending write bitwise by construction (`inj == 0` makes
@@ -48,11 +49,18 @@ gather whose CUDA element WIDTH (`uint4`/`uint32`/`uint8` by `row_bytes % 16 / %
 the rule - its fixture is a DERANGEMENT so an identity gather fails on every row, and both the 16-byte-aligned and
 the unaligned `row_bytes` are gated.  Falsified by `gates/inject-verify.sh gather-rows-identity`
 (`src[ids[r]*row_bytes + o]` -> `src[r*row_bytes + o]`) -> `FAIL  gather_rows: 16-byte-aligned rows  64/576`.
-**Arc 281/0/0** (272 + the two increments' nine verdicts); box `radeon_icd 277/0/1`, lvp 269/0/3, nvidia 272/0/2.
+**`scatter_rows_f32`** (the peer experts' write-back, `src/kernels/cuda/elementwise.cu:263`) is the third: `r` is a
+POSITION and `rows[r]` is the DESTINATION, an unnamed destination row must survive a sentinel, and the CUDA's
+`width % 4 == 0` + 16-byte-alignment precondition is its `float4` cast rather than the rule - the case GATES that
+by running `width = 6`, where the CUDA would refuse.  Falsified by `gates/inject-verify.sh scatter-rows-identity`
+-> `FAIL  scatter_rows_f32: permutation ... 511/3072`.  **Arc 284/0/0** (272 + the batch's twelve verdicts, and
+`run_gate.sh` **exit 0**); box `radeon_icd 280/0/1`, lvp 272/0/3, nvidia 275/0/2.  Seven of the ten `todo` symbols
+remain: `iq_dequant_f32`, `iq_embed_rows`, `native_q5_k_f32`, `moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`,
+`moe_hit_grouped_s2`.
 
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
-the gate now reads **`radeon_icd 277 passed / 0 failed / 1 skipped`**, `lvp_icd 269/0/3`, `nvidia_icd (K620)
-272/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the
+the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
+275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the
 `kv_q4 round trip` failure was the CASE's bound (`|d|/2`, wrong for a `d*[-8,+7]` code range whose +8 end clips -
 the shader was faithful, `dev-vs-rule mismatch 0`); the `quantize_q8_0 (ggml bytes)` failure was a lavapipe/Mesa
 26.0.8 bug (`roundEven(double)` rounds ties toward zero), so the CASE was right and the SHADER was changed to an

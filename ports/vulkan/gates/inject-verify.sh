@@ -47,6 +47,11 @@ case "$name" in
     old=$'    DST.b[i] = SRC.b[uint(IDS.v[r]) * pc.row_bytes + o];'
     new=$'    DST.b[i] = SRC.b[r * pc.row_bytes + o];   // INJECTION: ids[r] ignored - the row at the position'
     want="FAIL  gather_rows: 16-byte-aligned rows" ;;
+  scatter-rows-identity)
+    file="$SH/scatter_rows_f32.comp"; spv="scatter_rows_f32"
+    old=$'    const uint dbase = uint(ROWS.v[r]) * pc.width;'
+    new=$'    const uint dbase = r * pc.width;   // INJECTION: the destination row indirection dropped'
+    want="FAIL  scatter_rows_f32: permutation" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 

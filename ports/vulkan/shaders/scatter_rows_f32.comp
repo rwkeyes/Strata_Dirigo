@@ -1,0 +1,41 @@
+#version 450
+// ports/vulkan/shaders/scatter_rows_f32.comp - A ROW SCATTER, f32.
+//
+// Transcribed from `scatter_rows_f32` (src/kernels/cuda/elementwise.cu:263) and `scatter_rows_kernel` (:255).  Its
+// decode-path call site is `PeerExperts::run` (src/core/peer_experts.cpp:241): the rows a peer GPU computed are
+// written back to the ROWS the router asked for, out of the compact order the computation produced them in.
+//
+// THE RULE: one workgroup per SOURCE row; `rows[r]` is the DESTINATION row.
+//
+//     for r in [0, n):  for i in [0, width):  dst[ rows[r] * width + i ] = src[ r * width + i ]
+//
+// TWO THINGS THAT MAKE THIS FALSIFIABLE rather than plausible, both of them the port's own rules:
+//   * `r` is a POSITION in the compact source and `rows[r]` is the destination - the same two-roles confusion
+//     the KV gather's `ids[id]` carries.  A port that writes `dst[r * width + i]` (the identity) has the right
+//     SHAPE and the wrong rows, so the gate uses a PERMUTATION WITH NO FIXED POINT and distinct row contents.
+//   * A row of `dst` that `rows[]` does not name is NOT WRITTEN AT ALL.  The gate fills the destination with a
+//     sentinel and requires the unnamed rows to survive, which is what catches a port that writes every row.
+//
+// THE CUDA'S PRECONDITION IS ITS VECTORIZATION, NOT THE RULE: it casts to `float4` and therefore exits(1) unless
+// `width % 4 == 0` and both pointers are 16-byte aligned.  This kernel reads f32 words, so it carries neither
+// requirement - gated, not asserted: the case runs a width of 6, where the CUDA would refuse.
+//
+// `rows[r]` is not range-checked, exactly as in the CUDA; that is the caller's contract.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SRCb { float v[]; } SRC;
+layout(set = 0, binding = 1, std430) buffer DSTb { float v[]; } DST;
+layout(set = 0, binding = 2, std430) readonly buffer ROWSb { int v[]; } ROWS;
+
+layout(push_constant) uniform Pc {
+    uint width;   // floats per row
+    uint n;       // source rows
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.x;
+    if (r >= pc.n) return;
+    const uint sbase = r * pc.width;
+    const uint dbase = uint(ROWS.v[r]) * pc.width;
+    for (uint i = gl_LocalInvocationIndex; i < pc.width; i += 256u) DST.v[dbase + i] = SRC.v[sbase + i];
+}

@@ -134,6 +134,40 @@ pre-existing M8 skip, as at HEAD.
 **No honest limit to state**: the rule is a pure byte copy and the case compares bytes, so the arms are exact
 rather than tolerance-bearing.
 
+## M-A 3/3: `scatter_rows_f32` - the peer experts' row write-back
+
+`scatter_rows_f32.comp`, from `scatter_rows_f32` / `scatter_rows_kernel` (`src/kernels/cuda/elementwise.cu:263`,
+`:255`); call site `PeerExperts::run` (`src/core/peer_experts.cpp:241`).
+
+    for r in [0, n):  for i in [0, width):  dst[ rows[r]*width + i ] = src[ r*width + i ]
+
+Two rules, both of them traps this port has already met once elsewhere:
+
+* **`r` is a POSITION and `rows[r]` is the DESTINATION row** - the same two-roles confusion the KV gather's
+  `ids[id]` carries.  The fixture is a PERMUTATION WITH NO FIXED POINT with distinct row contents, so an identity
+  write fails on every row.
+* **A destination row `rows[]` does not name is NOT WRITTEN AT ALL.**  The destination is filled with a sentinel
+  and the unnamed rows - plus a `strays` count of zero - must survive, which is what catches a port that writes
+  every row.
+
+**The CUDA's precondition is its VECTORIZATION, not the rule**: it casts to `float4` and therefore `exit(1)`s
+unless `width % 4 == 0` and both pointers are 16-byte aligned.  This kernel reads f32 words and carries neither
+requirement - and that is GATED rather than asserted: the second arm runs `width = 6`, where the CUDA would refuse.
+
+**Falsified.**  `gates/inject-verify.sh scatter-rows-identity` drops the row indirection
+(`dst[rows[r]*width + i]` -> `dst[r*width + i]`): `FAIL  scatter_rows_f32: permutation ... 511/3072`.
+
+**Measured.**  vega, this commit: **Intel Arc 284 passed / 0 failed / 0 skipped** (default and intel_icd),
+llvmpipe 272/0/3, radeon-iGPU 275/0/2 - `run_gate.sh` **exit 0**.  z820b: radeon_icd (7900 XTX) **280/0/1**,
+lvp 272/0/3, nvidia (K620) 275/0/2; the script exits 1 there on the PRE-EXISTING M8 cooperative-matrix skip (a
+skip is not a pass), exactly as it does at HEAD.
+
+**M-A is now 3 of the ten.**  Still `todo`: `iq_dequant_f32`, `iq_embed_rows`, `native_q5_k_f32`,
+`moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`, `moe_hit_grouped_s2`.  The next increment in the derived order
+is the **`iq_dequant_f32` -> `iq_embed_rows` pair**: the standalone IQ/BF16 dequantiser the embedding path needs
+(15 `is_iq` types plus BF16 - the port has only the FUSED dot form today), a format at a time with one codebook's
+values per arm, then the row gather built on it.
+
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
 
 **Closed the same day the API was written.**  `case_recorded_step` (`harness/vk_gate.cpp`, six verdicts, one

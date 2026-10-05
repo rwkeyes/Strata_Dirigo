@@ -78,5 +78,5 @@ rope_table_release	host	table bookkeeping
 rope_table_set	host	table bookkeeping
 s_gemv_split_async	kernel	s_gemv_q8_split
 sample_tokens	kernel	sampler_greedy sampler_kernel
-scatter_rows_f32	todo	a row scatter, not ported
+scatter_rows_f32	kernel	scatter_rows_f32
 shared_expert_scratch_bytes	host	a size

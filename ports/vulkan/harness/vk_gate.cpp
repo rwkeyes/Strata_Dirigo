@@ -8858,6 +8858,64 @@ void case_gather_rows(Ctx& ctx, const std::string& dir) {
             "the fixture is a derangement, so an identity gather fails on every row");
 }
 
+// scatter_rows_f32 - the peer experts' row write-back (src/kernels/cuda/elementwise.cu:263).  `r` is a POSITION
+// in the compact source and `rows[r]` is the DESTINATION row; a destination row nobody names is NOT written.
+void case_scatter_rows_f32(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "scatter_rows_f32.spv")) return;
+    struct Arm { const char* what; uint32_t width, n_dst; std::vector<int32_t> rows; };
+    const Arm arms[] = {
+        {"permutation {3,0,5,2}: dst rows 1 and 4 must survive", 512, 6, {3, 0, 5, 2}},
+        {"width 6: the CUDA's float4 path refuses, this one must not", 6, 5, {3, 0, 4}},
+    };
+    struct Pc { uint32_t width, n; };
+    const VkPipeline p = ctx.pipeline(dir + "/scatter_rows_f32.spv", 3, sizeof(Pc));
+    const float SENT = -7.5f;
+    int bad_total = 0, checks_total = 0;
+    for (const Arm& a : arms) {
+        const uint32_t n_src = (uint32_t) a.rows.size();
+        std::vector<float> src((size_t) n_src * a.width);
+        for (uint32_t r = 0; r < n_src; ++r)
+            for (uint32_t i = 0; i < a.width; ++i) src[(size_t) r * a.width + i] = (float) (r + 1) * 1.5f;
+        std::vector<float> dst0((size_t) a.n_dst * a.width, SENT);
+
+        Buf bs = ctx.alloc(src.size() * 4), bd = ctx.alloc(dst0.size() * 4), br = ctx.alloc(n_src * 4);
+        ctx.write(bs, src.data(), src.size() * 4);
+        ctx.write(bd, dst0.data(), dst0.size() * 4);
+        ctx.write(br, a.rows.data(), n_src * 4);
+        Pc pc{a.width, n_src};
+        ctx.dispatch(p, {&bs, &bd, &br}, &pc, sizeof(pc), n_src);
+        std::vector<float> got(dst0.size());
+        ctx.read(bd, got.data(), got.size() * 4);   // BYTES, not elements - this line read 30 bytes once
+
+        std::vector<float> want = dst0;
+        for (uint32_t r = 0; r < n_src; ++r)
+            for (uint32_t i = 0; i < a.width; ++i) want[(size_t) a.rows[r] * a.width + i] = src[(size_t) r * a.width + i];
+
+        int bad = 0, wrote = 0, strays = 0;
+        std::vector<char> named(a.n_dst, 0);
+        for (int32_t r : a.rows) named[(size_t) r] = 1;
+        for (size_t i = 0; i < got.size(); ++i) {
+            ++checks_total;
+            if (got[i] != want[i]) ++bad;
+            if (got[i] != SENT) ++wrote;
+        }
+        for (uint32_t r = 0; r < a.n_dst; ++r)
+            if (!named[r])
+                for (uint32_t i = 0; i < a.width; ++i) if (got[(size_t) r * a.width + i] != SENT) ++strays;
+        if (strays) ++bad;                       // an unnamed destination row moved
+        std::printf("      %-58s width %u -> %d bad (%d values written, %d stray)\n",
+                    a.what, a.width, bad, wrote, strays);
+        char label[200];
+        std::snprintf(label, sizeof label, "scatter_rows_f32: %s", a.what);
+        verdict(label, bad == 0, bad, (int) got.size(), 0.0,
+                "a wrong destination row, an unnamed row that moved, or a value not copied");
+        bad_total += bad;
+        ctx.free(bs); ctx.free(bd); ctx.free(br);
+    }
+    verdict("scatter_rows_f32: position -> rows[r], unnamed rows survive", bad_total == 0, bad_total, checks_total,
+            0.0, "the fixture is a derangement with at least one unnamed destination row");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -8994,6 +9052,7 @@ int main(int argc, char** argv) {
     case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
     case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)
     case_gather_rows(ctx, dir);            // M-A: the MTP draft head's opaque-byte row gather
+    case_scatter_rows_f32(ctx, dir);       // M-A: the peer experts' row write-back
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);
