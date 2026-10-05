@@ -725,6 +725,26 @@ COMPILE-TIME macros - `STRATA_ENABLE_CUDA`, `STRATA_ENABLE_HIP`, `STRATA_ENABLE_
 (`kv_q4.hpp`: `fwht256_inplace_cuda(...) { fwht256_cuda(...); }`).  A Vulkan backend therefore plugs in the same way:
 a `_vulkan` body per wrapper, selected by a new macro, dispatching through this port's device layer.
 
+## NEXT KERNEL: `embedding_gather` - contract PINNED, shader not written
+
+The first-token path's gather, and the smallest of the ten holes.  What the engine's own reference
+(`src/kernels/elementwise_parity.cpp`, the parity test that drives it) fixes, so no guessing is needed:
+
+    out[i] = (code_i + bias) * scales[row * row_groups + i / group] + (offsets ? offsets[...] : 0.0f)
+
+* `code_i` is the `bits`-wide code UNPACKED from the row's packed bytes (`bits` and `bias` are parameters: S2/S4/S8
+  embeddings share this kernel), `row_bytes` is per row, `row_groups` the scales' stride per row.
+* **THE REFERENCE COMPARES BITWISE, AND AGAINST THE SEPARATE MULTIPLY-AND-ADD, NOT THE FUSED FORM.**  The test builds
+  `want = code * scale` then `+ offset` and `memcmp`s it against the kernel's output, while the fused
+  `std::fma(code, scale, offset)` is only COUNTED (`fma_diff`) rather than required.  A port that reaches for `fma`
+  as the "better" instruction fails that comparison wherever the two differ - so the port must compute the product
+  and the sum as two operations, and the case must carry the same fma-difference count as a reported datum.
+* The engine's fixture shape is worth copying: three rows, each run twice (with and without offsets), guard values
+  just outside the written range, plus a scale applied after the gather to show it uses the caller's stream - which in
+  this port is the descriptor-offset path, already gated.
+* `iq_embed_rows` (the IQ/BF16 table form, `include/strata/kernels/iq_kernels.hpp`) is a SECOND kernel on the same
+  path and is easy to mistake for host-side bookkeeping; it is not - the map said `host` until the header was read.
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one

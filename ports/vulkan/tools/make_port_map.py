@@ -69,7 +69,7 @@ TABLE = {
     'kv_q4_bytes_per_head':        ('host', 'a size'),
     'kv_q8_bytes_per_cell':        ('host', 'a size'),
     'iq_row_bytes':                ('host', 'a size'),
-    'iq_embed_rows':               ('host', 'host-side row bookkeeping'),
+    'iq_embed_rows':               ('todo', 'the IQ/BF16 token-embedding dequant, not ported - iq_kernels.hpp declares it'),
     'native_expert_layout':        ('host', 'a layout description'),
     'native_expert_scratch_bytes': ('host', 'a size'),
     'native_q8_1_bytes':           ('host', 'a size'),
