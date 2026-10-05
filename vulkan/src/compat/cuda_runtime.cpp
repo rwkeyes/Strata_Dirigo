@@ -55,6 +55,34 @@ Stream* current_or(Stream* s) {
     return s != nullptr ? s : g_current;
 }
 
+// THE ENGINE'S DEVICE BRING-UP (a stream-less allocation path).
+//
+// The engine program (`src/program/generate.cpp`) allocates through cudaMalloc/cudaHostAlloc and creates its
+// FIRST stream only AFTER the weight arena (generate.cpp:2243 vs :2339), and on this backend a Stream is ONE
+// device and ONE FIXED arena (`vk_arena.hpp`): every cudaMalloc/cudaHostAlloc carves from that one buffer, so
+// its size must be declared before the first allocation.  Without a stream, cudaMalloc refused
+// (cudaErrorInvalidValue) and the program stopped at device bring-up - the first gap past MODEL LOAD.
+//
+// STRATA_VK_ARENA_GIB is that declaration: with it set, a stream-less allocation opens the device with a
+// <G> GiB arena.  **UNSET (the smokes, and every gate case - they open their own streams), the behaviour is
+// EXACTLY the old refuse, so this cannot move a gate verdict.**  This is host-side device bring-up, not a
+// kernel wrapper: no dispatch, no capture node, no shader.
+Stream* ensure_device() {
+    if (g_current != nullptr) return g_current;
+    const char* gib = std::getenv("STRATA_VK_ARENA_GIB");
+    if (gib == nullptr || *gib == '\0') return nullptr;      // not asked to bring the device up
+    const long v = std::strtol(gib, nullptr, 10);
+    if (v <= 0) return nullptr;
+    const char* dir = std::getenv("STRATA_VK_SPV_DIR");
+    const std::string spv = (dir != nullptr && *dir != '\0') ? dir : "ports/vulkan/shaders";
+    Stream* s = strata::vulkan::stream_open((uint64_t) v << 30, spv);
+    if (s == nullptr) return nullptr;
+    g_current = s;
+    std::fprintf(stderr, "strata vulkan shim: device up, one arena of %ld GiB (STRATA_VK_ARENA_GIB; every "
+                         "cudaMalloc/cudaHostAlloc carves from it)\n", v);
+    return s;
+}
+
 // ---- one transfer, expressed in the device layer's primitives ----------------------------------------------
 // Every device pointer is resolved to an arena view first; anything not in the arena is a HOST pointer (either
 // one this shim's cudaHostAlloc handed out, or engine host memory the caller is uploading/downloading).
@@ -183,6 +211,7 @@ extern "C" {
 cudaError_t cudaMalloc(void** devPtr, size_t count) {
     if (devPtr == nullptr) return fail(cudaErrorInvalidValue);
     Stream* s = current_or(nullptr);
+    if (s == nullptr) s = ensure_device();     // a stream-less engine allocation (STRATA_VK_ARENA_GIB)
     if (s == nullptr)
         return fail(cudaErrorInvalidValue);   // no current stream: nothing to carve from
     *devPtr = strata::vulkan::arena_alloc(*s, count == 0 ? 1 : count);
@@ -206,6 +235,7 @@ cudaError_t cudaHostAlloc(void** hostPtr, size_t count, unsigned int flags) {
     (void) flags;      // Mapped/Portable/WriteCombined do not change what this device layer can offer
     if (hostPtr == nullptr) return fail(cudaErrorInvalidValue);
     Stream* s = current_or(nullptr);
+    if (s == nullptr) s = ensure_device();     // a stream-less engine allocation (STRATA_VK_ARENA_GIB)
     if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
     Buf b = s->ctx->alloc(count == 0 ? 1 : count);      // HOST_VISIBLE | HOST_COHERENT (Ctx::alloc's type)
     if (b.mapped == nullptr)
@@ -265,6 +295,7 @@ cudaError_t cudaMallocHost(void** ptr, size_t count) {
 
 cudaError_t cudaMemGetInfo(size_t* freeBytes, size_t* totalBytes) {
     Stream* s = current_or(nullptr);
+    if (s == nullptr) s = ensure_device();     // a stream-less engine allocation (STRATA_VK_ARENA_GIB)
     if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
     // The device's OWN figures: `usable_bytes()` is the driver's free HEAP figure (VK_EXT_memory_budget, the
     // whole-heap usage) minus the desktop reserve - the number the port sizes against; the total is the

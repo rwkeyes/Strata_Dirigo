@@ -69,16 +69,33 @@ Stream* require_stream(void* stream, const char* what) {
     return s;
 }
 
-// Resolve one raw device pointer to an arena view.  A pointer outside the arena is a refusal, never a wrong
-// bind (vk_arena.hpp).
+// Resolve one raw pointer the engine handed us to a bindable device view.
+//
+// A DEVICE pointer is inside the arena.  A **MAPPED PINNED HOST** pointer is what the doorbell's payload and
+// ring ARE: the engine allocates them with `cudaHostAlloc(Mapped)` + `cudaHostGetDevicePointer`
+// (`src/core/layer.cpp:1023`), and the shim returns that SAME host address as the "device pointer"
+// (`cuda_runtime.cpp`: "the mapped host address IS the token the shim's copies accept").  So a pointer here is
+// resolved against the live mapped regions, exactly as `copy_from_mapped` does - a Vulkan shader cannot
+// dereference host memory, so the region's DEVICE-VISIBLE buffer is bound.  Anything else is refused, never
+// bound to a wrong view.
 Buf view_of(Stream& s, const void* p, uint64_t bytes, const char* what) {
     Buf b{};
-    if (!arena_resolve(s, p, bytes, b)) {
-        std::fprintf(stderr, "%s: a pointer is not inside this stream's arena - refusing rather than binding a "
-                             "wrong view\n", what);
-        std::exit(2);
-    }
-    return b;
+    if (arena_resolve(s, p, bytes, b)) return b;
+    if (mapped_resolve(p, bytes, b)) return b;
+    std::fprintf(stderr, "%s: a pointer is neither inside this stream's arena nor a live MAPPED host region - "
+                         "refusing rather than binding a wrong view\n", what);
+    std::exit(2);
+}
+
+// Read/write THROUGH the resolution above.  `strata::vulkan::stream_read/write` only accept arena pointers;
+// the ring (`d_seq`) and the answer flag (`d_flag`) are mapped host memory, so they need these.
+void read_at(Stream& s, const void* p, void* host, uint64_t bytes, const char* what) {
+    Buf v = view_of(s, p, bytes, what);
+    s.ctx->read(v, host, bytes, v.offset);
+}
+void write_at(Stream& s, void* p, const void* host, uint64_t bytes, const char* what) {
+    Buf v = view_of(s, p, bytes, what);
+    s.ctx->write(v, host, bytes, v.offset);
 }
 
 void copy(Stream& s, const void* src, const void* dst, uint64_t bytes, const char* what) {
@@ -90,11 +107,10 @@ void copy(Stream& s, const void* src, const void* dst, uint64_t bytes, const cha
 // publication count where the host reads it (see the file header).  `store` selects the `_value` variant.
 uint32_t ring_raise(Stream& s, uint32_t* d_seq, bool store, uint32_t value, const char* what) {
     if (d_seq == nullptr) return 0;
-    (void) view_of(s, d_seq, sizeof(uint32_t), what);      // refuse a ring outside the arena, like every other bind
     uint32_t cur = 0;
-    stream_read(s, d_seq, &cur, sizeof(uint32_t));
+    read_at(s, d_seq, &cur, sizeof(uint32_t), what);          // refuse a ring outside the arena, like every bind
     const uint32_t next = store ? value : cur + 1u;
-    stream_write(s, d_seq, &next, sizeof(uint32_t));
+    write_at(s, d_seq, &next, sizeof(uint32_t), what);
     return next;
 }
 
@@ -174,8 +190,8 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     if (d_flag == nullptr || d_seq == nullptr) return;  // the CUDA form returns on null
     strata::vulkan::Stream* s = strata::vulkan::require_stream(stream, "doorbell_wait");
     uint32_t flag = 0, ring = 0;
-    strata::vulkan::stream_read(*s, d_flag, &flag, sizeof(uint32_t));
-    strata::vulkan::stream_read(*s, d_seq, &ring, sizeof(uint32_t));
+    strata::vulkan::read_at(*s, d_flag, &flag, sizeof(uint32_t), "doorbell_wait/flag");
+    strata::vulkan::read_at(*s, d_seq, &ring, sizeof(uint32_t), "doorbell_wait/seq");
     if (flag < ring) {
         std::fprintf(stderr,
                      "doorbell_wait: the host has not answered (flag %u < ring %u).  This backend never asks the "
