@@ -68,6 +68,21 @@ no `#version`.  **+30 green verdicts on every implementation, bit-exact against 
 302/0/3, nvidia 305/0/2.  **M-A is 5 of the ten**; the five `todo` symbols are `native_q5_k_f32`, `moe_grouped_s2`,
 `moe_hit_add`, `moe_hit_select`, `moe_hit_grouped_s2`.
 
+**M-A 6/10 landed the NATIVE HEAD's Q5_K matvec** (`native_q5_k_f32.comp`, from `native_q5_k_mmvq_kernel` /
+`q5_q8_dot`, `src/kernels/cuda/native_mmvq.cu`).  It is the one dot in the port whose scale and min are PACKED:
+Q5_K's 12-byte `scales` carries six 6-bit scales and six 6-bit mins, and an `hi` mask decides which six bits are
+which - the port transcribes the source's masks and shifts verbatim, because a "tidier" read is a plausible wrong
+number.  The case carries three arms (`n_in=2560` 1280 parts, `n_in=256` 16 parts, `n_in=10240` x2 columns)
+against a host double reference, and the increment found THREE silent defects in the transcription, all recorded
+in `NEXT.md`: the activation's `u` was read out of the weight buffer (the `f16_at` class), the per-block
+activation group must be `kbx*8` not the row base, and `unpackHalf2x16` fed only the low 16 bits silently zeroed
+`min` (a 1-13% per-row error - every value finite and close).  Falsified by `gates/inject-verify.sh
+native-q5k-aux-half` (drop the packed-scale half switch) -> `FAIL  native_q5_k_f32 ... 0/8  worst 5.62e+04`.
+**+3 verdicts on every implementation**: vega **Arc 317/0/0** (`run_gate.sh` exit 0), llvmpipe 305/0/3,
+radeon-iGPU 307/1/2 (the intermittent budget-requery drift); box `radeon_icd` (7900 XTX) **313/0/1**, lvp
+305/0/3, nvidia 308/0/2.  **M-A is now 6 of the ten**; the four `todo` symbols are `moe_grouped_s2`,
+`moe_hit_add`, `moe_hit_select`, `moe_hit_grouped_s2`.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the

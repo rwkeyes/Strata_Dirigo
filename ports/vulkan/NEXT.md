@@ -220,6 +220,66 @@ IQ2_XXS and IQ2_XS stay `todo` in `PORT-MAP.tsv` for the grid reason stated.
 `native_q5_k_mmvq`, the head's Q5_K matvec - `q5_q8_dot` in `src/kernels/cuda/native_mmvq.cu`, a pinned
 integer-dot order the `iq*_mmvq` family does not contain).
 
+## M-A 6/10: `native_q5_k_f32` - the native head's Q5_K matvec, and the ONE dot whose scale and min are PACKED
+
+`native_q5_k_f32.comp`, from `native_q5_k_mmvq_kernel` / `q5_q8_dot` (`src/kernels/cuda/native_mmvq.cu:239`,
+`:196`).  `native_q5_k_f32` (:1311) is `native_quantize_q8_1` PLUS this, and the decode head's type-13 path is
+exactly that pair (`src/core/native_head.cpp:78`), so this is the last matvec between the port and the head.
+
+**The rule is a pinned integer-dot order, and its shape is the point.**  One workgroup per row; each lane owns a
+strided set of the row's `(Q5_K block, 16-value part)` items, where part `p = iqs/2` in 0..15,
+`bq8_offset = 2*(p/4)`, `nib = p%4` - the engine's own `kqs = VDR*(tid % (QI/VDR))` decomposition.  Every part's
+VALUE is the source's f32 expression term for term (two `dp4a` chains: `dot1` against the codes, `dot2` against
+ones for the `sum(x)` term); the reduction that adds the parts is the port's barrier tree, so the comparison is a
+double reference, not bit-for-bit.
+
+**`aux` is what the `iq*_mmvq` family does not have.**  Q5_K's 12-byte `scales` packs SIX 6-bit scales and SIX
+6-bit mins, and which six bits are the scale and which the min depends on the block half: `j = bq8_offset/2`,
+`jm = j&1` (which `uint16` to read), and `hi`, the all-ones mask that switches between groups 0..2 and 3..5.  The
+port transcribes the source's masks and shifts literally rather than re-deriving them - a "tidier" read is a
+plausible wrong number, which is the class the falsification targets.
+
+**THREE TRAPS, ALL FOUND BY THIS CASE AND ALL SILENT.**
+1. **The activation's `u` is read out of the q8_1 block, not the weight.**  `q5_q8_dot` reads four int8 from
+   `bq8i->qs` and four from the Q5_K block's `qs`; collapsing the two 4-byte helpers into one buffer (the source's
+   pointer argument loses its buffer when the port makes it a byte offset) sent every activation read into the
+   weights - the same `f16_at` defect class, and it read a legal address.  The port keeps two named helpers
+   (`q5_i32` for the weight, `q5_a_i32` for the activation).
+2. **A Q5_K block's activation group is `kby = kbx*8`, not the row start.**  Each 256-value Q5_K block dots the
+   EIGHT q8_1 blocks at `kbx*8`; using the row base for every block computed a finite, wrong row.
+3. **`unpackHalf2x16` needs the full 32-bit half2.**  `unpackHalf2x16(q5_u16(blk))` passes only the LOW half, so
+   `.y` (the block's `min`) came back 0 and the whole `- min*sumf_m` term vanished - a per-row error of 1-13%,
+   every value finite and close.  The first two traps were caught by the arm failing at 1e2-1e5 of tolerance; this
+   one needed the shader's own `sumf_m` exposed to be seen, and it is recorded because "close but wrong" is the
+   signature a value comparison should have caught and a per-part dump did.
+
+**Fixtures.**  `q5_k_fill_blob` varies EVERY byte of `scales`, `qh` and `qs` (so both `qh` nibble halves, both
+`aux` branches and every `dp4a` byte position are exercised), with `dm = (d, min)` FINITE (a random byte pattern
+would assemble an inf half and the case would measure the inf instead of the decode).  Three arms: `n_in=2560,
+n_out=8` (1280 parts over 256 lanes), `n_in=256, n_out=1` (16 parts, most lanes idle), and `n_in=10240, n_out=4,
+ncols=2` (the widest Q5_K pitch and a two-column activation).  Each compares the row against a host double
+reference, requires finite outputs, a guard region past the buffer, and a live oracle mass.
+
+**Falsified.**  `gates/inject-verify.sh native-q5k-aux-half` drops the packed-scale half switch
+(`him = (j>=2) ? ~0 : 0` -> `him = 0`), so every group reads groups 0..2's fields:
+`FAIL  native_q5_k_f32 (n_in=2560, n_out=8, ncols=1, ...)  0/8  worst 5.62e+04`.
+
+**Measured.**  vega, this commit: **Intel Arc 317 passed / 0 failed / 0 skipped**, llvmpipe **305/0/3**,
+radeon-iGPU 307/1/2 (its `budget: independent requery agrees` drift again - the documented intermittent figure).
+z820b (7900 XTX): **radeon_icd 313/0/1** (the 1 skip is the pre-existing M8 cooperative-matrix case),
+lvp 305/0/3, nvidia (K620) 308/0/2; the box's script exits 1 on that pre-existing skip, as at HEAD.
+That is **+3 verdicts on every implementation**.
+
+**Honest limit.**  The arms supply the q8_1 activation directly (the boundary every other `iq*_mmvq` arm draws),
+so the oracle is INDEPENDENT of the quantiser rather than reading bytes the quantiser wrote; the quantiser half of
+`native_q5_k_f32` is gated byte-exactly by `case_quantize_q8_1`, and the composed quantiser->dot chain is the
+`case_quant_prefill_chain` pattern, already gated for iq2s.  What is NOT claimed here is the engine's exact
+4-warp summation order - the parts' values are, the order that adds them is the port's tree, and the tolerance is
+the double reference's.
+
+**M-A is now 6 of the ten.** Still `todo`: `moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`,
+`moe_hit_grouped_s2`.  The next in the derived order is **`moe_hit_select`**.
+
 
 
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**

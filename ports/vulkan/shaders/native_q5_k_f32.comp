@@ -1,0 +1,137 @@
+// ports/vulkan/shaders/native_q5_k_f32.comp - the Q5_K matvec the NATIVE HEAD uses, one workgroup per row.
+//
+// `native_q5_k_mmvq_kernel` (src/kernels/cuda/native_mmvq.cu:239) - llama.cpp's `vec_dot_q5_K_q8_1_impl_vmmq`
+// with a pinned integer-dot order.  `native_q5_k_f32` (:1311) is this PLUS `native_quantize_q8_1`
+// (`quantize_q8_1.comp`, gated by `case_quantize_q8_1`), which is why the head's type-13 path is this pair and
+// nothing else.  It is the decode head's matvec - `src/core/native_head.cpp:78`.
+//
+// THIS IS THE ONE DOT IN THE PORT WITH `aux`, THE PACKED (scale, min) PAIR.  The `iq*_mmvq` family carries one
+// scale and one min per group as separate bytes; Q5_K's 12-byte `scales` field packs SIX 6-bit scales and SIX
+// 6-bit mins, and which 6 bits are the scale and which are the min depends on the block's half
+// (`j = bq8_offset/2`, `jm = j&1`, and `hi`, the mask that switches between groups 0..2 and 3..5).  A port that
+// reads them the obvious way gets a plausible wrong number, which is exactly the class this port refuses to
+// guess at: the block below is a transcription of the engine's own body, shifts and masks included.
+//
+// THE SHAPE IS THE PORT'S: the CUDA is 4 warps x 32 lanes per row with a shuffle reduction, the port is one
+// workgroup (256) per row with the shared barrier tree, and each lane owns a strided set of the row's
+// (Q5_K block, 16-value part) items.  The pinning that matters is not the summation order - that is the tree's,
+// as everywhere in this port - but the PART DECOMPOSITION: `p = iqs/2` in 0..15, `bq8_offset = 2*(p/4)`,
+// `nib = p%4`, exactly the engine's `kqs = VDR*(tid % (QI/VDR))`.  Every part's VALUE is the source's f32
+// expression, term for term; the reduction that adds the parts is the tree's, so the comparison is against a
+// double reference rather than bit-for-bit.
+//
+// GLSL HAS NO `dp4a`; the four int8 products are written out.  Integer arithmetic is exact, so the two `dp4a`
+// sums (`dot1` against the codes, `dot2` against ones - the (code) and (sum of x) terms) are the SAME integers
+// either way, and only the instruction count differs - the source's own comment says as much.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;   // the Q5_K weight rows
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } a_b;   // q8_1 activation blocks (36 B)
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+const uint Q5K_BLOCK = 176u;      // sizeof(Q5KBlock): dm(4) + scales(12) + qh(32) + qs(128)
+const uint Q8_1_BLOCK = 36u;      // sizeof(Q81Block): half2 ds(4) + int8 qs[32]
+
+uint q5_u8(uint off) { return uint(w_b.b[off]); }
+uint q5_u16(uint off) { return q5_u8(off) | (q5_u8(off + 1u) << 8u); }
+// a 4-byte integer read, little-endian, bit-preserving (the source's `*(const int*)`)
+int q5_i32(uint off) {
+    const uint u = q5_u8(off) | (q5_u8(off + 1u) << 8u) | (q5_u8(off + 2u) << 16u) | (q5_u8(off + 3u) << 24u);
+    return int(u);   // bit-preserving; glslang lowers this to OpBitcast for same-width integers
+}
+// the same read from the ACTIVATION buffer - a separate helper because the CUDA's `u[]` is int8 read out of
+// `bq8i->qs` (the activation), NOT the weight block.  Collapsing the two is the `f16_at` defect's exact class.
+int q5_a_i32(uint off) {
+    const uint u = uint(a_b.b[off]) | (uint(a_b.b[off + 1u]) << 8u) | (uint(a_b.b[off + 2u]) << 16u) |
+                   (uint(a_b.b[off + 3u]) << 24u);
+    return int(u);
+}
+
+// four int8 multiply-accumulates, the source's `__dp4a` (see the header: exact, so identical)
+int q5_sb(int a, uint k) {   // signed byte k of a packed int (explicit sign-extend)
+    const int v = (a >> int(8u * k)) & 0xFF;
+    return (v << 24) >> 24;
+}
+int q5_dp4a(int a, int b, int c) {
+    int r = c;
+    for (uint k = 0u; k < 4u; ++k) {
+        r += q5_sb(a, k) * q5_sb(b, k);
+    }
+    return r;
+}
+
+// ONE (Q5_K block, part) item: the source's `q5_q8_dot`.  `blk` is the block's byte base, `abase` the
+// activation row's byte base, `p` = `iqs/2` in 0..15.
+float q5_q8_dot(uint blk, uint abase, uint p) {
+    const uint bq8_offset = 2u * (p / 4u);        // 0, 2, 4, 6
+    const uint nib = p % 4u;                      // (iqs/2) % 4
+
+    // ---- vl / vh: the low nibbles of `qs` and the high BIT of `qh`, per 32-value half.
+    const uint ql = blk + 48u + 16u * bq8_offset + 4u * nib;   // (int*)(qs + 16*bq8_offset + 4*((iqs/2)%4))
+    const uint qh = blk + 16u + 4u * nib;                      // (int*)(qh + 4*((iqs/2)%4))
+    const int vl0 = q5_i32(ql);                                // ql[0]
+    const int vl1 = q5_i32(ql + 16u);                          // ql[4]
+    const int vh0 = q5_i32(qh) >> int(bq8_offset);             // qh[0] >> bq8_offset
+    const int vh1 = q5_i32(qh + 16u) >> int(bq8_offset);       // qh[4] >> bq8_offset
+
+    // ---- aux: the packed (scale, min) pair, from `scales` read as uint16 at 2*jm (jm = (bq8_offset/2)&1) and
+    // the `hi` switch between groups 0..2 and 3..5.
+    const int j = int(bq8_offset) / 2;
+    const int jm = j & 1;
+    const uint sbase = blk + 4u + 2u * uint(jm);
+    const uint s0 = q5_u16(sbase);
+    const uint s2 = q5_u16(sbase + 4u);
+    const uint s4 = q5_u16(sbase + 8u);
+    const uint him = (j >= 2) ? 0xFFFFFFFFu : 0u;
+    const uint aux0 = ((s0 & 0x3f3fu) & ~him) | ((((s4 >> 0u) & 0x0f0fu) | ((s0 & 0xc0c0u) >> 2u)) & him);
+    const uint aux1 = ((s2 & 0x3f3fu) & ~him) | ((((s4 >> 4u) & 0x0f0fu) | ((s2 & 0xc0c0u) >> 2u)) & him);
+    const int sc0 = int(aux0 & 0xFFu), sc1 = int((aux0 >> 8u) & 0xFFu);   // sc[0], sc[1]
+    const int m0 = int(aux1 & 0xFFu), m1 = int((aux1 >> 8u) & 0xFFu);     // m[0], m[1]
+
+    // ---- the two q8_1 blocks this part spans, and their `d` scales.
+    float sumf_d = 0.0, sumf_m = 0.0;
+    for (uint i = 0u; i < 2u; ++i) {
+        const uint b8 = abase + (bq8_offset + i) * Q8_1_BLOCK;
+        // `__low2float(bq8i->ds)`: the block's fp16 `d`
+        const float d8 = unpackHalf2x16(uint(a_b.b[b8]) | (uint(a_b.b[b8 + 1u]) << 8u)).x;
+        const int ua = q5_a_i32(b8 + 4u + 4u * nib);            // ((int*)qs)[nib]     == u[2i]
+        const int ub = q5_a_i32(b8 + 4u + 4u * nib + 16u);      // ((int*)qs)[nib + 4] == u[2i+1]
+        const int v0 = ((vl0 >> int(4u * i)) & 0x0f0f0f0f) | (((vh0 >> int(i)) << 4) & 0x10101010);
+        const int v1 = ((vl1 >> int(4u * i)) & 0x0f0f0f0f) | (((vh1 >> int(i)) << 4) & 0x10101010);
+        const int dot1 = q5_dp4a(v0, ua, q5_dp4a(v1, ub, 0));
+        const int dot2 = q5_dp4a(0x01010101, ua, q5_dp4a(0x01010101, ub, 0));
+        const int scv = (i == 0u) ? sc0 : sc1;
+        const int mv = (i == 0u) ? m0 : m1;
+        sumf_d += d8 * float(dot1 * scv);
+        sumf_m += d8 * float(dot2 * mv);
+    }
+    const vec2 dm5 = unpackHalf2x16(q5_u16(blk) | (q5_u16(blk + 2u) << 16u));   // half2 dm = (d, min)
+    return dm5.x * sumf_d - dm5.y * sumf_m;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;                 // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / 256u;              // Q5_K blocks per row
+    const uint blocks_per_col = uint(pc.n_in) / 32u;   // q8_1 blocks per activation column
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint abase = c * blocks_per_col * Q8_1_BLOCK;
+        float acc = 0.0;
+        for (uint k = lid; k < nb * 16u; k += gl_WorkGroupSize.x) {
+            const uint blk = k / 16u;
+            // the Q5_K block's own EIGHT q8_1 blocks: `kby = kbx * (QK/Q8K)` in the source
+            acc += q5_q8_dot(wrow + blk * Q5K_BLOCK, abase + blk * 8u * Q8_1_BLOCK, k % 16u);
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}

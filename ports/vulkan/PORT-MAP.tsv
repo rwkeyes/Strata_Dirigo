@@ -56,7 +56,7 @@ native_gdn_enabled	host	a capability check
 native_mmvq	kernel	iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq
 native_mmvq_supported	host	a capability check
 native_mmvq_weight_bytes	host	a size
-native_q5_k_f32	todo	Q5_K matvec, not ported
+native_q5_k_f32	kernel	native_q5_k_f32
 native_q8_1_bytes	host	a size
 native_qsa_indexer_enabled	host	a capability check
 native_quantize_q8_1	kernel	quantize_q8_1

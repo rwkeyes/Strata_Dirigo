@@ -5534,6 +5534,178 @@ void case_quant_prefill_chain(Ctx& ctx, const std::string& dir) {
 }
 
 // -----------------------------------------------------------------------------------------------------------
+// Q5_K: the NATIVE HEAD's matvec (`native_q5_k_mmvq_kernel`, src/kernels/cuda/native_mmvq.cu:239; its entry is
+// `native_q5_k_f32`, which is `native_quantize_q8_1` PLUS this).  It is the ONE dot in the port whose scale and
+// min are PACKED: Q5_K's 12-byte `scales` shares six 6-bit scales and six 6-bit mins between the low and high
+// nibbles of `qh`, and `aux` picks the six bits apart with the `hi` mask that switches on the block's half.
+// A port that reads the obvious way gets a plausible wrong number, so the oracle below is a transcription of the
+// engine's own body, masks and shifts included, and the fixture varies every byte of `scales`, `qh` and `qs`.
+//
+// THE QUANTISER HALF IS NOT RE-TESTED HERE.  `native_q5_k_f32` = `native_quantize_q8_1` + this, and the
+// quantiser is gated byte-exactly by `case_quantize_q8_1`; the arms supply the q8_1 activation directly (the
+// same boundary every other `iq*_mmvq` arm draws), so the oracle is INDEPENDENT of the quantiser rather than
+// reading bytes the quantiser wrote.  The composed quantiser->dot chain is the `case_quant_prefill_chain` pattern,
+// already gated for iq2s.
+static int q5_dp4a_host(int a, int b, int c) {
+    int r = c;
+    for (int k = 0; k < 4; ++k) {
+        r += (int) (int8_t) (uint32_t) ((uint32_t) a >> (8 * k)) * (int) (int8_t) (uint32_t) ((uint32_t) b >> (8 * k));
+    }
+    return r;
+}
+
+// one (Q5_K block, part) value, in double: the source's expression term for term, the two integers exact.
+static double q5_dot_host(const std::vector<uint8_t>& w, size_t blk, const std::vector<uint8_t>& act, size_t abase,
+                          int p) {
+    const auto u8 = [&](size_t o) { return (uint32_t) w[o]; };
+    const auto u16 = [&](size_t o) { return u8(o) | (u8(o + 1) << 8); };
+    const auto i32 = [&](size_t o) {
+        return (int32_t) (u8(o) | (u8(o + 1) << 8) | (u8(o + 2) << 16) | (u8(o + 3) << 24));
+    };
+    const int bq8_offset = 2 * (p / 4);
+    const size_t nib = (size_t) (p % 4);
+    const size_t ql = blk + 48 + 16 * (size_t) bq8_offset + 4 * nib;
+    const size_t qh = blk + 16 + 4 * nib;
+    const int32_t vl0 = i32(ql), vl1 = i32(ql + 16);
+    const int32_t vh0 = i32(qh) >> bq8_offset, vh1 = i32(qh + 16) >> bq8_offset;
+    const int j = bq8_offset / 2, jm = j & 1;
+    const size_t sbase = blk + 4 + 2 * (size_t) jm;
+    const uint32_t s0 = u16(sbase), s2 = u16(sbase + 4), s4 = u16(sbase + 8);
+    const uint32_t him = (j >= 2) ? 0xFFFFFFFFu : 0u;
+    const uint32_t aux0 = (uint16_t) (((s0 & 0x3f3f) & ~him) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & him));
+    const uint32_t aux1 = (uint16_t) (((s2 & 0x3f3f) & ~him) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & him));
+    const int scv[2] = {(int) (aux0 & 0xFF), (int) ((aux0 >> 8) & 0xFF)};
+    const int mv[2] = {(int) (aux1 & 0xFF), (int) ((aux1 >> 8) & 0xFF)};
+    double sumf_d = 0.0, sumf_m = 0.0;
+    for (int i = 0; i < 2; ++i) {
+        const size_t b8 = abase + (size_t) (bq8_offset + i) * 36;
+        const double d8 = (double) strata::kernels::f32_from_f16((uint16_t) (act[b8] | ((uint16_t) act[b8 + 1] << 8)));
+        const int32_t ua = (int32_t) ((uint32_t) act[b8 + 4 + 4 * nib] | ((uint32_t) act[b8 + 5 + 4 * nib] << 8) |
+                                      ((uint32_t) act[b8 + 6 + 4 * nib] << 16) | ((uint32_t) act[b8 + 7 + 4 * nib] << 24));
+        const int32_t ub = (int32_t) ((uint32_t) act[b8 + 20 + 4 * nib] | ((uint32_t) act[b8 + 21 + 4 * nib] << 8) |
+                                      ((uint32_t) act[b8 + 22 + 4 * nib] << 16) | ((uint32_t) act[b8 + 23 + 4 * nib] << 24));
+        const int32_t v0 = (int32_t) ((((uint32_t) vl0 >> (4 * i)) & 0x0f0f0f0fu) |
+                                      ((((uint32_t) vh0 >> i) << 4) & 0x10101010u));
+        const int32_t v1 = (int32_t) ((((uint32_t) vl1 >> (4 * i)) & 0x0f0f0f0fu) |
+                                      ((((uint32_t) vh1 >> i) << 4) & 0x10101010u));
+        const int dot1 = q5_dp4a_host(v0, ua, q5_dp4a_host(v1, ub, 0));
+        const int dot2 = q5_dp4a_host(0x01010101, ua, q5_dp4a_host(0x01010101, ub, 0));
+        sumf_d += d8 * (double) (dot1 * scv[i]);
+        sumf_m += d8 * (double) (dot2 * mv[i]);
+    }
+    const double d = (double) strata::kernels::f32_from_f16((uint16_t) (w[blk] | ((uint16_t) w[blk + 1] << 8)));
+    const double mn = (double) strata::kernels::f32_from_f16((uint16_t) (w[blk + 2] | ((uint16_t) w[blk + 3] << 8)));
+    return d * sumf_d - mn * sumf_m;
+}
+
+// Random Q5_K blocks: dn and min FINITE and small (a random byte pattern would assemble an inf half and the case
+// would then measure the inf instead of the decode), every other byte varied so the packed `aux`, both `qh`
+// nibble halves and all of `qs` are exercised across the row set.
+static std::vector<uint8_t> q5_k_fill_blob(size_t n_out, int nb) {
+    const size_t row_bytes = (size_t) nb * 176;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * 176;
+            const float dmag = 0.02f * (float) (1 + ((b + (int) r) % 4));
+            const float mmag = ((b + (int) r) % 3 == 0) ? -0.01f : 0.005f * (float) (1 + (b % 3));
+            s2_put16(blk + 0, strata::kernels::f16_from_f32(((b + (int) r) % 5 == 0) ? -dmag : dmag));
+            s2_put16(blk + 2, strata::kernels::f16_from_f32(mmag));
+            for (int i = 0; i < 12; ++i) blk[4 + i] = (uint8_t) ((i * 29 + b * 17 + (int) r * 43 + 7) & 0xFF);
+            for (int i = 0; i < 32; ++i) blk[16 + i] = (uint8_t) ((i * 37 + b * 11 + (int) r * 53 + 5) & 0xFF);
+            for (int i = 0; i < 128; ++i) blk[48 + i] = (uint8_t) ((i * 61 + b * 7 + (int) r * 19 + 1) & 0xFF);
+        }
+    }
+    return w;
+}
+
+// q8_1 activation blocks (36 B: fp16 d, fp16 sum, int8 qs[32]); only `d` and `qs` are read by the dot.
+static std::vector<uint8_t> q5_k_fill_act(int ncols, int blocks_per_col) {
+    std::vector<uint8_t> a((size_t) ncols * (size_t) blocks_per_col * 36, 0);
+    for (size_t b = 0; b < (size_t) ncols * (size_t) blocks_per_col; ++b) {
+        uint8_t* blk = a.data() + b * 36;
+        const float d = 0.01f * (float) (1 + (int) (b % 5));
+        s2_put16(blk + 0, strata::kernels::f16_from_f32((b % 7 == 0) ? -d : d));
+        s2_put16(blk + 2, strata::kernels::f16_from_f32(0.25f * (float) (1 + (int) (b % 3))));
+        for (int i = 0; i < 32; ++i) blk[4 + i] = (uint8_t) (int8_t) (((i * 13 + (int) b * 7) % 255) - 127);
+    }
+    return a;
+}
+
+static void native_q5_k_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 176;
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> w = q5_k_fill_blob((size_t) n_out, nb);
+    const std::vector<uint8_t> act = q5_k_fill_act(ncols, blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, a_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 16; ++k) {
+                const int blk = k / 16;
+                const double v = q5_dot_host(w, wrow + (size_t) blk * 176, act, arow + (size_t) blk * 8 * 36, k % 16);
+                acc += v;
+                a_sum += std::fabs(v);
+            }
+            want[(size_t) c * n_out + r] = acc;
+            want_abs[(size_t) c * n_out + r] = a_sum;
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/native_q5_k_f32.spv", 3, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "native_q5_k_f32 (n_in=%d, n_out=%d, ncols=%d, %s)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live && nonfinite == 0, bad + nonfinite, (int) n_y, worst,
+            "rows outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_y);
+}
+
+void case_native_q5_k_f32(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_q5_k_f32.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("native_q5_k_f32", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    native_q5_k_arm(ctx, dir, 2560, 8, 1, "80 blocks, 1280 parts: parts > 256 lanes");
+    native_q5_k_arm(ctx, dir, 256, 1, 1, "one block: 16 parts < 256 lanes");
+    native_q5_k_arm(ctx, dir, 10240, 4, 2, "40 blocks x 2 columns: the widest Q5_K pitch");
+}
+
+
+// -----------------------------------------------------------------------------------------------------------
 // IQ3_XXS: the resident model's SECOND most common expert gate/up format (17 of 48 layers, behind IQ2_S's 20).
 //
 // The oracle transcribes `vec_dot_iq3_xxs_q8_1`.  It carries its OWN copy of the two per-byte helpers (the
@@ -9433,6 +9605,7 @@ int main(int argc, char** argv) {
     case_scatter_rows_f32(ctx, dir);       // M-A: the peer experts' row write-back
     case_iq_dequant_f32(ctx, dir);        // M-A: the standalone IQ/BF16 dequantiser (dq_dispatch)
     case_iq_embed_rows(ctx, dir);         // M-A: the token-embedding row gather built on it
+    case_native_q5_k_f32(ctx, dir);        // M-A: the native head's Q5_K matvec (the packed aux scale/min dot)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

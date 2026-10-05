@@ -20,6 +20,8 @@
 #                                       -> must FAIL  "iq_dequant_f32: IQ1_M"
 #   inject-verify.sh iq-embed-rows-identity     iq_embed_rows.comp  gather the row at the POSITION
 #                                       -> must FAIL  "iq_embed_rows: ..."
+#   inject-verify.sh native-q5k-aux-half        native_q5_k_f32.comp  drop the packed-scale half switch
+#                                       -> must FAIL  "native_q5_k_f32"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -67,6 +69,13 @@ case "$name" in
     old=$'    const uint row = uint(uint64_t(tok) * uint64_t(pc.row_bytes));'
     new=$'    const uint row = uint(uint64_t(gl_WorkGroupID.y) * uint64_t(pc.row_bytes));   // INJECTION: row index = position, not the token'
     want="FAIL  iq_embed_rows: " ;;
+  native-q5k-aux-half)
+    # The kernel's distinguishing rule: the 12-byte `scales` packs SIX 6-bit scales and SIX 6-bit mins and `hi`
+    # switches between groups 0..2 and 3..5.  Dropping it reads groups 0..2's fields for every group.
+    file="$SH/native_q5_k_f32.comp"; spv="native_q5_k_f32"
+    old=$'    const uint him = (j >= 2) ? 0xFFFFFFFFu : 0u;'
+    new=$'    const uint him = 0u;   // INJECTION: the packed-scale half switch dropped'
+    want="FAIL  native_q5_k_f32" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

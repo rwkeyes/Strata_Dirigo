@@ -94,7 +94,7 @@ TABLE = {
     # ---- GPU work this port has NOT done: the honest hole list ----
     'embedding_gather':            ('kernel', 'embedding_gather'),
     'iq_dequant_f32':              ('todo', 'a standalone IQ dequantiser (this port has the FUSED iq*_mmvq)'),
-    'native_q5_k_f32':             ('todo', 'Q5_K matvec, not ported'),
+    'native_q5_k_f32':             ('kernel', 'native_q5_k_f32'),
     'moe_grouped_s2':              ('todo', 'the grouped S2 MoE, not ported'),
     'moe_hit_add':                 ('todo', 'the hit accumulator, not ported'),
     'moe_hit_select':              ('todo', 'the hit selection, not ported'),
