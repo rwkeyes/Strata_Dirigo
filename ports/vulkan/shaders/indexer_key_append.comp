@@ -1,0 +1,120 @@
+#version 450
+// ports/vulkan/shaders/indexer_key_append.comp - the LEGACY QSA indexer append: the raw tail, then the pooling
+// (mean -> RMSNorm -> RoPE) that fires when a cell COMPLETES a block.
+//
+// Transcribed from `indexer_key_append_kernel` / `indexer_key_append` (src/kernels/cuda/qsa.cu:155-243,
+// :722-739); the contract is include/strata/kernels/qsa.hpp:222-250 and the rule is re-pinned by
+// src/kernels/qsa_parity.cpp's indexer section.  Call site src/core/layer.cpp:948.
+//
+// THE RULE (one invocation per indexer dim, ONE workgroup):
+//
+//     slot      = pos % r
+//     tail[slot] = raw                       (only while slot < r-1; a completing cell is consumed directly)
+//     if pos == 0:  dead = pooled[0] = rope_0(rms_norm(raw), w_k_norm)     // the spare slot's key, CONSTANT
+//     if slot == r-1:
+//         m      = (tail[0] + .. + tail[r-2] + raw) / r                    // the block's r raw keys, CELL order
+//         pooled[b] = rope(rms_norm(m, w_k_norm), pos_base + b*r)          // b = pos / r
+//         pooled[b+1] = dead                                               // the spare slot MOVES
+//
+//   * POOL-THEN-NORM, not norm-then-pool: the mean is taken over the RAW keys and the norm is applied once to
+//     the mean.  qsa_parity.cpp's rival `pool_then_norm = false` is `mean of the per-cell norms`; the case
+//     checks host-side that it moves the output.
+//   * the rotation position is the block's FIRST cell (`pos_base + b*r`), NOT its last (PROPERTY 4).
+//   * `pos_base` is the sequence's first cell's POSITION, so cell j sits at `pos_base + j` - a kernel that
+//     equates a cell's position with its index is wrong for any sequence not starting at 0.
+//   * the spare key comes from cell 0's raw key (CONSTANT), not the last raw key - the three-row tail no longer
+//     holds cell 0 after the first block.
+//   * the RAW keys are never rotated: `rope_raw = true` is the rival reading.
+//
+// THE BRANCH POLICY this kernel belongs to.  `qsa_layer` (src/core/layer.cpp:943-949) calls
+// `native_qsa_indexer_append` when `native_qsa_indexer_enabled()`, else THIS legacy kernel; the native sibling
+// is equally unported.  The backend answers `native_qsa_indexer_enabled() == false` (the indexer's OWN check,
+// separate from `native_qsa_enabled()`, and the same flag `layer_verify_compatible()` reads), so the layer runs
+// THIS kernel.  No CPU fallback is involved.
+//
+// DESIGN vs THE CUDA, and the ONE honest gap.
+//  * the CUDA reduces the sum of squares over `idx_dim` in DOUBLE (shared `double s_mean[]`, `__dadd_rn`), so
+//    the pooled row and the spare key are double-accurate.  The target device has no shaderFloat64
+//    (shaders/blocked/README.md), so this port accumulates in F32 - the `gdn_l2_norm` form - and the gate
+//    MEASURES the gap against the engine's own double oracle instead of claiming bit-exactness.  The mean of
+//    `r` f32 keys is likewise f32 here and double there.
+//  * the CUDA's 32-lane shuffle/hard of `idx_dim` threads is a lane width, not the rule; the port uses the
+//    workgroup barrier tree in common/wg_reduce.glsl with a FIXED workgroup of 256 (the host's kLocalSize), and
+//    requires `idx_dim <= 256`.  The graph and the argument list are the same for every token, which is what
+//    makes the function capturable - and `pos` arrives through `pos_dev`, never as a host scalar.
+//  * the mrope table is the IDENTITY at decode (no vision), so the rotation offset is `position * (n_rot/2) + i`
+//    exactly as `rope_neox.comp` computes it for text; the vision path is out of scope here and stated.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer RAW { float v[]; } raw;      // (idx_dim,) the incoming key
+layout(set = 0, binding = 1, std430) readonly buffer POS { int v[]; } posb;        // (1,) the cell's position
+layout(set = 0, binding = 2, std430) readonly buffer WK { float v[]; } wk;         // (idx_dim,) indexer k-norm gamma
+layout(set = 0, binding = 3, std430) buffer TAIL { float v[]; } tail;              // (r-1, idx_dim) RAW tail
+layout(set = 0, binding = 4, std430) buffer DEAD { float v[]; } dead;              // (idx_dim,) the spare key
+layout(set = 0, binding = 5, std430) buffer POOL { float v[]; } pooled;            // (max_blocks+1, idx_dim)
+layout(set = 0, binding = 6, std430) buffer BPOS { int v[]; } bpos;                // (1,) the rotation position
+layout(set = 0, binding = 7, std430) readonly buffer COS { float v[]; } ct;        // (max_pos, n_rot/2)
+layout(set = 0, binding = 8, std430) readonly buffer SIN { float v[]; } stb;       // (max_pos, n_rot/2)
+layout(push_constant, std430) uniform PC { int idx_dim; int r; int n_rot; int pos_base; float eps; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint idx_dim = uint(pc.idx_dim);
+    const uint r = uint(pc.r);
+    const uint d = gl_LocalInvocationIndex;
+    const bool live = d < idx_dim;
+    const int pos = posb.v[0];
+    const int slot = pos % pc.r;
+
+    // The RAW tail: a cell that COMPLETES a block is not stored - the pool below consumes it directly, which
+    // is what makes `r-1` rows enough.
+    if (live && slot < pc.r - 1) tail.v[uint(slot) * idx_dim + d] = raw.v[d];
+
+    // The spare slot's key is rms_norm(raw[0]), CONSTANT for the sequence and the only reason cell 0's raw key
+    // has to be kept.  At position 0 the rope is `v * cos[0]` (sin(0) == 0 exactly), so there is no partner.
+    if (pos == 0 && live) {
+        float ss = 0.0f;
+        for (uint i = 0u; i < idx_dim; ++i) { const float v = raw.v[i]; ss += v * v; }
+        const float inv = inversesqrt(ss / float(idx_dim) + pc.eps);
+        float y = raw.v[d] * inv * wk.v[d];
+        if (d < uint(pc.n_rot)) y *= ct.v[d % (uint(pc.n_rot) / 2u)];
+        dead.v[d] = y;
+        pooled.v[d] = y;
+    }
+
+    if (slot != pc.r - 1) return;   // workgroup-uniform: `pos` is the same for every invocation
+    barrier();                      // the tail rows this invocation is about to read were written above
+
+    // The block's r raw keys, in CELL order: the r-1 tail rows then the incoming cell.
+    float m = 0.0f;
+    if (live) {
+        for (uint j = 0u; j + 1u < r; ++j) m += tail.v[j * idx_dim + d];
+        m += raw.v[d];
+        m = m / float(r);
+    }
+    // The sum of squares of the mean vector: the same quantity the CUDA's shared `s_mean` scan produces, via
+    // the workgroup tree (a different summation order, which the case measures rather than assumes).
+    const float ss = wg_sum(m * m);
+    const float inv = inversesqrt(ss / float(idx_dim) + pc.eps);
+
+    const uint b = uint(pos) / r;
+    if (live) {
+        pooled.v[b * idx_dim + d] = m * inv * wk.v[d];
+        pooled.v[(b + 1u) * idx_dim + d] = dead.v[d];   // the spare slot MOVES to b+1, same value
+    }
+    if (d == 0u) bpos.v[0] = pc.pos_base + int(b) * pc.r;   // the rotation position (kept for capture readers)
+    barrier();   // the row is complete only now: the rotation below reads TWO elements of it
+
+    const uint nhalf = uint(pc.n_rot) / 2u;
+    if (live && d < nhalf) {
+        const uint base = b * idx_dim;
+        const uint toff = uint(pc.pos_base + int(b) * pc.r) * nhalf + d;
+        const float a = pooled.v[base + d];
+        const float c = pooled.v[base + nhalf + d];
+        const float co = ct.v[toff];
+        const float si = stb.v[toff];
+        // `rope_neox_pair`, verbatim: oa = a*c - b*s, ob = a*s + b*c.
+        pooled.v[base + d] = a * co - c * si;
+        pooled.v[base + nhalf + d] = a * si + c * co;
+    }
+}

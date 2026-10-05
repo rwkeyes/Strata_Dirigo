@@ -1,5 +1,43 @@
 # Status — what is done, what is verified, what is not
 
+## CLASS A IS CLOSED, and M-A IS RE-DEFINED (2026-10-05)
+
+The last three class-A forward-path kernels are LANDED and gated: **`indexer_key_append`** (the QSA indexer
+pair's legacy member; contract `native_qsa_indexer_enabled() == false`), **`gr_write`** (the hyper-connection
+write — reached on BOTH fused/unfused branches, so no dodge), and **`gr_read`** (the unfused five-stage
+hyper-connection read: `gr_norm`/`gr_down`/`gr_gate`/`gr_mean`/`gr_inject`).  The `gr_read` / `fused_gr_read`
+question left open by the triage is SETTLED — both were mis-kinded `host` (each launches kernels), so the honest
+device-op count is **54, not 52** — and the GR pair is closed by CONTRACT (`gr_set_native_mmvf(false)` +
+`layer_set_fused_gr(false)`, which selects the unfused `gr_read`+`gr_write` and removes `fused_gr_read`).
+
+| case | rule | oracle | measured (vega Arc) | falsified by |
+|---|---|---|---|---|
+| `indexer_key_append` (2 arms 128/4/64, 32/4/8) | raw tail; on completion `pooled[b]=rope(rms_norm(mean), pos_base+b*r)`; spare `rope(rms_norm(raw[0]),0)` | `qsa_parity.cpp` indexer reference, double | **384/384 err/tol 4.94e-02** (bound 1.0), spare key worst 1.02e-07 (tol 1e-5) | `indexer-key-append-rotate-last` → FAIL 274/384 w 9.46e+05 |
+| `gr_write` (3 arms 2560/4, 64/3, 16/2) | `out[i]=R[i]+block_out[d]·2·sigmoid(inject[c]/hc)`, in place; zero inject ⇒ `w=1` EXACTLY | `gr_parity.cpp` §6 + the rule in double | **20480/20480 err/tol 2.4e-01**, zero-inject property EXACT | `gr-write-drop-two-centring` → FAIL w 6.68e+06 |
+| `gr_read` (3 arms 2560/4/320, 64/2/8, 16/3/4) | 5 stages: per-stream RMSNorm → down+silu(`/hc` inside) → gate(sigmoid) → mean over streams → inject | `gr_parity.cpp::reference`, double, BF16 activation | **23364/23364 err/tol 3.0e-01**; xq==bf16(xn) exact | `gr-read-mean-vs-sum` → FAIL 20804/23364 w 2.99e+03 |
+
+**HONEST PARITY GAPS (measured):** `indexer_key_append`'s CUDA reduces the sum of squares in double; the target
+has no `shaderFloat64`, so the port accumulates in f32 and the case MEASURES the gap (worst err/tol 4.94e-02 on
+the Arc / 7.87e-02 on lvp+radeon) — the spare key is therefore NOT bit-exact here, unlike the CUDA's.
+`gr_read`'s stage oracles are fed the DEVICE's own input for that stage and bounded by the stage's TERMS
+(`rel·|want| + 16·2^-24·Σ|terms|`), because comparing a bf16-ROUNDED `lo` against an unrounded double oracle
+puts the odd element a whole bf16 ulp away and moved a near-zero `mixed` by 9.7 RELATIVE on RADV.
+
+**THE MILESTONE, RE-DEFINED.**  `todo = 0` is neither achievable nor meaningful: the map covers every
+kernels-namespace symbol the decode path reaches, including the `native_*` siblings and the verify/MTP/tooling
+helpers.  **M-A (re-defined):** every symbol the forward path reaches ON THE BRANCH THE CAPABILITY CONTRACT
+SELECTS has a shader and a gated case.  **Class-A remaining: 0.  MET: YES**, with two stated soft edges — the
+shipped `--spec 4` loop's MTP symbols (class D by the brief's definition: **a judgement, not a measurement**),
+and the `gr_read`-vs-`fused_gr_read` branch choice.  Full statement: `plan/DECODE-PATH-TRIAGE.md` → "THE
+RE-DEFINED MILESTONE M-A"; the batch's detail: `NEXT.md`'s top section.
+
+**The map moves by four rows:** `168 — 59 kernel, 63 host, 46 todo` → **`168 — 62 kernel, 61 host, 45 todo`**
+(the 45 = `11 capability-off + 4 B + 8 C + 22 D`); `check_port_map.py` passes, `make_port_map.py` regenerates it
+byte-identically.  **Gate: vega Arc 384/0/0, lvp 372/0/3, radeon 375/0/2, exit 0.  Box `z820b`: radeon (XTX)
+380/0/1, lvp 372/0/3, nvidia 375/0/2 — 0 failed on every arm; exit 1 only for the pre-existing M8 skip.**  (A
+later full-gate run on vega read its radeon-iGPU arm 374/1/2 — the documented intermittent
+`budget: independent requery agrees` flake, not this change.)
+
 ## THE GDN MIXER CHAIN IS COMPLETE, plus the first QSA gate member — class A #4-6 (2026-10-05)
 
 This increment lands the next three class-A forward-path kernels: **`gdn_step`** (the delta-rule state update),

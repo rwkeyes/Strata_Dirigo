@@ -1,0 +1,48 @@
+#version 450
+// ports/vulkan/shaders/gr_down.comp - stage 2 of the LEGACY hyper-connection READ: the down projection and the
+// silu bottleneck.
+//
+// Transcribed from `gr_down_kernel<uint16_t>` (src/kernels/cuda/gr.cu:164-230, launched from the BF16 branch at
+// gr.cu:381).  Contract include/strata/kernels/gr.hpp:89: `lo = silu((bf16(xn) @ w_down.T) / hc)` - the `/ hc`
+// is INSIDE the silu.
+//
+// THE RULE, ONE WORKGROUP PER OUTPUT ROW (the CUDA is one block per row with its warps splitting the reduction):
+//
+//     lo[k] = bf16( silu( (sum_i bf16(xn)[i] * bf16(w_down[k][i])) / hc ) )
+//
+//   * THE `/ hc` IS INSIDE THE SILU.  Moving it outside keeps every shape (gr_parity.cpp's item 2) and the case
+//     checks host-side that it moves the bottleneck.
+//   * the activation and the weight are BOTH bf16 under the default contract - `xq` is already bf16-rounded by
+//     gr_norm, and the weight is read as a bf16 pair.
+//   * the weight row is read as 32-bit PAIRS (element 2p low, 2p+1 high), which is the engine's own memory
+//     layout; swapping the halves charges a rounding-level error in a random sum, so the case gives one row
+//     halves differing by orders of magnitude.
+// The CUDA's summation order (warp trees then a shared-memory combine) differs from this workgroup tree; both are
+// sums, and the case measures against the engine's double oracle rather than assuming a bit-identity.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer XQ { float v[]; } xq;   // (hc_dim) bf16(xn) as f32
+layout(set = 0, binding = 1, std430) readonly buffer WD { uint v[]; } wd;    // row k as uint32 bf16 PAIRS
+layout(set = 0, binding = 2, std430) buffer LQ { float v[]; } lq;            // (hc_lr) bf16(lo) as f32
+layout(push_constant, std430) uniform PC { int hc_dim; int hc_lr; int hc; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint k = gl_WorkGroupID.x;
+    if (k >= uint(pc.hc_lr)) return;
+    const uint np = uint(pc.hc_dim) / 2u;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
+        const uint packed = wd.v[k * np + p];
+        acc += xq.v[2u * p]       * bf16_to_f32(packed & 0xFFFFu);
+        acc += xq.v[2u * p + 1u]  * bf16_to_f32(packed >> 16u);
+    }
+    const float t = wg_sum(acc);
+    if (lid == 0u) {
+        const float z = t / float(pc.hc);              // the division is INSIDE the silu
+        lq.v[k] = bf16_round(z / (1.0f + exp(-z)));
+    }
+}

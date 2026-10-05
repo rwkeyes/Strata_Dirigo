@@ -1,4 +1,9 @@
 # Decode-path triage — the 52 `todo` rows, from the engine's own sources
+#
+# CURRENT 2026-10-05 (after the class-A closure batch): the map reads **168 = 62 kernel + 61 host + 45 todo**,
+# the class-A set is CLOSED, and M-A is RE-DEFINED over the class-A set at the end of this file ("THE RE-DEFINED
+# MILESTONE M-A").  The numbers quoted immediately below are the state at `7c317c4`, kept as the record the
+# triage was written against.
 
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads
@@ -272,3 +277,109 @@ commit leaves `PORT-MAP.tsv` byte-identical.
 `include/strata/kernels/**` declaration (`port_map_lib.kernel_header_functions`) reached from a `src/core/`
 source with the namespace in scope, and each has a real call site cited above.  The rule's one stated residual
 (a local `src/core/` function shadowing a header name) does not occur here.
+
+---
+
+# THE KIND-TABLE FALSE NEGATIVE — `gr_read` / `fused_gr_read` (2026-10-05)
+
+The *Map caveat* above flagged two rows as mis-kinded `host`.  This section SETTLES it by reading both entry
+points and every call site (the increment the caveat asked for).
+
+**Both are DEVICE entry points, and the `host` kind was wrong for both:**
+
+* `gr_read` — `src/kernels/cuda/gr.cu:344-411` launches `gr_norm_kernel`, `gr_down_kernel`, `gr_gate_kernel`,
+  `gr_mean_kernel`, `gr_inject_kernel` (the non-native branch), or `native_gr_rms_norm_weighted` +
+  `bf16_gemv_fp32_mmvf` + `native_gr_down_silu` + `native_gr_pre_gated` (the `native_mmvf` branch).
+* `fused_gr_read` — `src/kernels/cuda/fused_gr.cu:1168-1183` launches `gr_down_kernel` / `gr_up_kernel`.
+
+`host / a workspace read` describes `gr_workspace_init` (a host hand-out) and `gr_workspace_bytes` (a size) — not
+the read entry.  **So the honest device-op count is 54, not 52**, and class A is 19 without them and 20 with the
+one that is on the selected branch (below).
+
+**Which of the two is on the forward path.**  `layer.cpp:1188` and `:1328` compute
+`fused = g_fused_gr && fused_gr_supported(g.n_embd, g.hc, g.hc_lr)`.  Two facts decide it:
+
+* `fused_gr_supported()` is a pure GEOMETRY predicate (`fused_gr.cu:1164-1166`: `n_embd == 2560 && hc == 4 &&
+  hc_lr == 320`), **TRUE at the artifact's geometry**.  It is NOT a capability answer — a Vulkan backend cannot
+  return false without lying about the geometry.
+* the selecting input is therefore **`g_fused_gr`**, set at `generate.cpp:2284` from `gr_native_mmvf`, which
+  `--native` (`generate.cpp:1804`) turns on.  **The shipped launch selects the FUSED read.**
+
+`gr_write` is reached on BOTH branches (`:1261` and `:1329` unfused; `:1195` and `:1332` fused), which is why it
+is the one hyper-connection entry the port cannot dodge.  The READ has to be chosen explicitly, and this port
+chooses the **unfused** member — the same shape as every other contract here (implement the legacy member, force
+the flag that selects it): the backend's init calls **`gr_set_native_mmvf(false)`** and
+**`layer_set_fused_gr(false)`**, so the layer takes `gr_read` at `:1255`/`:1278` and the legacy `gr_write` at
+`:1261`/`:1329`, and `fused_gr_read` leaves the forward path.  This follows the port's own recorded plan
+(`RUN-ON-B70.md`: `fused_gr.cu` is "deferrable"; "the engine carries its own fallbacks, so the fused gate-RoPE
+family is optional").
+
+**Consequences, stated rather than smoothed over.**  `fused_gr_read` is a real device op but a NON-SELECTED
+configuration under the contract (class C — the same shape as `qsa_attend_step`); its map row is corrected from
+`host` to `todo` with that reason, and it is NOT ported.  **The residual risk:** if the product must run the
+SHIPPED `--native` selection bit for bit, the class-A member is `fused_gr_read`, not `gr_read`; this batch closed
+the *pair* by choosing the branch, not the shipped branch.  Nothing here measures which branch the product wants.
+
+# THE RE-DEFINED MILESTONE M-A (2026-10-05)
+
+`todo = 0` is neither achievable nor meaningful.  The map covers EVERY kernels-namespace symbol the decode path
+reaches — including the `native_*` siblings of ported legacy members, the fused alternatives a flag removes, and
+the verifier/MTP/tooling helpers — so a `todo` column of zero would require porting ~45 more symbols of which
+**zero** are on the forward path the port runs.  The milestone is therefore re-defined over the class-A set:
+
+> **M-A (re-defined).**  Every kernels-namespace symbol the forward path of the shipped model reaches — **on the
+> branch the backend's capability contract selects** — has a shader and a gated case.  The contract:
+>
+> | the backend answers | which selects |
+> |---|---|
+> | `native_gdn_enabled() == false` | the legacy GDN / DeltaNet mixer (`gdn_conv_step`, `gdn_l2_norm`, `gdn_beta_gate`, `gdn_gate`, `gdn_step`, `gdn_out_norm`) and removes the three `fused_gdn_*` paths |
+> | `native_qsa_enabled() == false` | the legacy QSA gate (`qsa_gate_apply_f32`) and the class-B weighted-RMS-norm fallback |
+> | `native_qsa_indexer_enabled() == false` | the legacy QSA indexer append (`indexer_key_append`) |
+> | `native_rope_enabled() == false` | the ported NeXo RoPE (class B) |
+> | `native_router_enabled() == false` | the ported generic top-10 (class B) |
+> | `native_moe_combine_enabled() == false` | the ported weighted combine (class B) |
+> | `gr_set_native_mmvf(false)` **and** `layer_set_fused_gr(false)` | the legacy unfused read (`gr_read`) and write (`gr_write`) |
+>
+> **Deliberately out of scope, with the reason:**
+> * **class B (4)** — capability-gated with a PORTED fallback the backend selects by answering the check false.
+> * **class C (8)** — a configuration the launch does not select, whose selected branch IS ported: `bf16_gemv`,
+>   `bf16_gemv_split`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `qsa_attend_step`, `qsa_index_step`,
+>   `topk_512_step`, and `fused_gr_read` (above).
+> * **class D (22)** — the P6 verifier, the speculative drafter and the tooling helpers; separable from a correct
+>   first token, since a `--spec 0` run is the whole model and nothing less.
+> * **the capability-off siblings (11)** — the `native_*` members and the three `fused_gdn_*` paths: reachable
+>   only if a capability answers **true**, which the contract forbids.
+
+Counts after the closure batch: **`168 = 62 kernel + 61 host + 45 todo`**, and the 45 decompose as
+`11 capability-off + 4 B + 8 C + 22 D`.  **Class-A remaining: 0.**
+
+**IS M-A (re-defined) MET?  YES — with two soft edges stated rather than hidden.**
+
+1. **The shipped `--spec 4` loop.**  `setup.py:4224-4227` writes `--spec 4 --mtp`, so the MTP drafter DOES run on
+   the shipped product and its `mtp.cpp`-only symbols (`map_ids`, `mtp_select`, `moe_group_resident`,
+   `row_top_prob`, `window_ids`, `add_streams_broadcast`, `fused_gr_read_multi`, `qsa_decode_attn_batch`) are
+   classified D on the brief's definition.  **That is a JUDGEMENT, not a measurement**: read against the shipped
+   `--spec 4` loop they become forward-path holes and M-A is short by them.  The P6 verifier is blocked in any
+   case — `Verifier::init` refuses unless `layer_verify_compatible()` holds, which demands `native_gdn &&
+   g_fused_gdn` and `native_qsa_indexer_enabled()` — all false under the contract.
+2. **`gr_read` vs `fused_gr_read`** (above): the pair is closed by CONTRACT, not by matching the shipped launch's
+   own selection.
+
+## The class-A implementations, and where each landed
+
+| # | symbol | branch | shader(s) | state |
+|---|---|---|---|---|
+| 1 | `gdn_conv_step` | legacy | `gdn_conv_step` | LANDED |
+| 2 | `gdn_l2_norm` | legacy | `gdn_l2_norm` | LANDED |
+| 3 | `gdn_beta_gate` | legacy | `gdn_beta_gate` | LANDED |
+| 4 | `gdn_gate` | legacy | `gdn_gate` | LANDED (pre-existing) |
+| 5 | `gdn_step` | legacy | `gdn_step` | LANDED |
+| 6 | `gdn_out_norm` | legacy | `gdn_out_norm` | LANDED |
+| 7 | `qsa_gate_apply_f32` | legacy | `qsa_gate_apply_f32` | LANDED |
+| 8 | `indexer_key_append` | legacy | `indexer_key_append` | **LANDED 2026-10-05** |
+| 9 | `gr_write` | both | `gr_write` | **LANDED 2026-10-05** |
+| 10 | `gr_read` | unfused | `gr_norm gr_down gr_gate gr_mean gr_inject` | **LANDED 2026-10-05** |
+
+`gr_read` is the tenth because the pair's unfused member is what the GR contract selects; `fused_gr_read` leaves
+the path and is `todo` with that reason.
+

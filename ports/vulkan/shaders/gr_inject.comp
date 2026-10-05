@@ -1,0 +1,36 @@
+#version 450
+// ports/vulkan/shaders/gr_inject.comp - stage 5 of the LEGACY hyper-connection READ: the per-stream injection.
+//
+// Transcribed from `gr_inject_kernel<uint16_t>` (src/kernels/cuda/gr.cu:265-281, launched at gr.cu:396).
+// Contract include/strata/kernels/gr.hpp:87: `inject[c] = bf16(xn) @ w_inject[c]`, and it is computed ONLY when
+// `w_inject != nullptr` - the FINAL mixer passes null and "computing an injection nobody reads would be a claim,
+// not a convenience" (gr.cu:387-389).  The caller SKIPS this dispatch for the final mixer; the case keeps a
+// sentinel in the buffer and requires it untouched.
+//
+// THE RULE, ONE WORKGROUP PER STREAM (the CUDA is one block of 32*hc with one WARP per stream):
+//
+//     inject[c] = sum_i bf16(xn)[i] * bf16(w_inject[c][i])
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer XQ { float v[]; } xq;    // (hc_dim) bf16(xn) as f32
+layout(set = 0, binding = 1, std430) readonly buffer WI { uint v[]; } wi;     // row c as uint32 bf16 PAIRS
+layout(set = 0, binding = 2, std430) buffer INJ { float v[]; } inject;        // (hc)
+layout(push_constant, std430) uniform PC { int hc_dim; int hc; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    if (c >= uint(pc.hc)) return;
+    const uint np = uint(pc.hc_dim) / 2u;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
+        const uint packed = wi.v[c * np + p];
+        acc += xq.v[2u * p]       * bf16_to_f32(packed & 0xFFFFu);
+        acc += xq.v[2u * p + 1u]  * bf16_to_f32(packed >> 16u);
+    }
+    const float t = wg_sum(acc);   // OUTSIDE any divergent guard: a barrier tree reached by one lane is UB
+    if (lid == 0u) inject.v[c] = t;
+}

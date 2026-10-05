@@ -1,5 +1,98 @@
 # Start here next session
 
+## CLASS A IS CLOSED — `indexer_key_append`, `gr_write`, `gr_read`, and M-A RE-DEFINED — **DONE 2026-10-05**
+
+This increment lands the last three class-A forward-path kernels of `plan/DECODE-PATH-TRIAGE.md`, SETTLES the
+`gr_read` / `fused_gr_read` question that triage left open, and **re-defines the milestone** (below), because
+`todo = 0` was never achievable or meaningful.
+
+**1. `indexer_key_append`** — the QSA indexer pair's LEGACY member (the raw tail, then on a block completion
+`pooled[b] = rope(rms_norm(mean(raw[b*r..]), w_kn), pos_base + b*r)` and the spare slot
+`pooled[n_bid] = rope(rms_norm(raw[0]), 0)`). Rule `qsa.cu:155-243`/`:722-739`; contract `qsa.hpp:222-250`;
+call site `layer.cpp:948`. **Its own capability contract, stated:** the layer calls
+`native_qsa_indexer_append` when `native_qsa_indexer_enabled()`, else this kernel — the indexer's OWN check,
+separate from `native_qsa_enabled()`, and the one `layer_verify_compatible()` reads. The backend answers
+**`native_qsa_indexer_enabled() == false`**. Shader `indexer_key_append.comp`; oracle the triage's own reference
+in double. Case 2 arms (`idx_dim/r/n_rot` = 128/4/64, 32/4/8). **HONEST GAP:** the CUDA reduces the sum of
+squares in DOUBLE; the target has no `shaderFloat64`, so this port accumulates in F32 and the case MEASURES the
+gap (pooled worst err/tol 4.94e-02 on the Arc, 7.87e-02 on lvp/radeon, against a bound of 1.0; spare key worst
+1.02e-07 against 1e-5) — so the spare key is NOT bit-exact here, unlike the CUDA's. Falsified by
+`indexer-key-append-rotate-last` → `FAIL 274/384 worst 9.46e+05`.
+
+**2. `gr_write`** — the hyper-connection WRITE, the one entry reached on BOTH branches of the fused/unfused
+choice (`layer.cpp:1261`/`:1329` unfused, `:1195`/`:1332` fused), so no dodge exists. Rule `gr.cu:283-297`;
+contract `gr.hpp:114-120`. `out[i] = R[i] + block_out[d]·2·sigmoid(inject[c]/hc)`, in place. Shader
+`gr_write.comp` (no barrier, no subgroup op — recomputing `w[c]` per element is the same float the CUDA stages
+into shared). Case 3 arms, and it asserts the gr_parity PROPERTY 6 **bit-exactly**: a ZERO injection gives
+`w = 1` exactly, i.e. `out == R + block_out`. **Measured: PASS (20480/20480, 384/384, 64/64), worst err/tol
+2.4e-01, the numerical worst, and the property arm exact.** Falsified by `gr-write-drop-two-centring` →
+`FAIL worst 6.68e+06`.
+
+**3. `gr_read`** — the hyper-connection READ, the unfused five-stage chain (norm → down+silu → gate → mean →
+inject). Rule `gr.cu:135-297`/`:344-411`; contract `gr.hpp:79-112`; call sites `layer.cpp:1255`/`:1278`. FIVE
+shaders: `gr_norm`, `gr_down`, `gr_gate`, `gr_mean`, `gr_inject` (the map row names all five). Oracle:
+`gr_parity.cpp`'s `reference` in double, DEFAULT (BF16) activation contract. The case SNAPSHOTS EACH STAGE, fed
+the DEVICE's own input for that stage, with the port's terms-derived bound (`rel·|want| + 16·2^-24·Σ|terms|`) —
+both forced by the cross-implementation arm (see below). **Measured: PASS 23364/23364 on the Arc, worst err/tol
+3.0e-01; lvp/radeon 0.331.** Falsified by `gr-read-mean-vs-sum` → `FAIL 20804/23364 worst 2.99e+03`.
+
+**SETTLED: `gr_read` and `fused_gr_read` were BOTH mis-kinded `host` — a kind-table FALSE NEGATIVE.** `gr_read`
+(`gr.cu:344`) launches five kernels; `fused_gr_read` (`fused_gr.cu:1168`) launches `gr_down_kernel`/`gr_up_kernel`.
+`host / a workspace read` describes `gr_workspace_init`/`gr_workspace_bytes`, not the read entry. **So the honest
+device-op count is 54, not 52.** Which is on the forward path is decided by
+`fused = g_fused_gr && fused_gr_supported(...)` (`layer.cpp:1188`) — and `fused_gr_supported()` is a pure
+GEOMETRY predicate (`fused_gr.cu:1164`: n_embd 2560/hc 4/hc_lr 320) that is TRUE at the artifact's geometry, so it
+is NOT a capability a backend may answer false. The selecting input is `g_fused_gr` (from `gr_native_mmvf`, which
+`--native` sets), i.e. **the shipped launch selects the FUSED read**. The port therefore closes the pair by
+CONTRACT — the same shape as every other contract here (implement the legacy member, force the flag): the
+backend's init calls **`gr_set_native_mmvf(false)`** and **`layer_set_fused_gr(false)`**, so the layer takes
+`gr_read` + the legacy `gr_write`, and `fused_gr_read` leaves the path. Its map row is corrected from `host` to
+`todo` with that reason; it is NOT ported. **Residual risk, stated: if the product must run the SHIPPED
+`--native` selection bit for bit, the class-A member is `fused_gr_read`, not `gr_read`.** Full argument in
+`plan/DECODE-PATH-TRIAGE.md` ("THE KIND-TABLE FALSE NEGATIVE").
+
+**THE MILESTONE, RE-DEFINED.** `todo = 0` is neither achievable nor meaningful — the map covers every
+kernels-namespace symbol the decode path reaches, including the `native_*` siblings of ported legacy members and
+the verifier/MTP/tooling helpers. **M-A (re-defined):** *every symbol the forward path reaches ON THE BRANCH THE
+CAPABILITY CONTRACT SELECTS has a shader and a gated case*, under the contract
+`native_gdn_enabled() == false` + `native_qsa_enabled() == false` + `native_qsa_indexer_enabled() == false` +
+`native_rope_enabled() == false` + `native_router_enabled() == false` + `native_moe_combine_enabled() == false`
++ `gr_set_native_mmvf(false)` + `layer_set_fused_gr(false)`. **Class-A remaining: 0. Is it MET? YES, with two
+soft edges stated, not hidden:** (i) the shipped `setup.py` writes `--spec 4 --mtp`, so the MTP drafter runs;
+its symbols are class D by the brief's own definition ("separable from a correct first token") — **a judgement,
+not a measurement**; (ii) `gr_read` vs `fused_gr_read` above. The full statement, the 45-row decomposition
+(`11 capability-off + 4 B + 8 C + 22 D`) and the 10-implementation table are in
+`plan/DECODE-PATH-TRIAGE.md` → "THE RE-DEFINED MILESTONE M-A".
+
+**THE MAP MOVES BY FOUR ROWS.** `PORT-MAP.tsv` `168 — 59 kernel, 63 host, 46 todo` → **`168 — 62 kernel, 61 host,
+45 todo`** (`indexer_key_append` and `gr_write` todo→kernel; `gr_read` host→kernel; `fused_gr_read` host→todo);
+`check_port_map.py` passes and `make_port_map.py` regenerates the file BYTE-IDENTICALLY.
+
+**THE CROSS-IMPLEMENTATION ARM EARNED ITS KEEP TWICE, and both fixes are the port's own documented rules.** The
+first run was green on the Arc and FAILED on llvmpipe AND RADV (identical numbers → deterministic, not driver
+noise): (a) `gr_read` — comparing a bf16-ROUNDED `lo` against an unrounded double oracle puts the odd element a
+whole bf16 ulp away whenever the two sides straddle a boundary (measured: 19 flips on RADV's f32 `lo`), and a
+near-zero `mixed` then moved **9.7 RELATIVE**; fixed by feeding each stage's oracle the DEVICE's own input and
+bounding it by the stage's TERMS. (b) `indexer_key_append` — a component whose mean CANCELS carried a large
+relative error that was entirely the shared mean's, so the bound must carry the MEAN's term scale
+(`inv·|w_kn[d]|·Σ_j|raw[j][d]|/r`), derived, not fitted. And the lvp/radeon-specified **first box run** then
+found a THIRD defect in the FIXTURE: the "rotate at the block's LAST cell" margin was diluted by the 64
+UNROTATED dims to ~0.04-0.06, so it straddled its 0.05 bar and flipped with the RNG stream (a case before it
+skips on one ICD and runs on another, moving `g_rng`) — the arm was decorative on one device and not another.
+The margin is now measured where the rotation acts (dims 0..n_rot-1): **1.83e-01 on the Arc, 1.64e-01 on
+lvp/radeon**.
+
+**GATE TOTALS, after the change. vega:** intel_icd (Arc B70) **384 / 0 / 0**, llvmpipe **372 / 0 / 3**, radeon_icd
+(Ryzen iGPU) **375 / 0 / 2** — exit **0**; the 3 / 2 skips are pre-existing. Box (`z820b`): radeon_icd (RX 7900
+XTX) **380 / 0 / 1**, llvmpipe **372 / 0 / 3**, nvidia_icd (Quadro K620) **375 / 0 / 2** — **0 failed on every
+arm**; `run_gate.sh` exits **1** there only for the pre-existing M8 `prefill split` skip.  A later full-gate run
+on vega read the radeon-iGPU arm **374 / 1 / 2** — the single failure is the DOCUMENTED intermittent
+`budget: independent requery agrees` flake on that integrated device (it also read clean, 375/0/2, in the run
+immediately before), recorded rather than chased.
+
+**CLASS-A WORK REMAINING: none.** `fused_gr_read` (a real device op the GR contract removes), `fused_gr_read_multi`
+and the `_multi`/`gdn_conv_commit` verify family are class C/D; `fused_gr_read_multi` is class D and still `todo`.
+
 ## THE GDN MIXER CHAIN IS COMPLETE, plus the first QSA gate member — class A #4-6 — **DONE 2026-10-05**
 
 The previous increment landed the mixer's first three kernels (`gdn_conv_step`, `gdn_l2_norm`, `gdn_beta_gate`)

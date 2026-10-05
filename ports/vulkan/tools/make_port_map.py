@@ -42,6 +42,17 @@ TABLE = {
     # delta-rule state update and the closing norm.  Same branch policy, `native_gdn_enabled() == false`.
     'gdn_step':                       ('kernel', 'gdn_step'),
     'gdn_out_norm':                   ('kernel', 'gdn_out_norm'),
+    # The hyper-connection (GR) pair, under the branch policy `gr_set_native_mmvf(false)` + `layer_set_fused_gr(false)`
+    # (the same shape as `native_gdn_enabled() == false`; see DECODE-PATH-TRIAGE.md and NEXT.md): the LEGACY
+    # UNFUSED read (five stages) and the write.  `fused_gr_read` is a DEVICE op too - it launches
+    # gr_down_kernel/gr_up_kernel - but it LEAVES the forward path under that policy, so it is `todo` with a
+    # stated reason rather than `host`.  The old `host`/`a workspace read` rows for gr_read and fused_gr_read were
+    # FALSE NEGATIVES: a "workspace read" is gr_workspace_init/bytes, a host hand-out, not the read entry point.
+    'gr_read':                        ('kernel', 'gr_norm gr_down gr_gate gr_mean gr_inject'),
+    'gr_write':                       ('kernel', 'gr_write'),
+    # The QSA indexer pair's LEGACY member: `native_qsa_indexer_enabled() == false` - the indexer's OWN check,
+    # separate from `native_qsa_enabled()`, and the one `layer_verify_compatible()` reads.
+    'indexer_key_append':             ('kernel', 'indexer_key_append'),
     'iq_dequant_f32':                 ('kernel', 'iq_dequant_f32'),
     'iq_embed_rows':                  ('kernel', 'iq_embed_rows'),
     'kv_append_q4_step':              ('kernel', 'kv_q4_append'),
@@ -106,9 +117,7 @@ TABLE = {
     'f16_from_f32':                   ('host', 'a type conversion helper'),
     'f32_from_f16':                   ('host', 'a type conversion helper'),
     'fused_gr_check':                 ('host', 'a capability check'),
-    'fused_gr_read':                  ('host', 'a workspace read'),
     'fused_gr_supported':             ('host', 'a capability check'),
-    'gr_read':                        ('host', 'a workspace read'),
     'gr_workspace_bytes':             ('host', 'a size'),
     'gr_workspace_init':              ('host', 'a workspace hand-out'),
     'iq_row_bytes':                   ('host', 'a size'),
@@ -158,14 +167,13 @@ TABLE = {
     'fused_gdn_ab':                   ('todo', 'no shader in this tree yet'),
     'fused_gdn_conv_l2':              ('todo', 'no shader in this tree yet'),
     'fused_gdn_step_norm':            ('todo', 'no shader in this tree yet'),
+    'fused_gr_read':                  ('todo', 'a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes'),
     'fused_gr_read_multi':            ('todo', 'no shader in this tree yet'),
     'gdn_ab_multi':                   ('todo', 'no shader in this tree yet'),
     'gdn_conv_commit':                ('todo', 'no shader in this tree yet'),
     'gdn_conv_l2_multi':              ('todo', 'no shader in this tree yet'),
     'gdn_step_norm_multi':            ('todo', 'no shader in this tree yet'),
     'gpu_stamp':                      ('todo', 'no shader in this tree yet'),
-    'gr_write':                       ('todo', 'no shader in this tree yet'),
-    'indexer_key_append':             ('todo', 'no shader in this tree yet'),
     'map_ids':                        ('todo', 'no shader in this tree yet'),
     'moe_group_resident':             ('todo', 'no shader in this tree yet'),
     'mtp_select':                     ('todo', 'no shader in this tree yet'),

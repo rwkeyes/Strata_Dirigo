@@ -3415,6 +3415,677 @@ void case_qsa_gate_apply_f32(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// `build_rope_table`'s host loop, defined further down; forward-declared so the indexer case (which needs a
+// table with the SAME contents the engine builds) can use it rather than a second copy of the angle formula.
+static void rope_table_host(int n_rot, double theta, int max_pos, std::vector<float>& ct, std::vector<float>& st);
+
+// class-A: `gr_write`, the hyper-connection WRITE (`build_hc_combine`).  Rule src/kernels/cuda/gr.cu:283-297
+// (:413-430 the wrapper); contract include/strata/kernels/gr.hpp:114-120.  Call sites src/core/layer.cpp:1261
+// and :1329 on this batch's branch policy, and :1195/:1332 on the fused branch - it is reached on BOTH, which
+// is why it is the one hyper-connection entry that cannot be dodged.
+//
+// Rule: out[i] = R[i] + block_out[d]*w[c],  w[c] = 2*sigmoid(inject[c]/hc),  i = c*n_embd + d.  The case pins:
+//   * the `2 * sigmoid` CENTRING (gr_parity.cpp item 6): a ZERO injection gives w = 1 EXACTLY, i.e. a plain
+//     residual add, asserted as a PROPERTY and BIT-EXACT against `R + block_out` (a single correctly-rounded
+//     f32 add, which the double oracle reproduces exactly), not absorbed into a tolerance;
+//   * `inject / hc` INSIDE the sigmoid (dropping the divide keeps every shape);
+//   * the block output added to every stream IDENTICALLY (the gate weight, not a per-element stride).
+// The CUDA is f32 throughout, so the oracle is the same rule in double with a relative tolerance tied to the
+// host/device exp difference; the case dispenses ONE surplus workgroup to check the `i < n` guard against a
+// NaN-padded tail, and carries an IN-PLACE arm (R_out == R), which is how the layer calls it.
+void case_gr_write(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gr_write.spv")) return;
+    struct Shape { int n_embd, hc; };
+    const Shape shapes[] = {{2560, 4}, {64, 3}, {16, 2}};
+    for (const Shape& sh : shapes) {
+        const int n_embd = sh.n_embd, hc = sh.hc;
+        const size_t n = (size_t) hc * n_embd;
+        const uint64_t padded = n + 8u;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> R(padded, NaN), bo(n_embd), inj(hc), ref(n);
+        for (size_t i = 0; i < n; ++i) R[i] = rndf(1.0f);
+        for (auto& x : bo) x = rndf(0.5f);
+        for (int c = 0; c < hc; ++c)
+            inj[c] = (c % 3 == 0) ? 0.0f
+                                  : (float) hc * (0.5f + 0.5f * (float) (rnd() % 1000) / 1000.0f);  // inject ~ O(hc):
+        // the sigmoid is then in its RESPONSIVE region, so the `inject/hc` rival MOVES the output (an inject of
+        // several hc saturates both readings and the arm would be decorative - the presence-penalty lesson).
+        auto sigmoid = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+        std::vector<float> ref_zero(n);
+        for (size_t i = 0; i < n; ++i) {
+            const int c = (int) (i / n_embd), d = (int) (i % n_embd);
+            const double w = 2.0 * sigmoid((double) inj[c] / (double) hc);
+            ref[i] = (float) ((double) R[i] + (double) bo[d] * w);
+            ref_zero[i] = (float) ((double) R[i] + (double) bo[d]);   // w == 1 exactly when inject == 0
+        }
+        // the rival readings, host-side: drop the 2, drop the /hc, ignore the gate weight
+        std::vector<float> r_drop2(n), r_nodiv(n), r_now(n);
+        for (size_t i = 0; i < n; ++i) {
+            const int c = (int) (i / n_embd), d = (int) (i % n_embd);
+            r_drop2[i] = (float) ((double) R[i] + (double) bo[d] * sigmoid((double) inj[c] / (double) hc));
+            r_nodiv[i] = (float) ((double) R[i] + (double) bo[d] * 2.0 * sigmoid((double) inj[c]));
+            r_now[i]   = (float) ((double) R[i] + (double) bo[d]);
+        }
+        const bool drop2_moves = rel_l1_f(r_drop2, ref) > 0.05;
+        const bool nodiv_moves = rel_l1_f(r_nodiv, ref) > 0.05;
+        const bool now_moves   = rel_l1_f(r_now, ref) > 0.05;
+
+        Buf bR = ctx.alloc(padded * 4), bbo = ctx.alloc(n_embd * 4), binj = ctx.alloc((size_t) hc * 4),
+            bout = ctx.alloc(padded * 4);
+        ctx.write(bR, R.data(), padded * 4);
+        ctx.write(bbo, bo.data(), n_embd * 4);
+        ctx.write(binj, inj.data(), (size_t) hc * 4);
+        std::vector<float> out_init(padded, NaN);
+        ctx.write(bout, out_init.data(), padded * 4);
+        VkPipeline p = ctx.pipeline(dir + "/gr_write.spv", 4, 8);
+        struct { int32_t n_embd; int32_t hc; } pc{n_embd, hc};
+        ctx.dispatch(p, {&bR, &bbo, &binj, &bout}, &pc, sizeof(pc), groups_for(n) + 1u);   // one surplus group
+        std::vector<float> got(padded);
+        ctx.read(bout, got.data(), padded * 4);
+
+        int bad = 0, guard_bad = 0, prop_bad = 0;
+        double worst = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 2e-6, 1e-7)) ++bad;
+            // err over the BOUND, not a bare relative error: R + bo*w cancels for some elements, so a plain
+            // relative error reports the CONDITIONING of a near-zero output (the gr_parity rel_terms lesson).
+            worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) /
+                                    (2e-6 * std::fabs((double) ref[i]) + 1e-7));
+        }
+        for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got[i]) || got[i] == 0.0f)) ++guard_bad;
+        // THE PROPERTY: with the injection zero, the write must be `R + block_out` BIT FOR BIT (2*sigmoid(0) = 1).
+        for (size_t i = 0; i < (size_t) n_embd; ++i) if (got[i] != ref_zero[i]) ++prop_bad;
+
+        // IN-PLACE arm: the layer calls gr_write(R, ..., R).  Same inputs, out aliased onto R.
+        std::vector<float> Rcopy(R);
+        Buf bIn = ctx.alloc(padded * 4);
+        ctx.write(bIn, Rcopy.data(), padded * 4);
+        ctx.dispatch(p, {&bIn, &bbo, &binj, &bIn}, &pc, sizeof(pc), groups_for(n) + 1u);
+        std::vector<float> got_ip(padded);
+        ctx.read(bIn, got_ip.data(), padded * 4);
+        int ip_bad = 0;
+        for (size_t i = 0; i < n; ++i) if (!close_enough(got_ip[i], ref[i], 2e-6, 1e-7)) ++ip_bad;
+        for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got_ip[i]) || got_ip[i] == 0.0f)) ++ip_bad;
+
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "gr_write n_embd=%d hc=%d", n_embd, hc);
+        const bool ok = bad == 0 && guard_bad == 0 && prop_bad == 0 && ip_bad == 0 &&
+                        drop2_moves && nodiv_moves && now_moves;
+        verdict(tag, ok, bad + guard_bad + prop_bad + ip_bad +
+                              (drop2_moves ? 0 : 1) + (nodiv_moves ? 0 : 1) + (now_moves ? 0 : 1),
+                (int) (2 * n), worst,
+                "vs engine rule (double): worst err/tol (tol 2e-6 rel + 1e-7 abs) + zero-inject property EXACT");
+        if (!ok) {
+            int printed = 0;
+            for (size_t i = 0; i < n && printed < 4; ++i)
+                if (!close_enough(got[i], ref[i], 2e-6, 1e-7)) {
+                    std::printf("      offender i=%zu want=%.9g got=%.9g\n", i, (double) ref[i], got[i]);
+                    ++printed;
+                }
+            if (prop_bad) std::printf("      PROPERTY: %d of %d zero-inject elements are not R + block_out\n",
+                                      prop_bad, n_embd);
+            if (ip_bad) std::printf("      IN-PLACE arm: %d wrong\n", ip_bad);
+            if (!drop2_moves) std::printf("      FIXTURE: dropping the 2 does not move the output\n");
+            if (!nodiv_moves) std::printf("      FIXTURE: dropping the /hc does not move the output\n");
+            if (!now_moves) std::printf("      FIXTURE: ignoring the gate weight does not move the output\n");
+        }
+        ctx.free(bR);
+        ctx.free(bbo);
+        ctx.free(binj);
+        ctx.free(bout);
+        ctx.free(bIn);
+    }
+}
+
+// class-A: `indexer_key_append`, the QSA indexer pair's LEGACY member.  Rule src/kernels/cuda/qsa.cu:155-243,
+// :722-739; contract include/strata/kernels/qsa.hpp:222-250; call site src/core/layer.cpp:948.
+//
+// Rule: the raw tail, then on a block completion `pooled[b] = rope(rms_norm(mean(raw[b*r..b*r+r-1]), w_kn),
+// pos_base + b*r)` and the spare slot `pooled[n_bid] = rope(rms_norm(raw[0], w_kn), 0)`.  The case pins the
+// four rivals qsa_parity.cpp's indexer section names as silent: POOL-then-norm (not norm-then-pool), rotate at
+// the block's FIRST cell, the spare key from CELL 0 (constant, not the last raw key), and `pos_base` (a cell's
+// position is not its index).  The oracle is the same reference in double.
+//
+// HONEST GAP: the CUDA reduces the sum of squares in DOUBLE; the target has no shaderFloat64, so this port
+// accumulates in F32 and the case MEASURES the row gap against the double oracle (the `gdn_l2_norm` form)
+// instead of claiming the CUDA's 1e-6.  In particular the spare key is NOT bit-exact here (the CUDA's is,
+// because its own accumulator is double); the measured gap is printed.
+void case_indexer_key_append(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "indexer_key_append.spv")) return;
+    struct Geom { int IDXD, R, n_rot; };
+    const Geom geoms[] = {{128, 4, 64}, {32, 4, 8}};   // the artifact, then a guard/small-width arm
+    const double theta = 1e7;
+    const float EPS = 1e-6f;
+    const int NT = 10;                                  // 2 complete blocks + a 2-cell tail
+    const int POS_BASE = 100;                           // cells sit at positions 100..109, not 0..9
+    auto ref_rms_norm = [](std::vector<double>& x, const std::vector<float>& w, float eps) {
+        double ss = 0;
+        for (double v : x) ss += v * v;
+        const double inv = 1.0 / std::sqrt(ss / (double) x.size() + (double) eps);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = x[i] * inv * (double) w[i];
+    };
+    auto ref_rope = [](std::vector<double>& x, double pos, int n_rot, double th, std::vector<double>* terms) {
+        const int nhalf = n_rot / 2;
+        std::vector<double> a(x.begin(), x.begin() + nhalf), b(x.begin() + nhalf, x.begin() + n_rot);
+        if (terms) terms->assign(x.size(), 0.0);
+        for (size_t i = (size_t) n_rot; i < x.size() && terms; ++i) (*terms)[i] = std::fabs(x[i]);
+        for (int i = 0; i < nhalf; ++i) {
+            const double inv = std::pow(th, -2.0 * (double) i / (double) n_rot);
+            const double ang = pos * inv, c = std::cos(ang), s = std::sin(ang);
+            x[i] = a[i] * c - b[i] * s; x[nhalf + i] = a[i] * s + b[i] * c;
+            if (terms) {
+                (*terms)[i] = std::fabs(a[i] * c) + std::fabs(b[i] * s);
+                (*terms)[nhalf + i] = std::fabs(a[i] * s) + std::fabs(b[i] * c);
+            }
+        }
+    };
+    for (const Geom& g : geoms) {
+        const int IDXD = g.IDXD, R = g.R, n_rot = g.n_rot;
+        const int n_bid = NT / R;
+        const int max_pos = POS_BASE + NT + 8;
+        // raw keys: cell t has magnitude 4^(t%4), so pool-then-norm and norm-then-pool cannot agree by accident.
+        std::vector<float> raw_flat((size_t) NT * IDXD);
+        std::vector<std::vector<double>> raw(NT);
+        for (int t = 0; t < NT; ++t) {
+            raw[t].resize(IDXD);
+            for (int d = 0; d < IDXD; ++d) {
+                const double v = (double) (float) (std::pow(4.0, (double) (t % 4)) * rndf(1.0f));
+                raw_flat[(size_t) t * IDXD + d] = (float) v;
+                raw[t][d] = (double) raw_flat[(size_t) t * IDXD + d];
+            }
+        }
+        std::vector<float> w_kn(IDXD);
+        for (auto& x : w_kn) x = 1.0f + 0.1f * rndf(1.0f);
+        std::vector<float> ct, st;
+        rope_table_host(n_rot, theta, max_pos, ct, st);
+
+        // the reference pooled rows + the rope terms (the denominator for a cancellation-aware comparison)
+        std::vector<double> want((size_t) (n_bid + 1) * IDXD, 0.0), terms((size_t) (n_bid + 1) * IDXD, 0.0);
+        for (int b = 0; b < n_bid; ++b) {
+            std::vector<double> m(IDXD, 0.0);
+            for (int i = 0; i < R; ++i)
+                for (int d = 0; d < IDXD; ++d) m[d] += raw[b * R + i][d] / (double) R;
+            ref_rms_norm(m, w_kn, EPS);
+            std::vector<double> tm;
+            ref_rope(m, (double) (POS_BASE + b * R), n_rot, theta, &tm);
+            for (int d = 0; d < IDXD; ++d) { want[b * IDXD + d] = m[d]; terms[b * IDXD + d] = tm[d]; }
+        }
+        {
+            std::vector<double> dead = raw[0];
+            ref_rms_norm(dead, w_kn, EPS);
+            std::vector<double> tm;
+            ref_rope(dead, 0.0, n_rot, theta, &tm);
+            for (int d = 0; d < IDXD; ++d) {
+                want[n_bid * IDXD + d] = dead[d];
+                terms[n_bid * IDXD + d] = tm[d] == 0.0 ? 1.0 : tm[d];
+            }
+        }
+        // THE MEAN'S OWN TERM SCALE, which the rope's terms cannot see.  `pooled[b][d]` is `m[d] * inv * w_kn[d]`
+        // rotated, and `m[d]` is a mean of r f32 keys: its f32 rounding is bounded by eps * sum_j|raw[j][d]| / r.
+        // A component whose mean CANCELS (the fixture has one - measured want 7.3e-06 against a row scale of
+        // ~0.09) then carries a large RELATIVE error that is entirely the shared mean's, not the kernel's, so the
+        // bound has to carry `inv * |w_kn[d]| * sum_j|raw[j][d]| / r` as its own absolute term.  Derived from the
+        // mean's rounding, not fitted to the result (the port's "bound a reduction by its TERMS" rule).
+        std::vector<float> mean_terms((size_t) (n_bid + 1) * IDXD, 0.0f);
+        for (int b = 0; b < n_bid; ++b) {
+            std::vector<double> mm(IDXD, 0.0);
+            for (int i = 0; i < R; ++i)
+                for (int d = 0; d < IDXD; ++d) mm[d] += raw[b * R + i][d] / (double) R;
+            double ss = 0;
+            for (int d = 0; d < IDXD; ++d) ss += mm[d] * mm[d];
+            const double inv = 1.0 / std::sqrt(ss / (double) IDXD + (double) EPS);
+            for (int d = 0; d < IDXD; ++d) {
+                double S = 0;
+                for (int i = 0; i < R; ++i) S += std::fabs(raw[b * R + i][d]);
+                mean_terms[(size_t) b * IDXD + d] =
+                    (float) (inv * std::fabs((double) w_kn[d]) * S / (double) R);
+            }
+        }
+        auto id_tol = [&](size_t i) {
+            return 1e-6 * std::fabs(want[i]) + 16.0 * 0x1p-24 * ((double) terms[i] + (double) mean_terms[i]);
+        };
+        // host-side margins: each rival must MOVE the reference, or the arm is decorative
+        auto pooled_with = [&](bool pool_then_norm, bool rot_last, bool dead_last, bool flat_pos) {
+            std::vector<double> out((size_t) (n_bid + 1) * IDXD, 0.0);
+            for (int b = 0; b < n_bid; ++b) {
+                std::vector<double> m(IDXD, 0.0);
+                if (pool_then_norm) {
+                    for (int i = 0; i < R; ++i)
+                        for (int d = 0; d < IDXD; ++d) m[d] += raw[b * R + i][d] / (double) R;
+                    ref_rms_norm(m, w_kn, EPS);
+                } else {
+                    for (int i = 0; i < R; ++i) {
+                        std::vector<double> one = raw[b * R + i];
+                        ref_rms_norm(one, w_kn, EPS);
+                        for (int d = 0; d < IDXD; ++d) m[d] += one[d] / (double) R;
+                    }
+                }
+                const double pos = flat_pos ? (double) (b * R)
+                                            : (double) ((rot_last ? POS_BASE + b * R + R - 1 : POS_BASE + b * R));
+                ref_rope(m, pos, n_rot, theta, nullptr);
+                for (int d = 0; d < IDXD; ++d) out[b * IDXD + d] = m[d];
+            }
+            std::vector<double> dead = raw[dead_last ? (NT - 1) : 0];
+            ref_rms_norm(dead, w_kn, EPS);
+            ref_rope(dead, 0.0, n_rot, theta, nullptr);
+            for (int d = 0; d < IDXD; ++d) out[n_bid * IDXD + d] = dead[d];
+            return out;
+        };
+        auto rel_l1_d = [](const std::vector<double>& a, const std::vector<double>& b) {
+            double d = 0, m = 0;
+            for (size_t i = 0; i < a.size(); ++i) { d += std::fabs(a[i] - b[i]); m += std::fabs(b[i]); }
+            return d / (m > 1e-30 ? m : 1e-30);
+        };
+        // THE ROTATION'S MARGIN IS MEASURED WHERE THE ROTATION ACTS (dims 0..n_rot-1).  A rotation-position rival
+        // moves only the pairs whose angle actually changes, and `n_rot` = 64 of `idx_dim` = 128 leaves half the
+        // row untouched - so a whole-row rel_l1 is diluted to ~0.04-0.06 and FLIPPED across the 0.05 bar with the
+        // RNG stream (a case before this one skips on one ICD and runs on another, moving `g_rng`): the arm was
+        // decorative on one device and not another.  The claim is about the rotated dims, so the margin is too.
+        auto rel_rot = [&](const std::vector<double>& a, const std::vector<double>& b) {
+            double d = 0, m = 0;
+            for (int bl = 0; bl < n_bid; ++bl)
+                for (int dd = 0; dd < n_rot; ++dd) {
+                    const size_t i = (size_t) bl * IDXD + dd;
+                    d += std::fabs(a[i] - b[i]);
+                    m += std::fabs(b[i]);
+                }
+            return d / (m > 1e-30 ? m : 1e-30);
+        };
+        const double pool_obs = rel_l1_d(pooled_with(false, false, false, false), want);
+        const double rot_obs = rel_rot(pooled_with(true, true, false, false), want);
+        const double dead_obs = rel_l1_d(pooled_with(true, false, true, false), want);
+        const double base_obs = rel_rot(pooled_with(true, false, false, true), want);
+        const bool pool_moves = pool_obs > 0.05;
+        const bool rot_moves = rot_obs > 0.05;
+        const bool dead_moves = dead_obs > 0.05;
+        const bool base_moves = base_obs > 0.05;
+
+        const uint64_t pooled_rows = (uint64_t) (n_bid + 2);
+        const size_t pooled_n = (size_t) pooled_rows * IDXD;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        Buf braw = ctx.alloc((size_t) IDXD * 4), bpos = ctx.alloc(4), bwk = ctx.alloc((size_t) IDXD * 4),
+            btail = ctx.alloc((size_t) (R - 1) * IDXD * 4), bdead = ctx.alloc((size_t) IDXD * 4),
+            bpool = ctx.alloc(pooled_n * 4), bbp = ctx.alloc(4),
+            bct = ctx.alloc(ct.size() * 4), bst = ctx.alloc(st.size() * 4);
+        ctx.write(bwk, w_kn.data(), (size_t) IDXD * 4);
+        ctx.write(bct, ct.data(), ct.size() * 4);
+        ctx.write(bst, st.data(), st.size() * 4);
+        std::vector<float> init_pool(pooled_n, NaN), init_dead((size_t) IDXD, NaN);
+        ctx.write(bpool, init_pool.data(), pooled_n * 4);
+        ctx.write(bdead, init_dead.data(), (size_t) IDXD * 4);
+        VkPipeline p = ctx.pipeline(dir + "/indexer_key_append.spv", 9, 20);
+        struct { int32_t idx_dim; int32_t r; int32_t n_rot; int32_t pos_base; float eps; } pc{IDXD, R, n_rot, POS_BASE, EPS};
+        for (int t = 0; t < NT; ++t) {   // one cell at a time: the tail is a ring and the spare row MOVES
+            const int32_t tpos = t;
+            ctx.write(bpos, &tpos, 4);
+            ctx.write(braw, &raw_flat[(size_t) t * IDXD], (size_t) IDXD * 4);
+            ctx.dispatch(p, {&braw, &bpos, &bwk, &btail, &bdead, &bpool, &bbp, &bct, &bst}, &pc, sizeof(pc), 1u);
+        }
+        std::vector<float> got(pooled_n), got_dead((size_t) IDXD);
+        ctx.read(bpool, got.data(), pooled_n * 4);
+        ctx.read(bdead, got_dead.data(), (size_t) IDXD * 4);
+
+        int dead_bad = 0, pool_bad = 0, guard_bad = 0;
+        double worst = 0, dead_worst = 0;
+        for (int b = 0; b < n_bid; ++b)
+            for (int d = 0; d < IDXD; ++d) {
+                const size_t i = (size_t) b * IDXD + d;
+                const double e = std::fabs((double) got[i] - want[i]) / id_tol(i);
+                if (e > 1.0) ++pool_bad;
+                worst = std::max(worst, e);
+            }
+        for (int d = 0; d < IDXD; ++d) {
+            const double e = std::fabs((double) got_dead[d] - want[(size_t) n_bid * IDXD + d]) /
+                             (std::fabs(want[(size_t) n_bid * IDXD + d]) + 1e-30);
+            if (e > 1e-5) ++dead_bad;
+            dead_worst = std::max(dead_worst, e);
+        }
+        for (size_t i = (size_t) (n_bid + 1) * IDXD; i < pooled_n; ++i)
+            if (!(std::isnan(got[i]) || got[i] == 0.0f)) ++guard_bad;
+        int32_t last_block_pos = -1;
+        ctx.read(bbp, &last_block_pos, 4);
+        const bool bpos_ok = (last_block_pos == POS_BASE + (n_bid - 1) * R);
+
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "indexer_key_append idx_dim=%d r=%d n_rot=%d", IDXD, R, n_rot);
+        const bool ok = pool_bad == 0 && dead_bad == 0 && guard_bad == 0 && bpos_ok &&
+                        pool_moves && rot_moves && dead_moves && base_moves;
+        verdict(tag, ok, pool_bad + dead_bad + guard_bad + (bpos_ok ? 0 : 1) +
+                              (pool_moves ? 0 : 1) + (rot_moves ? 0 : 1) + (dead_moves ? 0 : 1) + (base_moves ? 0 : 1),
+                (int) (n_bid * IDXD + IDXD), worst,
+                "pooled rows f32 vs double oracle, err/tol (1e-6|want| + 16*2^-24*(rope terms + mean terms)); spare key tol 1e-5");
+        std::printf("      indexer gap: pooled worst err/tol %.3e | spare key worst %.3e (tol 1e-5, f32 sum-of-squares)\n",
+                    worst, dead_worst);
+        std::printf("      indexer margins (each > 0.05): norm-then-pool %.3e | rotate-at-LAST-cell %.3e | dead-from-LAST %.3e | positions-0.. %.3e\n",
+                    pool_obs, rot_obs, dead_obs, base_obs);
+        if (!ok) {
+            if (pool_bad) {
+                std::printf("      pooled rows: %d of %d over the bar\n", pool_bad, n_bid * IDXD);
+                // WHICH element, and with what terms: the numbers that decide whether this is the kernel or the BOUND.
+                size_t wi = 0;
+                double we = -1;
+                for (int b = 0; b < n_bid; ++b)
+                    for (int d = 0; d < IDXD; ++d) {
+                        const size_t i = (size_t) b * IDXD + d;
+                        const double e = std::fabs((double) got[i] - want[i]) / id_tol(i);
+                        if (e > we) { we = e; wi = i; }
+                    }
+                std::printf("      worst pooled[b=%zu][d=%zu] want %.9g got %.9g terms %.9g ratio %.3e\n",
+                            wi / IDXD, wi % IDXD, want[wi], (double) got[wi], terms[wi], we);
+            }
+            if (dead_bad) std::printf("      spare key: %d of %d over the bar\n", dead_bad, IDXD);
+            if (guard_bad) std::printf("      GUARD: %d pooled-slack elements written\n", guard_bad);
+            if (!bpos_ok) std::printf("      block_pos = %d, want %d\n", last_block_pos, POS_BASE + (n_bid - 1) * R);
+            if (!pool_moves) std::printf("      FIXTURE: norm-then-pool does not move the output\n");
+            if (!rot_moves) std::printf("      FIXTURE: rotating at the block's LAST cell does not move the output\n");
+            if (!dead_moves) std::printf("      FIXTURE: the spare key from the LAST raw key does not move the output\n");
+            if (!base_moves) std::printf("      FIXTURE: pos_base (positions 0..) does not move the output\n");
+        }
+        ctx.free(braw);
+        ctx.free(bpos);
+        ctx.free(bwk);
+        ctx.free(btail);
+        ctx.free(bdead);
+        ctx.free(bpool);
+        ctx.free(bbp);
+        ctx.free(bct);
+        ctx.free(bst);
+    }
+}
+
+// class-A: `gr_read`, the hyper-connection READ (`build_hc_mix`) - the LEGACY, non-native form.  Rule
+// src/kernels/cuda/gr.cu:135-297, :344-411 (the unfused branch at :374-384); contract
+// include/strata/kernels/gr.hpp:79-112; call sites src/core/layer.cpp:1255 and :1278.  The oracle is
+// gr_parity.cpp's `reference` (its own float64 transcription of `ref/gr.py`), with the DEFAULT activation
+// contract (round_activation = true, the BF16 one the layer runs when native_mmvf is off).
+//
+// This is FIVE stages, so the case SNAPSHOTS EACH STAGE and compares it against the same double reference: the
+// norm (`xn`), the silu bottleneck (`lq`), the gate (`gated`), the stream mean (`mixed`) and the injection
+// (`inject`).  Comparing only `mixed` would hide which stage moved.  It pins gr_parity.cpp's items 1-5 by
+// host-checking that each rival MOVES the reference first: one RMS over the whole stack (not per stream), the
+// `/hc` outside the silu, SiLU on the gate (not sigmoid), the SUM over streams (not the mean), and the FP32
+// activation contract (not BF16).
+//
+// HONEST GAPS, measured rather than assumed:
+//   * the CUDA's reductions run in F32 (gr_norm uses `block_sumf`) but in a different ORDER (warp trees), so
+//     the last bits of every sum are this port's - the case prints each stage's worst;
+//   * `lo` is rounded to bf16, so a device `lo` that differs from the double oracle by ~1e-5 crosses a bf16
+//     boundary for the odd element and comes out a whole bf16 ulp away.  `lq`/`xq` are therefore compared with
+//     a ~1-ulp bound and the count of boundary flips is printed - a hard `1e-6` on a bf16-rounded value would
+//     report a correct kernel as broken (the RoPE lesson).
+// The final-mixer contract (`w_inject == nullptr` writes NOTHING) is checked by re-running the read with the
+// injection stage SKIPPED and requiring a sentinel in that buffer to survive.
+void case_gr_read(Ctx& ctx, const std::string& dir) {
+    for (const char* spv : {"gr_norm.spv", "gr_down.spv", "gr_gate.spv", "gr_mean.spv", "gr_inject.spv"})
+        if (!have(dir, spv)) return;
+    struct Shape { int n_embd, hc, hc_lr; };
+    const Shape shapes[] = {{2560, 4, 320}, {64, 2, 8}, {16, 3, 4}};   // the artifact, then two small arms
+    const float EPS = 1e-6f;
+    for (const Shape& sh : shapes) {
+        const int n_embd = sh.n_embd, hc = sh.hc, hc_lr = sh.hc_lr;
+        const int hc_dim = hc * n_embd;
+        auto bf16_val = [](float f) {   // f32 -> bf16 round-half-to-even, KEPT AS AN F32 (gr_parity's to_bf16)
+            uint32_t i;
+            std::memcpy(&i, &f, 4);
+            i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
+            std::memcpy(&f, &i, 4);
+            return f;
+        };
+        auto hbits = [&](float f) {   // the 16 bf16 bits the shader reads out of a packed pair
+            const float b = bf16_val(f);
+            uint32_t u;
+            std::memcpy(&u, &b, 4);
+            return u >> 16;
+        };
+        auto bf = [&](float f) { return bf16_val(f); };
+
+        std::vector<float> R(hc_dim), w_norm(hc_dim);
+        std::vector<std::vector<float>> w_down(hc_lr, std::vector<float>(hc_dim));
+        std::vector<std::vector<float>> w_up(hc_dim, std::vector<float>(hc_lr));
+        std::vector<std::vector<float>> w_inject(hc, std::vector<float>(hc_dim));
+        for (int c = 0; c < hc; ++c) {
+            // per-STREAM magnitudes 1, 4, 16, ... (qsa_parity's own reason for its cell scales): i.i.d. streams
+            // of the SAME scale have nearly equal RMS values, so the whole-stack rival would agree to within the
+            // noise and the arm could not see its own trap.
+            const float sc = std::pow(4.0f, (float) c);
+            for (int d = 0; d < n_embd; ++d) R[c * n_embd + d] = sc * rndf(1.0f);
+        }
+        for (auto& x : w_norm) x = 1.0f + 0.1f * rndf(1.0f);
+        for (auto& row : w_down) for (auto& x : row) x = bf(0.02f * rndf(1.0f));
+        for (auto& row : w_up) for (auto& x : row) x = bf(0.05f * rndf(1.0f));
+        for (auto& row : w_inject) for (auto& x : row) x = bf(0.02f * rndf(1.0f));
+
+        // ---- THE ORACLE: gr_parity.cpp::reference, defaults, in double.
+        std::vector<float> xn(hc_dim), act(hc_dim), lq(hc_lr), gated(hc_dim), ref_mixed(n_embd), ref_inject(hc);
+        auto to_bf16 = [&](double d) { return bf16_val((float) d); };
+        for (int c = 0; c < hc; ++c) {
+            double ms = 0;
+            for (int d = 0; d < n_embd; ++d) ms += (double) R[c * n_embd + d] * (double) R[c * n_embd + d];
+            ms /= (double) n_embd;
+            const float rs = (float) (1.0 / std::sqrt(ms + (double) EPS));
+            for (int d = 0; d < n_embd; ++d) {
+                const int i = c * n_embd + d;
+                xn[i] = R[i] * rs * w_norm[i];
+                act[i] = to_bf16(xn[i]);
+            }
+        }
+        std::vector<float> lo(hc_lr);
+        for (int k = 0; k < hc_lr; ++k) {
+            double a = 0;
+            for (int i = 0; i < hc_dim; ++i) a += (double) act[i] * (double) w_down[k][i];
+            const float p = (float) a / (float) hc;                 // /hc INSIDE the silu
+            lo[k] = p / (1.0f + std::exp(-p));
+            lq[k] = to_bf16(lo[k]);
+        }
+        for (int i = 0; i < hc_dim; ++i) {
+            double a = 0;
+            for (int k = 0; k < hc_lr; ++k) a += (double) lq[k] * (double) w_up[i][k];
+            gated[i] = xn[i] * (float) (1.0 / (1.0 + std::exp(-a)));   // SIGMOID on the gate
+        }
+        for (int d = 0; d < n_embd; ++d) {
+            double m = 0;
+            for (int c = 0; c < hc; ++c) m += (double) gated[c * n_embd + d];
+            ref_mixed[d] = (float) (m / (double) hc);               // MEAN over streams
+        }
+        for (int c = 0; c < hc; ++c) {
+            double a = 0;
+            for (int i = 0; i < hc_dim; ++i) a += (double) act[i] * (double) w_inject[c][i];
+            ref_inject[c] = (float) a;
+        }
+        // the rival readings, host-side: each must MOVE its target or the arm is decorative
+        std::vector<float> xn_whole(hc_dim);
+        {
+            double ms = 0;
+            for (int i = 0; i < hc_dim; ++i) ms += (double) R[i] * (double) R[i];
+            ms /= (double) hc_dim;
+            const float rs = (float) (1.0 / std::sqrt(ms + (double) EPS));
+            for (int i = 0; i < hc_dim; ++i) xn_whole[i] = R[i] * rs * w_norm[i];
+        }
+        std::vector<float> r_mixed_sum(n_embd);
+        for (int d = 0; d < n_embd; ++d) {
+            double m = 0;
+            for (int c = 0; c < hc; ++c) m += (double) gated[c * n_embd + d];
+            r_mixed_sum[d] = (float) m;                              // SUM, not mean
+        }
+        const double act_obs = rel_l1_f(act, xn);   // the bf16 activation contract must be OBSERVABLE (~2^-9)
+        const double norm_obs = rel_l1_f(xn_whole, xn);
+        const double mean_obs = rel_l1_f(r_mixed_sum, ref_mixed);
+        const bool norm_moves = norm_obs > 0.05;
+        const bool mean_moves = mean_obs > 0.05;
+        const bool fp32_obs = act_obs > 1e-4;    // the bf16 rounding of `xn` changes it by ~2e-3
+
+        // ---- upload: bf16 weights/activations held the way the shader reads them
+        std::vector<uint32_t> wd_pack((size_t) hc_lr * (hc_dim / 2)), wu_pack((size_t) hc_dim * (hc_lr / 2)),
+            wi_pack((size_t) hc * (hc_dim / 2));
+        for (int k = 0; k < hc_lr; ++k)
+            for (int p = 0; p < hc_dim / 2; ++p)
+                wd_pack[(size_t) k * (hc_dim / 2) + p] = hbits(w_down[k][2 * p]) | (hbits(w_down[k][2 * p + 1]) << 16);
+        for (int i = 0; i < hc_dim; ++i)
+            for (int p = 0; p < hc_lr / 2; ++p)
+                wu_pack[(size_t) i * (hc_lr / 2) + p] = hbits(w_up[i][2 * p]) | (hbits(w_up[i][2 * p + 1]) << 16);
+        for (int c = 0; c < hc; ++c)
+            for (int p = 0; p < hc_dim / 2; ++p)
+                wi_pack[(size_t) c * (hc_dim / 2) + p] = hbits(w_inject[c][2 * p]) | (hbits(w_inject[c][2 * p + 1]) << 16);
+
+        Buf bR = ctx.alloc((size_t) hc_dim * 4), bWN = ctx.alloc((size_t) hc_dim * 4), bXN = ctx.alloc((size_t) hc_dim * 4),
+            bXQ = ctx.alloc((size_t) hc_dim * 4), bWD = ctx.alloc(wd_pack.size() * 4), bLQ = ctx.alloc((size_t) hc_lr * 4),
+            bWU = ctx.alloc(wu_pack.size() * 4), bGT = ctx.alloc((size_t) hc_dim * 4), bMX = ctx.alloc((size_t) n_embd * 4),
+            bWI = ctx.alloc(wi_pack.size() * 4), bINJ = ctx.alloc((size_t) hc * 4);
+        ctx.write(bR, R.data(), (size_t) hc_dim * 4);
+        ctx.write(bWN, w_norm.data(), (size_t) hc_dim * 4);
+        ctx.write(bWD, wd_pack.data(), wd_pack.size() * 4);
+        ctx.write(bWU, wu_pack.data(), wu_pack.size() * 4);
+        ctx.write(bWI, wi_pack.data(), wi_pack.size() * 4);
+
+        VkPipeline pn = ctx.pipeline(dir + "/gr_norm.spv", 4, 12);
+        VkPipeline pd = ctx.pipeline(dir + "/gr_down.spv", 3, 12);
+        VkPipeline pg = ctx.pipeline(dir + "/gr_gate.spv", 4, 8);
+        VkPipeline pm = ctx.pipeline(dir + "/gr_mean.spv", 2, 8);
+        VkPipeline pi = ctx.pipeline(dir + "/gr_inject.spv", 3, 8);
+        struct PCn { int32_t n_embd, hc; float eps; } pcn{n_embd, hc, EPS};
+        struct PCd { int32_t hc_dim, hc_lr, hc; } pcd{hc_dim, hc_lr, hc};
+        struct PCg { int32_t hc_dim, hc_lr; } pcg{hc_dim, hc_lr};
+        struct PCm { int32_t n_embd, hc; } pcm{n_embd, hc};
+        struct PCi { int32_t hc_dim, hc; } pci{hc_dim, hc};
+        ctx.dispatch(pn, {&bR, &bWN, &bXN, &bXQ}, &pcn, sizeof(pcn), (uint32_t) hc);
+        ctx.dispatch(pd, {&bXQ, &bWD, &bLQ}, &pcd, sizeof(pcd), (uint32_t) hc_lr);
+        ctx.dispatch(pg, {&bLQ, &bWU, &bXN, &bGT}, &pcg, sizeof(pcg), (uint32_t) hc_dim);
+        ctx.dispatch(pm, {&bGT, &bMX}, &pcm, sizeof(pcm), groups_for((uint64_t) n_embd));
+        ctx.dispatch(pi, {&bXQ, &bWI, &bINJ}, &pci, sizeof(pci), (uint32_t) hc);
+
+        std::vector<float> g_xn(hc_dim), g_xq(hc_dim), g_lq(hc_lr), g_gt(hc_dim), g_mx(n_embd), g_inj(hc);
+        ctx.read(bXN, g_xn.data(), (size_t) hc_dim * 4);
+        ctx.read(bXQ, g_xq.data(), (size_t) hc_dim * 4);
+        ctx.read(bLQ, g_lq.data(), (size_t) hc_lr * 4);
+        ctx.read(bGT, g_gt.data(), (size_t) hc_dim * 4);
+        ctx.read(bMX, g_mx.data(), (size_t) n_embd * 4);
+        ctx.read(bINJ, g_inj.data(), (size_t) hc * 4);
+
+        // ---- EACH STAGE IS CHECKED AGAINST AN ORACLE FED THE DEVICE'S OWN INPUT FOR THAT STAGE, and the bound
+        // is tied to the TERMS of that stage's reduction (`rel*|want| + 16*2^-24*sum|terms|`, the port's GEMV
+        // bound).  BOTH are load-bearing, and the cross-implementation arm forced each in turn:
+        //   * a stage whose result CANCELS (a down projection that lands near zero, the stream mean) carries a
+        //     relative error that measures its CONDITIONING, not its correctness - measured on RADV, a `mixed`
+        //     whose terms are ~2.0 but whose mean is ~0.004 moved 9.7 RELATIVE under a 1e-5 input difference;
+        //   * comparing a bf16-ROUNDED value against an unrounded double oracle puts the odd element a whole
+        //     bf16 ulp away whenever the two sides straddle a boundary (measured: 19 such flips on RADV's f32
+        //     `lo`, from a device-vs-double difference of 1e-5).  So `act_dev` below IS the device's own
+        //     rounded activation, and stage 1's rounding is asserted EXACTLY against it.
+        const std::vector<float>& act_dev = g_xq;
+        std::vector<float> lo2(hc_lr), terms_l(hc_lr, 0.0f);
+        for (int k = 0; k < hc_lr; ++k) {
+            double a = 0, tm = 0;
+            for (int i = 0; i < hc_dim; ++i) {
+                const double t = (double) act_dev[i] * (double) w_down[k][i];
+                a += t; tm += std::fabs(t);
+            }
+            const float p = (float) a / (float) hc;
+            lo2[k] = p / (1.0f + std::exp(-p));
+            terms_l[k] = (float) (tm / (double) hc);
+        }
+        std::vector<float> gt2(hc_dim), terms_g(hc_dim, 0.0f);
+        for (int i = 0; i < hc_dim; ++i) {
+            double a = 0, tm = 0;
+            for (int k = 0; k < hc_lr; ++k) {
+                const double t = (double) g_lq[k] * (double) w_up[i][k];
+                a += t; tm += std::fabs(t);
+            }
+            gt2[i] = g_xn[i] * (float) (1.0 / (1.0 + std::exp(-a)));
+            terms_g[i] = (float) tm;
+        }
+        std::vector<float> mx2(n_embd), terms_m(n_embd, 0.0f);
+        for (int d = 0; d < n_embd; ++d) {
+            double m = 0, tm = 0;
+            for (int c = 0; c < hc; ++c) { const double t = g_gt[c * n_embd + d]; m += t; tm += std::fabs(t); }
+            mx2[d] = (float) (m / (double) hc);
+            terms_m[d] = (float) tm;
+        }
+        std::vector<float> ij2(hc), terms_j(hc, 0.0f);
+        for (int c = 0; c < hc; ++c) {
+            double a = 0, tm = 0;
+            for (int i = 0; i < hc_dim; ++i) {
+                const double t = (double) act_dev[i] * (double) w_inject[c][i];
+                a += t; tm += std::fabs(t);
+            }
+            ij2[c] = (float) a;
+            terms_j[c] = (float) tm;
+        }
+
+        int bad = 0, xq_bad = 0;
+        double worst = 0;
+        auto cmpT = [&](const std::vector<float>& g, const std::vector<float>& w, double rel,
+                        const std::vector<float>& terms, double ulp_rel) {
+            double wst = 0;
+            for (size_t i = 0; i < g.size(); ++i) {
+                const double tol = (rel + ulp_rel) * std::fabs((double) w[i]) +
+                                   16.0 * 0x1p-24 * (double) terms[i] + 1e-12;
+                const double e = std::fabs((double) g[i] - (double) w[i]) / tol;
+                if (e > 1.0) ++bad;
+                wst = std::max(wst, e);
+            }
+            worst = std::max(worst, wst);
+            return wst;
+        };
+        double w_xn = 0;
+        for (int i = 0; i < hc_dim; ++i) {
+            const double e = std::fabs((double) g_xn[i] - (double) xn[i]) / (1e-4 * std::fabs((double) xn[i]) + 1e-6);
+            if (e > 1.0) ++bad;
+            w_xn = std::max(w_xn, e);
+        }
+        worst = std::max(worst, w_xn);
+        // STAGE 1's ROUNDING CONTRACT, asserted EXACTLY: xq must be bf16_round(xn) bit for bit.
+        for (int i = 0; i < hc_dim; ++i) if (g_xq[i] != bf16_val(g_xn[i])) ++xq_bad;
+        const double w_lq = cmpT(g_lq, lo2, 1e-3, terms_l, 1e-2);   // its own f32 accumulation + the bf16 round
+        const double w_gt = cmpT(g_gt, gt2, 1e-3, terms_g, 0.0);
+        const double w_mx = cmpT(g_mx, mx2, 1e-3, terms_m, 0.0);
+        const double w_ij = cmpT(g_inj, ij2, 1e-3, terms_j, 0.0);
+
+        // ---- the FINAL MIXER: `w_inject == nullptr` writes NOTHING.  Re-run stages 1-4 with a sentinel in the
+        // injection buffer and require it intact (gr.cu:387-389 - "computing an injection nobody reads would be a
+        // claim, not a convenience").
+        const float sentinel = -73.25f;
+        std::vector<float> sent(hc, sentinel);
+        ctx.write(bINJ, sent.data(), (size_t) hc * 4);
+        ctx.dispatch(pn, {&bR, &bWN, &bXN, &bXQ}, &pcn, sizeof(pcn), (uint32_t) hc);
+        ctx.dispatch(pd, {&bXQ, &bWD, &bLQ}, &pcd, sizeof(pcd), (uint32_t) hc_lr);
+        ctx.dispatch(pg, {&bLQ, &bWU, &bXN, &bGT}, &pcg, sizeof(pcg), (uint32_t) hc_dim);
+        ctx.dispatch(pm, {&bGT, &bMX}, &pcm, sizeof(pcm), groups_for((uint64_t) n_embd));
+        std::vector<float> g_inj2(hc);
+        ctx.read(bINJ, g_inj2.data(), (size_t) hc * 4);
+        int sent_bad = 0;
+        for (int c = 0; c < hc; ++c) if (g_inj2[c] != sentinel) ++sent_bad;
+
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "gr_read n_embd=%d hc=%d hc_lr=%d", n_embd, hc, hc_lr);
+        const bool ok = bad == 0 && xq_bad == 0 && sent_bad == 0 && norm_moves && mean_moves && fp32_obs;
+        verdict(tag, ok, bad + xq_bad + sent_bad + (norm_moves ? 0 : 1) + (mean_moves ? 0 : 1) + (fp32_obs ? 0 : 1),
+                hc_dim + hc_lr + hc_dim + n_embd + hc, worst,
+                "stages vs a DEVICE-fed double oracle; bound rel*|want| + 16*2^-24*sum|terms| (err/tol)");
+        std::printf("      gr_read stage worst (err/tol): xn %.2e lq %.2e gated %.2e mixed %.2e inject %.2e | xq contract bad %d\n",
+                    w_xn, w_lq, w_gt, w_mx, w_ij, xq_bad);
+        std::printf("      gr_read rivals: per-stream-vs-whole RMS %.2e | mean-vs-sum %.2e | bf16-activation obs %.2e\n",
+                    norm_obs, mean_obs, act_obs);
+        if (!ok) {
+            if (bad) std::printf("      %d stage elements over their bounds\n", bad);
+            if (xq_bad) std::printf("      xq != bf16(xn) for %d elements (the rounding contract)\n", xq_bad);
+            if (sent_bad) std::printf("      FINAL MIXER: %d injection values written without w_inject\n", sent_bad);
+            if (!norm_moves) std::printf("      FIXTURE: the whole-stack RMS does not move xn\n");
+            if (!mean_moves) std::printf("      FIXTURE: the SUM over streams does not move mixed\n");
+            if (!fp32_obs) std::printf("      FIXTURE: the bf16 activation rounding is not observable\n");
+            size_t wi = 0;
+            double we = -1;
+            for (size_t i = 0; i < g_mx.size(); ++i) {
+                const double e = std::fabs((double) g_mx[i] - (double) mx2[i]) /
+                                 (1e-3 * std::fabs((double) mx2[i]) + 16.0 * 0x1p-24 * terms_m[i] + 1e-12);
+                if (e > we) { we = e; wi = i; }
+            }
+            if (we > 1.0) std::printf("      worst mixed[%zu] want %.9g got %.9g terms %.9g err/tol %.3g\n",
+                                      wi, (double) mx2[wi], g_mx[wi], terms_m[wi], we);
+        }
+        for (Buf* b : {&bR, &bWN, &bXN, &bXQ, &bWD, &bLQ, &bWU, &bGT, &bMX, &bWI, &bINJ}) ctx.free(*b);
+    }
+}
+
 // rms_norm, INCLUDING the regression the CUDA source documents: the buffer is allocated with one extra
 // rounded-up workgroup's worth of rows, filled with NaN.  If the row guard is missing, the extra rows are
 // overwritten and this case fails - which is exactly how the QSA bug reached a running engine.
@@ -11353,6 +12024,9 @@ int main(int argc, char** argv) {
     case_gdn_step(ctx, dir);           // GDN class-A #4: the delta-rule state update (COMPLETES the mixer)
     case_gdn_out_norm(ctx, dir);       // GDN class-A #5: the closing norm (COMPLETES the mixer)
     case_qsa_gate_apply_f32(ctx, dir); // QSA class-A: attn * sigmoid(second half), the gate pair's legacy member
+    case_gr_write(ctx, dir);           // class-A: the hyper-connection write (2*sigmoid, centring on 1)
+    case_indexer_key_append(ctx, dir); // QSA class-A: the indexer append (pool-then-norm + rope on completion)
+    case_gr_read(ctx, dir);            // class-A: the hyper-connection READ (5-stage, unfused/legacy form)
     case_rms_norm(ctx, dir);
     case_exp_probe(ctx, dir);
     case_silu(ctx, dir);

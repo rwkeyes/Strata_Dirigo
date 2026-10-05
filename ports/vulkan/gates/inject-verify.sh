@@ -51,6 +51,12 @@
 #                                       instead of the MEAN -> must FAIL  "gdn_out_norm"
 #   inject-verify.sh qsa-gate-first-half   qsa_gate_apply_f32.comp  take the gate from the FIRST half of the
 #                                       2*head_dim block -> must FAIL  "qsa_gate_apply_f32"
+#   inject-verify.sh gr-write-drop-two-centring  gr_write.comp  drop the 2 that centres the write's gate on 1
+#                                       -> must FAIL  "gr_write"
+#   inject-verify.sh indexer-key-append-rotate-last  indexer_key_append.comp  rotate the pooled row at the
+#                                       block's LAST cell -> must FAIL  "indexer_key_append"
+#   inject-verify.sh gr-read-mean-vs-sum  gr_mean.comp  drop the `/ hc` (the SUM over streams, not the mean)
+#                                       -> must FAIL  "gr_read"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -275,6 +281,31 @@ case "$name" in
     old=$'    const float g = qfull.v[h * 2u * hd + hd + d];   // the SECOND half of the 2*head_dim block'
     new=$'    const float g = qfull.v[h * 2u * hd + d];   // INJECTION: the gate read from the FIRST half'
     want="FAIL  qsa_gate_apply_f32" ;;
+  gr-write-drop-two-centring)
+    # The `2 * sigmoid` is what CENTRES the write's gate on 1 (gr_parity.cpp item 6): a zero injection must give
+    # w = 1 EXACTLY, i.e. a plain residual add.  Dropping the 2 is the obvious slip.  The fixture's non-zero
+    # injections are sized ~ O(hc) so the sigmoid is RESPONSIVE (an inject of several hc saturates both readings
+    # and the arm would be decorative), and the zero-inject PROPERTY arm moves too.
+    file="$SH/gr_write.comp"; spv="gr_write"
+    old=$'        const float w = 2.0f / (1.0f + exp(-inj.v[c] / float(pc.hc)));   // 2*sigmoid(inject/hc), centred on 1'
+    new=$'        const float w = 1.0f / (1.0f + exp(-inj.v[c] / float(pc.hc)));   // INJECTION: the 2 dropped'
+    want="FAIL  gr_write" ;;
+  indexer-key-append-rotate-last)
+    # The pooled row is rotated at the block's FIRST cell (qsa_parity.cpp PROPERTY 4).  Rotating at its LAST cell
+    # keeps every shape and every magnitude; the fixture checks host-side that it moves the pooled rows, so this
+    # one-line change must move the DEVICE output too.
+    file="$SH/indexer_key_append.comp"; spv="indexer_key_append"
+    old=$'        const uint toff = uint(pc.pos_base + int(b) * pc.r) * nhalf + d;'
+    new=$'        const uint toff = uint(pc.pos_base + int(b) * pc.r + pc.r - 1) * nhalf + d;   // INJECTION: rotate at the LAST cell'
+    want="FAIL  indexer_key_append" ;;
+  gr-read-mean-vs-sum)
+    # `gr_read`'s last stage is the MEAN over the streams (gr_parity.cpp item 4).  Dropping the `/ hc` leaves a
+    # SUM - a factor of hc that reads as a scale problem rather than a structural one.  The case host-checks that
+    # the sum reading moves `mixed` (measured ratio ~3.0 at the artifact), so the device output must move too.
+    file="$SH/gr_mean.comp"; spv="gr_mean"
+    old=$'    mixed.v[d] = m / float(pc.hc);'
+    new=$'    mixed.v[d] = m;   // INJECTION: the /hc dropped - a SUM over the streams, not the mean'
+    want="FAIL  gr_read" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

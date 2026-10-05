@@ -1,0 +1,41 @@
+#version 450
+// ports/vulkan/shaders/gr_gate.comp - stage 3 of the LEGACY hyper-connection READ: the per-stream gate.
+//
+// Transcribed from `gr_gate_kernel<uint16_t>` (src/kernels/cuda/gr.cu:233-247, launched at gr.cu:382).  Contract
+// include/strata/kernels/gr.hpp:86: `mixed = mean over streams of xn * sigmoid(bf16(lo) @ w_up.T)`.
+//
+// THE RULE, ONE WORKGROUP PER OUTPUT ROW (the CUDA is ONE WARP PER ROW, `i = blockIdx.x*WARPS + warp`):
+//
+//     gated[i] = xn[i] * sigmoid( sum_k bf16(lo)[k] * bf16(w_up[i][k]) )
+//
+//   * SIGMOID on the gate, SiLU on `lo` a few lines apart in the same source - swapping them is gr_parity.cpp's
+//     item 3, and both are monotone saturating, so the magnitudes stay comparable and the case host-checks that
+//     each rival moves `gated`.
+//   * the reduction is over hc_lr (320 at the artifact), and the row is a bf16 PAIR array.
+// The CUDA broadcasts the warp's sum and every lane computes the sigmoid while lane 0 stores; here the workgroup
+// tree returns the sum to every invocation and inv 0 stores - the same value, one store.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer LQ { float v[]; } lq;   // (hc_lr) bf16(lo) as f32
+layout(set = 0, binding = 1, std430) readonly buffer WU { uint v[]; } wu;    // row i as uint32 bf16 PAIRS
+layout(set = 0, binding = 2, std430) readonly buffer XN { float v[]; } xn;   // (hc_dim) the UNROUNDED streams
+layout(set = 0, binding = 3, std430) buffer GT { float v[]; } gated;         // (hc_dim)
+layout(push_constant, std430) uniform PC { int hc_dim; int hc_lr; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= uint(pc.hc_dim)) return;
+    const uint np = uint(pc.hc_lr) / 2u;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
+        const uint packed = wu.v[i * np + p];
+        acc += lq.v[2u * p]      * bf16_to_f32(packed & 0xFFFFu);
+        acc += lq.v[2u * p + 1u] * bf16_to_f32(packed >> 16u);
+    }
+    const float s = 1.0f / (1.0f + exp(-wg_sum(acc)));   // SIGMOID (not SiLU)
+    if (lid == 0u) gated.v[i] = xn.v[i] * s;
+}

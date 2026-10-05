@@ -41,7 +41,7 @@ fused_gdn_ab	todo	no shader in this tree yet
 fused_gdn_conv_l2	todo	no shader in this tree yet
 fused_gdn_step_norm	todo	no shader in this tree yet
 fused_gr_check	host	a capability check
-fused_gr_read	host	a workspace read
+fused_gr_read	todo	a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes
 fused_gr_read_multi	todo	no shader in this tree yet
 fused_gr_supported	host	a capability check
 fwht256_inplace_cuda	kernel	fwht256
@@ -57,11 +57,11 @@ gdn_out_norm	kernel	gdn_out_norm
 gdn_step	kernel	gdn_step
 gdn_step_norm_multi	todo	no shader in this tree yet
 gpu_stamp	todo	no shader in this tree yet
-gr_read	host	a workspace read
+gr_read	kernel	gr_norm gr_down gr_gate gr_mean gr_inject
 gr_workspace_bytes	host	a size
 gr_workspace_init	host	a workspace hand-out
-gr_write	todo	no shader in this tree yet
-indexer_key_append	todo	no shader in this tree yet
+gr_write	kernel	gr_write
+indexer_key_append	kernel	indexer_key_append
 iq_dequant_f32	kernel	iq_dequant_f32
 iq_embed_rows	kernel	iq_embed_rows
 iq_row_bytes	host	a size

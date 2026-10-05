@@ -1,0 +1,22 @@
+#version 450
+// ports/vulkan/shaders/gr_mean.comp - stage 4 of the LEGACY hyper-connection READ: the mean over the streams.
+//
+// Transcribed from `gr_mean_kernel` (src/kernels/cuda/gr.cu:249-257, launched at gr.cu:386).  Contract
+// include/strata/kernels/gr.hpp:86: `mixed[d] = mean over c of gated[c][d]` - the MEAN, not the sum.
+//
+// THE RULE, flat and elementwise: `mixed[d] = (sum_c gated[c*n_embd + d]) / hc`.  The streams are strided by
+// n_embd, so there is NO cross-thread reduction here - one invocation per `d`, no barrier, no subgroup op.
+// Summing instead of averaging is gr_parity.cpp's item 4 (a factor of hc = 4 that reads as a scale problem);
+// the case checks host-side that the sum reading moves `mixed`.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer GT { float v[]; } gated;   // (hc, n_embd)
+layout(set = 0, binding = 1, std430) buffer MX { float v[]; } mixed;            // (n_embd)
+layout(push_constant, std430) uniform PC { int n_embd; int hc; } pc;
+
+void main() {
+    const uint d = gl_GlobalInvocationID.x;
+    if (d >= uint(pc.n_embd)) return;
+    float m = 0.0f;
+    for (int c = 0; c < pc.hc; ++c) m += gated.v[uint(c) * uint(pc.n_embd) + d];
+    mixed.v[d] = m / float(pc.hc);
+}

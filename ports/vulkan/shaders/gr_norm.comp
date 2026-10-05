@@ -1,0 +1,48 @@
+#version 450
+// ports/vulkan/shaders/gr_norm.comp - stage 1 of the LEGACY hyper-connection READ: the per-stream RMSNorm and
+// the two activation forms.
+//
+// Transcribed from `gr_norm_kernel` (src/kernels/cuda/gr.cu:135-161) and its `gr_read` call (gr.cu:380): the
+// non-native, FP32-accumulator branch (`gr_norm_kernel<false>`), which is the one the layer runs because the
+// Vulkan backend forces `gr_set_native_mmvf(false)`.  Contract include/strata/kernels/gr.hpp:79-112.
+//
+// THE RULE, ONE WORKGROUP PER RESIDUAL STREAM (the CUDA is `<<<hc, 256>>>`, one block per stream):
+//
+//     ms = mean_d R[c][d]^2          (PER STREAM: ne[0] = n_embd, so the reduction is over one stream)
+//     xn[c][d] = R[c][d] * rsqrt(ms + eps) * w_norm[c][d]
+//     xq[c][d] = bf16(xn[c][d])      (the DEFAULT activation contract; FP32 is the opt-in one)
+//
+// The rival reading - ONE RMS over the whole hc*n_embd stack - is gr_parity.cpp's item 1 and keeps every shape;
+// the case checks host-side that it moves `xn` before judging the kernel.  The CUDA sums in F32
+// (`gr_norm_kernel<false>` uses `block_sumf`, not the double `block_sum`), so this port's workgroup barrier tree
+// is the same arithmetic in a different order, and only the ORDER differs.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer RB { float v[]; } r;
+layout(set = 0, binding = 1, std430) readonly buffer WN { float v[]; } wn;   // (hc*n_embd) per-stream gamma
+layout(set = 0, binding = 2, std430) buffer XN { float v[]; } xn;            // (hc*n_embd) f32
+layout(set = 0, binding = 3, std430) buffer XQ { float v[]; } xq;            // (hc*n_embd) bf16(xn), held as f32
+layout(push_constant, std430) uniform PC { int n_embd; int hc; float eps; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    if (c >= uint(pc.hc)) return;              // workgroup-uniform, so every barrier below is reached
+    const uint n_embd = uint(pc.n_embd);
+    const uint base = c * n_embd;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint d = lid; d < n_embd; d += gl_WorkGroupSize.x) {
+        const float v = r.v[base + d];
+        acc += v * v;
+    }
+    const float ms = wg_sum(acc) / float(n_embd);
+    const float rs = inversesqrt(ms + pc.eps);
+    for (uint d = lid; d < n_embd; d += gl_WorkGroupSize.x) {
+        const float x = r.v[base + d] * rs * wn.v[base + d];
+        xn.v[base + d] = x;
+        xq.v[base + d] = bf16_round(x);
+    }
+}

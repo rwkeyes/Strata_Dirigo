@@ -1,0 +1,54 @@
+#version 450
+// ports/vulkan/shaders/gr_write.comp - the hyper-connection WRITE (`build_hc_combine`), the LEGACY form.
+//
+// Transcribed from `gr_write_kernel` (src/kernels/cuda/gr.cu:283-297) and its wrapper `gr_write`
+// (gr.cu:413-430); the semantics are include/strata/kernels/gr.hpp:114-120.  Call sites: src/core/layer.cpp
+// :1261 and :1329 (this batch's contract - see below), and :1195/:1332 on the fused branch.
+//
+// THE RULE, elementwise over the (hc, n_embd) residual stack:
+//
+//     w[c]     = 2 * sigmoid(inject[c] / hc)
+//     out[i]   = R[i] + block_out[d] * w[c]        i = c*n_embd + d
+//
+//   * the `2 * sigmoid` CENTRES the gate on 1: a ZERO injection gives w = 1 exactly, i.e. a plain residual add
+//     `out = R + block_out`.  That property is what gr_parity.cpp's item 6 asserts, and the gate's fixture
+//     re-asserts it as a property (a value, not a tolerance).  The obvious slip is dropping the 2.
+//   * the block output is added to EVERY stream identically; only the weight is per-stream.  Striding the
+//     block output by `c` (i.e. reading block_out[i]) is the other plausible wrong reading and the fixture
+//     gives the streams/columns distinct magnitudes so it cannot hide.
+//   * `inject / hc` - the division is inside the sigmoid.  Dropping it changes the gate materially; the gate's
+//     fixture checks host-side that each rival moves the output before it judges the kernel.
+//
+// THE BRANCH POLICY.  `gr_write` is reached on BOTH branches of the fused/unfused choice
+// (`if (!fused) gr_write(...)` at layer.cpp:1261, and `if (!(g_fused_gr && fused_gr_supported(...)))` at
+// :1328), so it is the one hyper-connection entry this port cannot dodge; the fused read is the alternative
+// and it is the read, not the write, that the flag removes.  Between the two internal variants the CUDA picks
+// `native_gr_post` when `native_mmvf` and THIS kernel otherwise; the Vulkan backend forces
+// `gr_set_native_mmvf(false)` (the same shape as `native_gdn_enabled() == false`), so this legacy kernel is the
+// one the layer runs.
+//
+// DESIGN vs THE CUDA.  The CUDA stages `w[]` into shared memory once per block and `__syncthreads()`s; that is
+// a redundant-recompute optimisation, not the rule - `w[c]` is a pure function of `inject[c]` and `hc`, so
+// recomputing it per element produces the SAME float (identical inputs, identical operation) and lets this
+// shader carry no barrier, no subgroup op and no atomic (checked by the gate's census).  The loop strides by
+// the whole grid exactly as the CUDA does, so the dispatch covers every element and the `i < n` guard is what
+// keeps a surplus group from writing past the stack - the gate dispatches one surplus group to check it.
+// In place is safe: `out[i]` is written from `R[i]` and nothing else, elementwise, as the layer calls it
+// (R_out == R).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer R { float v[]; } rb;      // (hc, n_embd), n_embd fastest
+layout(set = 0, binding = 1, std430) readonly buffer BO { float v[]; } bo;     // (n_embd)
+layout(set = 0, binding = 2, std430) readonly buffer INJ { float v[]; } inj;   // (hc)
+layout(set = 0, binding = 3, std430) buffer OUT { float v[]; } outb;           // (hc, n_embd)
+layout(push_constant, std430) uniform PC { int n_embd; int hc; } pc;
+
+void main() {
+    const uint n = uint(pc.hc) * uint(pc.n_embd);
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint i = gl_GlobalInvocationID.x; i < n; i += stride) {
+        const uint c = i / uint(pc.n_embd);
+        const uint d = i - c * uint(pc.n_embd);
+        const float w = 2.0f / (1.0f + exp(-inj.v[c] / float(pc.hc)));   // 2*sigmoid(inject/hc), centred on 1
+        outb.v[i] = rb.v[i] + bo.v[d] * w;                               // every stream adds the SAME block output
+    }
+}

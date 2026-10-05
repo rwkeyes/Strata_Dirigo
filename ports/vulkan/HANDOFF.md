@@ -107,9 +107,16 @@ the QSA gate and indexer (12 layers), and `gr_write`.
 
 **Milestones worth judging:**
 
-* **M-A** - the decode path's last kernels gated: the map's `todo` column reaches zero for the forward-path
-  work.  **NOT closed** - it still reads 52 `todo`, of which 19 are class-A forward-path holes
-  (`plan/DECODE-PATH-TRIAGE.md`).
+* **M-A** - the decode path's last kernels gated.  **RE-DEFINED 2026-10-05** (the old form, "the map's `todo`
+  column reaches zero for the forward-path work", is not achievable or meaningful - the map also covers the
+  `native_*` siblings, the fused alternatives a flag removes, and the verify/MTP/tooling helpers).  The
+  re-defined M-A is: **every symbol the forward path reaches ON THE BRANCH THE CAPABILITY CONTRACT SELECTS has a
+  shader and a gated case**, under `native_gdn_enabled() == false` + `native_qsa_enabled() == false` +
+  `native_qsa_indexer_enabled() == false` + `native_rope_enabled() == false` + `native_router_enabled() == false`
+  + `native_moe_combine_enabled() == false` + `gr_set_native_mmvf(false)` + `layer_set_fused_gr(false)`.
+  **MET: YES** (class-A remaining 0; the 45 `todo` rows are `11 capability-off + 4 B + 8 C + 22 D`), with two
+  stated soft edges (the shipped `--spec 4` MTP symbols - a judgement - and the `gr_read`/`fused_gr_read` branch
+  choice).  Full statement: `plan/DECODE-PATH-TRIAGE.md`.
 * **M-B** - **ONE LAYER, end to end, on the GPU with random weights.**  The first thing that proves the BACKEND
   rather than the kernels, and it needs no model at all.  Make it a gate case: a Vulkan-backed single-layer forward
   pass.
