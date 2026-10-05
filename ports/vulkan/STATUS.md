@@ -1,5 +1,34 @@
 # Status — what is done, what is verified, what is not
 
+## THE PREFILL PATH LANDS 23 OF ITS 40 ENTRY POINTS; the real pack RUNS the prompt path and stops at `gdn_recurrence` (2026-10-05, `vega`)
+
+**THE STOPPING POINT MOVED OFF `Gemm::init_external`.**  New TU `vulkan/src/kernels/prefill_vk.cpp` + 8 new
+shaders port **23 of the 40** prefill entry points: the whole `Gemm` class (`init_external`/`init`/`rebind`/`f16`/
+`bf16`/`native`), the 8-op hyper-connection family, the GDN gates/conv/L2, the thin elementwise/copy set
+(`to_f16`/`to_bf16`/`copy_f32_wide`/`copy_i32`/`gather_rows16`/`rms_rows`/`route`), and `qsa_block_scores_tc`
+(answered FALSE - a capability predicate, so the engine uses the ported `qsa_block_scores`).  **17 remain** (the
+ordered list with measured sizes is in `NEXT.md`).
+
+**THE RUN.**  `--prefill 1 --tokens "1,2"` on `coder-iq1_m` runs the prompt path through: GEMM init -> the chunk
+embedding -> `gr_broadcast` -> the PLE block -> `gr_norm_rs` -> 3 x `Gemm::bf16` -> `gr_silu` -> `gr_mix_r` ->
+2 x `Gemm::native` -> `gdn_gates` -> `gdn_conv`+L2, then exits 2 at
+`strata::prefill::gdn_recurrence: NOT PORTED on the Vulkan backend - REFUSING.`  (`/tmp/run_pf3.log`.)  A ONE-token
+prompt never enters the prefill block (`n_prompt > 1` guards it), so `--tokens 1` still gives `decode 0 tokens` -
+measured (`/tmp/run_pf.log`).
+
+**A DEFECT THE RUN FOUND.**  `iq_embed_rows` refused the token-embedding table because a native pack holds it in
+MAPPED HOST memory and the prefill's batched gather is the first caller to hand it a mapped pointer.  Fixed at the
+cause: the table now binds through `mapped_resolve` when `arena_resolve` fails (`vulkan/src/kernels/iq_vk.cpp`).
+
+**NO TOKEN.**  The verifier's two preconditions (`--expert-profile`, `native_qsa_indexer_enabled()`) are still
+BEHIND the whole prefill, so they were not reached and were not touched.  ENGINE BAR: the program LINKS, 0
+undefined - **0 BY CONSTRUCTION** (the refusals define the unported symbols), NOT a porting gain.  MAP:
+**`168 = 79 kernel + 0 shader + 45 host + 0 todo + 44 refused`** - UNCHANGED and correctly so: `PORT-MAP.tsv` is
+the DECODE path's set, and the prefill's 40 symbols are not in it.  **`refused` is NOT a capability**; the prefill
+refusal COUNT moved 40 -> 17, which the map does not carry.  Gate (vega): **Arc `intel_icd` 793/0/0 (exit 0)**,
+llvmpipe 781/0/3, Ryzen iGPU 783/1/2 (the one radeon failure is the DOCUMENTED intermittent
+`bf16_gemv_fp32_mmvf_cols entry`).  Five new injections registered; three RUN and all FALSIFY.
+
 ## THE NATIVE-DENSE K-QUANTS ARE PORTED (one generic shader), the LAUNCHER'S `view()` DEFECT IS FOUND AND FIXED, and the real pack stops at the PROMPT PREFILL (2026-10-05, `vega`)
 
 **No token from the real pack, and the stopping point is now a NAMED, MEASURED subsystem, not a flag.**  The

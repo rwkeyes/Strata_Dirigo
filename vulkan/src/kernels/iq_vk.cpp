@@ -105,10 +105,17 @@ void iq_embed_rows(Stream& s, int ggml_type, const void* table, size_t row_bytes
     // The table is one arena region; the first row sizes the RANGE CHECK.  Every row the shader reads is inside
     // the SAME buffer, so identifying the buffer + offset from the first row is what the shader needs (it does
     // its own 64-bit `token * row_bytes` arithmetic inside that buffer).
-    if (!arena_resolve(s, table, row_bytes, wv) ||
+    //
+    // **THE TABLE MAY BE MAPPED HOST MEMORY.**  A NATIVE pack holds the token embedding in mapped pinned host
+    // memory ("token embedding IQ4_XS in mapped host memory", 322 MiB) and the PREFILL's batched gather
+    // (`NativeEmbed::gather_dev`, native_head.cpp:195) hands that host pointer here - where the decode's
+    // per-token path (`embed_row` -> `embedding_gather`) never does.  A Vulkan shader cannot dereference a host
+    // address, so bind the region's DEVICE-VISIBLE buffer, exactly the `copy_from_mapped` handshake.  Measured
+    // 2026-10-05: this is the stop `--prefill 1` hit after `Gemm::init_external` was ported.
+    if (!(arena_resolve(s, table, row_bytes, wv) || mapped_resolve(table, row_bytes, wv)) ||
         !arena_resolve(s, tokens, (uint64_t) n_tok * 4, tv) ||
         !arena_resolve(s, out, (uint64_t) n_tok * (uint64_t) n_embd * 4, ov))
-        refuse("iq_embed_rows", "a pointer is not inside this stream's arena");
+        refuse("iq_embed_rows", "a pointer is neither inside this stream's arena nor a live mapped region");
     iq_grids(s, g1, g2, g3, g4, g5, g6);
     VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/iq_embed_rows.spv", 9, 12);
     struct { int32_t ty; int32_t n_embd; uint32_t row_bytes; } pc{ggml_type, (int32_t) n_embd, (uint32_t) row_bytes};

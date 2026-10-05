@@ -72,7 +72,8 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/sampler_vk.cpp                  # sample_tokens - the step that PRODUCES A TOKEN (the decode tail)
   src/kernels/refusals_vk.cpp                 # the kernels-namespace LOUD REFUSALS (unreachable symbols)
   src/kernels/refusals_engine_vk.cpp          # + the engine-LEVEL refusals (RemoteExpertOpt) + device_code_error
-  src/kernels/refusals_prefill_vk.cpp)  # + the PROMPT-path kernel refusals (src/prefill/*.cu, not ported)
+  src/kernels/prefill_vk.cpp                   # THE PREFILL PATH: Gemm + the hyper-connection family + the thin set
+  src/kernels/refusals_prefill_vk.cpp)  # + the PROMPT-path kernel refusals (the prefill entry points still unported)
                             # + the PLE/GR shared stages and the MoE routing rows (ple_vk.cpp)
 # THE ENGINE'S OWN HOST SOURCES the layer body crosses for the PLE table: `PleTable` (collect/is_open/issue)
 # is a pure host class whose ONE definition is `src/kernels/ngram.cpp` (with its `ple_reader.cpp` +

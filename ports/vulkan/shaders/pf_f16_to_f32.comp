@@ -1,0 +1,46 @@
+#version 450
+// ports/vulkan/shaders/pf_f16_to_f32.comp - f16 bits -> f32, the widening the PREFILL's native projections need.
+//
+// WHY IT EXISTS.  The engine's prefill activations are stored as F16 bits (`to_f16`, `Gemm::f16`'s operand), and
+// `Gemm::native` in the engine dequantizes the weight to f16 and runs the f16 GEMM.  This port has no ggml
+// dequantiser (that is the reported remaining hole), so `strata::prefill::Gemm::native` answers the same product
+// through the port's OWN, ALREADY-GATED decode arithmetic (`native_quantize_q8_1` + `native_mmvq`), which the
+// decode path uses for the same projections.  That route reads an f32 activation, so the f16 image is widened
+// here first.  The widening is exact.
+//
+// A TRANSCRIPTION OF `f32_from_f16` (include/strata/kernels/f16_bits.hpp:73), including its SUBNORMAL handling:
+// flushing subnormals to zero maps 0x0001 to 0.0 instead of 2^-24 - a 100% relative error on any activation that
+// lands there - so the loop that normalises the leading one is carried, not a builtin.
+layout(local_size_x = 256) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(push_constant, std430) uniform PC { int n; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer X { uint16_t v[]; } x_buf;
+layout(set = 0, binding = 1, std430) buffer Y { float v[]; } y_buf;
+
+float f32_from_f16_exact(uint16_t h) {
+    const uint sign = uint(h & 0x8000u) << 16;
+    const uint ex = (uint(h) >> 10) & 0x1Fu, man = uint(h) & 0x3FFu;
+    uint bits;
+    if (ex == 0u) {
+        if (man == 0u) {
+            bits = sign;
+        } else {
+            uint m = man;
+            int s = 0;
+            while ((m & 0x400u) == 0u) { m <<= 1; ++s; }
+            bits = sign | (uint(113 - s) << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (ex == 31u) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((ex - 15u + 127u) << 23) | (man << 13);
+    }
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    y_buf.v[i] = f32_from_f16_exact(x_buf.v[i]);
+}

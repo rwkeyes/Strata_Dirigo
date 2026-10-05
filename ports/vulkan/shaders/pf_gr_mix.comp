@@ -1,0 +1,45 @@
+#version 450
+// ports/vulkan/shaders/pf_gr_mix.comp - the PREFILL hyper-connection MIX (`gr_mix` / `gr_mix_r`).
+//
+// Transcribed from `gr_mix_kernel` / `gr_mix_r_kernel` (src/prefill/kernels.cu:103-124, :171-191).  One
+// invocation per (t, d) of the chunk's n_embd columns, summing over the hc streams:
+//
+//   mode 0 gr_mix   : x = xn[t, c, d]                (the FP32 normed read is live; gr_unfused's branch)
+//   mode 1 gr_mix_r : x = R[t,c,d] * rs[t,c] * w[c,d] (the SAME value gr_norm computed, recomputed here so the
+//                                                     T x 10240 FP32 copy is neither written nor read)
+//   s = sum_c fma(x, sigmoid(gated[t,c,d]), s);  mixed = s / hc
+//
+// Outputs: mixed (f32), mixed16 (BF16 bits), mixed_h (F16 bits).  The F16 image is what the native out-projection
+// quantizes; the BF16 image is the activation of the bf16 GEMMs - both are real 2-byte buffers.
+layout(local_size_x = 256) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(push_constant, std430) uniform PC { int mode; int T; int N; int HC; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer RB { float v[]; } rb;   // R (T*HC*N)         (mode 1)
+layout(set = 0, binding = 1, std430) readonly buffer SB { float v[]; } sb;   // rs (T*HC)          (mode 1)
+layout(set = 0, binding = 2, std430) readonly buffer WB { float v[]; } wb;   // w_norm (HC*N)      (mode 1)
+layout(set = 0, binding = 3, std430) readonly buffer XB { float v[]; } xb;   // xn (T*HC*N)        (mode 0)
+layout(set = 0, binding = 4, std430) readonly buffer GB { float v[]; } gb;   // gated (T*HC*N)
+layout(set = 0, binding = 5, std430) buffer MB { float v[]; } mb;            // mixed (T*N)
+layout(set = 0, binding = 6, std430) buffer M16 { uint16_t v[]; } m16;       // mixed16 bf16 bits
+layout(set = 0, binding = 7, std430) buffer MH { uint16_t v[]; } mh;         // mixed_h f16 bits
+
+#include "common/bf16.glsl"
+#include "common/f16_bits.glsl"
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.T * pc.N)) return;
+    const int N = pc.N, HC = pc.HC;
+    const int t = int(i) / N, d = int(i) % N;
+    float s = 0.0f;
+    for (int c = 0; c < HC; ++c) {
+        const int j = t * HC * N + c * N + d;
+        const float x = (pc.mode == 1) ? rb.v[j] * sb.v[t * HC + c] * wb.v[c * N + d] : xb.v[j];
+        s = fma(x, 1.0f / (1.0f + exp(-gb.v[j])), s);
+    }
+    s /= float(HC);
+    mb.v[i] = s;
+    m16.v[i] = uint16_t(floatBitsToUint(bf16_round(s)) >> 16u);
+    mh.v[i] = f16_from_f32_port(s);
+}

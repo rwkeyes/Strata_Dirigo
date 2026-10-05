@@ -1,0 +1,27 @@
+#version 450
+// ports/vulkan/shaders/pf_gdn_l2.comp - the PREFILL L2 norm of the q/k heads of every token.
+//
+// `gdn_l2_kernel` (src/prefill/kernels.cu:264-276): block (t, head) over the 2*HK q/k heads, S threads; each row
+// h[t, head*S .. head*S+S) is scaled by 1/sqrt(sum(x^2) + eps).  The rows live INSIDE the chunk's C-wide rows
+// (the q heads are [0, HK*S) and the k heads [HK*S, 2*HK*S)), so the row STRIDE is C, not S - that is why this
+// is its own shader and not the decode's contiguous-row `gdn_l2_norm.spv`.
+//
+// ONE workgroup per (t, head); lane lid owns column lid < S.  The reduction is `wg_sum` (the port's fixed
+// pairwise tree over the whole 256-lane workgroup, with lanes >= S contributing 0.0 - the same sum as the
+// CUDA's warp+shared tree, in a different order).
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int C; int T; int S; int NH; float eps; } pc;
+layout(set = 0, binding = 0, std430) buffer HB { float v[]; } h;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint wg = gl_WorkGroupID.x;                 // t * NH + head
+    const uint NH = uint(pc.NH), S = uint(pc.S), C = uint(pc.C);
+    const uint t = wg / NH, head = wg % NH;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint base = t * C + head * S;
+    const float v = (lid < S) ? h.v[base + lid] : 0.0;
+    const float ss = wg_sum(v * v);
+    if (lid < S) h.v[base + lid] = v * inversesqrt(ss + pc.eps);
+}

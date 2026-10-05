@@ -722,6 +722,44 @@ case "$name" in
     old=$'    v.offset = b.offset + off;'
     new=$'    v.offset = off;   // INJECTION: the view offset taken as arena-absolute (the measured defect)'
     want="FAIL  native_expert_grouped: the expert's GATE/UP half reaches the output" ;;
+  # ==========================================================================================================
+  # THIS BATCH: THE PREFILL PATH.  Each injection falsifies one wrapper's arithmetic on the REAL engine rule
+  # (src/prefill/gemm.cu / kernels.cu), and each must FAIL the named `prefill ... entry` verdict.
+  # ==========================================================================================================
+  pf-gemm-fma-wrong-ldy)
+    # The FMA GEMM's row stride: writing `row * pc.n` instead of `row * pc.ldy` smears the columns between n
+    # and ldy - exactly the `ldy > N` arm the case runs (T=3 N=5 K=8 ldy=7).
+    file="$SH/gemm_prefill_fma.comp"; spv="gemm_prefill_fma"
+    old=$'    Y.y[row * pc.ldy + col] = acc;'
+    new=$'    Y.y[row * pc.n + col] = acc;   // INJECTION: the row stride taken as n, not ldy'
+    want="FAIL  prefill Gemm::f16 entry" ;;
+  pf-gr-bcast-single-stream)
+    # gr_broadcast writes the SAME e[t,d] into all HC streams; indexing e by the flat R index reads another
+    # token's row for the streams past the first.
+    file="$SH/pf_gr_bcast.comp"; spv="pf_gr_bcast"
+    old=$'    rb.v[i] = eb.v[t * N + d];'
+    new=$'    rb.v[i] = eb.v[i];   // INJECTION: the source indexed by the flat residual index'
+    want="FAIL  prefill gr_broadcast entry" ;;
+  pf-gr-norm-mean-hc)
+    # The GR row scale is over ONE stream (n_embd values); dividing by HC*n_embd is the plausible wrong mean
+    # and moves every scale by sqrt(HC) = 2x.
+    file="$SH/pf_gr_norm.comp"; spv="pf_gr_norm"
+    old=$'    const float rs = inversesqrt(wg_sum(ss) / float(N) + pc.eps);'
+    new=$'    const float rs = inversesqrt(wg_sum(ss) / float(N * HC) + pc.eps);   // INJECTION: mean over the stack'
+    want="FAIL  prefill gr_norm_rs entry" ;;
+  pf-gdn-gates-drop-ssm-a)
+    # `softplus(ab+dt) * ssm_a`: dropping ssm_a is the gdn_parity.cpp trap (the decay rate is data, not 1).
+    file="$SH/pf_gdn_gates.comp"; spv="pf_gdn_gates"
+    old=$'    gt.v[i] = (v > 20.0 ? v : log(1.0 + exp(v))) * sa.v[h];'
+    new=$'    gt.v[i] = (v > 20.0 ? v : log(1.0 + exp(v)));   // INJECTION: ssm_a dropped'
+    want="FAIL  prefill gdn_gates entry" ;;
+  pf-gdn-l2-stride-cols)
+    # The q/k rows live inside the chunk's C-wide rows: the stride is C, not S.  Reading at t*S + head*S
+    # aliases a different token's channels and moves the L2.
+    file="$SH/pf_gdn_l2.comp"; spv="pf_gdn_l2"
+    old=$'    const uint base = t * C + head * S;'
+    new=$'    const uint base = t * S + head * S;   // INJECTION: the row stride taken as S, not C'
+    want="FAIL  prefill gdn_conv entry" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

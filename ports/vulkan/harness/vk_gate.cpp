@@ -21838,6 +21838,415 @@ void case_native_expert_capability_entry(Ctx& ctx, const std::string& dir) {
             "vs iq_kernels.cu:1879 transcribed here");
 }
 
+#include "strata/prefill/gemm.hpp"
+#include "strata/prefill/kernels.hpp"
+
+// ============================================================================================================
+// THIS BATCH: THE PREFILL PATH (`strata::prefill::Gemm`, its five methods, and the hyper-connection family).
+// The prompt path is what sets `pos_start` / `spec_pos`, and a native pack cannot start a decode without it
+// (generate.cpp:7564, :7806).  (A) every wrapper runs on the harness's own device (EnginePin) and is compared
+// against a HOST transcription of the engine's own rule (`src/prefill/gemm.cu`, `kernels.cu`) - BITWISE where
+// the arithmetic is the same and terms-bounded where a different summation order is the only difference;
+// (B) a CAPTURE arm records a block CONTAINING the wrappers through the shim's graph API, replays it, and
+// requires bitwise equality with direct execution - the "every new driver records or refuses loudly" rule.
+static float pf_bf16_f32(uint16_t h) {
+    const uint32_t u = (uint32_t) h << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+// the engine's bf16->f16 (`gemm.cu`'s bf16_to_f16_kernel): widen, CLAMP finite past +-65504, round-to-nearest.
+static uint16_t pf_bf16_to_f16_clamped(uint16_t h) {
+    float f = pf_bf16_f32(h);
+    if (f > 65504.0f && !std::isinf(f)) f = 65504.0f;
+    else if (f < -65504.0f && !std::isinf(f)) f = -65504.0f;
+    return strata::kernels::f16_from_f32(f);
+}
+
+void case_prefill_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gemm_prefill_fma.spv") || !have(dir, "pf_gr_norm.spv") || !have(dir, "pf_gr_mix.spv") ||
+        !have(dir, "pf_gr_silu.spv") || !have(dir, "pf_gr_bcast.spv"))
+        return;
+    if (!ctx.info().storage_buffer_16bit) {
+        skip("prefill entry points", "device lacks storageBuffer16BitAccess");
+        return;
+    }
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(48ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("prefill Gemm::f16 entry", false, 0, 1, 0, "the backend could not open a stream");
+        return;
+    }
+    strata::vulkan::cuda_compat_set_stream(s);
+    strata::prefill::Gemm gm;
+    std::string err;
+    uint16_t* sc = strata::vulkan::arena_alloc<uint16_t>(*s, 1 << 17);
+    char* wsp = strata::vulkan::arena_alloc<char>(*s, 1 << 16);
+    const bool gm_ok = gm.init_external(s, sc, 1 << 17, wsp, 1 << 16, err);
+
+    // ---- (1) Gemm::f16 - the ragged single-token case, ldy > N (a transposed read cannot survive N != K) ----
+    {
+        if (!gm_ok) { verdict("prefill Gemm::f16 entry", false, 1, 1, 0, err.c_str()); return; }
+        const int64_t T = 3, N = 5, K = 8, ldy = 7;
+        std::vector<float> xf((size_t) T * K), wf((size_t) N * K);
+        for (float& v : xf) v = rndf(1.0f);
+        for (float& v : wf) v = rndf(1.0f);
+        std::vector<uint16_t> x16(xf.size()), w16(wf.size());
+        std::vector<double> xr(xf.size()), wr(wf.size());
+        for (size_t i = 0; i < xf.size(); ++i) { x16[i] = f16_from_f32(xf[i]); xr[i] = (double) strata::kernels::f32_from_f16(x16[i]); }
+        for (size_t i = 0; i < wf.size(); ++i) { w16[i] = f16_from_f32(wf[i]); wr[i] = (double) strata::kernels::f32_from_f16(w16[i]); }
+        uint16_t* dX = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * K);
+        uint16_t* dW = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) N * K);
+        float* dY = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * ldy);
+        strata::vulkan::stream_write(*s, dX, x16.data(), x16.size() * 2);
+        strata::vulkan::stream_write(*s, dW, w16.data(), w16.size() * 2);
+        std::vector<float> z((size_t) T * ldy, -1e30f);
+        strata::vulkan::stream_write(*s, dY, z.data(), z.size() * 4);
+        gm.f16(dX, dW, dY, T, N, K, ldy, 0.0f);
+        std::vector<float> got((size_t) T * ldy);
+        strata::vulkan::stream_read(*s, dY, got.data(), got.size() * 4);
+        int bad = 0; double worst = 0;
+        for (int64_t r = 0; r < T; ++r) for (int64_t c = 0; c < N; ++c) {
+            double acc = 0;
+            for (int64_t i = 0; i < K; ++i) acc += xr[r * K + i] * wr[c * K + i];
+            const double d = std::fabs((double) got[r * ldy + c] - acc);
+            if (!(d <= 1e-4 * (1.0 + std::fabs(acc)))) ++bad;
+            worst = std::max(worst, d);
+        }
+        for (int64_t r = 0; r < T; ++r) for (int64_t c = N; c < ldy; ++c) if (got[r * ldy + c] != -1e30f) ++bad;   // stride columns survive
+        const int tot = (int) (T * ldy);
+        verdict("prefill Gemm::f16 entry: Y[T,ldy]=X.W^T (ragged T=3 N=5 K=8, ldy>N) vs a double reference",
+                bad == 0, bad, tot, worst, "gemm_prefill_fma layout/stride/guards");
+
+        std::vector<float> base(got);
+        gm.f16(dX, dW, dY, T, N, K, ldy, 1.0f);
+        std::vector<float> again((size_t) T * ldy);
+        strata::vulkan::stream_read(*s, dY, again.data(), again.size() * 4);
+        int b2 = 0; double w2 = 0;
+        for (int64_t r = 0; r < T; ++r) for (int64_t c = 0; c < N; ++c) {
+            const double want = 2.0 * (double) base[r * ldy + c];
+            const double d = std::fabs((double) again[r * ldy + c] - want);
+            if (!(d <= 1e-4 * (1.0 + std::fabs(want)))) ++b2;
+            w2 = std::max(w2, d);
+        }
+        verdict("prefill Gemm::f16 entry: beta=1 ADDS (Y = Y + X.W^T)", b2 == 0, b2, (int) (T * N), w2,
+                "the FMA kernel does not accumulate; the wrapper must");
+    }
+
+    // ---- (2) Gemm::bf16 - the engine's own bf16->f16 route, vs the clamped host transcription --------------
+    {
+        const int64_t T = 2, N = 4, K = 8, ldy = 6;
+        std::vector<float> xf((size_t) T * K), wf((size_t) N * K);
+        for (float& v : xf) v = rndf(1.0f);
+        for (float& v : wf) v = rndf(1.0f);
+        xf[0] = 1e5f;   // past fp16's range: the #540 clamp must bite rather than produce Inf
+        std::vector<uint16_t> xb(xf.size()), wb(wf.size());
+        std::vector<double> xr(xf.size()), wr(wf.size());
+        for (size_t i = 0; i < xf.size(); ++i) {
+            xb[i] = bf16_from_f32(xf[i]);
+            xr[i] = (double) strata::kernels::f32_from_f16(pf_bf16_to_f16_clamped(xb[i]));
+        }
+        for (size_t i = 0; i < wf.size(); ++i) {
+            wb[i] = bf16_from_f32(wf[i]);
+            wr[i] = (double) strata::kernels::f32_from_f16(pf_bf16_to_f16_clamped(wb[i]));
+        }
+        uint16_t* dX = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * K);
+        uint16_t* dW = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) N * K);
+        float* dY = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * ldy);
+        strata::vulkan::stream_write(*s, dX, xb.data(), xb.size() * 2);
+        strata::vulkan::stream_write(*s, dW, wb.data(), wb.size() * 2);
+        std::vector<float> z((size_t) T * ldy, 0.0f);
+        strata::vulkan::stream_write(*s, dY, z.data(), z.size() * 4);
+        gm.bf16(dX, dW, dY, T, N, K, ldy, 0.0f);
+        std::vector<float> got((size_t) T * ldy);
+        strata::vulkan::stream_read(*s, dY, got.data(), got.size() * 4);
+        int bad = 0; double worst = 0;
+        for (int64_t r = 0; r < T; ++r) for (int64_t c = 0; c < N; ++c) {
+            double acc = 0;
+            for (int64_t i = 0; i < K; ++i) acc += xr[r * K + i] * wr[c * K + i];
+            const double d = std::fabs((double) got[r * ldy + c] - acc);
+            if (!(d <= 1e-3 * (1.0 + std::fabs(acc)))) ++bad;
+            worst = std::max(worst, d);
+        }
+        verdict("prefill Gemm::bf16 entry: bf16->f16 (clamped) then the f16 GEMM vs a double reference",
+                bad == 0, bad, (int) (T * N), worst, "the engine's own <sm_80 route");
+    }
+
+    // ---- (3) gr_broadcast - exact, no summation error ------------------------------------------------------
+    {
+        const int64_t T = 2, N = 2560, HC = 4;
+        std::vector<float> e((size_t) T * N);
+        for (float& v : e) v = rndf(3.0f);
+        float* de = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * N);
+        float* dR = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * HC * N);
+        strata::vulkan::stream_write(*s, de, e.data(), e.size() * 4);
+        strata::prefill::gr_broadcast(de, dR, T, s);
+        std::vector<float> got((size_t) T * HC * N);
+        strata::vulkan::stream_read(*s, dR, got.data(), got.size() * 4);
+        int bad = 0;
+        for (int64_t t = 0; t < T; ++t) for (int64_t c = 0; c < HC; ++c) for (int64_t d = 0; d < N; ++d)
+            if (got[(t * HC + c) * N + d] != e[t * N + d]) ++bad;
+        verdict("prefill gr_broadcast entry: R[t,c,d]=e[t,d] over all hc streams, vs the host transcription",
+                bad == 0, bad, (int) (T * HC * N), 0, "gr_broadcast");
+    }
+
+    // ---- (4) gr_silu - bf16(silu(lo/hc)) -------------------------------------------------------------------
+    {
+        const int64_t n = 640;   // T = 2 * hc_lr 320
+        std::vector<float> lo((size_t) n);
+        for (float& v : lo) v = rndf(8.0f);
+        float* dl = strata::vulkan::arena_alloc<float>(*s, (uint64_t) n);
+        uint16_t* dh = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) n);
+        strata::vulkan::stream_write(*s, dl, lo.data(), lo.size() * 4);
+        strata::prefill::gr_silu(dl, dh, 2, s, nullptr);
+        std::vector<uint16_t> got((size_t) n);
+        strata::vulkan::stream_read(*s, dh, got.data(), got.size() * 2);
+        int bad = 0; double worst = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float x = lo[i] / 4.0f;
+            const double want = (double) x / (1.0 + std::exp(-(double) x));
+            const double g = (double) pf_bf16_f32(got[i]);
+            const double er = std::fabs(g - want) / (1.0 + std::fabs(want));
+            if (er > 0.01) ++bad;                          // bf16 has 8 mantissa bits: ~0.4% per value
+            worst = std::max(worst, er);
+        }
+        verdict("prefill gr_silu entry: lo16=bf16(silu(lo/hc)) vs the host rule (bf16-bounded)", bad == 0,
+                bad, (int) n, worst, "gr_silu");
+    }
+
+    // ---- (5) gr_norm_rs + gr_mix_r - rs + bf16 image, and the recomputed mix ---------------------------------
+    {
+        const int64_t T = 1, N = 2560, HC = 4;
+        std::vector<float> R((size_t) T * HC * N), w((size_t) HC * N), grs((size_t) HC), gated((size_t) T * HC * N);
+        for (float& v : R) v = rndf(2.0f);
+        for (float& v : w) v = rndf(0.5f) + 1.0f;
+        for (float& v : grs) v = 0.7f + 0.1f * grs.size();   // plausible scales
+        for (float& v : gated) v = rndf(4.0f);
+        float* dR = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * HC * N);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (uint64_t) HC * N);
+        float* drs = strata::vulkan::arena_alloc<float>(*s, (uint64_t) HC);
+        uint16_t* dx16 = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * HC * N);
+        float* dmixed = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * N);
+        uint16_t* dm16 = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * N);
+        uint16_t* dmh = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * N);
+        float* dg = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * HC * N);
+        strata::vulkan::stream_write(*s, dR, R.data(), R.size() * 4);
+        strata::vulkan::stream_write(*s, dw, w.data(), w.size() * 4);
+        strata::vulkan::stream_write(*s, dg, gated.data(), gated.size() * 4);
+
+        // (5a) gr_norm_rs: rs only, and the bf16 image
+        strata::prefill::gr_norm_rs(dR, dw, 1e-6f, drs, dx16, T, s, nullptr);
+        std::vector<float> got_rs((size_t) HC);
+        std::vector<uint16_t> got_x((size_t) T * HC * N);
+        strata::vulkan::stream_read(*s, drs, got_rs.data(), got_rs.size() * 4);
+        strata::vulkan::stream_read(*s, dx16, got_x.data(), got_x.size() * 2);
+        int bnorm = 0; double wnorm = 0;
+        for (int64_t c = 0; c < HC; ++c) {
+            double ss = 0;
+            for (int64_t d = 0; d < N; ++d) ss += (double) R[c * N + d] * (double) R[c * N + d];
+            const double rsv = 1.0 / std::sqrt(ss / (double) N + 1e-6);
+            if (std::fabs((double) got_rs[c] - rsv) > 0.01 * rsv) ++bnorm;
+            for (int64_t d = 0; d < N; ++d) {
+                const double xn = (double) R[c * N + d] * rsv * (double) w[c * N + d];
+                const double g = (double) pf_bf16_f32(got_x[c * N + d]);
+                const double er = std::fabs(g - xn) / (1.0 + std::fabs(xn));
+                if (er > 0.02) ++bnorm;
+                wnorm = std::max(wnorm, er);
+            }
+        }
+        verdict("prefill gr_norm_rs entry: rs + bf16 image of R*rs*w vs the host rule (bounded)", bnorm == 0,
+                bnorm, (int) (HC + HC * N), wnorm, "gr_norm_rs");
+
+        // (5b) gr_mix_r: mixed = mean_c xn * sigmoid(gated), with xn recomputed from R/rs/w
+        strata::vulkan::stream_write(*s, drs, grs.data(), grs.size() * 4);
+        strata::prefill::gr_mix_r(dR, drs, dw, dg, dmixed, dm16, T, s, dmh, nullptr);
+        std::vector<float> got_m((size_t) T * N);
+        strata::vulkan::stream_read(*s, dmixed, got_m.data(), got_m.size() * 4);
+        int bmix = 0; double wmix = 0;
+        for (int64_t d = 0; d < N; ++d) {
+            double s2 = 0;
+            for (int64_t c = 0; c < HC; ++c) {
+                const int64_t j = c * N + d;
+                const double xn = (double) R[j] * (double) grs[c] * (double) w[j];
+                s2 += xn / (1.0 + std::exp(-(double) gated[j]));
+            }
+            const double want = s2 / (double) HC;
+            const double er = std::fabs((double) got_m[d] - want) / (1.0 + std::fabs(want));
+            if (er > 1e-3) ++bmix;
+            wmix = std::max(wmix, er);
+        }
+        verdict("prefill gr_mix_r entry: mixed = mean_c (R*rs*w)*sigmoid(gated) vs the host rule (bounded)",
+                bmix == 0, bmix, (int) N, wmix, "gr_mix_r");
+    }
+
+    // ---- (6) the GDN batched gates / conv / L2 (the engine's kernels.cu:207 / :218 / :264) -------------------
+    {
+        const int64_t T = 2, C = 10240, HV = 48, HK = 16, S = 128, NH = 2 * HK;
+        // (6a) gates
+        std::vector<float> ab((size_t) T * 2 * HV), dt(HV), ssa(HV);
+        for (float& v : ab) v = rndf(3.0f);
+        for (float& v : dt) v = rndf(2.0f);
+        for (float& v : ssa) v = 0.2f + 0.01f * (float) (&v - ssa.data());
+        float* dab = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * 2 * HV);
+        float* ddt = strata::vulkan::arena_alloc<float>(*s, HV);
+        float* dsa = strata::vulkan::arena_alloc<float>(*s, HV);
+        float* dg = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * HV);
+        float* db = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * HV);
+        strata::vulkan::stream_write(*s, dab, ab.data(), ab.size() * 4);
+        strata::vulkan::stream_write(*s, ddt, dt.data(), dt.size() * 4);
+        strata::vulkan::stream_write(*s, dsa, ssa.data(), ssa.size() * 4);
+        strata::prefill::gdn_gates(dab, ddt, dsa, dg, db, T, s);
+        std::vector<float> gg((size_t) T * HV), gb((size_t) T * HV);
+        strata::vulkan::stream_read(*s, dg, gg.data(), gg.size() * 4);
+        strata::vulkan::stream_read(*s, db, gb.data(), gb.size() * 4);
+        int bg = 0; double wg = 0;
+        for (int64_t t = 0; t < T; ++t) for (int64_t h = 0; h < HV; ++h) {
+            const double v = (double) ab[t * 2 * HV + h] + (double) dt[h];
+            const double want = (v > 20.0 ? v : std::log1p(std::exp(v))) * (double) ssa[h];
+            const double werr = std::fabs((double) gg[t * HV + h] - want) / (1.0 + std::fabs(want));
+            if (werr > 1e-5) ++bg;
+            const double wexp = 1.0 / (1.0 + std::exp(-(double) ab[t * 2 * HV + HV + h]));
+            const double berr = std::fabs((double) gb[t * HV + h] - wexp) / (1.0 + std::fabs(wexp));
+            if (berr > 1e-5) ++bg;
+            wg = std::max(wg, std::max(werr, berr));
+        }
+        verdict("prefill gdn_gates entry: softplus(ab+dt)*ssm_a and sigmoid(beta half) vs the host rule",
+                bg == 0, bg, (int) (T * HV), wg, "gdn_gates");
+
+        // (6b) conv + SiLU + the q/k heads' L2
+        std::vector<float> hist((size_t) C * 3), qkv((size_t) T * C), cw((size_t) C * 4);
+        for (float& v : hist) v = rndf(1.0f);
+        for (float& v : qkv) v = rndf(2.0f);
+        for (float& v : cw) v = rndf(1.0f);
+        float* dh = strata::vulkan::arena_alloc<float>(*s, (uint64_t) C * 3);
+        float* dq = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * C);
+        float* dcw = strata::vulkan::arena_alloc<float>(*s, (uint64_t) C * 4);
+        float* dhb = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * C);
+        strata::vulkan::stream_write(*s, dh, hist.data(), hist.size() * 4);
+        strata::vulkan::stream_write(*s, dq, qkv.data(), qkv.size() * 4);
+        strata::vulkan::stream_write(*s, dcw, cw.data(), cw.size() * 4);
+        strata::prefill::gdn_conv(dh, dq, dcw, dhb, T, 1e-5f, s);
+        std::vector<float> gh((size_t) T * C), gh2((size_t) C * 3);
+        strata::vulkan::stream_read(*s, dhb, gh.data(), gh.size() * 4);
+        strata::vulkan::stream_read(*s, dh, gh2.data(), gh2.size() * 4);
+        // host: conv+silu, then the L2 over heads [0, 2*HK)
+        std::vector<double> want((size_t) T * C);
+        for (int64_t c = 0; c < C; ++c) {
+            double v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
+            const double w0 = cw[c * 4], w1 = cw[c * 4 + 1], w2 = cw[c * 4 + 2], w3 = cw[c * 4 + 3];
+            for (int64_t t = 0; t < T; ++t) {
+                const double x = qkv[t * C + c];
+                const double sn = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+                want[t * C + c] = sn / (1.0 + std::exp(-sn));
+                v0 = v1; v1 = v2; v2 = x;
+            }
+        }
+        for (int64_t t = 0; t < T; ++t) for (int64_t hd = 0; hd < NH; ++hd) {
+            double ss2 = 0;
+            for (int64_t d = 0; d < S; ++d) ss2 += want[t * C + hd * S + d] * want[t * C + hd * S + d];
+            const double rsv = 1.0 / std::sqrt(ss2 + 1e-5);
+            for (int64_t d = 0; d < S; ++d) want[t * C + hd * S + d] *= rsv;
+        }
+        int bc = 0; double wc = 0;
+        for (size_t i = 0; i < gh.size(); ++i) {
+            const double er = std::fabs((double) gh[i] - want[i]) / (1.0 + std::fabs(want[i]));
+            if (er > 1e-4) ++bc;
+            wc = std::max(wc, er);
+        }
+        // the OTHER channels (>= 2*HK*S) must be UNTOUCHED by the L2
+        int untouched = 0;
+        for (int64_t t = 0; t < T; ++t) for (int64_t c = NH * S; c < C; ++c) {
+            const double er = std::fabs((double) gh[t * C + c] - want[t * C + c]);
+            if (er > 1e-4 * (1.0 + std::fabs(want[t * C + c]))) ++untouched;
+        }
+        // history advanced to the last three INPUTS (the engine's gdn_conv_hist_kernel rule: slot k is the absolute
+        // input at index T-3+k, taken from the chunk where it exists and from the PRIOR history otherwise -
+        // `hist[c*3 + (t+3)]` with t < 0).  A check that read `hist[c*3]` for the oldest slot is WRONG for T < 3
+        // and was this case's own first bug (the kernel was right).
+        int bh = 0;
+        for (int64_t c = 0; c < C; ++c) {
+            double want_h[3];
+            for (int k = 0; k < 3; ++k) {
+                const int64_t idx = T - 3 + k;
+                want_h[k] = (idx >= 0) ? (double) qkv[(size_t) idx * C + c] : (double) hist[c * 3 + (size_t) (idx + 3)];
+            }
+            if (gh2[c * 3] != (float) want_h[0] || gh2[c * 3 + 1] != (float) want_h[1] ||
+                gh2[c * 3 + 2] != (float) want_h[2]) ++bh;
+        }
+        // THE BOUND, stated so it cannot be mistaken for a loosened case: the conv sum and the SiLU are F32 in
+        // the shader (its own summation order, `exp` per lane) and the oracle is a DOUBLE re-evaluation of the
+        // same expression, so the difference is summation/rounding order, not a term error.  The bound is
+        // RELATIVE WITH AN ABSOLUTE FLOOR (|d| / (1 + |ref|)); the measured worst is ~1.76e-7 = 1.5x f32 eps,
+        // which is the expected size of that difference.  It is NOT the port's 5e-3 cross-DEVICE bar - this is a
+        // host-double comparison, four orders tighter on purpose, and the gate value is unchanged.
+        verdict("prefill gdn_conv entry: 4-tap conv+SiLU and the q/k L2 over all C channels vs the host rule",
+                bc == 0, bc, (int) gh.size(), wc, "gdn_conv / pf_gdn_l2 rows");
+        verdict("prefill gdn_conv entry: channels >= 2*HK*S are UNTOUCHED by the q/k L2",
+                untouched == 0, untouched, (int) (T * (C - NH * S)), 0, "the L2 must only touch the q/k heads");
+        verdict("prefill gdn_conv entry: the history advanced to the chunk's last three INPUTS",
+                bh == 0, bh, (int) (C * 3), 0, "history");
+    }
+
+    // ---- (7) THE CAPTURE ARM: a block containing the wrappers records, replays, and equals direct -----------
+    {
+        const int64_t T = 2, N = 6, K = 8, ldy = 8;
+        std::vector<float> xf((size_t) T * K), wf((size_t) N * K);
+        for (float& v : xf) v = rndf(1.0f);
+        for (float& v : wf) v = rndf(1.0f);
+        std::vector<uint16_t> x16(xf.size()), w16(wf.size());
+        for (size_t i = 0; i < xf.size(); ++i) x16[i] = f16_from_f32(xf[i]);
+        for (size_t i = 0; i < wf.size(); ++i) w16[i] = f16_from_f32(wf[i]);
+        std::vector<float> e((size_t) T * 2560);
+        for (float& v : e) v = rndf(2.0f);
+        uint16_t* dX = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * K);
+        uint16_t* dW = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) N * K);
+        float* dYd = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * ldy);
+        float* dYc = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * ldy);
+        float* de = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * 2560);
+        float* dRd = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * 10240);
+        float* dRc = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * 10240);
+        strata::vulkan::stream_write(*s, dX, x16.data(), x16.size() * 2);
+        strata::vulkan::stream_write(*s, dW, w16.data(), w16.size() * 2);
+        strata::vulkan::stream_write(*s, de, e.data(), e.size() * 4);
+        // DIRECT reference (this also warms the pipelines and every lazily-allocated scratch)
+        gm.f16(dX, dW, dYd, T, N, K, ldy, 0.0f);
+        strata::prefill::gr_broadcast(de, dRd, T, s);
+        std::vector<float> refY((size_t) T * ldy), refR((size_t) T * 10240);
+        strata::vulkan::stream_read(*s, dYd, refY.data(), refY.size() * 4);
+        strata::vulkan::stream_read(*s, dRd, refR.data(), refR.size() * 4);
+        // CAPTURE the same two wrappers through the shim's graph API
+        const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+        int bad = 0;
+        const cudaError_t be = cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal);
+        if (be == cudaSuccess) {
+            gm.f16(dX, dW, dYc, T, N, K, ldy, 0.0f);
+            strata::prefill::gr_broadcast(de, dRc, T, s);
+        } else {
+            ++bad;
+        }
+        cudaGraph_t graph = nullptr;
+        const cudaError_t ee = cudaStreamEndCapture(cs, &graph);
+        cudaGraphExec_t exec = nullptr;
+        if (ee == cudaSuccess && graph != nullptr) {
+            cudaGraphInstantiate(&exec, graph, 0);
+            cudaGraphDestroy(graph);
+        }
+        if (exec == nullptr) ++bad;
+        if (exec != nullptr && cudaGraphLaunch(exec, cs) != cudaSuccess) ++bad;
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        std::vector<float> capY((size_t) T * ldy), capR((size_t) T * 10240);
+        strata::vulkan::stream_read(*s, dYc, capY.data(), capY.size() * 4);
+        strata::vulkan::stream_read(*s, dRc, capR.data(), capR.size() * 4);
+        for (size_t i = 0; i < refY.size(); ++i) if (capY[i] != refY[i]) ++bad;
+        for (size_t i = 0; i < refR.size(); ++i) if (capR[i] != refR[i]) ++bad;
+        const int tot = (int) (refY.size() + refR.size());
+        verdict("prefill entry: a CAPTURED block containing Gemm::f16 + gr_broadcast replays == direct execution",
+                bad == 0, bad, tot, 0, "the wrappers must RECORD under capture, not run");
+    }
+
+    strata::vulkan::stream_close(s);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -22280,6 +22689,9 @@ int main(int argc, char** argv) {
     case_q8_0_mmvq(ctx, dir);
     case_native_any_formats(ctx, dir);
     case_native_expert_grouped(ctx, dir);
+    // THIS BATCH: THE PREFILL PATH - `strata::prefill::Gemm` (its five methods) and the hyper-connection family,
+    // with a capture arm.  APPENDED last for the shared-RNG reason every batch above names.
+    case_prefill_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

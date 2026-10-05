@@ -1,0 +1,30 @@
+#version 450
+// ports/vulkan/shaders/pf_gdn_conv.comp - the PREFILL 4-tap causal conv + SiLU over a chunk.
+//
+// `gdn_conv_kernel` (src/prefill/kernels.cu:218-231): ONE invocation per conv channel c, walking the chunk's
+// tokens in order so the recurrence in TIME is inside one thread:
+//
+//     s = v0*w0 + v1*w1 + v2*w2 + x*w3;   h[t,c] = silu(s);   shift the window; commit the last three INPUTS
+//
+// The history is [C][3] (oldest first) and is advanced to the chunk's last three inputs at the end.  The L2 norm
+// of the q/k heads is a SEPARATE launch (pf_gdn_l2.spv), matching the engine's second kernel.
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int C; int T; } pc;
+layout(set = 0, binding = 0, std430) buffer HI { float v[]; } hist;         // [C, 3], oldest first (read+write)
+layout(set = 0, binding = 1, std430) readonly buffer QK { float v[]; } qkv; // [T, C]
+layout(set = 0, binding = 2, std430) readonly buffer WC { float v[]; } w;   // [C, 4]
+layout(set = 0, binding = 3, std430) buffer HB { float v[]; } h;            // [T, C]
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= uint(pc.C)) return;
+    float v0 = hist.v[c * 3u], v1 = hist.v[c * 3u + 1u], v2 = hist.v[c * 3u + 2u];
+    const float w0 = w.v[c * 4u], w1 = w.v[c * 4u + 1u], w2 = w.v[c * 4u + 2u], w3 = w.v[c * 4u + 3u];
+    for (uint t = 0; t < uint(pc.T); ++t) {
+        const float x = qkv.v[t * uint(pc.C) + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h.v[t * uint(pc.C) + c] = s / (1.0 + exp(-s));   // SiLU, the engine's `__expf` here is `exp`
+        v0 = v1; v1 = v2; v2 = x;
+    }
+    hist.v[c * 3u] = v0; hist.v[c * 3u + 1u] = v1; hist.v[c * 3u + 2u] = v2;
+}

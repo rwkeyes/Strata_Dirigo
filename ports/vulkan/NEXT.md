@@ -1,5 +1,93 @@
 # Start here next session
 
+## THE PREFILL PATH: 23 of its 40 entry points land, the REAL pack now RUNS the prompt path (embedding -> hyper-connection read -> BF16 projections -> `Gemm::native` -> GDN gates/conv/L2), and stops at `gdn_recurrence` (2026-10-05, `vega`)
+
+**THE STOPPING POINT MOVED OFF `Gemm::init_external` AND THROUGH THE WHOLE PREFILL PROLOGUE.**  With
+`--prefill 1` and a TWO-token prompt (a one-token prompt skips the prefill block entirely - `n_prompt > 1` guards
+it - so it cannot set `pos_start` at all), the run enters the prompt path, inits the GEMM, gathers the chunk's
+embedding, runs the hyper-connection read and its three BF16 projections, the native `attn_qkv`/`attn_gate`
+projections, the GDN gate+conv+L2, and then stops at a NAMED missing kernel.  Raw tail, `/tmp/run_pf3.log`, `RC=2`:
+
+```
+strata generate: prompt path allocates its own buffers (no cache slots to borrow)
+strata::prefill::gdn_recurrence: NOT PORTED on the Vulkan backend - REFUSING.
+```
+
+Exact command (the brief's, with `"1,2"` so the prefill block is REACHED):
+
+```
+STRATA_VK_SPV_DIR=/home/bob/strata-vulkan-wt/ports/vulkan/shaders \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json STRATA_VK_ARENA_GIB=26 \
+  ~/bin/memguard 40G ~/vkbuild-vulkan/vulkan/strata_vulkan \
+  --pack /media/bob/.../strata-packs/coder-iq1_m \
+  --native ~/strata-models/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf \
+  --spec 4 --prefill 1 --tokens "1,2" --max-new 1 --max-context 8
+```
+
+The SAME binary with `--tokens 1` (the brief's literal form) still prints `output :` EMPTY and `decode 0 tokens` -
+because `generate.cpp` guards the prefill block with `n_prompt > 1`, so a one-token prompt never enters it and
+`pos_start` stays 0.  **That is measured, not inferred** (`/tmp/run_pf.log`).
+
+### DELIVERABLE A - WHAT WAS PORTED, AND HOW (23 of 40; `vulkan/src/kernels/prefill_vk.cpp` + 8 new shaders)
+
+| group | entry points | how |
+|---|---|---|
+| **`Gemm`** (the reserved real work) | `init_external`, `init`, `rebind`, `~`, `f16`, `bf16`, `native` | `f16` = the ALREADY-GATED `gemm_prefill_fma.spv` (no shape precondition, so a 1-token chunk's `t=1` is computed - `gemm_prefill_f16_m8` would silently round `tiles_t = t/8` to ZERO rows). `bf16` = the ENGINE'S OWN route from `gemm.cu`'s `bf16_path()`: `bf16_to_f16.spv` on both operands, then the f16 GEMM. `native` = the port's ALREADY-GATED DECODE arithmetic (`f16->f32`, `native_quantize_q8_1`, `native_mmvq`) per token - the engine dequantises to f16 and runs the f16 GEMM, and this port has no ggml dequantiser, so the prompt's conditioning is computed by the SAME arithmetic as the decode steps that follow it. `beta=1` adds through a temp + `add_inplace`. |
+| **hyper-connection (GR)** | `gr_broadcast`, `gr_norm`, `gr_norm_rs`, `gr_mix`, `gr_mix_r`, `gr_silu`, `gr_write`, `gr_write_norm_rs` | 5 NEW shaders (`pf_gr_*.comp`) transcribed from `kernels.cu:66-204`, because the decode's GR decomposition is a DIFFERENT set of intermediates and no decode shader computes these. **The `xn16`/`mixed16` images are REAL uint16 BF16 buffers here** (prefill.cpp carves `T*D` uint16), not the decode's f32-holding-bf16 - storing f32 would write 4 bytes into a 2-byte slot. |
+| **thin bind-and-dispatch** | `to_f16`, `to_bf16`, `copy_f32_wide`, `copy_i32`, `gather_rows16`, `rms_rows`, `route` | over existing, gated shaders (`f32_to_f16`/`f32_to_bf16`/`copy`/`gather_rows`/`rms_norm`/`router_top10_f32`). Each resolves pointers to the arena (or a MAPPED region) and refuses loudly otherwise. |
+| **GDN** | `gdn_gates`, `gdn_conv` | `pf_gdn_gates.comp` + `pf_gdn_conv.comp` + `pf_gdn_l2.comp` (`kernels.cu:207-276`). The L2 of the q/k heads is a SEPARATE launch whose row STRIDE is C (the heads live inside C-wide rows), which is why it is not the decode's contiguous-row `gdn_l2_norm.spv`. |
+| **capability** | `qsa_block_scores_tc` -> FALSE | a real answer, not a stub: the engine falls back to the ported `qsa_block_scores`, and this backend has no tensor-core block-scores kernel. |
+
+### THE DEFECT THIS RUN FOUND - `iq_embed_rows` REFUSED A MAPPED-HOST TABLE
+
+The run's first stop after `Gemm` was `strata::vulkan::iq_embed_rows: a pointer is not inside this stream's arena`.
+**Root cause is the reach, not the pointer:** a native pack holds its token embedding in MAPPED PINNED HOST memory
+("token embedding IQ4_XS in mapped host memory (322 MiB)"), and the PREFILL's BATCHED gather
+(`NativeEmbed::gather_dev`, native_head.cpp:195) hands that host pointer to `iq_embed_rows` - whereas the decode's
+per-token path (`embed_row` -> `embedding_gather`) never passes a mapped table.  The wrapper resolved only the
+arena.  **Fixed at the cause** (`vulkan/src/kernels/iq_vk.cpp`): the table is now bound through `mapped_resolve`
+when `arena_resolve` fails - the same handshake `copy_from_mapped` uses.  A Vulkan shader cannot dereference a
+host address; the region's device-visible buffer is what it reads.
+
+### DELIVERABLE B - THE ORDERED REMAINING LIST (17 entry points; sizes measured from the engine's own sources)
+
+| # | entry point | needed for | CUDA size (lines / bytes, the defining file) |
+|---|---|---|---|
+| 1 | `gdn_recurrence` | **1-token prefill (NEXT)** | 94 lines in `kernels.cu`; `gdn_rec_kernel` is 512-thread `(S,RG)`, a 2D reduction + the state layout `[RG*RPG][HV][S]` |
+| 2 | `moe_fused*` + `moe_mmq*` (the MoE/MMQ prompt path) | **1-token prefill** (every layer's MoE) | `moe_fused.cu` 23 197 B, `moe_fused_iq.cu` 35 024 B, `moe_mmq.cu` 12 759 B |
+| 3 | `kv_append` (+`kv_append_q4`) | 1-token prefill at QSA layers | `prefill::kv_append` 43 lines `kernels.cu`; `kv_q4.cu` 11 510 B |
+| 4 | `native_qsa_indexer_append_batch` | 1-token prefill at QSA layers | `native_qsa_indexer.cu` 16 547 B |
+| 5 | `qsa_prompt_attn_batch` | 1-token prefill at QSA layers | `qsa_prompt_attn.cu` **73 860 B / 1479 lines** (the largest single item) |
+| 6 | `rope`, `split_q`, `gate_attn` | 1-token prefill at QSA layers | 20 / 10 / 11 lines `kernels.cu` (small; `rope`'s decode sibling `native_rope_apply` exists) |
+| 7 | `moe_combine` | 1-token prefill (the non-native combine) | 16 lines `kernels.cu` |
+| 8 | `swiglu_pair`, `swiglu_interleaved`, `blob_dequant_f16` | 1-token prefill's expert tier | 11 / small / 32 lines `kernels.cu` |
+| 9 | `round_f16` | only the `STRATA_IDX_FP16_CHECK` diagnostic | 9 lines `kernels.cu` |
+| 10 | `kv_stage_from_host` | only a KV-streaming (`kv_mode 1`) pack | `kv_stream.cu` 12 108 B |
+| 11 | `iq_dequant_f16` / `iq_dequant_gu_f16` | `Gemm::native`'s engine route + the IQ/GGUF-native PLE key | `iq_kernels.cu` 136 615 B (the whole dequantiser family; the port answers `native` a different way, so these are needed only if the engine route is wanted) |
+| 12 | `native_ple_postops_batch` | only `STRATA_PLE_BATCH=1` (the batched PLE block; default is per-token `ple_block`, already ported) | `native_ple_postops.cu` 11 262 B |
+
+### DELIVERABLE C/D/E - THE BAR, THE MAP, THE GATE
+
+**No token.**  The exact next stop is `strata::prefill::gdn_recurrence` (item 1 above); the verifier's two
+preconditions (the `--expert-profile` residency table, and `native_qsa_indexer_enabled()` which this port answers
+false) are STILL BEHIND the whole prefill, so they were not reached and were not touched.  ENGINE BAR: the
+`strata_vulkan` program LINKS, 0 undefined - **0 BY CONSTRUCTION** (the refusals define the unported symbols),
+NOT a porting gain.  **THE MAP LINE IS UNCHANGED: `168 = 79 kernel + 0 shader + 45 host + 0 todo + 44 refused`,
+and that is correct rather than a miss:** `PORT-MAP.tsv` is the DECODE path's symbol set (`port_map_lib.py`
+scans `src/core/`), and the prefill's 40 entry points are NOT in it - `make_port_map.py` finds 0 "prefill"
+matches.  **`refused` IS NOT A CAPABILITY**; porting prefill moves rows out of the prefill's OWN refusal COUNT
+(40 -> 17), which `PORT-MAP.tsv` does not carry.  Gate (vega): **Arc `intel_icd` 793 passed / 0 failed / 0 skipped
+(exit 0)**, llvmpipe **781/0/3**, Ryzen iGPU **783/1/2** - the one radeon failure is the DOCUMENTED
+non-deterministic `bf16_gemv_fp32_mmvf_cols entry`, NOT this batch's case.
+
+**BOUNDS, in the same breath.**  This is REAL weights: the 48-layer pack's dense K-quants and 23.42 GiB of
+experts are on the card, the embedding table is the pack's (mapped host), and the projections the run computed
+are the pack's (`Gemm::native` through the native MMVQ).  BUT: it is `--prefill 1` (a TWO-token prompt), PLE is
+file-backed, `--spec 4` is on, the PCIe probe reads 0.1 GB/s -> `pcie_frac 0.00`, and **per-kernel numerics are
+the GATE's job, not this run's** - no token came out, so this certifies that the PROMPT PATH EXECUTES through
+the named stages, not that any of its numbers are right (the `prefill ... entry` gate cases are the numeric
+evidence).
+
 ## THE NATIVE-DENSE K-QUANTS LAND (ONE generic shader), the LAUNCHER'S `view()` DEFECT IS FOUND AND FIXED, and the real pack stops at PREFILL — which a native pack REQUIRES (2026-10-05, `vega`)
 
 **THE REAL `coder-iq1_m` PACK NOW LOADS EVERY DENSE PROJECTION AND THE SESSION COMES UP** (the stopping point

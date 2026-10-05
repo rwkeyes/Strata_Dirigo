@@ -1,0 +1,20 @@
+#version 450
+// ports/vulkan/shaders/pf_gr_write.comp - the PREFILL hyper-connection WRITE.
+//
+// `gr_write_kernel` (src/prefill/kernels.cu:192-198): R[t,c,d] = fma(bo[t,d], 2*sigmoid(inj[t,c]/hc), R[t,c,d]).
+// The non-fused sibling in the read (mode 0 of pf_gr_norm) writes the FP32 normalized rows only, so this kernel
+// cannot fold the next half's norm the way `gr_write_norm_rs` does; both forms are used by the chunk loop.
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int T; int N; int HC; int inj_ld; } pc;
+layout(set = 0, binding = 0, std430) buffer RB { float v[]; } rb;            // R (T*HC*N), in place
+layout(set = 0, binding = 1, std430) readonly buffer BB { float v[]; } bb;   // bo (T*N)
+layout(set = 0, binding = 2, std430) readonly buffer IB { float v[]; } ib;   // inject (T*inj_ld)
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const int N = pc.N, HC = pc.HC;
+    if (i >= uint(pc.T) * uint(HC) * uint(N)) return;
+    const int t = int(i) / (HC * N), c = (int(i) % (HC * N)) / N, d = int(i) % N;
+    const float w = 2.0f / (1.0f + exp(-(ib.v[t * pc.inj_ld + c] / float(HC))));
+    rb.v[i] = fma(bb.v[t * N + d], w, rb.v[i]);
+}

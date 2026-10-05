@@ -1,0 +1,71 @@
+#version 450
+// ports/vulkan/shaders/pf_gr_norm.comp - the PREFILL hyper-connection READ: the row scale and the BF16 image.
+//
+// Transcribed from `gr_norm_kernel` / `gr_norm_rs_kernel` / `gr_write_norm_rs_kernel` (src/prefill/kernels.cu:66-160).
+// ONE workgroup per (t, c) row of the hc x n_embd residual stack (the CUDA is `<<<T * HC, 256>>>`), so the
+// reduction is over one stream's n_embd values - the same shape `gr_norm.comp` (the DECODE-side read) uses.
+//
+// THE THREE MODES, selected by `mode` (a push constant, so the whole workgroup takes the same branch and every
+// barrier in wg_sum is workgroup-uniform):
+//   0 gr_norm          : out0 = xn (f32), out1 = xn16 (BF16 bits)
+//   1 gr_norm_rs       : out0 = rs (f32, one per row), out1 = xn16
+//   2 gr_write_norm_rs : R += bo * 2*sigmoid(inj/hc) first, then rs + xn16 of the row just written
+//
+// **THE BF16 IMAGE IS A REAL uint16 BUFFER HERE, NOT AN F32 HOLDING A BF16 VALUE.**  The DECODE GR workspace is
+// sized for f32 images (`gr_workspace_init`, see NEXT.md); the PREFILL's `xn16` is `o.take<uint16_t>(T * D)`
+// (prefill.cpp's carve), i.e. TWO bytes an element.  Storing the f32 form would write 4 bytes into a 2-byte
+// slot and land on the next buffer - the "wrong element size between the engine's layout and the port's shader"
+// class this port keeps finding.  So the store is the bf16 BITS: `floatBitsToUint(bf16_round(x)) >> 16`.
+//
+// The reduction is `wg_sum` (common/wg_reduce.glsl): the same f32 sum as the CUDA's `block_sum`, in the port's
+// fixed pairwise order rather than the driver's tree.
+layout(local_size_x = 256) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(push_constant, std430) uniform PC {
+    int mode;      // 0 gr_norm, 1 gr_norm_rs, 2 gr_write_norm_rs
+    int N;         // n_embd
+    int HC;        // hc (streams)
+    int inj_ld;    // row stride of `inj` (mode 2)
+    float eps;
+} pc;
+layout(set = 0, binding = 0, std430) buffer RB { float v[]; } rb;          // R (T*HC*N), read/written (mode 2)
+layout(set = 0, binding = 1, std430) readonly buffer WB { float v[]; } wb; // w_norm (HC*N)
+layout(set = 0, binding = 2, std430) buffer OB { float v[]; } ob;          // mode 0: xn (T*HC*N); mode 1/2: rs (T*HC)
+layout(set = 0, binding = 3, std430) buffer XB { uint16_t v[]; } xb;       // xn16 (T*HC*N), bf16 bits
+layout(set = 0, binding = 4, std430) readonly buffer BB { float v[]; } bb; // bo (T*N)      (mode 2)
+layout(set = 0, binding = 5, std430) readonly buffer IB { float v[]; } ib; // inject (T*inj_ld) (mode 2)
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const int N = pc.N, HC = pc.HC;
+    const int row = int(gl_WorkGroupID.x);          // t * HC + c
+    const int t = row / HC, c = row % HC;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float ss = 0.0f;
+    if (pc.mode == 2) {
+        const float sc = 2.0f / (1.0f + exp(-(ib.v[t * pc.inj_ld + c] / float(HC))));
+        for (uint d = lid; d < uint(N); d += 256u) {
+            const int i = row * N + int(d);
+            const float x = fma(bb.v[t * N + int(d)], sc, rb.v[i]);
+            rb.v[i] = x;
+            ss += x * x;
+        }
+    } else {
+        for (uint d = lid; d < uint(N); d += 256u) {
+            const float x = rb.v[row * N + int(d)];
+            ss += x * x;
+        }
+    }
+    const float rs = inversesqrt(wg_sum(ss) / float(N) + pc.eps);
+    if (pc.mode != 0 && lid == 0u) ob.v[row] = rs;
+    for (uint d = lid; d < uint(N); d += 256u) {
+        const int i = row * N + int(d);
+        const float x = rb.v[i] * rs * wb.v[c * N + int(d)];
+        if (pc.mode == 0) ob.v[i] = x;
+        xb.v[i] = uint16_t(floatBitsToUint(bf16_round(x)) >> 16u);
+    }
+}

@@ -1,0 +1,28 @@
+#version 450
+// ports/vulkan/shaders/pf_gdn_gates.comp - the PREFILL GDN gate + beta over a chunk.
+//
+// `gdn_gates_kernel` (src/prefill/kernels.cu:207-216): one invocation per (t, h) of the chunk's HV value heads
+//
+//     gate[t,h] = softplus(ab[t, h] + dt[h]) * ssm_a[h]      ab: [T, 2*HV], the alpha|beta projection
+//     beta[t,h] = sigmoid(ab[t, HV + h])
+//
+// The DECODE splits this into `gdn_gate.spv` (the gate, its own log1p series) plus a sigmoid; the prefill's
+// formula here is the ENGINE's own (`v > 20 ? v : log1p(exp(v))`), transcribed from kernels.cu.  The two forms
+// agree to f32 rounding; both are bounded against the rule in the gate's case.
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int HV; int T; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer AB { float v[]; } ab;   // [T, 2*HV]
+layout(set = 0, binding = 1, std430) readonly buffer DT { float v[]; } dt;   // [HV]
+layout(set = 0, binding = 2, std430) readonly buffer SA { float v[]; } sa;   // [HV]  ssm_a
+layout(set = 0, binding = 3, std430) buffer GT { float v[]; } gt;            // [T, HV]
+layout(set = 0, binding = 4, std430) buffer BE { float v[]; } be;            // [T, HV]
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint HV = uint(pc.HV);
+    if (i >= uint(pc.T) * HV) return;
+    const uint t = i / HV, h = i % HV;
+    const float v = ab.v[t * 2u * HV + h] + dt.v[h];
+    gt.v[i] = (v > 20.0 ? v : log(1.0 + exp(v))) * sa.v[h];
+    be.v[i] = 1.0 / (1.0 + exp(-ab.v[t * 2u * HV + HV + h]));
+}

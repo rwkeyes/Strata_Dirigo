@@ -1,0 +1,22 @@
+#version 450
+// ports/vulkan/shaders/pf_gr_silu.comp - the PREFILL hyper-connection DOWN projection's activation.
+//
+// `gr_silu_kernel` (src/prefill/kernels.cu:161-170): lo16[i] = bf16( silu(lo[i] / hc) ) over the chunk's
+// hc_lr-wide rows.  One invocation per element; the output is a real uint16 BF16 buffer (the activation the
+// next bf16 GEMM reads).
+layout(local_size_x = 256) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(push_constant, std430) uniform PC { int n; int hc; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer LB { float v[]; } lb;
+layout(set = 0, binding = 1, std430) buffer OB { uint16_t v[]; } ob;
+
+#include "common/bf16.glsl"
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    const float x = lb.v[i] / float(pc.hc);
+    const float v = x / (1.0f + exp(-x));
+    ob.v[i] = uint16_t(floatBitsToUint(bf16_round(v)) >> 16u);
+}
