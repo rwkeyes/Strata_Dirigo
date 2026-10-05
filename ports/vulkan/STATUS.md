@@ -10,14 +10,14 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
 short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
-Walsh-Hadamard rotation), the hybrid K8V4 mode and descriptor OFFSETS landed, the box's GPU run was **242 passed /
-0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup
-size 32) - 230 / 0 / 3 on llvmpipe and 233 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the
-discrete card is gone (both
+Walsh-Hadamard rotation), the hybrid K8V4 mode, descriptor OFFSETS and the first SAMPLER kernel landed, the box's GPU
+run was **253 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
+Vulkan 1.4.318, subgroup size 32) - 241 / 0 / 3 on llvmpipe and 244 / 0 / 2 on the radeon ICD, which now picks the AMD
+iGPU because the discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 233/0/2 becomes 232/1/2 when the flaky budget-requery case fires
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 244/0/2 becomes 243/1/2 when the flaky budget-requery case fires
 when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
 compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
 (`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
@@ -26,7 +26,7 @@ that shares system memory with everything else.  Verified by building the previo
 the same ICD.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
 stale seven times in two days; read the last line of your own run.** All three available implementations are exercised
 again by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 66 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
+box after the swap (`NEXT.md`). 67 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -163,6 +163,17 @@ the driver.  Arc 242/0/0.  **Honest limit:** the aligned path is gated on three 
 was NOT reproduced out of tree - the probe's device contract differs from the gate's (it reads the LEDGER budget
 instead of the driver's and refuses the allocation first), and chasing it was not worth the time; what is verified is
 that the refusal machinery fires and names its cause.
+
+**The sampler has begun, and the port can now emit a TOKEN (2026-10-04).**  `sampler_greedy.comp` carries
+`sampler_greedy_kernel` (`src/kernels/cuda/sampler.cu`) with the penalty pair it calls - the `--temp 0` path - so the
+port has a complete deterministic generation path: logits in, a token out.  The rules a paraphrase inverts are all
+arms: the repeat penalty MULTIPLIES for a non-positive logit and DIVIDES for a positive one (dividing unconditionally
+inverts it on half the vocabulary); the presence penalty is a boolean, not the count, while the frequency penalty
+carries the count; the window is the TAIL, so a head-only hit is not penalised; and ties go to the LOWEST index, with
+0 for an all -inf/NaN row.  Ten arms, each stating the token it is built to produce, checked against a transcription
+of the rule as well.  **The falsification found a decorative arm:** the presence arm PASSED under the injection
+because its fixture let the penalised token lose under both rules - only an injection can say that.  Rebuilt, all
+four injections now fail exactly the arm built for them.  Arc 253/0/0.
 
 | Case | Verdict | Method |
 |---|---|---|

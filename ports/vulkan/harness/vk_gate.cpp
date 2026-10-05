@@ -2563,6 +2563,134 @@ void case_descriptor_offset(Ctx& ctx, const std::string& dir) {
     ctx.free(b_src); ctx.free(b_dst1); ctx.free(b_dst2);
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE GREEDY SAMPLER (src/kernels/cuda/sampler.cu) - the first sampler kernel, and the first TOKEN this port emits
+// ----------------------------------------------------------------------------------------------------------
+
+// The rule, transcribed independently of the shader: an ascending scan with a strict `>`, so the lowest index wins a
+// tie, over penalised logits, with the TAIL window.
+static int sampler_want(const std::vector<float>& logits, size_t row, int n_vocab, const std::vector<int32_t>& hist,
+                        size_t hrow, int history_len, int plen, float repeat, float freq, float present) {
+    int hlen = 0, hbase = 0;
+    if (history_len > 0) {
+        hlen = std::min(plen, history_len);
+        if (hlen < 0) hlen = 0;
+        hbase = (int) hrow + (history_len - hlen);
+    }
+    float bv = -std::numeric_limits<float>::infinity();
+    int best = n_vocab;
+    for (int v = 0; v < n_vocab; ++v) {
+        int count = 0;
+        for (int i = 0; i < hlen; ++i)
+            if (hist[(size_t) (hbase + i)] == v) ++count;
+        float l = logits[row + (size_t) v];
+        if (count > 0) {
+            if (l <= 0.0f) l *= repeat;
+            else           l /= repeat;
+            l -= (float) count * freq + ((count > 0) ? 1.0f : 0.0f) * present;
+        }
+        if (l > bv) { bv = l; best = v; }          // strict, ascending: the LOWEST index wins
+    }
+    return (best < n_vocab) ? best : 0;           // the all -inf / all NaN row answers 0
+}
+
+void case_sampler_greedy(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "sampler_greedy.spv")) return;
+    const uint32_t n_tokens = 4, history_len = 64;
+    const float NEG = -std::numeric_limits<float>::infinity();
+    struct Arm {
+        const char* what;
+        int n_vocab, plen;
+        float repeat, freq, present;
+        int want_logits;        // which per-token logit pattern to build
+        int want_hist;          // which history pattern to build
+        int expect;             // the token the rule gives (checked against the host oracle too)
+    };
+    const Arm arms[] = {
+        // `expect` is the token the fixture is BUILT to produce.  It is checked against the oracle too, so a fixture
+        // that stopped meaning what it claims fails here rather than passing quietly under a wrong kernel.
+        {"a plain argmax, with a NaN and a -inf in the row", 4096, 64, 1.0f, 0.0f, 0.0f, 0, 0, 11},
+        {"a TIE between two maxima: the LOWEST index wins", 4096, 64, 1.0f, 0.0f, 0.0f, 1, 0, 100},
+        {"every candidate -inf: the sentinel answers 0", 4096, 64, 1.0f, 0.0f, 0.0f, 2, 0, 0},
+        {"every candidate NaN: -inf loses to nothing, so 0", 4096, 64, 1.0f, 0.0f, 0.0f, 3, 0, 0},
+        {"the repeat penalty on a POSITIVE logit DIVIDES (it must lose)", 4096, 64, 4.0f, 0.0f, 0.0f, 4, 4, 600},
+        {"the repeat penalty on a NEGATIVE logit MULTIPLIES (it must lose)", 4096, 64, 4.0f, 0.0f, 0.0f, 5, 5, 600},
+        {"the FREQUENCY penalty carries the count", 4096, 64, 1.0f, 2.0f, 0.0f, 6, 6, 600},
+        {"the PRESENCE penalty is a boolean, not the count", 4096, 64, 1.0f, 0.0f, 2.0f, 7, 7, 500},
+        {"the window is the TAIL: a head-only hit is NOT penalised", 4096, 8, 4.0f, 0.0f, 0.0f, 8, 8, 500},
+        {"the real vocabulary (248320) and its strided scan", 248320, 64, 1.05f, 0.0f, 0.0f, 9, 10, 1234},
+    };
+
+    VkPipeline ps = ctx.pipeline(dir + "/sampler_greedy.spv", 3, 28);
+    int bad_total = 0;
+    for (const Arm& a : arms) {
+        const uint32_t nv = (uint32_t) a.n_vocab;
+        std::vector<float> logits((size_t) n_tokens * nv, 0.0f);
+        std::vector<int32_t> hist((size_t) n_tokens * history_len, 0);
+        // per-token logit patterns, each designed so a WRONG RULE lands on a different token
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            float* row = &logits[(size_t) t * nv];
+            for (uint32_t v = 0; v < nv; ++v) row[v] = -50.0f + 0.001f * (float) (v % 997);   // a background
+            switch (a.want_logits) {
+                case 0: row[7] = NEG; row[9] = NAN; row[11] = 3.0f; row[1000] = 1.0f; break;
+                case 1: row[100] = 2.0f; row[300] = 2.0f; row[299] = 1.999f; break;             // the tie
+                case 2: for (uint32_t v = 0; v < nv; ++v) row[v] = NEG; break;
+                case 3: for (uint32_t v = 0; v < nv; ++v) row[v] = NAN; break;
+                case 4: row[500] = 8.0f; row[600] = 3.0f; break;         // 8/4 = 2.0 < 3.0: 600 wins
+                case 5: for (uint32_t v = 0; v < nv; ++v) row[v] = -50.0f;
+                        row[500] = -2.0f; row[600] = -3.0f; break;       // -2*4 = -8 loses to -3; /4 would win
+                case 6: row[500] = 9.0f; row[600] = 3.0f; break;   // 9 - 4*2.0 = 1.0 loses to 3.0
+                case 7: row[500] = 9.0f; row[600] = 8.0f; break;   // 500 hit 3x, 600 hit 1x
+                case 8: row[500] = 9.0f; row[600] = 8.0f; break;         // 500 is hit, but only in the HEAD
+                case 9: row[1234] = 6.0f; row[200000] = 5.0f; break;
+                default: break;
+            }
+        }
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            int32_t* hr = &hist[(size_t) t * history_len];
+            for (uint32_t i = 0; i < history_len; ++i) hr[i] = 9999;          // nothing that can be a candidate
+            switch (a.want_hist) {
+                case 4: hr[10] = 500; break;                                     // one hit, in the window
+                case 5: hr[10] = 500; hr[11] = 500; break;                        // a negative logit, hit twice
+                case 6: hr[10] = 500; hr[11] = 500; hr[12] = 500; hr[13] = 500; break;   // 4 hits, none of 600
+                case 7: hr[10] = 500; hr[11] = 500; hr[12] = 500; hr[13] = 600; break;
+                case 8: hr[0] = 500; hr[1] = 500; hr[2] = 500; break;   // the HEAD: outside a plen of 8
+                case 10: hr[10] = 1234; break;
+                default: break;
+            }
+        }
+        Buf b_l = ctx.alloc(logits.size() * 4), b_h = ctx.alloc(hist.size() * 4), b_o = ctx.alloc(n_tokens * 4);
+        ctx.write(b_l, logits.data(), logits.size() * 4);
+        ctx.write(b_h, hist.data(), hist.size() * 4);
+        std::vector<int32_t> sent(n_tokens, -1);
+        ctx.write(b_o, sent.data(), sent.size() * 4);
+        struct { int n_vocab, n_tokens, history_len, plen; float r, f, p; } pc{
+            (int) nv, (int) n_tokens, (int) history_len, a.plen, a.repeat, a.freq, a.present};
+        ctx.dispatch(ps, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), n_tokens);
+        std::vector<int32_t> got(n_tokens);
+        ctx.read(b_o, got.data(), got.size() * 4);
+
+        int bad = 0;
+        int32_t first_expect = -1;
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const int want = sampler_want(logits, (size_t) t * nv, (int) nv, hist, (size_t) t * history_len,
+                                          (int) history_len, a.plen, a.repeat, a.freq, a.present);
+            if (t == 0) first_expect = want;
+            if (got[t] != want) ++bad;
+            if (a.expect >= 0 && t == 0 && want != a.expect) ++bad;     // the fixture must mean what it claims
+        }
+        std::printf("      %-58s vocab %6d plen %2d -> token %6d (rule says %6d)%s\n", a.what, a.n_vocab, a.plen,
+                    got[0], first_expect, bad ? "   <-- MISMATCH" : "");
+        char label[220];
+        std::snprintf(label, sizeof label, "sampler_greedy: %s", a.what);
+        verdict(label, bad == 0, bad, (int) n_tokens, 0.0, "tokens not equal to the rule's");
+        bad_total += bad;
+        ctx.free(b_l); ctx.free(b_h); ctx.free(b_o);
+    }
+    verdict("sampler_greedy: ten arms against the rule", bad_total == 0, bad_total, (int) (10 * n_tokens), 0.0,
+            "a wrong penalty branch, tie rule or window would land here");
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -8155,6 +8283,7 @@ int main(int argc, char** argv) {
     case_kv_q4_rot(ctx, dir);              // the Q4_0 KV path: the FWHT rotation, the group rule, the design claim
     case_kv_hybrid(ctx, dir);              // the hybrid mode: INT8 K, rotated Q4_0 V, the asymmetry
     case_descriptor_offset(ctx, dir);      // binding a row slice (the engine's pointer arithmetic, made bindable)
+    case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

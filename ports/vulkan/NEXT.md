@@ -605,6 +605,54 @@ running engine and what is deferrable.
 
 
 
+## THE SAMPLER, KERNEL 1: the greedy argmax - the first TOKEN this port emits
+
+**What was ported.**  `sampler_greedy_kernel` (`src/kernels/cuda/sampler.cu`) with the `history_count` /
+`apply_penalties` pair it calls.  This is the `--temp 0` path, and it is the first sampler kernel here; the general
+top-k/top-p kernel and the Philox draw come next, on the same penalties.  With this, the port has a complete
+deterministic generation path: logits in, a token out.
+
+    out[t] = argmax over v of apply_penalties(logit[t][v], count(v))
+    count(v) = occurrences of v in the TAIL of the token's history, min(plen, history_len) long
+    ties     = the LOWEST index wins; 0 when no candidate is above -inf
+
+**THE PENALTY RULES ARE WHERE A PARAPHRASE INVERTS THE MODEL.**  The repeat penalty MULTIPLIES for a non-positive
+logit and DIVIDES for a positive one - "divide by the repeat penalty" is the natural reading and it inverts the
+penalty on half the vocabulary.  The presence penalty is `float(count > 0)`, a boolean, NOT the count, while the
+frequency penalty carries the count.  The window is the TAIL of the history, so a token occurring only in the head of
+a longer history is not penalised.  Each of those is an arm, and each fixture is built so the WRONG rule lands on a
+different token.
+
+**THE TIE RULE IS THE SERIAL SCAN'S.**  The source walks `v` ascending with a strict `>` and merges with "larger
+value, or on equality the SMALLER index"; this port keeps that total order in a barrier tree (subgroup ops are banned
+here) with the source's `n_vocab` sentinel for a thread with no elements, and answers 0 for an all -inf/NaN row.
+
+**ONE PORT DECISION, stated rather than hidden.**  The source builds a shared BITMAP of the history's ids so
+membership is O(1) and only the hits pay a count scan (~31 KB of shared at this model's 248,320-token vocabulary).
+This port scans the window per candidate instead - what that source did before the bitmap, with identical counts -
+because the bitmap and the reduction tree do not both fit the port's 32 KB shared budget at that vocabulary, and a
+fast wrong membership test is worse than a slow right one.  The bitmap is the optimisation to add.
+
+**Evidence.**  Arc: **253 passed / 0 failed / 0 skipped** (eleven new verdicts).  Ten arms against a transcription of
+the rule, and every arm states the token it is BUILT to produce, which is checked as well as the oracle: a plain
+argmax with a NaN and a -inf present; a two-way tie; all -inf; all NaN; the repeat penalty on a positive logit (it
+must lose); on a negative logit (it must lose); the frequency count (4 hits at 2.0 drops 9.0 to 1.0, so an
+unpenalised 3.0 wins); the presence penalty as a boolean rather than the count (9-2 beats 8-2, but 9-6 would not);
+the TAIL window (a head-only hit is unpenalised); and the real 248,320-token vocabulary with its strided scan.
+
+**FALSIFIED, and the fourth injection is the finding:**  the repeat branch divided unconditionally -> the negative-
+logit arm; the tie rule preferring the highest index -> the tie arm; the window read as the head -> the tail arm; and
+the presence penalty as the count -> the presence arm.  **The first version of that last arm PASSED under the
+injection**, because its fixture let the penalised token lose under both rules: the arm was decorative, and only a
+falsification could say so.  Rebuilding it (600 also in the history, once) makes the correct rule keep 500 at 9-2
+against 6 and the wrong one drop it to 3.  The `expect` field earned its place the same way: with every arm stating
+its token, a fixture that no longer means what it claims fails immediately - and one of them did, on the first run
+after I touched it (arm 6's history still hit the runner-up once, so its count changed nothing).
+
+**What the sampler still needs.**  `sampler_kernel` (the general path: temperature, top-k, top-p, and the cumulative
+walk with the Philox draw - the RNG and its reference implementation come with it), the split-warp and
+coupled/draft-staging variants (speculative decoding), and the `sample_tokens` entry point that picks between them.
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one

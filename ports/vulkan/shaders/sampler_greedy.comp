@@ -1,0 +1,108 @@
+// ports/vulkan/shaders/sampler_greedy.comp - the greedy argmax, with the sampler's penalties.
+// Ported from src/kernels/cuda/sampler.cu (`sampler_greedy_kernel`, and the `history_count` / `apply_penalties`
+// pair it uses).  This is the `--temp 0` path and the first of the sampler's kernels here: the general top-k/top-p
+// kernel and the Philox draw come next, on top of the same penalties.
+//
+//     out[t] = argmax over v of apply_penalties(logit[t][v], count(v))
+//     count(v) = how many times v appears in the TAIL of the token's history, `min(plen, history_len)` long
+//     ties     = the LOWEST index wins, and 0 when no candidate is above -inf
+//
+// **THE PENALTY BRANCH IS NOT A DETAIL.**  The repeat penalty MULTIPLIES for a non-positive logit and DIVIDES for a
+// positive one; dividing unconditionally is the natural reading of the paper and it INVERTS the penalty on half the
+// vocabulary.  The presence penalty is `float(count > 0)` - a boolean, not the count - while the frequency penalty
+// carries the count.  The case's fixtures are built so a wrong branch changes the ARGMAX, which is why they gate the
+// observable answer rather than the device function.
+//
+// THE TIE RULE IS THE SERIAL SCAN'S.  The source walks `v` ascending with a strict `>`, so the lowest index wins,
+// and its reduction keeps that total order by taking the larger value and, on equality, the SMALLER index.  This port
+// does the same in a barrier tree (subgroup ops are banned here) with the source's `n_vocab` sentinel - an index that
+// loses every comparison - standing in for a thread with no elements.
+//
+// THE WINDOW IS THE TAIL: `hlen = min(plen, history_len)` starting at `history_len - hlen`, so a token occurring
+// only in the HEAD of a longer history is NOT penalised.  Reading the head is the plausible mistake; it is a gate arm.
+//
+// **ONE PORT DECISION, stated rather than hidden.**  The source builds a SHARED BITMAP of the history's ids so
+// membership is O(1) and only the hits pay a count scan (~31 KB of shared memory at this model's 248,320-token
+// vocabulary).  This port scans the window per candidate instead - which is what that source did before the bitmap,
+// with exactly the same counts - because the bitmap and the reduction tree do not both fit this port's 32 KB shared
+// budget at that vocabulary, and a fast wrong membership test is worse than a slow right one.  The bitmap is the
+// optimisation to add, and the counts it accelerates are already pinned by the case.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float x[]; } LO_;
+layout(set = 0, binding = 1, std430) readonly buffer HIST { int h[]; } HI_;
+layout(set = 0, binding = 2, std430) buffer OUT { int o[]; } OUT_;
+
+layout(push_constant) uniform Pc {
+    int n_vocab;
+    int n_tokens;
+    int history_len;      // the history row stride (0 when there is none)
+    int plen;             // the penalty window: at most this many of the most recent tokens
+    float penalty_repeat;
+    float penalty_freq;
+    float penalty_present;
+} pc;
+
+shared float rv[256];
+shared int ri[256];
+
+// `count_in_history` and the penalty application, transcribed from the source (itself transcribing
+// `llama_sampler_penalties_apply`).
+float apply_penalties(float logit, int count) {
+    if (count <= 0) return logit;
+    if (logit <= 0.0) logit *= pc.penalty_repeat;
+    else              logit /= pc.penalty_repeat;
+    logit -= float(count) * pc.penalty_freq + ((count > 0) ? 1.0 : 0.0) * pc.penalty_present;
+    return logit;
+}
+
+void main() {
+    const int t = int(gl_WorkGroupID.x);
+    if (t >= pc.n_tokens) return;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint row = uint(t) * uint(pc.n_vocab);
+
+    // THE WINDOW IS THE TAIL of this token's history row.
+    int hlen = 0, hbase = 0;
+    if (pc.history_len > 0) {
+        hlen = min(pc.plen, pc.history_len);
+        if (hlen < 0) hlen = 0;
+        hbase = t * pc.history_len + (pc.history_len - hlen);
+    }
+
+    float bv = uintBitsToFloat(0xff800000u);      // -inf
+    int best = pc.n_vocab;                        // the sentinel index: it loses every comparison
+    for (int v = int(lid); v < pc.n_vocab; v += 256) {
+        int count = 0;
+        if (hlen > 0) {
+            for (int i = 0; i < hlen; ++i) {
+                if (HI_.h[hbase + i] == v) ++count;
+            }
+        }
+        const float s = apply_penalties(LO_.x[row + uint(v)], count);
+        if (s > bv) { bv = s; best = v; }         // strict: the LOWEST index wins a tie
+    }
+
+    // The barrier tree keeps that total order: the larger value, or the smaller index on equality.
+    rv[lid] = bv;
+    ri[lid] = best;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (int(lid) < off) {
+            const float ov = rv[lid + uint(off)];
+            const int oi = ri[lid + uint(off)];
+            if (ov > rv[lid] || (ov == rv[lid] && oi < ri[lid])) {
+                rv[lid] = ov;
+                ri[lid] = oi;
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        // A tie between two -inf candidates leaves the sentinel, and the source's serial version answered 0.
+        OUT_.o[t] = (ri[0] < pc.n_vocab) ? ri[0] : 0;
+    }
+}
