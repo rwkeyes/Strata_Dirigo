@@ -15,6 +15,69 @@ stale input read (a single-element mutation of the previous/zero/byte-zeroed for
 a stale word would persist on re-dispatch). **The case is not skipped on radeon and the bound is not
 widened.** Full detail and evidence paths in `NEXT.md`'s top section.
 
+## INCREMENT I2 — THE DOORBELL REPLACEMENT + THE FIRST THREE GLUE ENTRY POINTS (2026-10-05, `vega`)
+
+The ENGINE half of I2 (`plan/BACKEND-INTEGRATION.md` §3). Measured on `vega`: Arc B70 (ANV), Ryzen iGPU (RADV)
+and llvmpipe.
+
+**THE DOORBELL.** `src/kernels/cuda/elementwise.cu`'s handshake is a kernel that SPINS on host memory ordered
+by `__threadfence_system()` (`doorbell_publish` :293, `doorbell_ring` :209, `doorbell_wait` :214; call sites
+`layer.cpp:380`/`:389` and `session.cpp:873`). Vulkan has no equivalent and this port forbids a waiting
+kernel, so `vulkan/src/device/sync.*` (new) replaces the two directions SEPARATELY: DEVICE->HOST becomes the
+submission FENCE (every submit in the device layer is fenced and waited, so `sync_publish` returning IS "every
+payload byte has landed" - that is the `__threadfence_system()`+ring ordering), and HOST->DEVICE becomes a
+HOST-DRIVEN SPLIT SUBMISSION (the consumer is submitted only after the host has written the answer, so the
+device never waits).  The result is that the recorded step is SPLIT at the handoff - the structural change the
+plan's I2 risk note names - and a literal translation (a kernel waiting for the host inside the SAME submission
+that must finish before the host can answer) could never complete.  `case_sync_handoff` pins the ORDERING, not
+the values: a consume BEFORE the answer reads the zero sentinel (1024/1024), the SAME call after the answer
+reads it (1024/1024), and the ring counts device publications (1 then 2).  The deadlock arm is reasoned, NOT
+executed: executing it means submitting a spinning kernel, which this port forbids and which risks the display
+card.  PASS on all three devices.
+
+**THE THREE GLUE ENTRY POINTS.** The plan's I2 list is NOT an order.  Read from `src/core/layer.cpp`'s layer
+body, the first three glue kernels `gdn_layer` (the mixer for 36 of 48 layers) reaches are `silu_inplace`
+(:257), `scale_inplace` (:276) and `f32_to_bf16_bulk` (:290); all three are wired in
+`vulkan/src/kernels/elementwise_vk.cpp` and proved by `case_*_entry` through the ENGINE WRAPPER, bitwise against
+the port's own shader path AND against the explicit oracle: scale 1000/1000, silu 1000/1000 bitwise (worst
+7.97e-07 vs the double reference), f32_to_bf16 1024/1024.  The engine's headers are unchanged.
+
+**A GATE HAZARD, FOUND AND FIXED IN THE CASE (NOT A KERNEL BUG).** The gate's own `case_icd_resolution`
+(~:4673) calls `unsetenv("VK_ICD_FILENAMES")` and never restores it, so every later `*_entry` case's second
+`VkInstance` enumerated EVERY ICD and took the Intel Arc while the harness `ctx` sat on the arm's ICD.  The
+same `silu_f32.spv` on the same input differs by exactly 1 ULP between the Arc and llvmpipe (x=-3.44161081:
+Arc bits bddaa466, llvmpipe bddaa465), which failed the bitwise arm on llvmpipe (535/1000) and RADV (798/1000).
+The entry cases now pin `STRATA_VK_DEVICE` to the HARNESS DEVICE's NAME before opening the engine stream
+(`EnginePin`, in the appended block); the bitwise claim is KEPT, not loosened, and all arms are green.
+`case_fwht256_entry` has the same exposure and never noticed, because fwht256 is bitwise identical on every
+device.
+
+**THE W26 ALLOCATION/VISIBILITY SEAM - CHECKED; THE CHARACTERISATION STANDS.** The two questions the defect
+asks of the device layer, answered by reading it.  (1) **Does it fence before releasing/reusing a buffer?**
+`Ctx::free` (`vk_compute.cpp:684-697`) does NOT fence, but it does not need to: EVERY submission the layer
+makes is fenced and waited BEFORE it returns (`end_oneshot_and_wait` :774-788, used by `dispatch` and both
+staging directions; `submit_recorded` :1064-1076 - the file has exactly two `vkQueueSubmit` sites, each
+followed by `vkWaitForFences(..., UINT64_MAX)`), so no submission that references a buffer can be in flight
+when `free()` runs.  The release/reuse hazard is RULED OUT for this layer's call patterns.  (2) **Is an upload
+barrier missing that the fence does not cover?** No.  A staged upload carries a `TRANSFER_WRITE ->
+SHADER_READ|HOST_READ` memory barrier AND the fence (`stage_upload` :795-815); a mapped write is a plain
+memcpy into `HOST_VISIBLE|HOST_COHERENT` memory (the type `Ctx::alloc` requires, :398), whose visibility to
+the next dispatch is Vulkan's implicit host-write ordering at `vkQueueSubmit`.  So the seam is not the cause,
+and the defect is left as characterised rather than guessed at - `NEXT.md`'s two standing hypotheses (a
+stale/partial read at the write/dispatch boundary, or a subgroup-width shared-memory read on the 64-wide RADV
+implementation) are untouched.  One residual, stated rather than hidden: freeing a buffer that a RECORDED
+command buffer still binds is a use-after-free the synchronous API cannot prevent (the recording holds raw
+`VkBuffer` handles), and no gate pattern reaches it because every replay is fenced before returning.
+
+**BUILD.** `cmake -DSTRATA_ENABLE_VULKAN=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF
+-DSTRATA_ENABLE_SYCL=OFF` CONFIGURE 0.15 s, BUILD 0.94 s on `vega` (the option `return()`s before the CUDA
+engine, as I1 left it, so this builds the backend: device layer + sync + the four kernel TUs + the smoke
+target).  `strata_vk_entry_smoke` RUNS on the Arc, llvmpipe and the Ryzen iGPU: fwht256, the three glue
+wrappers and the four handoff arms all PASS.  Gate on `vega`: **Arc 455/0/0, llvmpipe 443/0/3, radeon iGPU
+446/0/2, exit 0**; `check_port_map.py` passes (`168 - 78 kernel, 61 host, 29 todo`) and `make_port_map.py`
+regenerates `PORT-MAP.tsv` byte-identically; the radeon arm's own caveat (a green run means "no failure
+observed", not deterministic) still stands.  **The box `z820b` is PENDING** - no XTX/K620 number here.
+
 ## THE SAMPLER, MEASURED PROPERLY — the engine's DEFAULT is the SPLIT, and the PENALTY HOIST — the performance tier's first target (2026-10-05)
 
 The one number in the port above 100 ms, with a caveat the release notes carried: `sampler_kernel_f32` **546.9 ms

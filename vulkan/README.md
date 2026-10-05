@@ -1,4 +1,4 @@
-# vulkan/ - the engine's Vulkan backend (experimental; I1 landed, M-B not yet)
+# vulkan/ - the engine's Vulkan backend (experimental; I1 and I2 landed, M-B not yet)
 
 This is the **backend tree** the top-level `-DSTRATA_ENABLE_VULKAN=ON` option configures.  It is a *separate*
 tree like `sycl/` (docs/INTEL_ARC.md), not a branch of `src/kernels/cuda/`: the port's kernels are GLSL
@@ -18,16 +18,19 @@ each one - is `ports/vulkan/plan/BACKEND-INTEGRATION.md`.  Read that first; this
         vk_compat.hpp/.cpp               deps of vk_compute (host/driver/stack facts)
         vk_stack.hpp/.cpp                deps of vk_compute (loader/ICD/firmware detection)
         vk_arena.hpp/.cpp                the ARENA, the pointer -> buffer resolution, the stream registry
+        sync.hpp/.cpp                    (I2) the DOORBELL REPLACEMENT: the fence + host-driven handoff
       src/kernels/
         fwht_vk.cpp                      the fwht256 entry point: strata::kernels::fwht256_cuda + fwht256
+        elementwise_vk.cpp               (I2) silu_inplace / scale_inplace / f32_to_bf16_bulk
+        native_caps_vk.cpp               the native_*_enabled() capability answers the backend owns
       tests/
-        entry_point_smoke.cpp            strata_vk_entry_smoke: builds + RUNS the entry point via the wrapper
+        entry_point_smoke.cpp            strata_vk_entry_smoke: builds + RUNS the entry points via the wrappers
 
 Later increments add the per-subsystem kernel TUs the plan names:
 
     vulkan/
-      src/kernels/<subsystem>_vk.cpp     one TU per engine entry-point group (elementwise, rope, kv, gemv, attn, moe)
-      src/device/sync.*                  the fence/semaphore replacement for the CUDA doorbell (I2)
+      src/kernels/<subsystem>_vk.cpp     one TU per engine entry-point group (rope, kv, gemv, attn, moe)
+      src/device/sync.*                  (LANDED, I2) the fence/semaphore replacement for the CUDA doorbell
 
 ## How the engine's sources join this configuration (I1's decision)
 
@@ -82,3 +85,18 @@ On top of the adopted layer, `vk_arena.*` adds:
 * **Does NOT prove:** the engine program itself.  Nothing in `src/` is compiled under `STRATA_ENABLE_VULKAN` yet,
   and the other 39 entry points are the plan's later increments.  **Do not wire this into `setup.py` until M-B
   (one layer, end to end) is green.**
+
+## What I2 adds (2026-10-05)
+
+* `src/device/sync.*` - the CUDA doorbell's replacement.  The CUDA handshake is a kernel that spins on host
+  memory ordered by `__threadfence_system()`; this backend splits the two directions: device->host is the
+  submission FENCE (every submit is fenced and waited, so a publish that returns is a publish the host can
+  read), host->device is a HOST-DRIVEN SPLIT SUBMISSION (the consumer is submitted only after the host has
+  written the answer), so no kernel ever waits.  The header states what each CUDA call site is for and why
+  this mechanism; the gate's `case_sync_handoff` pins the ordering.
+* `src/kernels/elementwise_vk.cpp` - the first three glue entry points the LAYER BODY reaches, in order:
+  `silu_inplace` (`src/core/layer.cpp:257`), `scale_inplace` (:276), `f32_to_bf16_bulk` (:290).  Each is the
+  thin wrapper the engine header declares; the gate's `case_*_entry` re-runs it through the ENGINE wrapper
+  bitwise against the port's own shader path.
+* `strata_vk_entry_smoke` now RUNS fwht256 + the three glue wrappers + the handoff on the device, on the
+  CMake-built object code (the numeric proof stays in the port's gate).

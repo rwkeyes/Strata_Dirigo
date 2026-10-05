@@ -39,4 +39,17 @@ Stream* stream_of(void* stream);
 /// increment 1; declared here so the entry point compiles now.
 void fwht256(Stream& s, const float* src, float* dst, int64_t n_rows);
 
+// ---- I2: THE ELEMENTWISE GLUE (vulkan/src/kernels/elementwise_vk.cpp) ---------------------------------------
+// The first three glue kernels the layer body reaches, in the order `src/core/layer.cpp`'s `gdn_layer`
+// reaches them: silu_inplace (:257), scale_inplace (:276), f32_to_bf16_bulk (:290).  Each answers the
+// engine wrapper in `include/strata/kernels/elementwise.hpp`; the shader each drives is named here so the
+// gate can hold the two paths to the same .spv.
+//
+// `silu_inplace`   -> shader silu_f32.spv    (1 storage buffer, push {int n})
+// `scale_inplace`  -> shader scale.spv       (1 storage buffer, push {int n; float s})
+// `f32_to_bf16_bulk` -> shader f32_to_bf16.spv (X float[] read, Y uint16_t[] write, push {int n})
+void silu_inplace(Stream& s, float* x, int64_t n);
+void scale_inplace(Stream& s, float* x, int64_t n, float factor);
+void f32_to_bf16_bulk(Stream& s, const float* x, uint16_t* y, int64_t n);
+
 }  // namespace strata::vulkan

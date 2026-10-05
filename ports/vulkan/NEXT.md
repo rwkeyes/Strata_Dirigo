@@ -100,8 +100,72 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
-## THE SAMPLER, MEASURED PROPERLY — the DEFAULT is the SPLIT, its real cost, and the PENALTY-HOIST fix — **DONE 2026-10-05**
+## INCREMENT I2 — THE DOORBELL REDESIGN + THE FIRST THREE GLUE ENTRY POINTS — **DONE 2026-10-05** (`vega`)
 
+The engine half of I2.  The plan's I2 list is NOT an order, and the doorbell was the increment's named biggest
+unknown; both are settled by reading the engine rather than guessing.
+
+**THE DOORBELL, READ FIRST.** `src/kernels/cuda/elementwise.cu`'s handshake is a kernel that SPINS on host
+memory ordered by `__threadfence_system()`: `doorbell_publish` (:293, called from `layer.cpp:380` - the GPU
+copies the router's `x`/`ids`/`weights` into mapped pinned host memory and increments a mapped ring),
+`doorbell_ring` (:209, `layer.cpp:389` - the ring alone), `doorbell_wait` (:214, `session.cpp:873` - a
+one-thread kernel that waits for the host-written mapped flag).  So it is a BIDIRECTIONAL CPU-in-the-middle
+handoff, and each direction needs a different replacement.  `vulkan/src/device/sync.*` (new) gives:
+DEVICE->HOST = the submission FENCE (`Ctx::dispatch` submits and waits a fence before returning, so
+`sync_publish` returning is exactly "the payload is visible to the host" - the `__threadfence_system()`+ring
+ordering, needing no counter to poll and no flush, because the handoff buffers are `HOST_VISIBLE|HOST_COHERENT`
+the type `Ctx::alloc` requires); HOST->DEVICE = a HOST-DRIVEN SPLIT SUBMISSION (the consumer is submitted only
+AFTER the host has written the answer, so the device never waits).  The consequences for I3/I4, stated so the
+next increment is not surprised: **the recorded decode step is SPLIT at the handoff** (phase 1 = the publish,
+phase 2 = the consume), and the host's per-token loop becomes submit-publish -> read payload -> run the pool ->
+write answer -> submit-consume.  A timeline semaphore was considered and NOT used (the submission path here is
+synchronous, so the fence already gives the ordering, and enabling `timelineSemaphore` would be a device-create
+change); the swap is local to `sync_publish` when the step becomes a genuinely asynchronous re-submission.
+`case_sync_handoff` pins the ORDERING (consume before the answer reads the sentinel, the same call after it
+reads the answer; the ring counts publications).  The deadlock arm is reasoned, NOT executed - executing it
+means submitting a spinning kernel, which is forbidden and risks the display card.  Where the engine's
+`doorbell_*` symbols get answered from `sync.*` is I2's NEXT piece (the device-crossing host rows), together
+with `build_rope_table`, `rope_table_set/release`, `kv_ring_table`, `kv_stream_reset`, `gr_workspace_init`.
+
+**THE THREE GLUE ENTRY POINTS.** Read from `src/core/layer.cpp`'s layer body (`block_layer` -> `gdn_layer`, the
+mixer for 36 of the 48 layers), the first three glue kernels it reaches are `silu_inplace` (:257, the legacy
+conv+SiLU), `scale_inplace` (:276, the legacy 1/sqrt(S) on q) and `f32_to_bf16_bulk` (:290, the alpha/beta
+activation, reached by DEFAULT because `native_bf16_projections` defaults false).  Wired in
+`vulkan/src/kernels/elementwise_vk.cpp`; each proved by `case_*_entry` through the ENGINE WRAPPER, bitwise
+against the port's own shader path and against the explicit oracle (scale 1000/1000, silu 1000/1000, bf16
+1024/1024).  **The NEXT three, same reading, are `gdn_gate` (:300), `rms_norm_weighted` (:880) and
+`embedding_gather` (:1083).**
+
+**A GATE HAZARD FOUND WHILE PROVING THEM, AND ITS FIX.** The gate's own `case_icd_resolution` (~:4673) calls
+`unsetenv("VK_ICD_FILENAMES")` and never restores it, so any `*_entry` case's SECOND `VkInstance` enumerates
+every ICD and takes the Intel Arc while the harness `ctx` sits on the arm's ICD.  The same `silu_f32.spv` on
+the same input differs by exactly 1 ULP between the Arc and llvmpipe (x=-3.44161081: bddaa466 vs bddaa465).
+The entry cases now pin `STRATA_VK_DEVICE` to the harness device's NAME (`EnginePin`); the bitwise claim was
+KEPT, not loosened.  `case_fwht256_entry` shares the exposure and never noticed because fwht256 is bitwise
+identical on every device - worth remembering for any future cross-instance case.
+
+**THE W26 ALLOCATION/VISIBILITY SEAM — CHECKED; THE TOP SECTION'S CHARACTERISATION STANDS.** (1) `Ctx::free`
+(`vulkan/src/device/vk_compute.cpp:684-697`) does NOT fence, but it does not need to: the file has exactly TWO
+`vkQueueSubmit` sites and each is followed by `vkWaitForFences(..., UINT64_MAX)` (`end_oneshot_and_wait`
+:774-788, used by `dispatch` and both staging directions; `submit_recorded` :1064-1076), so no submission that
+references a buffer is ever in flight when `free()` runs - the release/reuse hazard is RULED OUT for this
+layer's call patterns.  (2) No upload barrier is missing: a staged upload carries a `TRANSFER_WRITE ->
+SHADER_READ|HOST_READ` barrier AND the fence (:795-815), and a mapped write goes into `HOST_VISIBLE|
+HOST_COHERENT` memory whose visibility to the next dispatch is Vulkan's implicit host-write ordering at
+`vkQueueSubmit`.  The defect is therefore left as characterised, not guessed at.  The one residual worth
+knowing: freeing a buffer that a RECORDED command buffer still binds is a use-after-free the synchronous API
+cannot prevent (a recording holds raw `VkBuffer` handles); no gate pattern reaches it because every replay is
+fenced before returning.
+
+**RESULTS.** Engine CONFIGURE 0.15 s / BUILD 0.94 s (`-DSTRATA_ENABLE_VULKAN=ON`, CUDA/HIP/SYCL OFF; the option
+`return()`s before the CUDA engine, so this builds the backend + smoke target).  `strata_vk_entry_smoke` RUNS
+on the Arc, llvmpipe and the Ryzen iGPU and passes every arm.  Gate on `vega`: **Arc 455/0/0, llvmpipe
+443/0/3, radeon iGPU 446/0/2, exit 0**; `check_port_map.py` passes and `PORT-MAP.tsv` regenerates
+byte-identically.  **`z820b` is PENDING** (no XTX/K620 number).  Not measured here: the engine's own PROGRAM
+(the layer/session loop) - the `doorbell_*` symbols are not yet answered, so "one layer end to end" is M-B,
+not this increment.
+
+## THE SAMPLER, MEASURED PROPERLY — the DEFAULT is the SPLIT, its real cost, and the PENALTY-HOIST fix — **DONE 2026-10-05**
 The performance tier's named first target, and the only number in the port above 100 ms.  The baseline carried
 `sampler_kernel_f32` **546.9 ms (Arc) / 202.0 ms (XTX)** with a CAVEAT: it is the ONE-BLOCK **fallback**, not the
 engine's default.  This increment names the default, measures it over the real vocabulary, finds WHY it was slow,

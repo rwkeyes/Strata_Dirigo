@@ -44,7 +44,8 @@ strata_vulkan_resolve(_device
   src/device/vk_compat.cpp
   src/device/vk_stack.cpp
   src/device/vk_compute.cpp
-  src/device/vk_arena.cpp)
+  src/device/vk_arena.cpp
+  src/device/sync.cpp)          # I2: the fence/host-handoff replacement for the CUDA doorbell
 add_library(strata_vulkan_device STATIC ${_device})
 target_compile_features(strata_vulkan_device PRIVATE cxx_std_20)
 target_include_directories(strata_vulkan_device PUBLIC
@@ -55,7 +56,8 @@ target_compile_definitions(strata_vulkan_device PUBLIC STRATA_ENABLE_VULKAN=1)
 target_link_libraries(strata_vulkan_device PUBLIC Vulkan::Vulkan)
 
 # --- the kernel translation units: one engine entry point per symbol, behind the macro -----------------------
-strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp)
+strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp
+  src/kernels/elementwise_vk.cpp)   # I2: silu_inplace / scale_inplace / f32_to_bf16_bulk
 add_library(strata_vulkan_kernels STATIC ${_kernels})
 target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
 
@@ -65,5 +67,6 @@ target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
 add_executable(strata_vk_entry_smoke tests/entry_point_smoke.cpp)
 target_link_libraries(strata_vk_entry_smoke PRIVATE strata_vulkan_kernels)
 
-message(STATUS "Strata: Vulkan backend (experimental) - device layer + 1 entry point (fwht256) + "
-               "strata_vk_entry_smoke; see ports/vulkan/plan/BACKEND-INTEGRATION.md")
+message(STATUS "Strata: Vulkan backend (experimental) - device layer + sync (the doorbell replacement) + "
+               "4 entry points (fwht256 + silu/scale/f32_to_bf16 glue) + strata_vk_entry_smoke; see "
+               "ports/vulkan/plan/BACKEND-INTEGRATION.md")

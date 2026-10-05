@@ -33,6 +33,8 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "vk_arena.hpp"
+#include "sync.hpp"          // I2: the doorbell replacement (sync_open/publish/read/answer/consume)
+#include "strata/kernels/elementwise.hpp"   // I2: the three glue wrappers this gate drives through the backend
 
 #include <algorithm>
 #include <cmath>
@@ -13505,6 +13507,338 @@ void case_fused_gdn_step_norm(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ============================================================================================================
+// I2 — THE DOORBELL REPLACEMENT AND THE FIRST THREE GLUE ENTRY POINTS
+//
+// The design and the call-site reading are in `vulkan/src/device/sync.hpp` (the replacement) and
+// `vulkan/src/kernels/elementwise_vk.cpp` (which three, and why).  These four cases are the PROOF.  They are
+// APPENDED after every existing case for the shared-RNG reason stated at the end of main(): every case draws
+// from the gate's ONE `g_rng(11)`, so appending keeps every existing case's input stream byte-identical.
+// ============================================================================================================
+
+// PIN THE ENTRY CASES TO THE HARNESS'S OWN PHYSICAL DEVICE.  This is required for the comparison to MEAN
+// anything, and it fixes a real hazard the I1 case got away with only because `fwht256` is bitwise identical
+// on every device.  The gate's own `case_icd_resolution` (~line 4673) calls `unsetenv("VK_ICD_FILENAMES")`
+// and does not restore it, so a SECOND `VkInstance` created after it - which every `*_entry` case is -
+// enumerates EVERY ICD and takes the first compute-capable device.  On this box that is the Intel Arc, while
+// the harness `ctx` was created at startup under the arm's ICD (llvmpipe, RADV iGPU).  Measured: the same
+// `silu_f32.spv` on the same input differs by exactly 1 ULP between the Arc and llvmpipe
+// (x=-3.44161081: arcs bits bddaa466, llvmpipe bddaa465), so a bitwise arm comparing them is comparing two
+// DIFFERENT hardware implementations, not the wrapper against the shader.  The engine's `stream_open` honours
+// `STRATA_VK_DEVICE` as an index into the list it itself enumerates, so this scopes that index to the harness
+// device's NAME and restores the environment on the way out.
+class EnginePin {
+public:
+    explicit EnginePin(const Ctx& harness) {
+        const std::vector<strata::vulkan::DeviceInfo> devs = strata::vulkan::Ctx::list_devices();
+        for (size_t i = 0; i < devs.size(); ++i) {
+            if (devs[i].name == harness.info().name) { idx_ = (int) i; break; }
+        }
+        if (idx_ < 0) return;                      // not found: leave the environment alone and let it fail loudly
+        const char* old = std::getenv("STRATA_VK_DEVICE");
+        if (old != nullptr) saved_ = old;
+        had_ = (old != nullptr);
+        setenv("STRATA_VK_DEVICE", std::to_string(idx_).c_str(), 1);
+    }
+    ~EnginePin() {
+        if (idx_ < 0) return;
+        if (had_) setenv("STRATA_VK_DEVICE", saved_.c_str(), 1);
+        else unsetenv("STRATA_VK_DEVICE");
+    }
+    bool pinned() const { return idx_ >= 0; }
+    int index() const { return idx_; }
+
+private:
+    int idx_ = -1;
+    bool had_ = false;
+    std::string saved_;
+};
+
+// I2 — THE DOORBELL REPLACEMENT.  The CUDA handshake is a kernel that SPINS on host memory ordered by
+// `__threadfence_system()` (elementwise.cu:209-218, called from layer.cpp:380 and session.cpp:873); Vulkan
+// has no equivalent and a spinning kernel is forbidden here.  The replacement is a FENCE for the device->host
+// ring and a HOST-DRIVEN SPLIT SUBMISSION for the host->device answer (sync.hpp states what each call site
+// is for and why the mechanism is this one).  This case pins the two things a value-only test would miss:
+//
+//   * the ORDER, not the values: the consumer dispatched BEFORE the host's answer reads the answer buffer's
+//     sentinel, and the SAME call after the answer reads the answer.  (A translating spin would HANG on the
+//     first of those - it would wait, inside its submission, for an answer that cannot be produced until
+//     that submission has completed.  This design never asks the device to wait, so the wrong order is
+//     OBSERVABLE as a value instead of an unrecoverable hang.  The deadlock arm is not executed: executing it
+//     means submitting a spinning kernel, which this port forbids and which risks the display card.)
+//   * the ring counts DEVICE publications and advances by exactly one per publish.
+void case_sync_handoff(Ctx& ctx, const std::string& dir) {
+    // The handoff lives in the ENGINE's device layer, so this case opens its own engine stream below and does
+    // not use the harness's `ctx`; it is here so the case has the gate's uniform signature.
+    (void) ctx;
+    if (!have(dir, "copy.spv") || !have(dir, "scale.spv")) return;
+
+    // The ENGINE's own device layer (a second Ctx through the same stream_open case_fwht256_entry uses), so
+    // this exercises vulkan/src/device/sync.cpp and not the port harness's copy of it.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("sync doorbell: handoff", false, 1, 1, 0, "the backend could not open a stream");
+        return;
+    }
+    strata::vulkan::Ctx& ectx = *s->ctx;
+
+    const uint32_t N = 1024;                                   // floats in the payload and the answer
+    strata::vulkan::Handoff* h = strata::vulkan::sync_open(ectx, (uint64_t) N * 4, (uint64_t) N * 4, dir);
+
+    // The DEVICE produces the payload: a shader scales a known input (x *= -2.5).  The publish then copies
+    // that buffer into host memory, so what the host reads was written BY THE DEVICE.
+    std::vector<float> x(N);
+    for (uint32_t i = 0; i < N; ++i) x[i] = rndf(3.0f);
+    strata::vulkan::Buf src = ectx.alloc((uint64_t) N * 4);
+    ectx.write(src, x.data(), (uint64_t) N * 4);
+    {
+        VkPipeline p = ectx.pipeline(dir + "/scale.spv", 1, 8);
+        struct { int32_t n; float s; } pc{(int32_t) N, -2.5f};
+        ectx.dispatch(p, {&src}, &pc, sizeof(pc), groups_for(N));
+    }
+
+    // ---- (A) DEVICE -> HOST: publish, then the host reads.  `sync_publish` returns only after the publish
+    //          submission has been fenced and waited, so this read is ordered after the device's writes.
+    //          THAT is the replacement for `__threadfence_system()` + the mapped ring.
+    strata::vulkan::sync_publish(*h, src, (uint64_t) N * 4);
+    const uint32_t ring_after_publish = strata::vulkan::sync_ring(*h);
+    std::vector<float> payload(N);
+    strata::vulkan::sync_read_payload(*h, payload.data(), (uint64_t) N * 4);
+    int bad_pub = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t a, b;
+        std::memcpy(&a, &payload[i], 4);
+        const float want = x[i] * -2.5f;
+        std::memcpy(&b, &want, 4);
+        if (a != b) ++bad_pub;
+    }
+    verdict("sync doorbell: device->host publish is ordered (the fence is __threadfence_system)",
+            bad_pub == 0, bad_pub, (int) N, 0.0,
+            "the published words differ from the device's own scaled output - the fence did not order the "
+            "shader's writes before the host read");
+
+    // ---- (B) THE FALSIFICATION.  The consumer is dispatched BEFORE the host writes the answer, so it reads
+    //          the answer buffer's ZERO SENTINEL.  This is the deadlock a translating spin would show as a
+    //          hang; here it is a value the case can see.  (It is meaningful only together with (C) below,
+    //          which re-runs the SAME call on the SAME buffer and reads the answer - so a copy that never ran
+    //          cannot pass both.)
+    strata::vulkan::Buf out = ectx.alloc((uint64_t) N * 4);
+    strata::vulkan::sync_consume(*h, out, (uint64_t) N * 4);
+    std::vector<float> got(N);
+    ectx.read(out, got.data(), (uint64_t) N * 4);
+    int early_nonzero = 0;
+    for (uint32_t i = 0; i < N; ++i) if (got[i] != 0.0f) ++early_nonzero;
+    verdict("sync doorbell: the consumer BEFORE the answer reads the sentinel (no device wait)",
+            early_nonzero == 0, early_nonzero, (int) N, 0.0,
+            "expected the answer buffer's zero sentinel - the consumer must not wait for the host, and the "
+            "ordering is what makes the handoff correct");
+
+    // ---- (C) HOST -> DEVICE: the host answers (payload + 1.0), then the SAME consumer reads it.
+    std::vector<float> answer(N);
+    for (uint32_t i = 0; i < N; ++i) answer[i] = payload[i] + 1.0f;
+    strata::vulkan::sync_write_answer(*h, answer.data(), (uint64_t) N * 4);
+    strata::vulkan::sync_consume(*h, out, (uint64_t) N * 4);
+    ectx.read(out, got.data(), (uint64_t) N * 4);
+    int bad_ans = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t a, b;
+        std::memcpy(&a, &got[i], 4);
+        std::memcpy(&b, &answer[i], 4);
+        if (a != b) ++bad_ans;
+    }
+    verdict("sync doorbell: host->device answer is consumed in order", bad_ans == 0, bad_ans, (int) N, 0.0,
+            "the same consumer on the same buffer returned something other than the host's answer written "
+            "BEFORE the call - the host-side handoff is not ordered");
+
+    // ---- (D) the ring counts DEVICE publications only, and advances by one each time.
+    strata::vulkan::sync_publish(*h, src, (uint64_t) N * 4);
+    const uint32_t ring_after_second = strata::vulkan::sync_ring(*h);
+    const bool ring_ok = (ring_after_publish == 1u && ring_after_second == 2u);
+    verdict("sync doorbell: the ring is monotonic, one per device publish", ring_ok, ring_ok ? 0 : 1, 2, 0.0,
+            "the ring did not read 1 then 2 - it is not counting publications");
+
+    strata::vulkan::sync_close(h);
+    ectx.free(src);
+    ectx.free(out);
+    strata::vulkan::stream_close(s);
+}
+
+// I2, the three glue entry points.  Each is proved the way case_fwht256_entry proves the rotation: (A) run the
+// port's shader path, (B) run the ENGINE WRAPPER through the backend's arena, (C) require the two to agree
+// BITWISE (same SPIR-V, same device, so a difference can only be the wrapper's binding/dispatch), and (D)
+// compare the wrapper's answer against the SAME oracle the existing shader-level case uses, so the two
+// agreeing paths cannot share a defect.  The order these three are wired in is derived in
+// vulkan/src/kernels/elementwise_vk.cpp from the layer body (layer.cpp:257 -> :276 -> :290).
+
+void case_scale_inplace_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "scale.spv")) return;
+    const uint32_t N = 1000;
+    const float S = -1.75f;
+    std::vector<float> a(N), want(N);
+    for (uint32_t i = 0; i < N; ++i) { a[i] = rndf(2.0f); want[i] = a[i] * S; }
+
+    // (A) the port's shader path, exactly as case_scale runs it.
+    Buf bx = ctx.alloc(N * 4);
+    ctx.write(bx, a.data(), N * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/scale.spv", 1, 8);
+        struct { int32_t n; float s; } pc{(int32_t) N, S};
+        ctx.dispatch(p, {&bx}, &pc, sizeof(pc), groups_for(N));
+    }
+    std::vector<float> ref(N);
+    ctx.read(bx, ref.data(), N * 4);
+
+    // (B) THE ENGINE WRAPPER: strata::kernels::scale_inplace, through the backend's arena.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("scale_inplace entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bx);
+        return;
+    }
+    float* dev = strata::vulkan::arena_alloc<float>(*s, N);
+    strata::vulkan::stream_write(*s, dev, a.data(), N * 4);
+    strata::kernels::scale_inplace(dev, (int64_t) N, S, s);       // THE ENGINE WRAPPER (in place)
+    std::vector<float> got(N);
+    strata::vulkan::stream_read(*s, dev, got.data(), N * 4);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE against the port's shader path (32-bit words: a float `==` hides NaN payloads and +0/-0).
+    int bad = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t u, v;
+        std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4);
+        if (u != v) ++bad;
+    }
+    verdict("scale_inplace entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) N, 0.0,
+            "words differ - the arena view, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    // (D) against the explicit oracle (x * s), the same one the shader-level case asserts.
+    int bad_oracle = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t u, v;
+        std::memcpy(&u, &got[i], 4); std::memcpy(&v, &want[i], 4);
+        if (u != v) ++bad_oracle;
+    }
+    verdict("scale_inplace entry point: engine wrapper == x*s", bad_oracle == 0, bad_oracle, (int) N, 0.0,
+            "words differ - the wrapper's arena slice is not the row it claims");
+    ctx.free(bx);
+}
+
+void case_silu_inplace_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "silu_f32.spv")) return;
+    const uint32_t N = 1000;
+    std::vector<float> x(N), refd(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        x[i] = rndf(6.0f);
+        const double v = (double) x[i];
+        refd[i] = (float) (v / (1.0 + std::exp(-v)));          // the engine's double reference (case_silu's oracle)
+    }
+
+    // (A) the port's shader path.
+    Buf bx = ctx.alloc(N * 4);
+    ctx.write(bx, x.data(), N * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/silu_f32.spv", 1, 4);
+        struct { int32_t n; } pc{(int32_t) N};
+        ctx.dispatch(p, {&bx}, &pc, sizeof(pc), groups_for(N));
+    }
+    std::vector<float> ref(N);
+    ctx.read(bx, ref.data(), N * 4);
+
+    // (B) THE ENGINE WRAPPER.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("silu_inplace entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bx);
+        return;
+    }
+    float* dev = strata::vulkan::arena_alloc<float>(*s, N);
+    strata::vulkan::stream_write(*s, dev, x.data(), N * 4);
+    strata::kernels::silu_inplace(dev, (int64_t) N, s);           // THE ENGINE WRAPPER (in place)
+    std::vector<float> got(N);
+    strata::vulkan::stream_read(*s, dev, got.data(), N * 4);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE against the port's shader path: the SAME SPIR-V and the same constants, so a single
+    // differing word is the wrapper, not arithmetic.
+    int bad = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t u, v;
+        std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4);
+        if (u != v) ++bad;
+    }
+    verdict("silu_inplace entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) N, 0.0,
+            "words differ - the wrapper's binding or dispatch does not match the ported shader's own path");
+
+    // (D) against the engine's double reference, with case_silu's tolerance and reporting its measured gap.
+    int bad_oracle = 0;
+    double worst = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (!close_enough(got[i], refd[i], 2e-6, 1e-12)) ++bad_oracle;
+        const double r = std::fabs((double) got[i] - refd[i]) / (std::fabs((double) refd[i]) + 1e-30);
+        worst = std::max(worst, r);
+    }
+    verdict("silu_inplace entry point: engine wrapper vs double ref", bad_oracle == 0, bad_oracle, (int) N, worst,
+            "relative (tol 2e-6)");
+    ctx.free(bx);
+}
+
+void case_f32_to_bf16_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "f32_to_bf16.spv")) return;
+    if (!ctx.info().storage_buffer_16bit || !ctx.info().shader_int16) {
+        skip("f32_to_bf16_bulk entry point: engine wrapper", "device lacks storageBuffer16BitAccess/shaderInt16");
+        return;
+    }
+    uint32_t N = 0;
+    const std::vector<float> f = conversion_fixture(N);
+    std::vector<uint16_t> want(N);
+    for (uint32_t i = 0; i < N; ++i) want[i] = bf16_from_f32(f[i]);
+
+    // (A) the port's shader path, exactly as run_conversion<uint16_t> runs it.
+    Buf bx = ctx.alloc(N * 4), by = ctx.alloc(N * 2);
+    ctx.write(bx, f.data(), N * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/f32_to_bf16.spv", 2, 4);
+        struct { int32_t n; } pc{(int32_t) N};
+        ctx.dispatch(p, {&bx, &by}, &pc, sizeof(pc), groups_for(N));
+    }
+    std::vector<uint16_t> ref(N);
+    ctx.read(by, ref.data(), N * 2);
+
+    // (B) THE ENGINE WRAPPER: strata::kernels::f32_to_bf16_bulk, x into an f32 arena region, y into a u16 one.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("f32_to_bf16_bulk entry point: engine wrapper", false, 1, 1, 0,
+                "the backend could not open a stream");
+        ctx.free(bx); ctx.free(by);
+        return;
+    }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, N);
+    uint16_t* dy = strata::vulkan::arena_alloc<uint16_t>(*s, N);
+    strata::vulkan::stream_write(*s, dx, f.data(), N * 4);
+    strata::kernels::f32_to_bf16_bulk(dx, dy, (int64_t) N, s);    // THE ENGINE WRAPPER
+    std::vector<uint16_t> got(N);
+    strata::vulkan::stream_read(*s, dy, got.data(), N * 2);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE against the port's shader path, and (D) against the engine's own converter.
+    int bad = 0, bad_oracle = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (ref[i] != got[i]) ++bad;
+        if (want[i] != got[i]) ++bad_oracle;
+    }
+    verdict("f32_to_bf16_bulk entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) N, 0.0,
+            "words differ - the wrapper's binding or dispatch does not match the ported shader's own path");
+    verdict("f32_to_bf16_bulk entry point: engine wrapper == bf16_from_f32", bad_oracle == 0, bad_oracle, (int) N,
+            0.0, "words differ - the wrapper converted the wrong fixture");
+    ctx.free(bx); ctx.free(by);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -13706,6 +14040,14 @@ int main(int argc, char** argv) {
     // same shared-RNG reason as every batch above.
     case_bf16_gemv(ctx, dir);                    // bf16_gemv       (1 thread/row; split=false call sites)
     case_bf16_gemv_split(ctx, dir);              // bf16_gemv_split (1 workgroup/row; split=true call sites)
+    // I2: THE DOORBELL REPLACEMENT AND THE FIRST THREE GLUE ENTRY POINTS.  APPENDED last for the same
+    // shared-RNG reason as every batch above.  The doorbell case drives vulkan/src/device/sync.*; the three
+    // entry cases drive the wrappers in vulkan/src/kernels/elementwise_vk.cpp (silu_inplace, scale_inplace,
+    // f32_to_bf16_bulk - the first three the layer body reaches, layer.cpp:257/276/290).
+    case_sync_handoff(ctx, dir);                 // the doorbell's fence + host-driven handoff, ordering pinned
+    case_silu_inplace_entry(ctx, dir);           // silu_inplace      -> silu_f32.spv
+    case_scale_inplace_entry(ctx, dir);          // scale_inplace     -> scale.spv
+    case_f32_to_bf16_entry(ctx, dir);            // f32_to_bf16_bulk  -> f32_to_bf16.spv
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.
