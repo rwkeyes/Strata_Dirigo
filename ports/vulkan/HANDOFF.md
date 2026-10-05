@@ -1,185 +1,162 @@
-# Handoff - host `vega`, the Arc swap, and the Strata Vulkan port
+# Handoff - the Vulkan port after the sampler, the embedding gather, and the move to the 7900 XTX
 
-Written 2026-10-04 at the end of a long working session.  It assumes you know nothing about that session, so it
-states what is true, what was measured, and what is genuinely unknown.  Read this first, then `NEXT.md`'s top
-block (the port's own resume point), then `STATUS.md`.
+Written 2026-10-04 at the end of a long session, and it SUPERSEDES the earlier handoff on this host (whose machine
+facts still hold: `vega` has the Intel **Arc Pro B70**, the display is on the **Ryzen iGPU**).  **Keep the earlier one
+to hand** - it is commit `d595375`, readable with `git show d595375:ports/vulkan/HANDOFF.md`, and it carries what this
+document does not: the Arc swap and why it happened, the BOOT FAILURE and its cause, the NVMe staging that is a husk
+of symlink stubs (`~/strata-gguf-iq3/flat/`), `~/start-strata-flash-next.sh` and its preflight, and the measurement
+caveats.  This document is about the PORT.  It assumes you know nothing about this session, so it states what is true,
+what was measured, and what is genuinely unknown.  Read this first, then `NEXT.md`'s top block, then `STATUS.md`, then
+`PORT-MAP.tsv`.
+
+Repo: `/home/bob/strata-vulkan-wt`, branch `vulkan-arc-port`, tree clean at `d1237ee`.
+Gate on this box: **Arc 272 passed / 0 failed / 0 skipped**, llvmpipe 260/0/3, radeon-iGPU 263/0/2, `run_gate.sh` exit 0.
 
 ---
 
-## 1. What changed on the machine (and the one thing that broke it)
+## 1. What this session added (all committed)
 
-The host gained an **Intel Arc Pro B70** and lost the **AMD Radeon RX 7900 XTX**.  The monitor stayed on the
-**AMD Ryzen iGPU** (Raphael, `gfx1036`), which is where it was before - the discrete card never drove a display
-here and still does not: the Arc owns **no connectors at all** (`probe_display=0` below).
-
-| | |
+| commit | what |
 |---|---|
-| discrete GPU | `03:00.0` Battlemage G31 [Arc Pro B70] `[8086:e223]`, driver **`xe`**, no `force_probe` needed |
-| memory | 32 GiB VRAM (31.89 GiB usable, fully CPU-accessible), ReBAR on (Region 2 = 32G prefetchable) |
-| firmware | GuC `bmg_guc_70.bin` 70.44.1, HuC `bmg_huc.bin` 8.2.10 - loaded from the **.zst** blobs |
-| display | the **iGPU**: `card2-HDMI-A-1` connected.  Note the connector was `HDMI-A-2` with the Radeon in |
-| second implementation | the iGPU itself, via RADV (`gfx1036`, 4 SIMDs) - the gate's radeon arm now picks it |
-| third | llvmpipe (`lvp_icd`), as always |
+| `dd9fd17` | **descriptor offsets** - the recorded blocker between the port and the engine, retired.  `Buf` gained a view offset, the single descriptor-write site honours `VkDescriptorBufferInfo::offset`, and the measured alignment is **4 bytes** on the Arc (not the 64 a comment claimed), so the engine's `X + t0*K` row slices are bindable as they stand. |
+| `5da8ba4` | **`sampler_greedy.comp`** - the `--temp 0` path with the penalty pair, and the first TOKEN this port can emit. |
+| `5066380` | **`sampler_kernel.comp` + `common/philox.glsl`** - the general path: penalties, top-k, top-p, min-p, temperature, the softmax, and one Philox draw. |
+| `11a84f4`, `0925a58` | **`PORT-MAP.tsv`** - every `kernels::` symbol the DECODE path calls, classified, with a checker wired into the gate. |
+| `a304dad` | the map corrected: `iq_embed_rows` is GPU work, not host-side bookkeeping (found by reading its header). |
+| `d1237ee` | **`embedding_gather.comp`** - packed codes + per-group scales -> float rows, and the `precise` finding. |
 
-**A boot failure that looks like hardware and is not.**  Six consecutive boots froze at the Plymouth splash with
-a dead keyboard.  The cause was a file the previous session wrote to "pin" the display:
+Gate totals moved 238 -> 272 verdicts.  Everything landed with the usual discipline: a gated case, falsification by
+injection, three implementations, and the docs kept current.
 
-```
-/var/log/Xorg.0.log:  (EE) open /dev/dri/card0: No such file or directory
-                      (EE) No devices detected.  (EE) no screens found
-journal:              sddm: Attempt 1..3 starting the Display server on vt 2 failed
-journal:              amdgpu 0000:1a:00.0: [drm] REG_WAIT timeout - optc31_disable_crtc line:145
-```
+---
 
-The amdgpu X driver resolved an explicit `BusID "PCI:0:26:0"` to `/dev/dri/card0`, which does not exist here (the
-iGPU is `card2`, the dGPU was `card1`).  X found no devices, SDDM gave up after three attempts, and the last frame
-stayed on screen - which reads exactly like a hard freeze, and happened with **either** card installed because the
-config was GPU-independent.  The kernel's `REG_WAIT timeout` is a red herring; it is the symptom of the failed
-modeset, not failing hardware.
+## 2. THREE FINDINGS A FRESH SESSION MUST NOT RE-DERIVE
 
-**Current state:** `/etc/X11/xorg.conf.d/` holds only `00-keyboard.conf`.  Nothing pins the display, and nothing
-should: with the monitor on the iGPU and the discrete card having no connected output, X picks the iGPU itself.
-**Never pin a display by BusID on this box** - if it is ever genuinely required, prove it on a spare VT and read
-`/var/log/Xorg.*.log` for `(EE)` before rebooting into it.  The boot is healthy today (`sddm active`, zero
-"Could not start Display server" lines).
+1. **`precise` is load-bearing.**  A driver may FUSE a multiply and an add unless the result is qualified `precise`,
+   even though the SPIR-V contains no fma op.  GLSL's default permits *contraction*; one fused op rounds ONCE where
+   the engine's `__fmul_rn` + `__fadd_rn` round TWICE, and the engine compares bitwise.  Measured: four of six
+   embedding arms failed before `precise`, and the two that passed were those whose products happen to be exact --
+   that signature is what identified the cause.  **This applies to any kernel ported to match an engine that controls
+   its rounding.**
+2. **The sampler's two "fixable" behaviours.**  The penalties belong on the RAW logits, exactly ONCE, before the
+   filters (the source records having applied them a second time after the temperature).  And **`temperature == 0` is
+   NOT greedy**: `inv_t` is zero, so every survivor scales to zero and the draw is UNIFORM over the shortlist; greedy
+   is the separate path.  "Fix" either and every zero-temperature token changes.  Also: the engine's Philox uses
+   **its own constants** (`0x9E3779B9 / 0xBB67AE85`), not Random123's (`0xD2511F53 / 0xCD9E8D57`) - a swap yields a
+   perfectly good generator producing different numbers, which reads as "the model got a bit worse".
+3. **The grid is the CAPACITY, not the live count** - the engine's own rule, measured through the record/replay path
+   (capacity grid -> 8/8 rows after replay; live-count grid -> 6/8).
 
-Two files survive from the swap preparation, both benign:
+---
 
-- `/etc/modprobe.d/50-xe-compute-only.conf` -> `options xe probe_display=0`.  Inert with no Intel GPU; with the Arc
-  it keeps the card out of the display path, which is what we want.  Untested against the card before it was
-  written; the card behaves as intended.
-- `/etc/default/grub` was edited (by the user, while fighting the wrong cause): `idle=nomwait amdgpu.gpu_recovery=1`
-  were added, `pci=realloc` predates it.  All benign.  **`nomodeset` lives only in the recovery entries - do not
-  copy it into the defaults**, or normal boots lose the display driver too.
+## 3. THE TARGET GPU MOVED: the 7900 XTX IS IN z820b NOW
 
-## 2. The engine cannot run on this box, and that is measured
+* **`vega`** = the Intel **Arc Pro B70** (the port's development box) + the Ryzen iGPU driving the display.  There is
+  **no AMD dGPU here any more** - the 7900 XTX was moved out, which is exactly what a fresh session must not assume
+  (the earlier handoff's machine section is stale on this point).
+* **`z820b`** = `192.168.1.116` (`bob`, ssh key works) - HP Z820, 2x E5-2687W (**AVX1-only, no AVX2**), 92 GB RAM,
+  **AMD Radeon RX 7900 XTX 24 GiB as "AMD Radeon RX 7900 XTX (RADV NAVI31)"**, RADV, Mesa 26.0.8, api 1.4.335, plus
+  a Quadro K620 on the NVIDIA driver.  `/opt/rocm` exists.  **It suspends when idle (~2700 s) and needs a manual
+  wake** - keep work brisk, use ssh keepalives.
+* **The port is already copied there**: `~/strata-vulkan-wt` (7.8 MB: `include/`, `src/`,
+  `ports/vulkan/{harness,shaders,gates,tools}` + the docs).
+* **THE COPY NEEDS `third_party/ggml/ggml-common.h`.**  Without it the gate's generated-table check
+  (`tools/gen-iq-tables.py --check`) fails and the run ABORTS BEFORE ANY KERNEL - measured on the first attempt.
+  Copy it together with the rest:
+  `tar czf - include src third_party/ggml/ggml-common.h ports/vulkan/{harness,shaders,gates,tools} ports/vulkan/*.md ports/vulkan/*.tsv | ssh bob@192.168.1.116 'tar xzf - -C ~/strata-vulkan-wt'`.
+  Do **not** copy `ports/vulkan/logs` (246 MB of gate logs) and do not bother with `*.spv` (gitignored; the gate
+  compiles and validates them itself).
+* **Run the gate there:**
+  `cd ~/strata-vulkan-wt && STRATA_VK_DESKTOP_RESERVE_MIB=0 STRATA_VK_RESERVE_FLOOR_MIB=0 bash ports/vulkan/gates/run_gate.sh`
+  The cross-implementation arm will pick up radeon (the XTX), llvmpipe, and possibly the K620 - an old device failing
+  cases there is a DATA POINT, not a defect in the port.
 
-The resident model (`qwen3.8-flash-next-coder-iq1_m`, a 58 GB MoE) was served by Strata's **HIP** engine built for
-**gfx1100**.  With the 7900 XTX gone there is no HIP device:
+---
 
-```
-$ strata generate --pack ... --tokens ...        # the real thing, not a simulation
-strata generate: PCIe probe: 12.9 GB/s host->device ...
-strata generate: native pack: .../packs/coder-iq1_m experts ...
-strata generate: cudaMemcpy failed for blk.0.ffn_gate_inp_shexp.weight
-```
+## 4. HOW MUCH FURTHER TO SOMETHING THAT GENERATES TOKENS
 
-The kernel's own topology is the authority, not the runtime's enumerator:
+`PORT-MAP.tsv` (checked by the gate) classifies **every** `kernels::` symbol the decode path (`src/core/`) calls:
+**77 symbols - 18 kernel, 49 host, 10 todo.**  The inference core is done and gated: attention, the KV cache in all
+four modes (f16 / q8 / q4 / hybrid), the QSA block selection, the embedding gather, the router top-10, the quantised
+matvec family, rms_norm / rope / silu / swiglu - and **both samplers, so the port can turn logits into a token**.
 
-```
-/sys/class/kfd/kfd/topology/nodes/1/properties:  gfx_target_version=100306   (gfx1036, the iGPU)
-$ rocm_agent_enumerator                          gfx1100                     (stale - the departed card)
-```
+**The ten holes, all GPU work this port has not done:**
 
-Consequences, all current:
+    cvec_apply  gather_rows  scatter_rows_f32  iq_dequant_f32  iq_embed_rows
+    native_q5_k_f32  moe_grouped_s2  moe_hit_add  moe_hit_select  moe_hit_grouped_s2
 
-- **`strata-coder.service` is stopped AND disabled** (so a reboot does not crash-loop it against a missing GPU).
-  Re-enable it only when a HIP-capable GPU is back.
-- **Hermes delegation to `:18110` has no backend.**  The alternative tunnel (`ornith-tunnel.service` -> z820a
-  Ornith-1.5-9B `@127.0.0.1:18400`) is **inactive** too.  Expect local subagents to fail.
-- `/etc/modprobe.d/50-xe-compute-only.conf` and the display config are the only persistent changes from the swap.
+**Three things stand between here and tokens, in order:**
 
-## 3. What was measured with the model, and what it is NOT
+1. **Those ten kernels.**  Roughly one increment each (shader + gated case + falsification + docs) at the rate this
+   port has been moving.  Five or six of them are the MoE/expert half.
+2. **The backend does not exist in the engine.**  Backend selection is COMPILE-TIME macro driven
+   (`STRATA_ENABLE_CUDA` / `_HIP` / `_SYCL`; there is no `_VULKAN`), and each GPU entry point is a thin wrapper in a
+   header calling the backend's implementation (`kv_q4.hpp`: `fwht256_inplace_cuda(...) { fwht256_cuda(...); }`), with
+   per-backend translation units behind it.  This is **integration**, 3-5 increments of a different kind: the numeric
+   gate proves KERNELS, it says nothing about a PROGRAM, and that is where the surprises are.  The port's
+   `harness/vk_compute.*` is the seed of the device layer (arena, grow-on-demand descriptor pool, view offsets).
+3. **58 GB of weights against 24 GiB of VRAM.**  The engine's expert file-tier streaming is required, not optional.
+   It is host-side and already in the engine (the map's `kv_stream_*` rows), but the Vulkan path has to satisfy its
+   residency assumptions.  Feed the prompt through the DECODE path so the batched-prefill port (~250 KB) stays
+   deferred - slow but real.
 
-llama.cpp's Vulkan build (`~/llama-050/build-vulkan`, device 0 = the Arc) with the model's **NVMe** shards, experts
-split between the card and CPU threads:
+**Milestones worth judging:**
 
-| expert placement | pp64 | tg32 |
-|---|---|---|
-| all 48 layers' experts on CPU (Arc does attention/shared only) | 15.75 t/s | 10.03 t/s |
-| **24/48 layers' experts on the Arc** | **25.72 t/s** | **13.72 t/s** |
-| the same with the page cache dropped (cold) | 24.35 t/s | 13.65 t/s |
+* **M-A** - the decode path's last kernels gated: the map's `todo` column reaches zero for the inference half.
+* **M-B** - **ONE LAYER, end to end, on the GPU with random weights.**  The first thing that proves the BACKEND
+  rather than the kernels, and it needs no model at all.  Make it a gate case: a Vulkan-backed single-layer forward
+  pass.
+* **M-C** - the real model emitting a token, on llvmpipe first (deterministic, no VRAM ceiling), then on the 7900 XTX.
 
-Storage, measured directly on the shards (`dd`, 4M direct): **NVMe 2.7 GB/s vs USB disk 250 MB/s**.
+**Estimate: ~2-3 more sessions of this size.**  The kernels are the predictable half (~1); the integration is 1-2 and
+carries the risk.
 
-**Read the caveats as carefully as the numbers.**
+**A shortcut that was considered and REJECTED by the user: the CPU hybrid.**  The engine's CPU expert/MoE
+implementations (`src/kernels/cpu/`: expert, native_expert, iq_avx2/512, kq_avx1/2, q2_avx2, router, pool) are
+always compiled in and used unconditionally for layout and routing, so a "GPU attention + CPU experts" mode is
+architecturally plausible and would skip five or six kernels.  The user's instruction was explicit: **no CPU path -
+the target is the 7900 XTX.**  Do not re-open it.
 
-- **This is llama.cpp, not Strata.**  Strata's engine cannot run here (§2).
-- **It is not comparable to the 62-92 t/s Strata did on the 7900 XTX** (same box, different software, different
-  expert placement, different cache design).  Reading 13.72 against 92 as a regression is a category error.
-- The cold run **refuted** the expectation that the page cache was hiding the NVMe: ~5% prefill, 0.5% decode.  At a
-  64-token prompt too few experts are touched for the disk to matter; the NVMe's speed shows at long contexts and
-  large batches.
-- `ggml_vulkan` reports **`int dot: 0`** for the Arc, i.e. no integer-dot-product path for the sub-4-bit kernels -
-  the likely reason the card's contribution is +37-63% rather than multiples.  Worth investigating: the port's own
-  device query *does* see `VK_KHR_shader_integer_dot_product` as an extension, so this may be a detection or
-  feature-enablement gap rather than absent hardware.
+---
 
-## 4. The Strata -> Arc Vulkan port: where it stands
+## 5. THE DISCIPLINE (unchanged - it is what makes the numbers mean anything)
 
-Living in `~/strata-vulkan-wt` (worktree of the fork, branch **`vulkan-arc-port`**), the port itself under
-`ports/vulkan/`.  Read `NEXT.md`'s top block first; `gates/run_gate.sh` is the only authority on coverage.
+* **Every case is falsified**: inject the wrong rule, confirm the arm fails, revert, and record honest negatives.
+  An injection that silently does not apply is worse than none - the script must print `ANCHOR MISSED` or
+  `DID NOT COMPILE` rather than run the stale binary, and must recompile the shader that INCLUDES a changed file.
+* **The fixture's margin must serve the arm's CLAIM.**  Reachable is not ordered (a head that appears under either
+  ordering proves nothing - use a one-token shortlist); a majority test is noise-dominated once probabilities
+  compress; a membership check cannot see too FEW survivors; equal logits make a scaling factor irrelevant.  Give
+  every arm a stated expected value and check it against the oracle too, so a stale fixture fails loudly.
+* **Three implementations, every run**, plus the target: the cross-implementation arm always runs.
+* **The gate's own printed totals are the authority**, and a skipped case is not a passing one.
+* **Known environment, not a defect:** the radeon ICD intermittently fails `budget: independent requery agrees`
+  (the driver's figure drifts ~2.8 MB against a 1.7 MB tolerance; an older commit reproduces it).  Re-run; record it.
 
-**State: the port's kernel suite runs on the Arc.**
+---
 
-```
-intel_icd  (Arc Pro B70, BMG G31)   156 passed, 0 failed, 1 skipped
-lvp_icd    (llvmpipe)               154 passed, 0 failed, 1 skipped
-radeon_icd (AMD iGPU, RADV)         155 passed,  1 failed, 1 skipped
-```
+## 6. OPEN ITEMS
 
-- The Intel **skip** is `gemm_coopmat`: this device reports no usable M16N16K16 subgroup-scope f16 -> f32 config.
-  The gate exits non-zero on any skip by its own rule ("a skipped case is not a passing one"), so **the Arc's exit
-  code is 1 with zero failures** - read the totals, not the exit code, and say which you are quoting.
-- The iGPU's single failure is `budget: independent requery agrees`: an integrated GPU's free figure is system RAM
-  shared with the OS, so two queries disagree by construction.  Left red on purpose (documented in `STATUS.md`).
-- The one **device-specific kernel defect found so far** was `quantize_q8_K` on the Arc, off by one byte in a
-  block's scale: the driver FOLDS `1.0f/(-127/mx)` into `mx/-127`.  The case now carries both forms as images,
-  demands a byte-exact match to one, and prints which (`Arc -> folded, iGPU -> source`).  Commits `c8d32c4`.
+1. **The 7900 XTX gate run** - the first run on the target, pending the `third_party` copy (section 3).  Expect
+   gfx1100-specific findings from the coopmat / fp64 / shared-memory probes; the port's reductions are barrier trees
+   on purpose, so they do not depend on subgroup size (RDNA3 offers wave32/wave64 against the Arc's 32).
+2. **The sampler's remaining variants**: split-warp and coupled/draft-staging (speculative decoding), the
+   `sample_tokens` entry point that chooses between the paths, and the **portable f32 sibling** every other double
+   kernel in this port has (the Arc here reports `fp64 = 1` while Intel's own article says Arc has none - the case
+   SKIPS rather than passes on a device without fp64).
+3. **The ten kernels** of section 4, in whatever order the first-token path wants them.
 
-**The Battlemage stability question is answered for the loads tested.**  `gates/smoke-arc.sh` ran 8 concurrent
-instances for 8 minutes: **5,744 suite runs (~890k case executions), 0 kernel failures, 0 hangs, 0 xe errors, no
-latency creep**, after 502 sequential runs likewise clean.  The card did **not** wedge - the open bug
-(`intel/compute-runtime#948`) did not reproduce.  The plan's own bar is "an hour of inference", so the honest claim
-is "has not wedged under the loads tested"; an inference-shaped arm is what would close that gap.
+---
 
-## 5. What to do next, in order
+## 7. WHERE THE DOCS LIVE
 
-1. **Stage 3, the remaining step: `case_recorded_step`.**  The API is written and compiling
-   (`Ctx::record_begin` / `record_dispatch` / `record_end_and_submit` / `replay_recorded`, commit `55555ca`), and
-   the refactor it rests on is verified by the full existing suite.  The **new calls are exercised by no case**, so
-   they are not evidence yet.  The case's design is in `NEXT.md`: three chained copies of the harness's own copy
-   kernel; the single-shot `dispatch()` path as the reference; then **write NEW bytes into the source and replay** -
-   which no re-recording path can pass.  Also outstanding: the destructor does not destroy `rec_fence_`.
-2. **Stage 4** - device-local memory + staging + `VK_EXT_memory_budget` fit accounting (the gate currently uses
-   host-visible memory only, which is correct for a gate and wrong for a benchmark).
-3. **Stage 5** - the hand-written GEMM / prefill path.  The plan calls this "the only part that is genuine
-   engineering rather than translation. Multi-day."  Do not promise a date before it is done.
-4. **Stage 6** - engine integration: `STRATA_ENABLE_VULKAN`, the arena, `gpu_arch_problem` for Intel.  **Its
-   verification changed**: the plan says to compare tokens against the HIP build, and this box can no longer produce
-   one (§2).  Use the engine's CPU oracle on the same inputs, or a token stream captured pre-swap if one exists.
-
-## 6. Traps that cost time in this session (so they do not cost yours)
-
-- **`pkill -f` with a pattern that also appears in your own command line kills your own shell.**  The bracket trick
-  (`[s]moke-arc`) does *not* save you if the literal name appears elsewhere in the same command - a log path was
-  enough.  Kill by PID, or from a pattern that cannot appear in your own line.
-- **A test that creates and removes a file needs a per-process path.**  `case_firmware_variants` used one fixed
-  `/tmp/...` name; under 8 concurrent instances one cleanup deleted the file another was reading (2 of 8 jobs),
-  invisible in 502 sequential passes.  Fixed with `/tmp/<name>-<pid>/`.
-- **Two harness checks are incompatible with a busy card by construction** (`budget: independent requery agrees`,
-  `stack: resolvable ICD not flagged`).  `smoke-arc.sh` classifies them; an explicit ceiling does **not** stabilise
-  the requery (measured: still 8/8 with 16 GiB set).
-- **A recorded step needs one descriptor set per dispatch** - host updates happen at record time, dispatches run at
-  submit time, so a shared set leaves every dispatch reading the last binding.  Caught before it produced a wrong
-  token; the same class as the grouped-expert wave's wrong-buffer read.
-- **`vulkaninfo`'s ICD filename is `intel_icd.json` here, not `intel_icd.x86_64.json`.**  A wrong
-  `VK_ICD_FILENAMES` silently yields no device and an empty summary.
-- **The Vulkan loader is older than the drivers advertise** (`libvulkan.so.1.3.275` vs ICDs claiming 1.4.318/1.4.329).
-  Harmless so far; suspect it first if a documented extension is missing.
-- **The kernel wants GuC 70.54.0** for the Arc and this box ships 70.44.1 (`linux-firmware` update would clear it;
-  the only consequence seen is SR-IOV PF migration being disabled, which we do not want).
-- **Mesa is 25.2.8**, below the 26.2 floor the port's own rules name for trusting a driver-backed free-memory
-  figure on Intel - so the explicit-ceiling path (`STRATA_VK_MAX_BUDGET_MIB`) is the one that matters here.
-
-## 7. Loose ends outside the port
-
-- **The USB disk (12.7 TB, `sda`) holds the Strata packs** (`Strata-data/packs` is a symlink into it) and the base
-  models' shards.  With it unplugged no model loads at all - the NVMe holds only the coder's GGUF shards.  The pack
-  for the coder model is **1406 MiB**, so it could be staged on the NVMe to make that model disk-independent; not
-  done.
-- **The NVMe staging of the base models is a husk**: `~/strata-gguf-iq3/flat/` holds 88- and 125-byte symlink stubs
-  from an aborted HuggingFace download, 4K of real data.  Re-staging needs 44 GB against 27 GB free.
-- **`~/start-strata-flash-next.sh`** (home dir) starts the coder model from the NVMe shards; its preflight is what
-  caught the missing pack.  It cannot start anything today (§2), and its default is the NVMe checkpoint.
-- **The Hermes desktop app runs on this box; never kill or suspend it.**
+* `ports/vulkan/NEXT.md` - the resume point at the top, then one section per landed increment (each states the rule
+  ported, the traps, the evidence, and what the falsification found).
+* `ports/vulkan/STATUS.md` - the gate's totals per implementation and the notable entries.
+* `ports/vulkan/PORT-MAP.tsv` + `ports/vulkan/tools/{make,check}_port_map.py` - the checked classification of the
+  decode path; the gate fails if it drifts from the engine or from the built shaders.
+* `ports/vulkan/RUN-ON-B70.md` - the plan from "kernels" to "a running engine" (retitle it for the XTX).
+* `ports/vulkan/plan/PORT-PLAN.md` - the six stages of the port itself.
+* The skill **`vulkan-compute-shader-porting`** - the accumulated lessons (contraction and `precise`, the
+  decorative-arm trap, the fixture-margin rules, glslang's `ull` and subscript quirks, pinning an RNG through an
+  observable decision, and the "improvements a careful port would make" that need arms).
