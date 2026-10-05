@@ -21,7 +21,9 @@ each one - is `ports/vulkan/plan/BACKEND-INTEGRATION.md`.  Read that first; this
         sync.hpp/.cpp                    (I2) the DOORBELL REPLACEMENT: the fence + host-driven handoff
       src/kernels/
         fwht_vk.cpp                      the fwht256 entry point: strata::kernels::fwht256_cuda + fwht256
-        elementwise_vk.cpp               (I2) silu_inplace / scale_inplace / f32_to_bf16_bulk
+        elementwise_vk.cpp               (I2) silu_inplace / scale_inplace / f32_to_bf16_bulk + the I2c glue
+        doorbell_vk.cpp                  (I2b) the five doorbell_* symbols (device<->host, from sync.*)
+        gdn_vk.cpp                       (I2d) the first six GDN / DeltaNet mixer entry points (the layer body)
         native_caps_vk.cpp               the native_*_enabled() capability answers the backend owns
       tests/
         entry_point_smoke.cpp            strata_vk_entry_smoke: builds + RUNS the entry points via the wrappers
@@ -134,10 +136,29 @@ user's call; `ports/vulkan/NEXT.md`'s I2-continued section reports it and does n
   with the shader path AND with the case's explicit oracle (`case_*_entry` in `ports/vulkan/harness/vk_gate.cpp`,
   each pinned to the harness device with `EnginePin`).  `strata_vk_entry_smoke` now RUNS all five too.
 * **The LINK PROGRESS (the port's progress bar toward a layer that LINKS):** the one-layer-body link
-  (`src/core/layer.cpp` vs `libstrata_vulkan_kernels.a` + `libstrata_vulkan_device.a`) moved **214 -> 204
-  undefined references / 80 -> 73 distinct `strata::kernels::` symbols**.  THIS batch accounts for two of those
+  (`src/core/layer.cpp` vs `libstrata_vulkan_kernels.a` + `libstrata_vulkan_device.a`) moved **214 -> 204**
+  undefined references / **80 -> 73** distinct `strata::kernels::` symbols.  THIS batch accounts for two of those
   seven (`cvec_apply`, `cvec` - the only two of the five `layer.cpp` itself reaches); the other five are I2b's
   glue/`doorbell_*` that `layer.cpp` also calls and the "backend answers 4" baseline predates.  The remaining 73
   are grouped in `ports/vulkan/NEXT.md`'s I2-continued-further section, with the reproducing command.
+
+## What I2 continued-further-still adds (2026-10-05)
+
+* `vulkan/src/kernels/gdn_vk.cpp` (new) - **the first six GDN / DeltaNet MIXER entry points** the layer body
+  reaches, in the order `gdn_layer` (`src/core/layer.cpp:223`, the mixer for 36 of the 48 layers) reaches them:
+  `fused_gdn_conv_l2` (:250), `native_gdn_conv_silu` (:253), `gdn_conv_step` (:255), `native_gdn_l2_norm`
+  (:266/267), `gdn_l2_norm` (:269/270) and `fused_gdn_ab` (:287).  Engine headers unchanged.  Each is proved by a
+  new `case_*_entry` in the port's gate through the ENGINE WRAPPER, BITWISE against the port's own shader path AND
+  against the case's explicit oracle (a double transcription of the engine's own CUDA body), pinned to the harness
+  device (`EnginePin`); the conv cases compare the slid state bitwise too.  `strata_vk_entry_smoke` runs all six.
+* **No `host` row was needed:** the only row the six reach is `native_gdn_enabled()`, already answered by
+  `native_caps_vk.cpp`.  None of them reads module state (unlike `cvec_apply`); they carry the CUDA wrappers'
+  argument contracts (`d_conv == 4`, `channels % 128 == 0`, `n_embd % 8 == 0`) as loud refusals.
+* **The LINK PROGRESS moved `204 -> 196` undefined references / `73 -> 67` distinct `strata::kernels::` symbols**
+  (the six this batch answers; all six references `layer.cpp` makes).  The remaining 67, grouped by subsystem
+  (glue 0 - matvec/GEMV/KV 21 - attention/QSA/MoE/GR/PLE/rope 36 - GDN mixer 8 - other 2), are at the top of
+  `ports/vulkan/NEXT.md`'s I2-continued-further-still section, with the reproducing command.
+* **Left in the mixer:** the remaining 8 GDN symbols (the beta/gate and step/norm stages, including
+  `fused_gdn_step_norm`).
 
 

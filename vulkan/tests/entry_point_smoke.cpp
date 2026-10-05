@@ -12,6 +12,9 @@
 #include "strata/kernels/elementwise.hpp"   // the engine's wrappers: silu/scale/f32_to_bf16 (+ add/scale/f16/scatter)
 #include "strata/kernels/verify_kernels.hpp"  // the engine's wrapper: gather_rows
 #include "strata/kernels/cvec.hpp"          // the engine's wrapper + module: cvec_apply / cvec_upload
+#include "strata/kernels/gdn.hpp"                 // gdn_conv_step / gdn_l2_norm
+#include "strata/kernels/fused_gdn.hpp"           // fused_gdn_conv_l2 / fused_gdn_ab
+#include "strata/kernels/native_gdn_preprocess.hpp"  // native_gdn_conv_silu / native_gdn_l2_norm
 #include "strata/kernels/bf16_bits.hpp"     // bf16_from_f32: the engine's own converter, included not transcribed
 #include "strata/kernels/f16_bits.hpp"      // f16_from_f32: ditto, for f32_to_f16_bulk
 #include "strata/vulkan/vk_backend.hpp"
@@ -435,6 +438,194 @@ int main(int argc, char** argv) {
             }
         std::printf("  cvec_apply wrapper vs double oracle (worst abs %.3g); upload %s\n", worst, up ? "ok" : "FAILED");
         check("cvec_apply (project) via the module + wrapper", worst <= 1e-4 && up);
+    }
+
+    // ---- I2 (the GDN / DeltaNet MIXER): the six wrappers in vulkan/src/kernels/gdn_vk.cpp -----------------
+    // Each is checked against a small hand-written oracle so a build that runs but computes nothing is caught;
+    // the numeric proof (wrapper == the ported shader path, bitwise, and vs the case's oracle) is the gate.
+    {   // gdn_conv_step: the legacy four-tap conv, out + the slid state
+        const int C = 8, dc = 4;
+        const size_t hist = (size_t) C * (dc - 1);
+        std::vector<float> cs(hist), x((size_t) C), kw((size_t) C * dc);
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc - 1; ++i) cs[(size_t) c * (dc - 1) + i] = (float) (10 * (i + 1) + c);
+        for (int c = 0; c < C; ++c) x[(size_t) c] = 100.0f + (float) c;
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc; ++i) kw[(size_t) c * dc + i] = ((i & 1) ? -1.0f : 1.0f) * (float) (i + 1);
+        float* dcs = strata::vulkan::arena_alloc<float>(*s, hist);
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) C * dc);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        strata::vulkan::stream_write(*s, dcs, cs.data(), hist * 4);
+        strata::vulkan::stream_write(*s, dx, x.data(), (size_t) C * 4);
+        strata::vulkan::stream_write(*s, dw, kw.data(), (size_t) C * dc * 4);
+        strata::kernels::gdn_conv_step(dcs, dx, dw, dout, C, dc, s);
+        std::vector<float> got((size_t) C);
+        strata::vulkan::stream_read(*s, dout, got.data(), (size_t) C * 4);
+        int bad = 0;
+        for (int c = 0; c < C; ++c) {
+            double acc = 0;
+            for (int i = 0; i < dc - 1; ++i) acc += (double) cs[(size_t) c * (dc - 1) + i] * kw[(size_t) c * dc + i];
+            acc += (double) x[(size_t) c] * kw[(size_t) c * dc + dc - 1];
+            if (!(std::fabs((double) got[(size_t) c] - acc) <= 1e-5 * (std::fabs(acc) + 1.0))) ++bad;
+        }
+        check("gdn_conv_step vs the four-tap rule (double)", bad == 0);
+    }
+    {   // native_gdn_conv_silu: the fused conv + SiLU, both outputs
+        const int C = 8, dc = 4;
+        const size_t hist = (size_t) C * 3;
+        std::vector<float> cs(hist), x((size_t) C), kw((size_t) C * dc);
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < 3; ++i) cs[(size_t) c * 3 + i] = (float) (10 * (i + 1) + c);
+        for (int c = 0; c < C; ++c) x[(size_t) c] = 100.0f + (float) c;
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc; ++i) kw[(size_t) c * dc + i] = ((i & 1) ? -1.0f : 1.0f) * (float) (i + 1);
+        float* dcs = strata::vulkan::arena_alloc<float>(*s, hist);
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) C * dc);
+        float* draw = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        float* dsil = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        strata::vulkan::stream_write(*s, dcs, cs.data(), hist * 4);
+        strata::vulkan::stream_write(*s, dx, x.data(), (size_t) C * 4);
+        strata::vulkan::stream_write(*s, dw, kw.data(), (size_t) C * dc * 4);
+        strata::kernels::native_gdn_conv_silu(dcs, dx, dw, draw, dsil, C, dc, s);
+        std::vector<float> gr((size_t) C), gs((size_t) C);
+        strata::vulkan::stream_read(*s, draw, gr.data(), (size_t) C * 4);
+        strata::vulkan::stream_read(*s, dsil, gs.data(), (size_t) C * 4);
+        int bad = 0;
+        for (int c = 0; c < C; ++c) {
+            double sum = 0;
+            for (int i = 0; i < 3; ++i) sum += (double) cs[(size_t) c * 3 + i] * kw[(size_t) c * dc + i];
+            sum += (double) x[(size_t) c] * kw[(size_t) c * dc + 3];
+            if (!(std::fabs((double) gr[(size_t) c] - sum) <= 1e-5 * (std::fabs(sum) + 1.0))) ++bad;
+            const double silu = sum / (1.0 + std::exp(-sum));
+            if (!(std::fabs((double) gs[(size_t) c] - silu) <= 1e-5 * (std::fabs(silu) + 1.0))) ++bad;
+        }
+        check("native_gdn_conv_silu vs the conv+SiLU rule (double)", bad == 0);
+    }
+    {   // fused_gdn_conv_l2: conv + SiLU + the per-head L2 norm over the q/k heads
+        const int C = 256, qk = 1, dc = 4;
+        const size_t hist = (size_t) C * 3;
+        std::vector<float> cs(hist), x((size_t) C), kw((size_t) C * dc);
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < 3; ++i) cs[(size_t) c * 3 + i] = (float) (10 * (i + 1) + (c % 90));
+        for (int c = 0; c < C; ++c) x[(size_t) c] = 100.0f + (float) c;
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc; ++i) kw[(size_t) c * dc + i] = ((i & 1) ? -1.0f : 1.0f) * (float) (i + 1);
+        float* dcs = strata::vulkan::arena_alloc<float>(*s, hist);
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) C * dc);
+        float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) C);
+        strata::vulkan::stream_write(*s, dcs, cs.data(), hist * 4);
+        strata::vulkan::stream_write(*s, dx, x.data(), (size_t) C * 4);
+        strata::vulkan::stream_write(*s, dw, kw.data(), (size_t) C * dc * 4);
+        strata::kernels::fused_gdn_conv_l2(dcs, dx, dw, dh, C, qk, 1e-6f, s);
+        std::vector<float> got((size_t) C);
+        strata::vulkan::stream_read(*s, dh, got.data(), (size_t) C * 4);
+        std::vector<double> pre((size_t) C);
+        for (int c = 0; c < C; ++c) {
+            double sum = 0;
+            for (int i = 0; i < 3; ++i) sum += (double) cs[(size_t) c * 3 + i] * kw[(size_t) c * dc + i];
+            sum += (double) x[(size_t) c] * kw[(size_t) c * dc + 3];
+            pre[(size_t) c] = sum / (1.0 + std::exp(-sum));
+        }
+        double ysum = 0;
+        for (int c = 0; c < 128; ++c) ysum += pre[(size_t) c] * pre[(size_t) c];
+        const double scale = 1.0 / std::sqrt(ysum + 1e-6);
+        int bad = 0;
+        for (int c = 0; c < C; ++c) {
+            const double head = (c / 128 < qk) ? pre[(size_t) c] * scale : pre[(size_t) c];
+            if (!(std::fabs((double) got[(size_t) c] - head) <= 1e-5 * (std::fabs(head) + 1.0))) ++bad;
+        }
+        check("fused_gdn_conv_l2 vs the conv+SiLU+L2 rule (double)", bad == 0);
+    }
+    {   // native_gdn_l2_norm / gdn_l2_norm: the two L2 rules, both in place
+        const int rows = 2, cols = 128;
+        const uint64_t n = (uint64_t) rows * cols;
+        std::vector<float> x((size_t) n);
+        for (uint64_t i = 0; i < n; ++i) x[i] = (float) ((int) (i % 37) - 18) * 0.25f;
+        float* dx = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+        strata::kernels::native_gdn_l2_norm(dx, rows, cols, 1e-6f, s);
+        std::vector<float> gn((size_t) n);
+        strata::vulkan::stream_read(*s, dx, gn.data(), n * 4);
+        const float inv_sqrt_cols = 1.0f / std::sqrt((float) cols);
+        int bad_nat = 0;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(size_t) r * cols + c]; acc += t * t; }
+            const double sc = 1.0 / std::sqrt(acc / cols + 1e-6 / cols);
+            for (int c = 0; c < cols; ++c) {
+                const size_t i = (size_t) r * cols + c;
+                const double want = sc * x[i] * inv_sqrt_cols;
+                if (!(std::fabs((double) gn[i] - want) <= 1e-5 * (std::fabs(want) + 1.0))) ++bad_nat;
+            }
+        }
+        check("native_gdn_l2_norm vs the native rule (double)", bad_nat == 0);
+
+        strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+        strata::kernels::gdn_l2_norm(dx, rows, cols, 1e-6f, s);
+        std::vector<float> gl((size_t) n);
+        strata::vulkan::stream_read(*s, dx, gl.data(), n * 4);
+        int bad_leg = 0;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(size_t) r * cols + c]; acc += t * t; }
+            const double inv = 1.0 / std::sqrt(acc + 1e-6);
+            for (int c = 0; c < cols; ++c) {
+                const size_t i = (size_t) r * cols + c;
+                const double want = x[i] * inv;
+                if (!(std::fabs((double) gl[i] - want) <= 1e-5 * (std::fabs(want) + 1.0))) ++bad_leg;
+            }
+        }
+        check("gdn_l2_norm vs the eps-on-the-squared-norm rule (double)", bad_leg == 0);
+    }
+    {   // fused_gdn_ab: the BF16 alpha/beta matvec with the softplus/sigmoid epilogues
+        const int n2 = 64, hv = 4;
+        std::vector<uint16_t> wa((size_t) hv * n2), wb((size_t) hv * n2);
+        for (size_t i = 0; i < wa.size(); ++i) {
+            wa[i] = strata::kernels::bf16_from_f32(((i & 1) ? 0.01f : 1.0f) * (float) ((int) (i % 11) - 5) * 0.1f);
+            wb[i] = strata::kernels::bf16_from_f32(((i & 1) ? 0.1f : 1.0f) * (float) ((int) (i % 7) - 3) * 0.1f);
+        }
+        std::vector<float> x((size_t) n2), dt((size_t) hv), sa((size_t) hv);
+        for (int j = 0; j < n2; ++j) x[(size_t) j] = (float) ((j % 9) - 4) * 0.02f;
+        for (int r = 0; r < hv; ++r) { dt[(size_t) r] = (float) r * 0.05f; sa[(size_t) r] = -0.5f - (float) r; }
+        dt[0] = 30.0f;
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) n2);
+        uint16_t* dwa = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) hv * n2);
+        uint16_t* dwb = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) hv * n2);
+        float* ddt = strata::vulkan::arena_alloc<float>(*s, (size_t) hv);
+        float* dsa = strata::vulkan::arena_alloc<float>(*s, (size_t) hv);
+        float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) hv);
+        float* db = strata::vulkan::arena_alloc<float>(*s, (size_t) hv);
+        strata::vulkan::stream_write(*s, dx, x.data(), (size_t) n2 * 4);
+        strata::vulkan::stream_write(*s, dwa, wa.data(), (size_t) hv * n2 * 2);
+        strata::vulkan::stream_write(*s, dwb, wb.data(), (size_t) hv * n2 * 2);
+        strata::vulkan::stream_write(*s, ddt, dt.data(), (size_t) hv * 4);
+        strata::vulkan::stream_write(*s, dsa, sa.data(), (size_t) hv * 4);
+        strata::kernels::fused_gdn_ab(dx, dwa, dwb, ddt, dsa, dg, db, n2, hv, s);
+        std::vector<float> gg((size_t) hv), gb((size_t) hv);
+        strata::vulkan::stream_read(*s, dg, gg.data(), (size_t) hv * 4);
+        strata::vulkan::stream_read(*s, db, gb.data(), (size_t) hv * 4);
+        int bad = 0;
+        for (int r = 0; r < hv; ++r) {
+            double acc = 0, accb = 0, terms = 0;
+            for (int j = 0; j < n2; ++j) {
+                const double wv = strata::kernels::f32_from_bf16(wa[(size_t) r * n2 + j]);
+                const double wvb = strata::kernels::f32_from_bf16(wb[(size_t) r * n2 + j]);
+                acc += wv * x[(size_t) j];
+                accb += wvb * x[(size_t) j];
+                terms += std::fabs(wv * x[(size_t) j]);
+            }
+            const double v = acc + dt[(size_t) r];
+            const double sp = v > 20.0 ? v : std::log1p(std::exp(v));
+            const double want_g = sp * sa[(size_t) r];
+            const double want_b = 1.0 / (1.0 + std::exp(-accb));
+            const double bg_ = 1e-4 * std::fabs(want_g) + 1e-6 * terms + 1e-30;
+            if (!(std::fabs((double) gg[(size_t) r] - want_g) <= bg_)) ++bad;
+            if (!(std::fabs((double) gb[(size_t) r] - want_b) <= 1e-4 * (std::fabs(want_b) + 1.0))) ++bad;
+        }
+        check("fused_gdn_ab vs the gate/beta rule (double, terms-bound)", bad == 0);
     }
 
     strata::vulkan::stream_close(s);

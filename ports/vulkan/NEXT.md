@@ -100,6 +100,87 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I2 (CONTINUED FURTHER-STILL) — THE FIRST SIX GDN / DELTANET MIXER ENTRY POINTS, AND THE LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**LINK PROGRESS (the port's progress bar toward a layer that LINKS): `204 → 196` undefined references, `73 → 67`
+distinct `strata::kernels::` symbols** (and `71 → 65` under the parent's simpler name-only regex that drops the two
+signatures carrying a nested `strata::kernels::GdnShapes` - the `gdn_step` / `native_gdn_step` pair; the full-signature
+NEXT.md pattern below is the one this tree uses).  Re-run the one-layer-body link with (build = the
+`-DSTRATA_ENABLE_VULKAN=ON` CMake build; measured with `/tmp/vkbuild-gdn`):
+
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 \
+        -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o <build>/vulkan/libstrata_vulkan_kernels.a <build>/vulkan/libstrata_vulkan_device.a -lvulkan \
+        -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                     # -> 196
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                              # -> 67
+
+**OF THE SIX-SYMBOL DROP THIS BATCH OWNS ALL SIX.**  `layer.cpp` reaches exactly the six GDN kernels wired here, so
+each one it answers removes its own reference(s) from THIS link (8 raw lines: `native_gdn_l2_norm` and `gdn_l2_norm`
+are called twice each, at :266/267 and :269/270).
+
+**THE REMAINING 67 `strata::kernels::` SYMBOLS, GROUPED (so the next batches plan from a number).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue (the I2 elementwise set)** | **0** | all answered |
+| **matvec / GEMV / KV** | **21** | unchanged: `bf16_gemv`, `bf16_gemv_split`, `bf16_gemv_fp32_mmvf`, `bf16_gemv_fp32_mmvf_cols`, `native_mmvq`, `native_quantize_q8_1`, `quantize_q8_0`, `quantize_q8_K`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `s2_gemv_q8`, `kv_*` (11) |
+| **attention / QSA / MoE / GR / PLE / rope** | **36** | unchanged: the attention/QSA/MoE/GR/PLE/rope set |
+| **GDN / DeltaNet mixer** | **8** | `gdn_beta_gate`, `gdn_step`, `gdn_out_norm`, `native_gdn_beta_gate`, `native_gdn_gate`, `native_gdn_step`, `native_gdn_out_norm`, `fused_gdn_step_norm` |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+(The 196 total also carries the 12 CUDA-runtime symbols and the engine's own cross-TU `strata::core`/`main`
+references - the CUDA-runtime surface is the un-approved RE-SCOPE I2b reported and this batch did not touch.)
+
+**THE SIX, IN THE ORDER THE MIXER'S OWN BODY REACHES THEM.**  Read from `gdn_layer` (`src/core/layer.cpp:223`, the
+mixer for 36 of the 48 layers, called from `block_layer_pre` at `:1259`), NOT from the plan's §3 list (which names
+the GDN rows in class-B/class-A prose and is not an order).  Within a mixer STAGE the branches are alternatives, so
+the order is the order the call sites appear: fused, then native, then legacy.
+
+| # | symbol | call site | shader | wrapper == shader (bitwise) | wrapper vs oracle |
+|---|---|---|---|---|---|
+| 1 | `fused_gdn_conv_l2` | layer.cpp:250 (conv stage, fused) | fused_gdn_conv_l2.spv | **40960/40960 + 2048/2048, worst 0** | **10240/10240 w 2.42e-04; 512/512 w 6.63e-06** (terms bound) |
+| 2 | `native_gdn_conv_silu` | layer.cpp:253 (native) | native_gdn_conv_silu.spv | **12800/12800 + 120/120, worst 0** | **5120/5120 w 1.24e-05; 48/48 w 2.49e-07** (terms bound) |
+| 3 | `gdn_conv_step` | layer.cpp:255 (legacy) | gdn_conv_step.spv | **96/96 + 1200/1200, worst 0** | **24/24 w 2.04e-06; 300/300 w 1.15e-06** |
+| 4 | `native_gdn_l2_norm` | layer.cpp:266/267 (native) | native_gdn_l2_norm.spv | **128/128 + 2048/2048, worst 0** | **128/128 w 1.18e-07; 2048/2048 w 1.68e-07** (tol 1e-4) |
+| 5 | `gdn_l2_norm` | layer.cpp:269/270 (legacy) | gdn_l2_norm.spv | **2048/2048 + 384/384, worst 0** | **2048/2048 w 1.26e-07; 384/384 w 0** (tol 1e-5) |
+| 6 | `fused_gdn_ab` | layer.cpp:287 (beta/gate stage, fused) | fused_gdn_ab.spv | **96/96 + 8/8, worst 0** | **96/96 w 3.48e-07; 8/8 w 9.31e-08** (terms bound) |
+
+All measured on `vega`'s Arc (intel_icd) through the port's gate, each case pinned to the harness device
+(`EnginePin`).  The engine wrapper's output is compared BITWISE (as 32-bit words) to the port's shader path over the
+same fixture, and separately against the case's explicit oracle (a double transcription of the engine's OWN body -
+`fused_gdn.cu` / `native_gdn_preprocess.cu` / `gdn.cu`).  The conv cases also compare the SLID state bitwise.
+
+**NO `host` ROW WAS NEEDED, and that is stated rather than assumed.**  The only `host` row the mixer's six reach is
+`native_gdn_enabled()` (`layer.cpp:247`/`:253`/`:265`/`:295`/`:306`/`:324`), already answered by
+`vulkan/src/kernels/native_caps_vk.cpp`.  The GDN headers carry NO `*_scratch_bytes`-style symbol and no shape
+accessor - the only shared shape, `GdnShapes`, is a by-value POD passed to `gdn_step` (not in this batch) - so the
+six are self-contained and the link introduced no new undefined reference.
+
+**NONE OF THE SIX IS A MODULE-STATE READER LIKE `cvec_apply`.**  Each is bind-and-dispatch over an already-gated
+shader; what they DO carry is the CUDA wrapper's argument CONTRACT, kept as the port's customary loud refusal (never
+a silently wrong binding): `fused_gdn_conv_l2` refuses `channels % 128 != 0` or `qk_heads > channels/128` (the CUDA
+body's own check), `native_gdn_conv_silu` refuses `d_conv != 4` (four taps), `fused_gdn_ab` refuses `n_embd % 8 != 0`
+(the shader's 8-element activation chunk).  One wrapper detail worth recording: the port's `native_gdn_l2_norm`
+shader divides the push `eps` by `cols` ITSELF, so this wrapper passes the RAW engine epsilon and
+`1/sqrt(cols)` - matching the gate case's push bit for bit (the CUDA passes `eps/S` and `1/sqrt(S)`; identical at
+`cols == S == 128`).
+
+**RESULTS (vega).**  Engine CONFIGURE + BUILD under `-DSTRATA_ENABLE_VULKAN=ON` clean;
+`strata_vk_entry_smoke` RUNS the six new wrappers on the Arc and PASSES.  Gate on `vega`: **Arc 516/0/0 (exit 0),
+llvmpipe 504/0/3, radeon iGPU 507/0/2** - **+24 verdicts on every arm** (6 cases x 2 arms x 2 verdicts), 0 failed;
+the radeon arm's `budget` flake did NOT fire this run.  `check_port_map.py` passes (`168 - 78 kernel, 61 host, 29
+todo; 111 shaders built, 92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (the six
+were already `kernel` rows, so the map does not move).  No new falsification injection: the wrapper proof IS the
+check (wrapper == shader path BITWISE), and the wrong-view-offset class is falsified by
+`gates/inject-verify.sh fwht-entry-wrong-view-offset`.  **`z820b` is PENDING** (no XTX/K620 number).  The CUDA-runtime
+host surface was NOT touched, and the plan was NOT re-scoped.
+
+**WHAT IS LEFT.**  The GDN mixer's remaining **8** symbols: the beta/gate and step/norm stages - `native_gdn_beta_gate`,
+`gdn_beta_gate`, `native_gdn_gate`, `native_gdn_step`, `gdn_step`, `native_gdn_out_norm`, `gdn_out_norm`, and the
+fused `fused_gdn_step_norm` - which would complete the mixer and take the GDN group to 0.
+
 ## INCREMENT I2 (CONTINUED FURTHER) — the next five glue entry points, and THE LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **LINK PROGRESS (the port's progress bar toward a layer that links): `214 → 204` undefined references, `80 → 73`

@@ -58,7 +58,8 @@ target_link_libraries(strata_vulkan_device PUBLIC Vulkan::Vulkan)
 # --- the kernel translation units: one engine entry point per symbol, behind the macro -----------------------
 strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp
   src/kernels/elementwise_vk.cpp
-  src/kernels/doorbell_vk.cpp)   # I2: the engine's doorbell_* (the split submission; sync.* is the design)
+  src/kernels/doorbell_vk.cpp
+  src/kernels/gdn_vk.cpp)       # the first six GDN/DeltaNet mixer entry points the layer body reaches
 add_library(strata_vulkan_kernels STATIC ${_kernels})
 target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
 
@@ -69,5 +70,6 @@ add_executable(strata_vk_entry_smoke tests/entry_point_smoke.cpp)
 target_link_libraries(strata_vk_entry_smoke PRIVATE strata_vulkan_kernels)
 
 message(STATUS "Strata: Vulkan backend (experimental) - device layer + sync (the doorbell replacement) + "
-               "the engine entry points (fwht256 + 11 elementwise/glue + 5 doorbell + the cvec module) + "
-               "strata_vk_entry_smoke; see ports/vulkan/plan/BACKEND-INTEGRATION.md")
+               "the engine entry points (fwht256 + 11 elementwise/glue + 5 doorbell + the cvec module + "
+               "the first 6 GDN/DeltaNet mixer kernels) + strata_vk_entry_smoke; see "
+               "ports/vulkan/plan/BACKEND-INTEGRATION.md")
