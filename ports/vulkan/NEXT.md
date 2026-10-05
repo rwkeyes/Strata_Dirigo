@@ -100,6 +100,75 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I2 (CONTINUED FURTHER) — the next five glue entry points, and THE LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**LINK PROGRESS (the port's progress bar toward a layer that links): `214 → 204` undefined references, `80 → 73`
+distinct `strata::kernels::` symbols.**  Re-run the one-layer-body link with (build = the `-DSTRATA_ENABLE_VULKAN=ON`
+CMake build; measured with `/tmp/vkbuild-i2c`):
+
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 \
+        -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o <build>/vulkan/libstrata_vulkan_kernels.a <build>/vulkan/libstrata_vulkan_device.a -lvulkan \
+        -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                     # -> 204
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                              # -> 73
+
+**OF THE SEVEN-SYMBOL DROP, THIS BATCH OWNS TWO.**  `layer.cpp` reaches exactly two of the five this batch wired
+(`cvec_apply` and the cvec `host` accessor `cvec()`); the other five of the drop (`gdn_gate`, `rms_norm_weighted`,
+`embedding_gather`, `doorbell_publish`, `doorbell_ring`) landed in I2/I2b and were already answered before this
+batch — the README's "214 / 80, the backend answers 4" baseline predates them.  The other three of the five
+(`add_inplace`, `gather_rows`, `scatter_rows_f32`) and `f32_to_f16_bulk` are called from `expert_source.cpp` /
+`peer_experts.cpp` / `mtp.cpp` / nowhere, so they do NOT move THIS link — they are wired and proved, and will move
+the link for the full program.
+
+**THE REMAINING 73 `strata::kernels::` SYMBOLS, GROUPED (so the next batches plan from a number).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue (the I2 elementwise set)** | **0** | all answered — `silu/scale/f32_to_bf16/gdn_gate/rms_norm_weighted/embedding_gather/add_inplace/gather_rows/scatter_rows_f32/cvec_apply/f32_to_f16_bulk` |
+| **matvec / GEMV / KV** | **21** | `bf16_gemv`, `bf16_gemv_split`, `bf16_gemv_fp32_mmvf`, `bf16_gemv_fp32_mmvf_cols`, `native_mmvq`, `native_quantize_q8_1`, `quantize_q8_0`, `quantize_q8_K`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `s2_gemv_q8`, `kv_append_step`, `kv_append_q4_step`, `kv_append_q8_step`, `kv_gather_step`, `kv_gather_q4_step`, `kv_gather_q8_step`, `kv_block_bytes`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve` |
+| **attention / QSA / MoE / GR / PLE / rope** | **36** | `native_flash_attn_short_step`, `native_rope_apply`, `rope_neox_apply`, `rope_scaling`, `rope_table_set`, `build_rope_table`, `native_router_top10`, `router_top10`, `moe_combine`, `native_moe_combine`, `shared_expert(+_scratch_bytes)`, `ple_block(+_scratch_bytes)`, `ple_history_advance`, `PleTable::{collect,is_open,issue}`, `ngram_rows`, `qsa_attend_step`, `qsa_block_scores`, `qsa_block_topk`, `qsa_decode_attn_scratch_floats`, `qsa_decode_attn_step`, `qsa_gate_apply_f32`, `qsa_index_step`, `qsa_step_fill`, `native_qsa_{gate_apply,rms_norm_weighted,indexer_append}`, `topk_512_step`, `gr_read`, `gr_write`, `gr_workspace_init`, `fused_gr_read`, `fused_gr_supported` |
+| **GDN / DeltaNet mixer** | **14** | `gdn_conv_step`, `gdn_l2_norm`, `gdn_beta_gate`, `gdn_step`, `gdn_out_norm` and their `native_gdn_*` siblings, and `fused_gdn_conv_l2`, `fused_gdn_ab`, `fused_gdn_step_norm` |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+(The 204 total also carries the 12 CUDA-runtime symbols and the engine's own cross-TU `strata::core`/`main`
+references — the CUDA-runtime surface is the un-approved RE-SCOPE I2b reported and this batch did not touch.)
+
+**THE FIVE ENTRY POINTS, in the order the forward path reaches them.**  Read from the decode path, NOT from the
+plan's list (the plan's list is alphabetical in part).  `layer.cpp`'s body reaches exactly ONE of the five
+directly; the others are the same forward path through its sibling files:
+
+| # | symbol | call site | shader | wrapper == shader (bitwise) | wrapper vs oracle |
+|---|---|---|---|---|---|
+| 1 | `add_inplace` | `expert_source.cpp:2353` (MoE hit combine) | add.spv | **1000/1000, worst 0** | **1000/1000 == d+s, worst 0** |
+| 2 | `scatter_rows_f32` | `peer_experts.cpp:241` | scatter_rows_f32.spv | **3072/3072 + 30/30, worst 0** | **3072/3072 + 30/30 vs the rule, worst 0** |
+| 3 | `cvec_apply` | `layer.cpp:1330/1333/1336` | cvec_apply.spv | **6144/6144, worst 0** | **6144/6144 vs the project(2·s) oracle, worst 4.74e-07** (tol 1e-4) |
+| 4 | `gather_rows` | `mtp.cpp:450` (MTP drafter) | gather_rows.spv | **576/576 + 316/316, worst 0** | **576/576 + 316/316 vs ids[r] source rows, worst 0** |
+| 5 | `f32_to_f16_bulk` | NO `src/core/` site | f32_to_f16.spv | **1024/1024, worst 0** | **1024/1024 == f16_from_f32, worst 0** |
+
+All measured on `vega`'s Arc (intel_icd) through the port's gate, each case pinned to the harness device
+(`EnginePin`).  `strata_vk_entry_smoke` runs all five too.
+
+**`cvec_apply` IS THE ONE THAT IS NOT THIN.**  Its engine wrapper reads MODULE state (`strata::kernels::cvec()`),
+which `src/kernels/cuda/cvec.cu` owns and a Vulkan build does not compile; the plan's §1 classifies `cvec` as a
+`host` row ("the table the cvec_apply kernel reads") but it is a device-crossing row like the 18 it lists — the
+backend must answer it.  So this batch also implements `cvec`, `cvec_upload`, `cvec_replicate`,
+`cvec_set_enabled`, `cvec_enabled`, and places the device tables LAZILY into each `Stream`'s arena
+(`Stream::cvec_tables` in `vulkan/src/device/vk_arena.hpp` — the tables live and die with the stream, so a
+reopened stream cannot inherit a stale direction).  The published `Cvec::dir/s/on` are non-null sentinels: the
+engine only tests them for null, and `covers()` reads the host `steered` vector.
+
+**RESULTS (vega).**  Engine CONFIGURE 0.2 s / BUILD ~2 s (`-DSTRATA_ENABLE_VULKAN=ON`; the option `return()`s
+before the CUDA engine, so this builds the backend + smoke).  `strata_vk_entry_smoke` PASSES on the Arc, running
+all eleven wrappers + five doorbell + the handoff.  Gate on `vega`: **Arc 492/0/0 (exit 0), llvmpipe 480/0/3,
+radeon iGPU 483/0/2** — **+14 verdicts on every arm** (5 new cases × 2–4 verdicts), 0 failed; the radeon arm's
+`budget` flake did NOT fire this run.  `check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo; 111
+shaders built, 92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **`z820b` is
+PENDING** (no XTX/K620 number).  No new falsification injection was added: the wrapper proof IS the check
+(wrapper == shader path BITWISE), and the wrong-view-offset class is already falsified by
+`gates/inject-verify.sh fwht-entry-wrong-view-offset`.
+
 ## INCREMENT I2 (CONTINUED) — the `doorbell_*` symbols answered, the next three glue kernels, AND THE ENGINE-PROGRAM GAP (2026-10-05, `vega`)
 
 The rest of I2's engine half, plus the measurement the increments never had: **what it actually takes to compile

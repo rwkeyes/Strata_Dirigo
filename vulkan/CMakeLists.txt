@@ -69,5 +69,5 @@ add_executable(strata_vk_entry_smoke tests/entry_point_smoke.cpp)
 target_link_libraries(strata_vk_entry_smoke PRIVATE strata_vulkan_kernels)
 
 message(STATUS "Strata: Vulkan backend (experimental) - device layer + sync (the doorbell replacement) + "
-               "4 entry points (fwht256 + silu/scale/f32_to_bf16 glue) + strata_vk_entry_smoke; see "
-               "ports/vulkan/plan/BACKEND-INTEGRATION.md")
+               "the engine entry points (fwht256 + 11 elementwise/glue + 5 doorbell + the cvec module) + "
+               "strata_vk_entry_smoke; see ports/vulkan/plan/BACKEND-INTEGRATION.md")

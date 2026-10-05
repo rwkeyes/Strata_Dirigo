@@ -9,8 +9,11 @@
 // doorbell replacement (vulkan/src/device/sync.*).  Each is checked against a small hand-written oracle, so a
 // build that runs but computes nothing is still caught.
 #include "strata/kernels/kv_q4.hpp"         // the engine's wrapper: fwht256_inplace_cuda
-#include "strata/kernels/elementwise.hpp"   // the engine's wrappers: silu/scale/f32_to_bf16
+#include "strata/kernels/elementwise.hpp"   // the engine's wrappers: silu/scale/f32_to_bf16 (+ add/scale/f16/scatter)
+#include "strata/kernels/verify_kernels.hpp"  // the engine's wrapper: gather_rows
+#include "strata/kernels/cvec.hpp"          // the engine's wrapper + module: cvec_apply / cvec_upload
 #include "strata/kernels/bf16_bits.hpp"     // bf16_from_f32: the engine's own converter, included not transcribed
+#include "strata/kernels/f16_bits.hpp"      // f16_from_f32: ditto, for f32_to_f16_bulk
 #include "strata/vulkan/vk_backend.hpp"
 #include "vk_arena.hpp"
 #include "sync.hpp"                         // the doorbell replacement
@@ -310,6 +313,128 @@ int main(int argc, char** argv) {
         strata::vulkan::stream_write(*s, dflag, &served, 4);
         strata::kernels::doorbell_wait(dflag, dseq, s);        // returns: no kernel waits
         check("doorbell_wait: returns without a device wait", true);
+    }
+
+    // ---- I2, continued further: the next five wrappers ---------------------------------------------------
+    {   // add_inplace: dst += src, bitwise
+        const uint32_t N2 = 512;
+        std::vector<float> d(N2), c(N2);
+        uint32_t st = 2024u;
+        for (float& v : d) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f) * 4.0f - 2.0f; }
+        for (float& v : c) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f) * 4.0f - 2.0f; }
+        float* dd = strata::vulkan::arena_alloc<float>(*s, N2);
+        float* ds = strata::vulkan::arena_alloc<float>(*s, N2);
+        strata::vulkan::stream_write(*s, dd, d.data(), N2 * 4);
+        strata::vulkan::stream_write(*s, ds, c.data(), N2 * 4);
+        strata::kernels::add_inplace(dd, ds, (int64_t) N2, s);
+        std::vector<float> got(N2);
+        strata::vulkan::stream_read(*s, dd, got.data(), N2 * 4);
+        int bad = 0;
+        for (uint32_t i = 0; i < N2; ++i) bad += !words_equal(got[i], d[i] + c[i]);
+        check("add_inplace == dst+src, bitwise", bad == 0);
+    }
+    {   // f32_to_f16_bulk: the engine's own f16 converter, over the regimes that matter
+        const uint32_t N2 = 1024;
+        std::vector<float> f(N2);
+        uint32_t st = 3141u;
+        for (float& v : f) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f) * 20.0f - 10.0f; }
+        f[0] = 0.0f; f[1] = -0.0f; f[2] = 65504.0f; f[3] = 1e30f; f[4] = 1e-8f; f[5] = 65536.0f;
+        float* dx = strata::vulkan::arena_alloc<float>(*s, N2);
+        uint16_t* dy = strata::vulkan::arena_alloc<uint16_t>(*s, N2);
+        strata::vulkan::stream_write(*s, dx, f.data(), N2 * 4);
+        strata::kernels::f32_to_f16_bulk(dx, dy, (int64_t) N2, s);
+        std::vector<uint16_t> got(N2);
+        strata::vulkan::stream_read(*s, dy, got.data(), N2 * 2);
+        int bad = 0;
+        for (uint32_t i = 0; i < N2; ++i) bad += (got[i] != strata::kernels::f16_from_f32(f[i]));
+        check("f32_to_f16_bulk == f16_from_f32, bitwise", bad == 0);
+    }
+    {   // gather_rows: a derangement, both an aligned and an unaligned row width
+        int bad = 0;
+        struct GArm { uint32_t rb, n; } arms[] = {{64, 8}, {42, 6}};
+        for (const GArm& a : arms) {
+            std::vector<uint8_t> src((size_t) 16 * a.rb);
+            for (uint32_t k = 0; k < 16; ++k)
+                for (uint32_t j = 0; j < a.rb; ++j) src[(size_t) k * a.rb + j] = (uint8_t) ((k * 31 + j * 7 + 1) & 0xFF);
+            std::vector<int32_t> ids = {9, 0, 13, 2, 15, 4, 11, 6, 1, 14, 3, 12, 5, 8, 7, 10};
+            ids.resize(a.n);
+            uint8_t* dsrc = strata::vulkan::arena_alloc<uint8_t>(*s, src.size());
+            int32_t* dids = strata::vulkan::arena_alloc<int32_t>(*s, a.n);
+            uint8_t* ddst = strata::vulkan::arena_alloc<uint8_t>(*s, (uint64_t) a.n * a.rb + 64);
+            strata::vulkan::stream_write(*s, dsrc, src.data(), src.size());
+            strata::vulkan::stream_write(*s, dids, ids.data(), a.n * 4);
+            std::vector<uint8_t> sent((size_t) a.n * a.rb + 64, 0xA5);
+            strata::vulkan::stream_write(*s, ddst, sent.data(), sent.size());
+            strata::kernels::gather_rows(dsrc, a.rb, dids, a.n, ddst, s);
+            std::vector<uint8_t> got(sent.size());
+            strata::vulkan::stream_read(*s, ddst, got.data(), got.size());
+            for (uint32_t r = 0; r < a.n; ++r)
+                for (uint32_t o = 0; o < a.rb; ++o) bad += (got[(size_t) r * a.rb + o] != src[(size_t) ids[r] * a.rb + o]);
+            for (uint32_t i = 0; i < 64; ++i) bad += (got[(size_t) a.n * a.rb + i] != 0xA5);
+        }
+        check("gather_rows: derangement, aligned + unaligned", bad == 0);
+    }
+    {   // scatter_rows_f32: permutation, an unnamed dst row survives; width 6 (the CUDA would refuse)
+        int bad = 0;
+        struct SArm { uint32_t width, n_dst; std::vector<int32_t> rows; } arms[] = {
+            {512, 6, {3, 0, 5, 2}}, {6, 5, {3, 0, 4}}};
+        for (const SArm& a : arms) {
+            const uint32_t n_src = (uint32_t) a.rows.size();
+            std::vector<float> src((size_t) n_src * a.width);
+            for (uint32_t r = 0; r < n_src; ++r)
+                for (uint32_t i = 0; i < a.width; ++i) src[(size_t) r * a.width + i] = (float) (r + 1) * 1.5f;
+            std::vector<float> dst((size_t) a.n_dst * a.width, -7.5f);
+            float* dsrc = strata::vulkan::arena_alloc<float>(*s, (size_t) n_src * a.width);
+            float* ddst = strata::vulkan::arena_alloc<float>(*s, (size_t) a.n_dst * a.width);
+            int32_t* drows = strata::vulkan::arena_alloc<int32_t>(*s, n_src);
+            strata::vulkan::stream_write(*s, dsrc, src.data(), src.size() * 4);
+            strata::vulkan::stream_write(*s, ddst, dst.data(), dst.size() * 4);
+            strata::vulkan::stream_write(*s, drows, a.rows.data(), n_src * 4);
+            strata::kernels::scatter_rows_f32(dsrc, ddst, drows, n_src, a.width, s);
+            std::vector<float> got(dst.size());
+            strata::vulkan::stream_read(*s, ddst, got.data(), got.size() * 4);
+            std::vector<float> want = dst;
+            for (uint32_t r = 0; r < n_src; ++r)
+                for (uint32_t i = 0; i < a.width; ++i) want[(size_t) a.rows[r] * a.width + i] = src[(size_t) r * a.width + i];
+            for (size_t i = 0; i < got.size(); ++i) bad += !words_equal(got[i], want[i]);
+        }
+        check("scatter_rows_f32: permutation + unnamed rows survive (width 6)", bad == 0);
+    }
+    {   // cvec_apply: the module upload + the engine wrapper, project mode (reflection) vs a double oracle
+        const int n = 256, hc = 4, T = 2, L = 48, kLayer = 7;
+        const int64_t r_ld = (int64_t) hc * n;
+        std::vector<float> dirv((size_t) L * n, 0.0f), sl((size_t) L, 0.0f);
+        {
+            double nrm = 0.0;
+            std::vector<float> vv((size_t) n);
+            uint32_t st = 99u;
+            for (float& x : vv) { st = st * 1664525u + 1013904223u; x = ((st >> 8) / 16777216.0f) * 2.0f - 1.0f; nrm += (double) x * x; }
+            nrm = std::sqrt(nrm);
+            for (int j = 0; j < n; ++j) dirv[(size_t) kLayer * n + j] = (float) (vv[(size_t) j] / nrm);
+        }
+        sl[kLayer] = 2.0f;
+        std::string err;
+        const bool up = strata::kernels::cvec_upload(dirv, sl, /*project*/ 0, kLayer, kLayer, n, hc, err);
+        std::vector<float> R0((size_t) T * r_ld);
+        { uint32_t st = 7u; for (float& x : R0) { st = st * 1664525u + 1013904223u; x = ((st >> 8) / 16777216.0f) * 6.0f - 3.0f; } }
+        float* dR = strata::vulkan::arena_alloc<float>(*s, (size_t) T * r_ld);
+        strata::vulkan::stream_write(*s, dR, R0.data(), R0.size() * 4);
+        strata::kernels::cvec_apply(dR, kLayer, T, r_ld, nullptr, 0, nullptr, 0, false, s);
+        std::vector<float> got(R0.size());
+        strata::vulkan::stream_read(*s, dR, got.data(), got.size() * 4);
+        double worst = 0.0;
+        for (int t = 0; t < T; ++t)
+            for (int cc = 0; cc < hc; ++cc) {
+                double dot = 0.0;
+                const float* row0 = &R0[(size_t) t * r_ld + (size_t) cc * n];
+                for (int j = 0; j < n; ++j) dot += (double) row0[j] * dirv[(size_t) kLayer * n + j];
+                for (int j = 0; j < n; ++j) {
+                    const double want = (double) row0[j] - 2.0 * dot * dirv[(size_t) kLayer * n + j];
+                    worst = std::max(worst, std::fabs((double) got[(size_t) t * r_ld + (size_t) cc * n + j] - want));
+                }
+            }
+        std::printf("  cvec_apply wrapper vs double oracle (worst abs %.3g); upload %s\n", worst, up ? "ok" : "FAILED");
+        check("cvec_apply (project) via the module + wrapper", worst <= 1e-4 && up);
     }
 
     strata::vulkan::stream_close(s);

@@ -117,3 +117,27 @@ CUDA-runtime symbols — the engine calls the CUDA runtime directly in 18 host f
 engine-linked target that runs is `strata_vk_entry_smoke`.  Whether that is I5's wiring or a re-scope is the
 user's call; `ports/vulkan/NEXT.md`'s I2-continued section reports it and does not re-scope it.
 
+## What I2 continued-further adds (2026-10-05)
+
+* **Five more glue entry points** in `vulkan/src/kernels/elementwise_vk.cpp`, in the order the forward path
+  reaches them: `add_inplace` (`expert_source.cpp:2353`, the MoE expert pool's hit combine), `scatter_rows_f32`
+  (`peer_experts.cpp:241`), `cvec_apply` (`layer.cpp:1330`, the ONLY one `layer.cpp` calls DIRECTLY),
+  `gather_rows` (`mtp.cpp:450`, the MTP drafter) and `f32_to_f16_bulk` (no `src/core/` call site - it is on the
+  plan's I2 list and in `elementwise.hpp`'s contract).  Four are thin wrappers over the port's own already-gated
+  shaders (`add.spv`, `scatter_rows_f32.spv`, `gather_rows.spv`, `f32_to_f16.spv`).
+* **`cvec_apply` is NOT a thin wrapper**: it reads the engine's control-vector MODULE (`strata::kernels::cvec()`)
+  that `cvec.cu` owns, so this TU also answers the cvec `host` row (`cvec`, `cvec_upload`, `cvec_replicate`,
+  `cvec_set_enabled`, `cvec_enabled`).  The device tables are placed LAZILY into each `Stream`'s arena (the
+  tables live in `Stream::cvec_tables`, `vk_arena.hpp`), because `cvec_upload` carries no stream and the CUDA's
+  per-"current device" table has no Vulkan analogue.
+* **The proof is the established one**: each is re-run through the ENGINE WRAPPER and required to agree BITWISE
+  with the shader path AND with the case's explicit oracle (`case_*_entry` in `ports/vulkan/harness/vk_gate.cpp`,
+  each pinned to the harness device with `EnginePin`).  `strata_vk_entry_smoke` now RUNS all five too.
+* **The LINK PROGRESS (the port's progress bar toward a layer that LINKS):** the one-layer-body link
+  (`src/core/layer.cpp` vs `libstrata_vulkan_kernels.a` + `libstrata_vulkan_device.a`) moved **214 -> 204
+  undefined references / 80 -> 73 distinct `strata::kernels::` symbols**.  THIS batch accounts for two of those
+  seven (`cvec_apply`, `cvec` - the only two of the five `layer.cpp` itself reaches); the other five are I2b's
+  glue/`doorbell_*` that `layer.cpp` also calls and the "backend answers 4" baseline predates.  The remaining 73
+  are grouped in `ports/vulkan/NEXT.md`'s I2-continued-further section, with the reproducing command.
+
+

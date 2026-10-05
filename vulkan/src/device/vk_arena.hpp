@@ -43,6 +43,18 @@ struct Stream {
     // Where this backend's .spv files are (fwht256.spv and, in later increments, the rest).
     std::string spv_dir;
 
+    // THE CONTROL-VECTOR TABLES `cvec_apply` reads (I2-continued).  The engine's cvec.cu owns these on a CUDA
+    // build; a Vulkan build compiles no cvec.cu, so this backend answers the cvec `host` row and places the
+    // tables HERE.  They live and die with the stream - the same lifetime rule the arena follows - so a
+    // reopened stream can never inherit a stale direction.  `gen` is the module generation they were built at;
+    // cvec_apply replaces them when it no longer matches (an upload, a replicate or a switch change).
+    struct CvecTables {
+        Buf dir{}, s{}, on{}, dummy{};
+        bool valid = false;
+        uint64_t gen = 0;
+    };
+    CvecTables cvec_tables;
+
     // The synthetic device-address base and the alignment every carving starts on.  The alignment is the
     // device's OWN storage-buffer-offset limit raised to 256, so a view computed from an allocation is
     // bindable on every implementation the port runs on (the Arc measures 4 bytes; the limit is still a

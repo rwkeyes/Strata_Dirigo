@@ -15,6 +15,43 @@ stale input read (a single-element mutation of the previous/zero/byte-zeroed for
 a stale word would persist on re-dispatch). **The case is not skipped on radeon and the bound is not
 widened.** Full detail and evidence paths in `NEXT.md`'s top section.
 
+## INCREMENT I2 (CONTINUED FURTHER) — the next five glue entry points + THE LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**THE LINK PROGRESS — the measured one-layer-body link: `214 → 204` undefined references / `80 → 73` distinct
+`strata::kernels::` symbols.**  This batch owns TWO of the seven (`cvec_apply`, `cvec()` — the only two of the
+five it wired that `layer.cpp` itself reaches); the other five dropped from I2/I2b's glue/`doorbell_*` that
+`layer.cpp` also calls and that the README's "backend answers 4" baseline predates.  Reproducing command and the
+remaining 73 grouped by subsystem (glue 0 · matvec/GEMV/KV 21 · attention/QSA/MoE/GR/PLE/rope 36 · GDN mixer 14 ·
+other 2) are at the top of `NEXT.md`'s I2-continued-further section.
+
+**THE FIVE.**  In the order the forward path reaches them (NOT the plan's list): `add_inplace`
+(`expert_source.cpp:2353`), `scatter_rows_f32` (`peer_experts.cpp:241`), `cvec_apply` (`layer.cpp:1330` — the only
+one `layer.cpp` calls DIRECTLY), `gather_rows` (`mtp.cpp:450`, the MTP drafter) and `f32_to_f16_bulk` (NO
+`src/core/` call site).  Wired in `vulkan/src/kernels/elementwise_vk.cpp`, engine headers unchanged; each proved
+by a new `case_*_entry` through the ENGINE WRAPPER, BITWISE against the port's shader path AND against the case's
+explicit oracle, each pinned to the harness device (`EnginePin`):
+
+| kernel | shader | wrapper == shader (bitwise) | wrapper vs oracle |
+|---|---|---|---|
+| `add_inplace` | add.spv | 1000/1000, worst 0 | 1000/1000 == d+s |
+| `scatter_rows_f32` | scatter_rows_f32.spv | 3072/3072 + 30/30, worst 0 | 3072/3072 + 30/30 vs the rule |
+| `cvec_apply` | cvec_apply.spv | 6144/6144, worst 0 | 6144/6144, worst 4.74e-07 (tol 1e-4) |
+| `gather_rows` | gather_rows.spv | 576/576 + 316/316, worst 0 | 576/576 + 316/316 vs ids[r] source rows |
+| `f32_to_f16_bulk` | f32_to_f16.spv | 1024/1024, worst 0 | 1024/1024 == f16_from_f32 |
+
+**`cvec_apply` IS NOT A THIN WRAPPER.**  Its wrapper reads the engine's control-vector MODULE
+(`strata::kernels::cvec()`), owned by `src/kernels/cuda/cvec.cu`, which a Vulkan build does not compile — so the
+backend also answers the cvec `host` row (`cvec`, `cvec_upload`, `cvec_replicate`, `cvec_set_enabled`,
+`cvec_enabled`) and places the device tables lazily in each `Stream`'s arena (`Stream::cvec_tables`,
+`vulkan/src/device/vk_arena.hpp`).  The four others are thin.
+
+**RESULTS.**  `strata_vk_entry_smoke` RUNS all five (plus the earlier wrappers/doorbell) and PASSES on the Arc.
+Gate on `vega`: **Arc 492/0/0 (exit 0), llvmpipe 480/0/3, radeon iGPU 483/0/2** — +14 verdicts per arm (5 new
+cases), 0 failed; the radeon `budget` flake did not fire.  `check_port_map.py` passes (`168 — 78 kernel, 61 host,
+29 todo; 111 shaders built, 92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.
+**`z820b` PENDING** (no XTX/K620 number).  The CUDA-runtime host surface was NOT touched (still the un-approved
+re-scope I2b reported).
+
 ## INCREMENT I2 — THE DOORBELL REPLACEMENT + THE FIRST THREE GLUE ENTRY POINTS (2026-10-05, `vega`)
 
 The ENGINE half of I2 (`plan/BACKEND-INTEGRATION.md` §3). Measured on `vega`: Arc B70 (ANV), Ryzen iGPU (RADV)

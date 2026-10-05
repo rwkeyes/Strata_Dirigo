@@ -35,6 +35,8 @@
 #include "vk_arena.hpp"
 #include "sync.hpp"          // I2: the doorbell replacement (sync_open/publish/read/answer/consume)
 #include "strata/kernels/elementwise.hpp"   // I2: the three glue wrappers this gate drives through the backend
+#include "strata/kernels/verify_kernels.hpp" // I2: gather_rows
+#include "strata/kernels/cvec.hpp"           // I2: cvec_apply + the control-vector module
 
 #include <algorithm>
 #include <cmath>
@@ -14228,6 +14230,355 @@ void case_embedding_gather_entry(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// I2 CONTINUED FURTHER, the next five the forward path reaches.  Same proof shape as the six above: (A) the
+// port's shader path with the case's own fixture, (B) the ENGINE WRAPPER through the backend's arena, (C)
+// BITWISE between the two (same SPIR-V, same device - a difference can only be the wrapper's binding/dispatch),
+// (D) the explicit oracle the shader-level case uses.  `cvec_apply` is NOT a thin wrapper: it reads the engine's
+// control-vector MODULE, so its case uploads a vector first.  `EnginePin` pins every case to the harness device.
+
+// `add_inplace` (expert_source.cpp:2353, the MoE expert pool's hit combine) -> add.spv
+void case_add_inplace_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "add.spv")) return;
+    const uint32_t N = 1000;
+    std::vector<float> d(N), src(N), want(N);
+    for (uint32_t i = 0; i < N; ++i) { d[i] = rndf(1.0f); src[i] = rndf(1.0f); want[i] = d[i] + src[i]; }
+
+    // (A) the port's shader path, exactly as case_add runs it.
+    Buf bd = ctx.alloc(N * 4), bs = ctx.alloc(N * 4);
+    ctx.write(bd, d.data(), N * 4);
+    ctx.write(bs, src.data(), N * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/add.spv", 2, 4);
+        struct { int32_t n; } pc{(int32_t) N};
+        ctx.dispatch(p, {&bd, &bs}, &pc, sizeof(pc), groups_for(N));
+    }
+    std::vector<float> ref(N);
+    ctx.read(bd, ref.data(), N * 4);
+
+    // (B) THE ENGINE WRAPPER: strata::kernels::add_inplace, through the backend's arena.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("add_inplace entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bd); ctx.free(bs);
+        return;
+    }
+    float* dd = strata::vulkan::arena_alloc<float>(*s, N);
+    float* ds = strata::vulkan::arena_alloc<float>(*s, N);
+    strata::vulkan::stream_write(*s, dd, d.data(), N * 4);
+    strata::vulkan::stream_write(*s, ds, src.data(), N * 4);
+    strata::kernels::add_inplace(dd, ds, (int64_t) N, s);          // THE ENGINE WRAPPER
+    std::vector<float> got(N);
+    strata::vulkan::stream_read(*s, dd, got.data(), N * 4);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE vs the shader path; (D) vs the explicit oracle (d + s).
+    int bad = 0, bad_oracle = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t u, v;
+        std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4); if (u != v) ++bad;
+        std::memcpy(&v, &want[i], 4); if (u != v) ++bad_oracle;
+    }
+    verdict("add_inplace entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) N, 0.0,
+            "words differ - the arena view, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+    verdict("add_inplace entry point: engine wrapper == dst+src", bad_oracle == 0, bad_oracle, (int) N, 0.0,
+            "words differ - the wrapper added the wrong pair");
+    ctx.free(bd); ctx.free(bs);
+}
+
+// `f32_to_f16_bulk` -> f32_to_f16.spv.  The fixture is the gate's own conversion_fixture (ties, subnormals,
+// overflow, inf/NaN, signed zero); the oracle is the engine's f16_from_f32, the same one run_conversion uses.
+void case_f32_to_f16_bulk_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "f32_to_f16.spv")) return;
+    if (!ctx.info().storage_buffer_16bit || !ctx.info().shader_int16) {
+        skip("f32_to_f16_bulk entry point: engine wrapper", "device lacks storageBuffer16BitAccess/shaderInt16");
+        return;
+    }
+    uint32_t N = 0;
+    const std::vector<float> f = conversion_fixture(N);
+    std::vector<uint16_t> want(N);
+    for (uint32_t i = 0; i < N; ++i) want[i] = f16_from_f32(f[i]);
+
+    // (A) the port's shader path, exactly as run_conversion<uint16_t> runs it.
+    Buf bx = ctx.alloc(N * 4), by = ctx.alloc(N * 2);
+    ctx.write(bx, f.data(), N * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/f32_to_f16.spv", 2, 4);
+        struct { int32_t n; } pc{(int32_t) N};
+        ctx.dispatch(p, {&bx, &by}, &pc, sizeof(pc), groups_for(N));
+    }
+    std::vector<uint16_t> ref(N);
+    ctx.read(by, ref.data(), N * 2);
+
+    // (B) THE ENGINE WRAPPER.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("f32_to_f16_bulk entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bx); ctx.free(by);
+        return;
+    }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, N);
+    uint16_t* dy = strata::vulkan::arena_alloc<uint16_t>(*s, N);
+    strata::vulkan::stream_write(*s, dx, f.data(), N * 4);
+    strata::kernels::f32_to_f16_bulk(dx, dy, (int64_t) N, s);     // THE ENGINE WRAPPER
+    std::vector<uint16_t> got(N);
+    strata::vulkan::stream_read(*s, dy, got.data(), N * 2);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE vs the shader path; (D) vs the engine's own f16 converter.
+    int bad = 0, bad_oracle = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (ref[i] != got[i]) ++bad;
+        if (want[i] != got[i]) ++bad_oracle;
+    }
+    verdict("f32_to_f16_bulk entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) N, 0.0,
+            "words differ - the wrapper's binding or dispatch does not match the ported shader's own path");
+    verdict("f32_to_f16_bulk entry point: engine wrapper == f16_from_f32", bad_oracle == 0, bad_oracle, (int) N,
+            0.0, "words differ - the wrapper converted the wrong fixture");
+    ctx.free(bx); ctx.free(by);
+}
+
+// `gather_rows` (mtp.cpp:450, the MTP draft head's token gather) -> gather_rows.spv.  Arms are case_gather_rows':
+// a 16-byte-aligned and an unaligned row_bytes, both a DERANGEMENT so an identity gather fails every row.
+void case_gather_rows_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gather_rows.spv")) return;
+    struct Arm { const char* what; uint32_t row_bytes, n; };
+    const Arm arms[] = {
+        {"16-byte-aligned rows", 64, 8},
+        {"unaligned rows", 42, 6},
+    };
+    const uint32_t guard = 64;
+    for (const Arm& a : arms) {
+        const uint32_t total = a.n * a.row_bytes;
+        std::vector<uint8_t> src((size_t) 16 * a.row_bytes);
+        for (uint32_t k = 0; k < 16; ++k)
+            for (uint32_t j = 0; j < a.row_bytes; ++j)
+                src[(size_t) k * a.row_bytes + j] = (uint8_t) ((k * 31 + j * 7 + 1) & 0xFF);
+        std::vector<int32_t> ids = {9, 0, 13, 2, 15, 4, 11, 6, 1, 14, 3, 12, 5, 8, 7, 10};
+        ids.resize(a.n);
+        std::vector<uint8_t> sent(total + guard, 0xA5);
+
+        // (A) the port's shader path.
+        Buf bs = ctx.alloc(src.size()), bi = ctx.alloc(ids.size() * 4), bd = ctx.alloc(sent.size());
+        ctx.write(bs, src.data(), src.size());
+        ctx.write(bi, ids.data(), ids.size() * 4);
+        ctx.write(bd, sent.data(), sent.size());
+        {
+            VkPipeline p = ctx.pipeline(dir + "/gather_rows.spv", 3, 8);
+            struct { uint32_t rb, n; } pc{a.row_bytes, a.n};
+            ctx.dispatch(p, {&bs, &bi, &bd}, &pc, sizeof(pc), groups_for(total));
+        }
+        std::vector<uint8_t> ref(sent.size());
+        ctx.read(bd, ref.data(), ref.size());
+
+        // (B) THE ENGINE WRAPPER.
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("gather_rows entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bs); ctx.free(bi); ctx.free(bd);
+            return;
+        }
+        uint8_t* dsrc = strata::vulkan::arena_alloc<uint8_t>(*s, src.size());
+        int32_t* dids = strata::vulkan::arena_alloc<int32_t>(*s, a.n);
+        uint8_t* ddst = strata::vulkan::arena_alloc<uint8_t>(*s, sent.size());
+        strata::vulkan::stream_write(*s, dsrc, src.data(), src.size());
+        strata::vulkan::stream_write(*s, dids, ids.data(), a.n * 4);
+        strata::vulkan::stream_write(*s, ddst, sent.data(), sent.size());
+        strata::kernels::gather_rows(dsrc, a.row_bytes, dids, a.n, ddst, s);   // THE ENGINE WRAPPER
+        std::vector<uint8_t> got(sent.size());
+        strata::vulkan::stream_read(*s, ddst, got.data(), got.size());
+        strata::vulkan::stream_close(s);
+
+        // (C) BITWISE vs the shader path; (D) vs the source rows ids names, guard bytes intact.
+        int bad = 0, bad_oracle = 0;
+        for (uint32_t r = 0; r < a.n; ++r)
+            for (uint32_t o = 0; o < a.row_bytes; ++o) {
+                const size_t i = (size_t) r * a.row_bytes + o;
+                if (got[i] != ref[i]) ++bad;
+                if (got[i] != src[(size_t) ids[r] * a.row_bytes + o]) ++bad_oracle;
+            }
+        for (uint32_t i = 0; i < guard; ++i) {
+            if (got[total + i] != ref[total + i]) ++bad;
+            if (got[total + i] != 0xA5) ++bad_oracle;
+        }
+        char tag[200];
+        std::snprintf(tag, sizeof tag, "gather_rows entry point: %s (wrapper == shader path, bitwise)", a.what);
+        verdict(tag, bad == 0, bad, (int) (total + guard), 0.0,
+                "a wrong source row, a wrong row stride, or a guard byte moved");
+        std::snprintf(tag, sizeof tag, "gather_rows entry point: %s (wrapper == ids[r] source rows)", a.what);
+        verdict(tag, bad_oracle == 0, bad_oracle, (int) (total + guard), 0.0,
+                "the fixture is a derangement, so an identity gather fails every row");
+        ctx.free(bs); ctx.free(bi); ctx.free(bd);
+    }
+}
+
+// `scatter_rows_f32` (peer_experts.cpp:241, the peer experts' row write-back) -> scatter_rows_f32.spv.  Arms
+// are case_scatter_rows_f32's: a permutation with unnamed destination rows that must survive, and width 6 (the
+// CUDA's float4 path refuses it; this one must not).
+void case_scatter_rows_f32_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "scatter_rows_f32.spv")) return;
+    struct Arm { const char* what; uint32_t width, n_dst; std::vector<int32_t> rows; };
+    const Arm arms[] = {
+        {"permutation {3,0,5,2}: dst rows 1 and 4 survive", 512, 6, {3, 0, 5, 2}},
+        {"width 6: the CUDA's float4 path refuses, this one must not", 6, 5, {3, 0, 4}},
+    };
+    const float SENT = -7.5f;
+    for (const Arm& a : arms) {
+        const uint32_t n_src = (uint32_t) a.rows.size();
+        std::vector<float> src((size_t) n_src * a.width);
+        for (uint32_t r = 0; r < n_src; ++r)
+            for (uint32_t i = 0; i < a.width; ++i) src[(size_t) r * a.width + i] = (float) (r + 1) * 1.5f;
+        std::vector<float> dst0((size_t) a.n_dst * a.width, SENT);
+
+        // (A) the port's shader path.
+        Buf bs = ctx.alloc(src.size() * 4), bd = ctx.alloc(dst0.size() * 4), br = ctx.alloc(n_src * 4);
+        ctx.write(bs, src.data(), src.size() * 4);
+        ctx.write(bd, dst0.data(), dst0.size() * 4);
+        ctx.write(br, a.rows.data(), n_src * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/scatter_rows_f32.spv", 3, 8);
+            struct { uint32_t width, n; } pc{a.width, n_src};
+            ctx.dispatch(p, {&bs, &bd, &br}, &pc, sizeof(pc), n_src);
+        }
+        std::vector<float> ref(dst0.size());
+        ctx.read(bd, ref.data(), ref.size() * 4);
+
+        // (B) THE ENGINE WRAPPER.
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("scatter_rows_f32 entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bs); ctx.free(bd); ctx.free(br);
+            return;
+        }
+        float* dsrc = strata::vulkan::arena_alloc<float>(*s, (size_t) n_src * a.width);
+        float* ddst = strata::vulkan::arena_alloc<float>(*s, (size_t) a.n_dst * a.width);
+        int32_t* drows = strata::vulkan::arena_alloc<int32_t>(*s, n_src);
+        strata::vulkan::stream_write(*s, dsrc, src.data(), src.size() * 4);
+        strata::vulkan::stream_write(*s, ddst, dst0.data(), dst0.size() * 4);
+        strata::vulkan::stream_write(*s, drows, a.rows.data(), n_src * 4);
+        strata::kernels::scatter_rows_f32(dsrc, ddst, drows, n_src, a.width, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(dst0.size());
+        strata::vulkan::stream_read(*s, ddst, got.data(), got.size() * 4);
+        strata::vulkan::stream_close(s);
+
+        // (C) BITWISE vs the shader path; (D) vs the rule (dst[rows[r]] = src[r], unnamed rows survive).
+        std::vector<float> want = dst0;
+        for (uint32_t r = 0; r < n_src; ++r)
+            for (uint32_t i = 0; i < a.width; ++i) want[(size_t) a.rows[r] * a.width + i] = src[(size_t) r * a.width + i];
+        int bad = 0, bad_oracle = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            uint32_t u, v;
+            std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4); if (u != v) ++bad;
+            std::memcpy(&v, &want[i], 4); if (u != v) ++bad_oracle;
+        }
+        char tag[200];
+        std::snprintf(tag, sizeof tag, "scatter_rows_f32 entry point: %s (wrapper == shader path, bitwise)", a.what);
+        verdict(tag, bad == 0, bad, (int) got.size(), 0.0,
+                "a wrong destination row, an unnamed row that moved, or a value not copied");
+        std::snprintf(tag, sizeof tag, "scatter_rows_f32 entry point: %s (wrapper == the rule)", a.what);
+        verdict(tag, bad_oracle == 0, bad_oracle, (int) got.size(), 0.0,
+                "the wrapper routed a position to the wrong destination row or moved an unnamed row");
+        ctx.free(bs); ctx.free(bd); ctx.free(br);
+    }
+}
+
+// `cvec_apply` (layer.cpp:1330) -> cvec_apply.spv.  THE ONE NON-THIN WRAPPER: it reads the engine's
+// control-vector MODULE (strata::kernels::cvec()), so this case UPLOADS a vector first.  (A) the shader path
+// with the same tables, (B) the ENGINE WRAPPER through the module, (C) BITWISE, (D) the double oracle
+// case_cvec_apply uses (project reflects; |err| <= 1e-4).
+void case_cvec_apply_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "cvec_apply.spv")) return;
+    const int n = 512, hc = 4, T = 3, L = 48;
+    const int kLayer = 7;
+    const int64_t r_ld = (int64_t) hc * n;
+    struct Pc { int mode, layer, n, hc, r_ld, bo_ld, inj_ld, write; };
+
+    std::vector<float> dirv((size_t) L * n, 0.0f), sl((size_t) L, 0.0f);
+    {
+        double nrm = 0.0;
+        std::vector<float> v((size_t) n);
+        for (auto& x : v) { x = rndf(1.0f); nrm += (double) x * x; }
+        nrm = std::sqrt(nrm);
+        for (int j = 0; j < n; ++j) dirv[(size_t) kLayer * n + j] = (float) (v[j] / nrm);
+    }
+    sl[kLayer] = 2.0f;                                    // project reflects
+    std::vector<float> R((size_t) T * r_ld);
+    for (auto& x : R) x = rndf(3.0f);
+    std::vector<float> bo((size_t) T * n);
+    for (auto& x : bo) x = rndf(1.0f);
+    std::vector<float> inj((size_t) T * hc, 0.0f);        // inj == 0 -> w == 1 exactly
+    int32_t onflag = 1;
+
+    // (A) the port's shader path, exactly as case_cvec_apply runs it (project, write = 0).
+    Buf bR = ctx.alloc(R.size() * 4), bDir = ctx.alloc(dirv.size() * 4), bSl = ctx.alloc(sl.size() * 4),
+        bOn = ctx.alloc(4), bBo = ctx.alloc(bo.size() * 4), bInj = ctx.alloc(inj.size() * 4);
+    ctx.write(bDir, dirv.data(), dirv.size() * 4);
+    ctx.write(bSl, sl.data(), sl.size() * 4);
+    ctx.write(bOn, &onflag, 4);
+    ctx.write(bBo, bo.data(), bo.size() * 4);
+    ctx.write(bInj, inj.data(), inj.size() * 4);
+    ctx.write(bR, R.data(), R.size() * 4);
+    Pc pc{};
+    pc.n = n; pc.hc = hc; pc.r_ld = (int) r_ld; pc.bo_ld = n; pc.inj_ld = hc;
+    pc.mode = 0; pc.layer = kLayer; pc.write = 0;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/cvec_apply.spv", 6, sizeof(Pc));
+        ctx.dispatch(p, {&bR, &bDir, &bSl, &bOn, &bBo, &bInj}, &pc, sizeof(pc), (uint32_t) hc, (uint32_t) T);
+    }
+    std::vector<float> ref(R.size());
+    ctx.read(bR, ref.data(), ref.size() * 4);
+
+    // (B) THE ENGINE WRAPPER through the MODULE: cvec_upload, then cvec_apply.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("cvec_apply entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bR); ctx.free(bDir); ctx.free(bSl); ctx.free(bOn); ctx.free(bBo); ctx.free(bInj);
+        return;
+    }
+    std::string uerr;
+    const bool up = strata::kernels::cvec_upload(dirv, sl, /*mode=project*/ 0, kLayer, kLayer, n, hc, uerr);
+    float* dR = strata::vulkan::arena_alloc<float>(*s, (size_t) T * r_ld);
+    strata::vulkan::stream_write(*s, dR, R.data(), R.size() * 4);
+    strata::kernels::cvec_apply(dR, kLayer, T, r_ld, nullptr, 0, nullptr, 0, false, s);   // THE ENGINE WRAPPER
+    std::vector<float> got(R.size());
+    strata::vulkan::stream_read(*s, dR, got.data(), got.size() * 4);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE vs the port's shader path.
+    int bad = 0;
+    for (size_t i = 0; i < R.size(); ++i) {
+        uint32_t u, v;
+        std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4);
+        if (u != v) ++bad;
+    }
+    verdict("cvec_apply entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) R.size(), 0.0,
+            "words differ - the module tables, the push constants or the dispatch the wrapper uses does not match "
+            "the ported shader's own path");
+    // (D) vs the double oracle (the reflection), case_cvec_apply's 1e-4.
+    double worst = 0.0;
+    int bad_oracle = up ? 0 : 1;
+    for (int t = 0; t < T; ++t)
+        for (int cc = 0; cc < hc; ++cc) {
+            double dot = 0.0;
+            const float* row0 = &R[(size_t) t * r_ld + (size_t) cc * n];
+            for (int j = 0; j < n; ++j) dot += (double) row0[j] * dirv[(size_t) kLayer * n + j];
+            for (int j = 0; j < n; ++j) {
+                const double want = (double) row0[j] - 2.0 * dot * dirv[(size_t) kLayer * n + j];
+                const double err = std::fabs((double) got[(size_t) t * r_ld + (size_t) cc * n + j] - want);
+                worst = std::fmax(worst, err);
+                if (err > 1e-4) ++bad_oracle;
+            }
+        }
+    verdict("cvec_apply entry point: engine wrapper vs project(2*s) oracle", bad_oracle == 0, bad_oracle, T * hc * n,
+            worst, "worst absolute vs a double oracle (engine's own 1e-4); an upload failure also counts here");
+    ctx.free(bR); ctx.free(bDir); ctx.free(bSl); ctx.free(bOn); ctx.free(bBo); ctx.free(bInj);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -14441,6 +14792,14 @@ int main(int argc, char** argv) {
     case_gdn_gate_entry(ctx, dir);               // gdn_gate          -> gdn_gate.spv
     case_rms_norm_weighted_entry(ctx, dir);      // rms_norm_weighted -> rms_norm.spv
     case_embedding_gather_entry(ctx, dir);       // embedding_gather  -> embedding_gather.spv
+    // I2, continued FURTHER: the next five the FORWARD PATH reaches, in the order its call sites give (the four
+    // thin ones first, cvec_apply - the only one layer.cpp calls directly - third).  APPENDED last for the same
+    // shared-RNG reason as every batch above.
+    case_gather_rows_entry(ctx, dir);            // gather_rows       -> gather_rows.spv      (mtp.cpp:450)
+    case_scatter_rows_f32_entry(ctx, dir);       // scatter_rows_f32  -> scatter_rows_f32.spv (peer_experts.cpp:241)
+    case_cvec_apply_entry(ctx, dir);             // cvec_apply        -> cvec_apply.spv       (layer.cpp:1330)
+    case_add_inplace_entry(ctx, dir);            // add_inplace       -> add.spv              (expert_source.cpp:2353)
+    case_f32_to_f16_bulk_entry(ctx, dir);        // f32_to_f16_bulk   -> f32_to_f16.spv       (no src/core site)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.
