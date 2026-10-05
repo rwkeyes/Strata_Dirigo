@@ -1,0 +1,48 @@
+// ports/vulkan/shaders/gemm_prefill_fma.comp - the prefill GEMM without the matrix units.
+//
+// SAME CONTRACT as gemm_prefill_f16_m8.comp: Y[T x ldy] = X[T x K] . W[N x K]^T, f16 operands, f32 accumulate.
+// Different everything else, on purpose:
+//
+//   * NO SHAPE PRECONDITION.  One invocation per output element, so T, N and K can be anything - a single-token
+//     decode row, a prompt whose length is not a multiple of the tile, a K below one chunk.  This is the kernel
+//     that finishes a prefill the cooperative-matrix path cannot cover, which is why the gate exercises the SPLIT
+//     (aligned rows on the matrix units, the remainder here) and not each half alone.
+//   * No cooperative matrix, no subgroup op, no barrier: it needs 16-bit storage and nothing else, so it runs on
+//     a device whose config list has no usable f16 entry at all (llvmpipe, RADV here).
+//   * It is a correctness floor, not a fast kernel: the K loop reads global memory every time.  The tiled
+//     shared-memory version is the optimisation to make when this path carries real work.
+//
+// The GRID is M*N invocations, so T*ldy must stay under 2^32; the caller sizes it and this kernel guards the top
+// edge.  Y rows are independent, which is what makes the aligned/remainder split safe: the two kernels write
+// disjoint rows of the same buffer.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+// X: [T x K] row-major.  W: [N x K] row-major.  Y: [T x ldy] row-major.
+layout(set = 0, binding = 0, std430) readonly buffer Xbuf { float16_t x[]; } X;
+layout(set = 0, binding = 1, std430) readonly buffer Wbuf { float16_t w[]; } W;
+layout(set = 0, binding = 2, std430) buffer Ybuf { float y[]; } Y;
+
+layout(push_constant) uniform Pc {
+    uint t;      // tokens in X (rows written here): the caller passes the REMAINDER rows on a split
+    uint n;      // output features
+    uint k;      // reduction length
+    uint ldy;    // row stride of Y in floats (>= n)
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.t * pc.n) return;                  // the grid is rounded up; surplus invocations exit
+    const uint row = idx / pc.n;                     // token
+    const uint col = idx % pc.n;                     // output feature
+    float acc = 0.0;
+    // The reduction runs over the CONTIGUOUS axis of both operands - W's row and X's row - which is the engine's
+    // (OP_T, OP_N) layout.  fp16 -> fp32 is exact, so the widening below costs nothing but the load.
+    for (uint i = 0u; i < pc.k; ++i) {
+        acc += float(X.x[row * pc.k + i]) * float(W.w[col * pc.k + i]);
+    }
+    Y.y[row * pc.ldy + col] = acc;
+}

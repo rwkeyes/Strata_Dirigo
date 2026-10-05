@@ -8,17 +8,18 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
                                                  # checks each shader's declared local size, then runs the gate
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
-was swapped for an Arc Pro B70 and after stages 3 and 4 plus the matrix path landed, the box's GPU run was
-**180 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan
-1.4.318, subgroup size 32) - 172 / 0 / 2 on llvmpipe and 175 / 0 / 1 on the radeon ICD, which now picks the AMD
-iGPU because the discrete card is gone (both still skip cooperative matrix: their drivers do not advertise the
-extension).  **The Arc has no skips at all**: the last one (`gemm_coopmat`) was the port misreading the device, not
-the device lacking anything - BMG's matrix config is M8 N16 K16, not the M16 the case demanded, so the matrix path
-now RUNS on XMX.  On the iGPU, 174/0/1 becomes 173/1/1 when its intermittent budget-requery case fires.  Before the
-swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three times in two days; read
-the last line of your own run.** All three available implementations are exercised again by `run_gate.sh`: it used
-to stop at the Intel skip, which meant the cross-implementation arm never ran on this box after the swap
-(`NEXT.md`). 55 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
+was swapped for an Arc Pro B70 and after stages 3, 4 and the prefill GEMM landed, the box's GPU run was
+**189 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan
+1.4.318, subgroup size 32) - 177 / 0 / 3 on llvmpipe and 180 / 0 / 2 on the radeon ICD, which now picks the AMD
+iGPU because the discrete card is gone (both skip cooperative matrix, whose driver does not advertise the
+extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one
+(`gemm_coopmat`) was the port misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion
+demanded - and since then the matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 180/0/2 becomes
+179/1/2 when its intermittent budget-requery case fires.  Before the swap the same gate read 160 / 0 / 0 on RADV
+and on radeon. That count has gone stale three times in two days; read the last line of your own run.** All three
+available implementations are exercised again by `run_gate.sh`: it used to stop at the Intel skip, which meant the
+cross-implementation arm never ran on this box after the swap (`NEXT.md`). 58 kernels, 17 shared includes, one
+generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -47,6 +48,14 @@ by name, and what a droppable cache buys - and the gate fits and PRINTS the plan
 round trip was falsified with a four-byte offset error (174/0/1 -> 172/2/1). Full detail, including the ONE defect
 class the round trip does NOT cover (an absent barrier: deleting the post-copy barrier changes no verdict on the
 Arc or llvmpipe) is in `NEXT.md`'s stage-4 block.
+
+**Stage 5's GEMM is DONE AND VERIFIED (2026-10-04) for the layout the engine calls** - `Y[T x ldy] = X[T x K] .
+W[N x K]^T` in f16 with an f32 accumulator, on Intel's real matrix tile (8x16x16) and in FMA for the ragged shapes,
+plus the engine's `bf16 -> f16` conversion with its clamp.  Ten verdicts (189/0/0 on the Arc; the FMA half green on
+all three implementations), with the transposed-operand bug falsified to fail four of them, and an `ldy > n` arm
+that leaves the stride columns NaN and requires them to survive.  `NEXT.md`'s stage-5 block carries the layout
+proof, the two-kernel split (aligned rows on the matrix units, the remainder on FMA) and the device-layer gap it
+found: the harness binds descriptors at offset 0, and the engine reaches row slices by pointer arithmetic.
 
 | Case | Verdict | Method |
 |---|---|---|
@@ -201,7 +210,16 @@ the case prints the shape it selected rather than only PASS.
 * **Kernel waves 2-6 (37 files):** the first wave's 8 kernels took ~40 minutes wall-clock end to end
   including the two defects above, most of it gating. At a similar rate, and with generation offloaded to the
   local model, expect **~2-3 focused sessions**. The long tail (MoE + the 7 quant formats) is the larger half.
-* **The GEMM + prefill path:** the only part that is genuine engineering rather than translation. Multi-day.
+* **The GEMM + prefill path: the GEMM IS DONE (2026-10-04) for the layout the engine calls.**  `Y[T x ldy] =
+  X[T x K] . W[N x K]^T` in f16 with an f32 accumulator (`Gemm::f16`/`Gemm::bf16` in `src/prefill/gemm.cu`, whose
+  cuBLAS call is (OP_T, OP_N) - the weight is the transposed operand), on the matrix units at Intel's real tile
+  (8x16x16) and in plain FMA for every ragged shape and every device without a config, plus the engine's own
+  `bf16 -> f16` operand conversion (with its clamp, not an overflow into Inf).  Ten verdicts, green on the Arc and
+  the FMA half green on all three implementations, with the transposed-operand bug falsified to fail four of them.
+  What remains in this area: **`src/prefill/kernels.cu` (53 KB), `moe_fused.cu`, `moe_fused_iq.cu` and
+  `moe_mmq.cu`** - the fused prefill kernels and the quantised-weight MMQ path (`Gemm::native` over ggml types),
+  which is the same porting grind as the expert tier with a different reduction; and the device-layer gap recorded
+  in `NEXT.md` (descriptor bindings are offset-0, and the engine passes row slices by pointer).
 * **Engine integration to a served model:** ~1 session for a CPU-verifiable path, then a GPU window on the
   hardware that is actually being targeted.
 * Cheaper alternative worth considering first: the port buys *compatibility* (Arc, and any Vulkan GPU). If the

@@ -194,7 +194,7 @@ resident model). 512 MiB is the compositor-only floor (measured: 354 MB for a tw
 | 2 | kernel registry + kernel waves 2-3, gated as they land | same gate, extended |
 | 3 ✅ | recorded command buffers (the graph replacement) + one captured decode step | the recorded step replays and equals the single-shot path, byte for byte, plus the falsification that 3 of its 6 verdicts fail on a shared descriptor set |
 | 4 ✅ | device-local memory + staging + `VK_EXT_memory_budget` fit accounting | the engine's own VRAM plan printed against the driver's numbers, a device-local round trip through staging, and the plan policy as five pure arms |
-| 5 | hand-written GEMM (+ cooperative matrix if the toolchain allows) | prompt-path parity vs the CPU reference |
+| 5 ◐ | hand-written GEMM (+ cooperative matrix if the toolchain allows) | prompt-path parity vs the CPU reference - **the GEMM itself is done and gated (the engine's OP_T/OP_N layout in f16, on the XMX tile and in FMA), and what remains under this stage is the rest of `src/prefill/` (the fused kernels and the quantised-weight MMQ path)** |
 | 6 | engine integration: `STRATA_ENABLE_VULKAN`, the arena, `gpu_arch_problem` for Intel | serve a model and compare output tokens to the HIP build |
 
 Stages 3 and 4 changed verifiability rather than only content, so here is what each of their entries means in

@@ -1,0 +1,21 @@
+// ports/vulkan/shaders/gemm_prefill_f16_m8.comp - the prefill GEMM on Intel XMX.
+//
+// The kernel body is common/gemm_prefill.glsl (the engine's `Gemm::f16` layout, the K loop, the dispatch shape);
+// this file exists only to pin the TILE, because a GLSL cooperative matrix is sized at compile time and **Intel
+// BMG's floating-point config is M8 N16 K16** - measured with the driver's own property list, and the reason the
+// port's original M16 criterion reported the Arc as having no matrix units at all.
+//
+// A sibling at M16 (RADV/WMMA) is a three-line file: set CM_M to 16 before the include.  It is NOT shipped yet, and
+// deliberately so: no device in this gate advertises an M16 config (RADV here does not expose the extension, and
+// the Radeon that did is no longer in the box), and an untested tile variant is exactly the kind of claim this port
+// does not make.  Where the device's tile is not 8, the caller uses gemm_prefill_fma.comp - slower, correct, and
+// verified on every implementation.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+#define CM_M 8
+#include "common/gemm_prefill.glsl"

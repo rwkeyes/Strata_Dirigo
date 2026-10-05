@@ -1,0 +1,43 @@
+// ports/vulkan/shaders/bf16_to_f16.comp - y[i] = f16(bf16(x[i])), the engine's own conversion, bit for bit.
+//
+// WHERE IT COMES FROM: src/prefill/gemm.cu's `bf16_to_f16_kernel`, which is how the engine runs its prefill on
+// cards with no BF16 tensor cores (Turing and Volta) - convert both operands once, then run the FP16 GEMM with
+// fp32 accumulation.  On Intel there is no BF16 cooperative-matrix config either (the driver's list has f16 and
+// integer entries), so the same strategy is the path from the engine's bf16 storage to the matrix units.  This is
+// a port of an EXISTING, deliberate strategy, not an invention.
+//
+// THE THREE STEPS, in the engine's order, and the middle one is the one that is easy to get wrong:
+//
+//   1. WIDEN.  bf16 -> f32 is a pure shift (`bf16_to_f32`: bitcast of h << 16).  Exact, no rounding.
+//   2. CLAMP finite values beyond FP16's range to +-65504 - DO NOT let them become Inf.  The engine does this
+//      because a weight or activation just past the fp16 maximum is a real number, and turning it into Inf poisons
+//      every product it enters (that is the #540 fix, and the reason this is a kernel rather than a cast).
+//      An input that was ALREADY Inf stays Inf: the clamp is `f > 65504 && !isinf(f)` in the CUDA and the same
+//      here, because `isinf` is exactly what separates "beyond the range" from "not a number in the range".
+//   3. ROUND to fp16 with round-to-nearest-even, using the port's gated converter (common/f16_bits.glsl) rather
+//      than a builtin: `packHalf2x16` saturates and need not round to nearest-even, and this kernel's output is
+//      the input to a GEMM, so a half-ULP difference propagates.
+//
+// BF16 -> FP16 is exact for every value inside fp16's NORMAL range (bf16 has 8 mantissa bits, fp16 has 11), so the
+// only interesting inputs are at the edges: the clamp band, the subnormal band, Inf and NaN.  The gate's fixture
+// is built from exactly those.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+layout(push_constant, std430) uniform PC { int n; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer X { uint16_t x[]; } x_buf;
+layout(set = 0, binding = 1, std430) buffer Y { uint16_t y[]; } y_buf;
+
+#include "common/bf16.glsl"
+#include "common/f16_bits.glsl"
+#define f16_from_f32(f) f16_from_f32_port(f)
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    float f = bf16_to_f32(uint(x_buf.x[i]));                       // 1. widen, exact
+    if (f > 65504.0f && !isinf(f)) f = 65504.0f;                   // 2. clamp, do not overflow into Inf
+    else if (f < -65504.0f && !isinf(f)) f = -65504.0f;
+    y_buf.y[i] = f16_from_f32(f);                                  // 3. round-to-nearest-even, the engine's rule
+}

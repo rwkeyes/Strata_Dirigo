@@ -521,6 +521,247 @@ void case_device_local_staging(Ctx& ctx, const std::string& dir) {
     ctx.free(dst);
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE PREFILL PATH: bf16 -> f16, then the GEMM the engine actually calls.
+// ----------------------------------------------------------------------------------------------------------
+
+// y[i] = f16(bf16(x[i])), bit for bit against src/prefill/gemm.cu's `bf16_to_f16_kernel`.  The engine needs this
+// conversion because Turing/Volta have no BF16 tensor cores, and on Intel there is no BF16 cooperative-matrix
+// config either - so it is the route from the engine's bf16 storage to the matrix units on both.
+//
+// The oracle is written out here rather than imported into the shader: the widening is a shift (exact), the CLAMP
+// is the engine's #540 rule (a finite value past fp16's range becomes +-65504, NEVER Inf), and the rounding is the
+// port's own gated converter - the same one f32_to_f16 is checked against, so a defect there cannot hide behind a
+// second implementation of it.
+void case_bf16_to_f16(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "bf16_to_f16.spv")) return;
+    if (!ctx.info().storage_buffer_16bit || !ctx.info().shader_int16) {
+        skip("bf16_to_f16", "device lacks storageBuffer16BitAccess/shaderInt16 - the operands are 16-bit");
+        return;
+    }
+    // Values a FLOAT can express, converted to bf16 by the engine's own converter, plus raw bf16 patterns for the
+    // cases a float cannot hold (a signalling NaN payload, the biggest finite bf16, and the clamp band's edges).
+    const float vals[] = {
+        0.0f, -0.0f, 1.0f, -1.0f, 0.5f, 2.0f, 3.14159274f, -2.71828175f,
+        65504.0f, 65505.0f, 70000.0f, -70000.0f, 1e30f, -1e30f,                 // the clamp band
+        5.96e-8f, 6.1e-8f, 1e-7f, -1e-7f, 1e-5f,                               // fp16's subnormal band
+        std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+    };
+    std::vector<uint16_t> bits;
+    for (float v : vals) bits.push_back(bf16_from_f32(v));
+    const uint16_t raw[] = {0x7F80, 0xFF80, 0x7FC0, 0x7FFF, 0x7F7F, 0xC77F};   // +inf, -inf, NaN, sNaN, 65504-ish
+    for (uint16_t r : raw) bits.push_back(r);
+    while (bits.size() < 1024) bits.push_back((uint16_t) (rnd() & 0xFFFFu));
+    const uint32_t N = (uint32_t) bits.size();
+
+    std::vector<uint16_t> want(N);
+    int clamp_changes = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        const float f = strata::kernels::f32_from_bf16(bits[i]);
+        const float clamped = (f > 65504.0f && !std::isinf(f))
+                                  ? 65504.0f
+                                  : ((f < -65504.0f && !std::isinf(f)) ? -65504.0f : f);
+        want[i] = f16_from_f32(clamped);
+        clamp_changes += (want[i] != f16_from_f32(f));
+    }
+
+    Buf bx = ctx.alloc(N * 2), by = ctx.alloc(N * 2);
+    ctx.write(bx, bits.data(), N * 2);
+    VkPipeline p = ctx.pipeline(dir + "/bf16_to_f16.spv", 2, 4);
+    struct { int32_t n; } pc{(int32_t) N};
+    ctx.dispatch(p, {&bx, &by}, &pc, sizeof(pc), groups_for(N));
+    std::vector<uint16_t> got(N);
+    ctx.read(by, got.data(), N * 2);
+    int bad = 0, shown = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (got[i] != want[i]) {
+            if (shown < 6) std::printf("      bf16 0x%04x -> got 0x%04x want 0x%04x\n", bits[i], got[i], want[i]);
+            ++shown;
+            ++bad;
+        }
+    }
+    verdict("bf16_to_f16 (bit-exact)", bad == 0, bad, (int) N, 0.0, "bit-mismatches");
+    // THE CLAMP MUST BE EXERCISED, not merely present: if no fixture entry crosses fp16's range, the clamp could be
+    // deleted and this case would stay green - an assertion over an input that never reaches the branch.
+    verdict("bf16_to_f16 clamp exercised", clamp_changes > 0, clamp_changes > 0 ? 0 : 1, 1, (double) clamp_changes,
+            "entries the clamp changes");
+    ctx.free(bx);
+    ctx.free(by);
+}
+
+// One prefill GEMM compared against a double-precision reference: Y[T x ldy] = X[T x K] . W[N x K]^T, f16
+// operands, f32 accumulate.  `cma` selects the dispatch shape (tiles plus a deliberate over-dispatch) and the
+// pipeline; both kernels take the SAME four push constants and the same three bindings, so they are
+// interchangeable by construction.
+//
+// The operands are f16 on the device, so the reference is built from the f16-ROUNDED values: comparing against the
+// f32 originals would charge the kernel for the storage format's own precision.
+static void prefill_check(Ctx& ctx, const std::string& dir, const char* spv, uint32_t t, uint32_t n, uint32_t k,
+                          uint32_t ldy, bool cma, const char* label) {
+    std::vector<float> xf((size_t) t * k), wf((size_t) n * k);
+    for (float& v : xf) v = rndf(1.0f);
+    for (float& v : wf) v = rndf(1.0f);
+    std::vector<uint16_t> x16(xf.size()), w16(wf.size());
+    std::vector<float> xr(xf.size()), wr(wf.size());
+    for (size_t i = 0; i < xf.size(); ++i) { x16[i] = f16_from_f32(xf[i]); xr[i] = strata::kernels::f32_from_f16(x16[i]); }
+    for (size_t i = 0; i < wf.size(); ++i) { w16[i] = f16_from_f32(wf[i]); wr[i] = strata::kernels::f32_from_f16(w16[i]); }
+
+    std::vector<float> ref((size_t) t * ldy);
+    for (uint32_t r = 0; r < t; ++r) {
+        for (uint32_t c = 0; c < n; ++c) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < k; ++i) acc += (double) xr[(size_t) r * k + i] * (double) wr[(size_t) c * k + i];
+            ref[(size_t) r * ldy + c] = (float) acc;
+        }
+    }
+
+    const uint64_t slack = 512;    // NaN pad beyond the last row: a write past the end must be DETECTED
+    Buf bx = ctx.alloc((uint64_t) x16.size() * 2);
+    Buf bw = ctx.alloc((uint64_t) w16.size() * 2);
+    Buf by = ctx.alloc((uint64_t) t * ldy * 4 + slack * 4);
+    ctx.write(bx, x16.data(), x16.size() * 2);
+    ctx.write(bw, w16.data(), w16.size() * 2);
+    std::vector<float> pad((size_t) t * ldy + slack, std::numeric_limits<float>::quiet_NaN());
+    ctx.write(by, pad.data(), pad.size() * 4);
+
+    VkPipeline p = ctx.pipeline(dir + "/" + spv, 3, 16);
+    struct { uint32_t t, n, k, ldy; } pc{t, n, k, ldy};
+    const uint32_t groups = cma ? (uint32_t) ((t / 8) * (n / 16) + 8) : groups_for((uint64_t) t * n);
+    ctx.dispatch(p, {&bx, &bw, &by}, &pc, sizeof(pc), groups);
+
+    std::vector<float> got(pad.size());
+    ctx.read(by, got.data(), pad.size() * 4);
+    int bad = 0, guard_bad = 0;
+    double worst = 0;
+    for (uint32_t r = 0; r < t; ++r) {
+        // The row STRIDE, which is not a detail: the engine passes ldy, and a row of Y is n floats wide inside it.
+        // The columns between n and ldy must be untouched - a kernel that assumed ldy == n would smear them - and
+        // the slack past the last row must be untouched too (the over-dispatch).
+        for (uint32_t c = n; c < ldy; ++c) guard_bad += std::isnan(got[(size_t) r * ldy + c]) ? 0 : 1;
+        for (uint32_t c = 0; c < n; ++c) {
+            const float g = got[(size_t) r * ldy + c];
+            const float w = ref[(size_t) r * ldy + c];
+            if (!close_enough(g, w, 1e-3f, 1e-4f)) ++bad;
+            worst = std::max(worst, std::fabs((double) g - (double) w) / (std::fabs((double) w) + 1e-30));
+        }
+    }
+    for (size_t i = (size_t) t * ldy; i < pad.size(); ++i) guard_bad += std::isnan(got[i]) ? 0 : 1;
+    if (guard_bad) std::printf("      %d float(s) written outside the tile: the row stride or the grid guard\n", guard_bad);
+    verdict(label, bad == 0 && guard_bad == 0, bad + guard_bad, (int) ((uint64_t) t * n), worst, "worst rel err");
+    ctx.free(bx);
+    ctx.free(bw);
+    ctx.free(by);
+}
+
+// THE PREFILL GEMM, both paths, on whatever device is running.  This is the shape the prompt path needs and the
+// one the plan's stage 5 is named for; the engine calls it as `Gemm::f16` (src/prefill/gemm.cu), whose cuBLAS
+// call is (CUBLAS_OP_T, CUBLAS_OP_N) - the weight is the transposed operand.
+void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gemm_prefill_fma.spv") || !have(dir, "gemm_prefill_f16_m8.spv")) return;
+    if (!ctx.info().storage_buffer_16bit) {
+        skip("gemm_prefill", "device lacks storageBuffer16BitAccess - the operands are fp16");
+        return;
+    }
+    const bool cma = ctx.info().cooperative_matrix && ctx.info().cm_m == 8;
+    std::printf("INFO  %-28s FMA on every shape; cooperative matrix %s\n", "gemm_prefill paths",
+                cma ? "on the tile-aligned ones (XMX, tile 8x16x16)"
+                    : "NOT USED - this device offers no M8 f16 config, so every shape takes the FMA path");
+    std::fflush(stdout);
+
+    // THE FMA PATH, on the shapes the matrix units structurally cannot take: a single-token row (decode), a
+    // ragged everything, and a mid-sized prompt.  ldy > n on one of them, so the row stride is exercised here too.
+    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 1, 64, 64, 64, false, "prefill_fma 1x64x64 (decode row)");
+    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 17, 13, 5, 20, false, "prefill_fma 17x13x5 (ragged, ldy>n)");
+    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 40, 64, 96, 64, false, "prefill_fma 40x64x96");
+
+    if (cma) {
+        // THE MATRIX-UNIT PATH at tile-aligned prompt-like shapes.  N != K on purpose: a transposed operand read
+        // is dimensionally wrong there, so the layout cannot be wrong and still agree.
+        prefill_check(ctx, dir, "gemm_prefill_f16_m8.spv", 8, 16, 16, 16, true, "prefill_cma 8x16x16 (one tile)");
+        prefill_check(ctx, dir, "gemm_prefill_f16_m8.spv", 64, 512, 512, 512, true, "prefill_cma 64x512x512");
+        prefill_check(ctx, dir, "gemm_prefill_f16_m8.spv", 128, 256, 256, 264, true, "prefill_cma 128x256x256 ldy>n");
+
+        // THE SPLIT: T = 37 is 4 tiles of 8 plus 5 rows, so the aligned rows go to the matrix units and the
+        // remainder to the FMA kernel - the two halves a real prefill of an odd-length prompt actually takes.
+        // The harness binds buffers at offset 0, so the case gives each half its OWN X and Y buffer and compares
+        // each against its rows of the reference; the engine reaches the same rows by pointer arithmetic
+        // (`Y + t0 * ldy` in gemm.cu), which is a DEVICE-LAYER gap recorded in NEXT.md rather than papered over.
+        {
+            const uint32_t t = 37, n = 64, k = 96, ldy = 64, aligned = (37u / 8u) * 8u;   // 32
+            std::vector<float> xf((size_t) t * k), wf((size_t) n * k);
+            for (float& v : xf) v = rndf(1.0f);
+            for (float& v : wf) v = rndf(1.0f);
+            std::vector<uint16_t> x16(xf.size()), w16(wf.size());
+            std::vector<float> xr(xf.size()), wr(wf.size());
+            for (size_t i = 0; i < xf.size(); ++i) { x16[i] = f16_from_f32(xf[i]); xr[i] = strata::kernels::f32_from_f16(x16[i]); }
+            for (size_t i = 0; i < wf.size(); ++i) { w16[i] = f16_from_f32(wf[i]); wr[i] = strata::kernels::f32_from_f16(w16[i]); }
+            std::vector<float> ref((size_t) t * ldy);
+            for (uint32_t r = 0; r < t; ++r) {
+                for (uint32_t c = 0; c < n; ++c) {
+                    double acc = 0.0;
+                    for (uint32_t i = 0; i < k; ++i) {
+                        acc += (double) xr[(size_t) r * k + i] * (double) wr[(size_t) c * k + i];
+                    }
+                    ref[(size_t) r * ldy + c] = (float) acc;
+                }
+            }
+            const uint32_t rem = t - aligned;                       // 5
+            Buf ba = ctx.alloc((uint64_t) x16.size() * 2), bw = ctx.alloc((uint64_t) w16.size() * 2);
+            Buf by = ctx.alloc((uint64_t) t * ldy * 4);
+            std::vector<float> pad((size_t) t * ldy, std::numeric_limits<float>::quiet_NaN());
+            ctx.write(ba, x16.data(), x16.size() * 2);
+            ctx.write(bw, w16.data(), w16.size() * 2);
+            ctx.write(by, pad.data(), pad.size() * 4);
+            VkPipeline pcma = ctx.pipeline(dir + "/gemm_prefill_f16_m8.spv", 3, 16);
+            VkPipeline pfma = ctx.pipeline(dir + "/gemm_prefill_fma.spv", 3, 16);
+            struct { uint32_t t, n, k, ldy; } pc1{aligned, n, k, ldy}, pc2{rem, n, k, ldy};
+            ctx.dispatch(pcma, {&ba, &bw, &by}, &pc1, sizeof(pc1), (aligned / 8) * (n / 16) + 4);   // rows 0..31
+            // The remainder's own X and Y: rows [32, 37).
+            std::vector<uint16_t> xrem((size_t) rem * k);
+            for (uint32_t r = 0; r < rem; ++r) {
+                for (uint32_t i = 0; i < k; ++i) xrem[(size_t) r * k + i] = x16[(size_t) (aligned + r) * k + i];
+            }
+            Buf brem_x = ctx.alloc((uint64_t) xrem.size() * 2);
+            Buf brem_y = ctx.alloc((uint64_t) rem * ldy * 4);
+            ctx.write(brem_x, xrem.data(), xrem.size() * 2);
+            std::vector<float> padr((size_t) rem * ldy, std::numeric_limits<float>::quiet_NaN());
+            ctx.write(brem_y, padr.data(), padr.size() * 4);
+            ctx.dispatch(pfma, {&brem_x, &bw, &brem_y}, &pc2, sizeof(pc2), groups_for((uint64_t) rem * n));
+
+            std::vector<float> g1(pad.size()), g2(padr.size());
+            ctx.read(by, g1.data(), pad.size() * 4);
+            ctx.read(brem_y, g2.data(), padr.size() * 4);
+            int bad = 0, guard = 0;
+            double worst = 0;
+            for (uint32_t r = 0; r < aligned; ++r) {
+                for (uint32_t c = 0; c < n; ++c) {
+                    const float g = g1[(size_t) r * ldy + c], w = ref[(size_t) r * ldy + c];
+                    if (!close_enough(g, w, 1e-3f, 1e-4f)) ++bad;
+                    worst = std::max(worst, std::fabs((double) g - (double) w) / (std::fabs((double) w) + 1e-30));
+                }
+            }
+            for (uint32_t r = 0; r < rem; ++r) {
+                for (uint32_t c = 0; c < n; ++c) {
+                    const float g = g2[(size_t) r * ldy + c], w = ref[(size_t) (aligned + r) * ldy + c];
+                    if (!close_enough(g, w, 1e-3f, 1e-4f)) ++bad;
+                    worst = std::max(worst, std::fabs((double) g - (double) w) / (std::fabs((double) w) + 1e-30));
+                }
+                // The remainder rows of the ALIGNED buffer must still be untouched: the tile path must not compute
+                // past the rows it was given (it would if the host dispatched a whole tile for a partial row count).
+                for (uint32_t c = 0; c < n; ++c) guard += std::isnan(g1[(size_t) (aligned + r) * ldy + c]) ? 0 : 1;
+            }
+            std::printf("      split: %u rows on the matrix units + %u rows on FMA, %d leftover row(s) touched\n",
+                        aligned, rem, guard);
+            verdict("prefill split 37 = 32 + 5", bad == 0 && guard == 0, bad + guard, (int) ((uint64_t) t * n), worst,
+                    "worst rel err");
+            ctx.free(ba); ctx.free(bw); ctx.free(by); ctx.free(brem_x); ctx.free(brem_y);
+        }
+    } else {
+        skip("prefill split (aligned + remainder)", "this device offers no M8 cooperative-matrix config");
+    }
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -5979,6 +6220,8 @@ int main(int argc, char** argv) {
     case_add(ctx, dir);
     case_recorded_step(ctx, dir);   // the record/replay API: the ONE case that exercises it (stage 3)
     case_device_local_staging(ctx, dir);   // device-local memory + staging + the printed plan (stage 4)
+    case_bf16_to_f16(ctx, dir);            // the prefill path's operand conversion (stage 5)
+    case_gemm_prefill(ctx, dir);           // THE prefill GEMM: engine layout, both kernels (stage 5)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

@@ -173,6 +173,57 @@ and any driver that does not advertise the extension) - and the selection has to
 
 
 
+## STAGE 5: the PREFILL GEMM - **DONE FOR THE LAYOUT THE ENGINE CALLS, WITH ITS OPERAND CONVERSION**
+
+**What "the GEMM" means here.**  The engine's prompt path calls `Gemm::f16` / `Gemm::bf16`
+(`src/prefill/gemm.cu`), whose cuBLAS call is `(CUBLAS_OP_T, CUBLAS_OP_N)` with m = N, n = T, k = K:
+
+```
+Y[T x ldy] = X[T x K] . W[N x K]^T          f16 operands, f32 accumulate
+```
+
+**The WEIGHT is the transposed operand** - an output row is an output feature, and the reduction runs over the
+contiguous axis of both inputs.  That is a different layout from `gemm_coopmat.comp` / `gemm_fma.comp` (which are
+`C[MxN] = A[MxK].B[KxN]`, the shape and no-CMA fallbacks), and getting it backwards is the classic SILENT GEMM
+bug: every number stays plausible.  So it is stated in the kernel, each loader says which layout it reads, and the
+gate compares at shapes where `N != K` - a transposed read cannot survive that.
+
+**Three new kernels.**
+
+| shader | what it is |
+|---|---|
+| `bf16_to_f16.comp` | the engine's own operand conversion (`prefill/gemm.cu`'s `bf16_to_f16_kernel`): widen, **CLAMP finite values past fp16's range to +-65504 rather than letting them become Inf** (the #540 rule), then round-to-nearest-even with the port's gated converter. This is the route from the engine's bf16 storage to the matrix units on Intel too, where the driver's list has no bf16 config. |
+| `gemm_prefill_f16_m8.comp` | the GEMM on XMX at the tile Intel actually has (8x16x16). The body lives in `common/gemm_prefill.glsl`, where the tile is a compile-time knob - so the RADV/WMMA M16 sibling is a three-line file when a Radeon is in the box. Not shipped: an untested tile variant is exactly the claim this port does not make, and the FMA kernel below covers those devices correctly. |
+| `gemm_prefill_fma.comp` | the same contract with **no shape precondition at all** - one invocation per output element, f16 operands read as fp16 and widened (exact), no cooperative matrix, no subgroup op, no barrier. It is the decode row, the ragged prompt, and the devices without a usable config. |
+
+**Why there are two, and why the case tests the SPLIT.**  The tile path has no ragged edge: `tiles_t = t / TM`
+rounds DOWN, so rows the tile cannot cover are silently not computed.  A real prefill of a prompt whose length is
+not a multiple of the tile therefore runs BOTH kernels - aligned rows on the matrix units, the remainder on FMA -
+and the case exercises exactly that (`T = 37 = 4 x 8 + 5 rows`) rather than each half alone, including a check that
+the tile dispatch left the remainder rows untouched.
+
+**Evidence (Arc Pro B70, this box):** **189 passed / 0 failed / 0 skipped**, ten new verdicts - `bf16_to_f16`
+bit-exact over 1024 patterns with the clamp measured as exercised on 437 of them, three FMA shapes (1x64x64 decode
+row, 17x13x5 ragged with `ldy > n`, 40x64x96 mid-prompt), three matrix-unit shapes (one tile, 64x512x512,
+128x256x256 with `ldy > n`), and the split.  `ldy > n` is exercised on purpose: a kernel that assumed `ldy == n`
+would smear the columns between n and the stride, and the case leaves those columns NaN and requires them to
+survive.
+
+**Falsification.**  Reading the weight RowMajor instead of ColumnMajor - the transposed-operand bug itself - fails
+all four matrix-unit arms (`0/128`, `14/32768`, `16/32768`, `320/2368`, totals 189/0/0 -> 185/4/0) while the FMA
+arms stay green, which is what makes this a test of the LAYOUT rather than of the arithmetic.  And the clamp's own
+arm counts the entries the clamp changes, so it cannot be deleted with the case still green.
+
+**A DEVICE-LAYER GAP THIS FOUND, and it blocks stage 6 rather than stage 5.**  The engine reaches a row slice of Y
+by POINTER arithmetic (`f16(tc_x_, tc_w_, Y + t0 * ldy, ...)` in `gemm.cu`, and `X + t0 * K` for the activations in
+row slices), because cuBLAS takes pointers.  The harness binds **offset 0** on every descriptor, so the case has to
+give each half its own X and Y buffer instead of pointing both at one.  A Vulkan backend needs
+`VkDescriptorBufferInfo::offset` (or one buffer per slice, which is what the engine's own conversion buffers
+amount to) before it can serve a real prompt.  Recorded here because it is invisible until someone tries to pass a
+slice.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
