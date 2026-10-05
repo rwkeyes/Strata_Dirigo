@@ -134,7 +134,11 @@ bool arena_resolve(const Stream& s, const void* p, uint64_t bytes, Buf& out) {
 void stream_write(Stream& s, void* dev, const void* host, uint64_t bytes) {
     Buf v;
     if (!arena_resolve(s, dev, bytes, v)) {
-        std::fprintf(stderr, "strata::vulkan: stream_write given a pointer that is not in the arena\n");
+        const uintptr_t a = reinterpret_cast<uintptr_t>(dev);
+        std::fprintf(stderr, "strata::vulkan: stream_write given a pointer that is not in the arena "
+                             "(off=%llu bytes=%llu bump=%llu)\n",
+                     (unsigned long long) (a >= Stream::kArenaBase ? a - Stream::kArenaBase : a),
+                     (unsigned long long) bytes, (unsigned long long) s.bump);
         std::exit(2);
     }
     s.ctx->write(v, host, bytes, v.offset);
@@ -143,7 +147,11 @@ void stream_write(Stream& s, void* dev, const void* host, uint64_t bytes) {
 void stream_read(const Stream& s, const void* dev, void* host, uint64_t bytes) {
     Buf v;
     if (!arena_resolve(s, dev, bytes, v)) {
-        std::fprintf(stderr, "strata::vulkan: stream_read given a pointer that is not in the arena\n");
+        const uintptr_t a = reinterpret_cast<uintptr_t>(dev);
+        std::fprintf(stderr, "strata::vulkan: stream_read given a pointer that is not in the arena "
+                             "(off=%llu bytes=%llu bump=%llu)\n",
+                     (unsigned long long) (a >= Stream::kArenaBase ? a - Stream::kArenaBase : a),
+                     (unsigned long long) bytes, (unsigned long long) s.bump);
         std::exit(2);
     }
     s.ctx->read(v, host, bytes, v.offset);

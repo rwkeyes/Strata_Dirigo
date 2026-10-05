@@ -39,6 +39,9 @@
 #include "strata/kernels/cvec.hpp"           // I2: cvec_apply + the control-vector module
 #include "strata/kernels/fused_gdn.hpp"            // I2 (GDN mixer): fused_gdn_conv_l2 / fused_gdn_ab
 #include "strata/kernels/native_gdn_preprocess.hpp" // I2 (GDN mixer): native_gdn_conv_silu / native_gdn_l2_norm
+#include "strata/kernels/native_mmvq.hpp"    // I3: native_quantize_q8_1 / native_mmvq / native_q5_k_f32
+#include "strata/kernels/quantize_act.hpp"   // I3: quantize_q8_0 / quantize_q8_0_scaled / quantize_q8_K
+#include "strata/kernels/iq_kernels.hpp"     // I3: quantize_q8_1_rows (same shader as native_quantize_q8_1)
 
 #include <algorithm>
 #include <cmath>
@@ -15920,6 +15923,534 @@ void case_gdn_out_norm_entry(Ctx& ctx, const std::string& dir) {
 }
 
 
+// ============================================================================================================
+// I3 - THE FIRST EIGHT MATVEC / GEMV / KV ENTRY POINTS (vulkan/src/kernels/matvec_vk.cpp).
+//
+// Each case runs the port's EXISTING shader fixture through (A) the shader path on the harness `ctx` and (B) the
+// ENGINE WRAPPER `strata::kernels::<symbol>` on its own engine stream (`EnginePin`-pinned), then asserts (C) the
+// wrapper's answer equals the shader path's BITWISE and (D) equals the case's explicit oracle.  APPENDED at the
+// end of main() for the shared-RNG reason every prior batch names.
+// ============================================================================================================
+
+// #1 `quantize_q8_K` (layer.cpp:236) -> quantize_q8_K.spv.  Fixture: case_quantize_q8_K's three forms (a zero
+// block, the negative-first max TIE, and ordinary data).  The oracle is the transcribed rule; the scale has two
+// driver-picked forms (see q8_K_host_block), so the byte-exact demand is "equals one of them".
+void case_quantize_q8_K_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_K.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("quantize_q8_K entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int QK = 256, BY = 292, nb = 3, n = nb * QK;
+    std::vector<float> x((size_t) n, 0.0f);
+    x[(size_t) QK + 0] = -5.0f; x[(size_t) QK + 7] = 5.0f;
+    for (int i = 8; i < QK; ++i) x[(size_t) QK + i] = 0.25f * (float) ((i % 7) - 3);
+    for (int i = 2 * QK; i < 3 * QK; ++i) x[(size_t) i] = rndf(1.0f) * 3.0f;
+    const size_t blk = (size_t) nb * BY, slack = 64;
+    Buf bx = ctx.alloc((size_t) n * 4), bb = ctx.alloc(blk + slack);
+    ctx.write(bx, x.data(), (size_t) n * 4);
+    std::vector<uint8_t> sent(blk + slack, 0x5A); ctx.write(bb, sent.data(), sent.size());
+    struct { int n_blocks; } pc{nb};
+    { VkPipeline p = ctx.pipeline(dir + "/quantize_q8_K.spv", 2, 4);
+      ctx.dispatch(p, {&bx, &bb}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize)); }
+    std::vector<uint8_t> ref(blk + slack); ctx.read(bb, ref.data(), ref.size());
+
+    std::vector<uint8_t> w1(blk, 0), w2(blk, 0);
+    for (int b = 0; b < nb; ++b) {
+        q8_K_host_block(&x[(size_t) b * QK], &w1[(size_t) b * BY]);
+        q8_K_host_block(&x[(size_t) b * QK], &w2[(size_t) b * BY], false, true);
+    }
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) { verdict("quantize_q8_K entry: engine wrapper", false, 1, 1, 0, "no stream"); ctx.free(bx); ctx.free(bb); return; }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) n);
+    uint8_t* db = strata::vulkan::arena_alloc<uint8_t>(*s, blk + slack);
+    strata::vulkan::stream_write(*s, dx, x.data(), (size_t) n * 4);
+    std::vector<uint8_t> init(blk + slack, 0xA5); strata::vulkan::stream_write(*s, db, init.data(), blk + slack);
+    strata::kernels::quantize_q8_K(dx, db, n, s);   // THE ENGINE WRAPPER
+    std::vector<uint8_t> got(blk + slack); strata::vulkan::stream_read(*s, db, got.data(), blk + slack);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0, guard = 0;
+    for (size_t i = 0; i < blk; ++i) if (ref[i] != got[i]) ++bad_bw;
+    for (size_t i = blk; i < ref.size(); ++i) if (ref[i] != 0x5A || got[i] != 0xA5) { guard = 1; break; }
+    if (bad_bw != 0) {
+        size_t i = 0; while (i < blk && ref[i] == got[i]) ++i;
+        const int w = (int) (i % (size_t) BY);
+        std::printf("      first differing byte %zu = block %zu %s | shader path 0x%02x wrapper 0x%02x\n", i,
+                    i / (size_t) BY, w < 4 ? "SCALE" : (w < 4 + QK ? "codes" : "bsums"), (int) ref[i], (int) got[i]);
+        if (w < 4) {
+            float a = 0, c = 0; std::memcpy(&a, &ref[i], 4); std::memcpy(&c, &got[i], 4);
+            std::printf("        shader d=%a  wrapper d=%a  (the two legitimate Q8_K scale forms differ here)\n", a, c);
+        }
+        int m1 = 0, m2 = 0;
+        for (size_t k = 0; k < blk; ++k) { if (got[k] != w1[k]) ++m1; if (got[k] != w2[k]) ++m2; }
+        std::printf("        wrapper vs image1 (division) %d, vs image2 (folded) %d\n", m1, m2);
+    }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "quantize_q8_K entry (nb=%d): engine wrapper == shader path, bitwise", nb);
+    verdict(tag, bad_bw == 0 && guard == 0, bad_bw + guard, (int) blk, 0.0,
+            "bytes differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the shader");
+    int bad = 0, bad_alt = 0;
+    for (size_t i = 0; i < blk; ++i) { if (got[i] != w1[i]) ++bad; if (got[i] != w2[i]) ++bad_alt; }
+    std::snprintf(tag, sizeof tag, "quantize_q8_K entry: engine wrapper vs the Q8_K rule (double, one of the two scale forms)");
+    verdict(tag, bad == 0 || bad_alt == 0, std::min(bad, bad_alt), (int) blk, 0.0,
+            "bytes differ from BOTH scale images");
+    ctx.free(bx); ctx.free(bb);
+}
+
+// #2 `quantize_q8_0` (layer.cpp:237) -> quantize_q8_0.spv.  Fixture: case_quantize_q8_0's tie/subnormal blocks.
+// The ggml shader's quotient is fp64, so the case skips (as the existing case does) where the device lacks it.
+void case_quantize_q8_0_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_0.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("quantize_q8_0 entry", "device lacks storageBuffer8BitAccess"); return; }
+    if (!ctx.info().shader_float64) { skip("quantize_q8_0 entry", "device lacks shaderFloat64 - the shader's quotient is fp64"); return; }
+    const int nb = 3, n = nb * 32;
+    std::vector<float> x((size_t) n, 0.0f);
+    x[32] = 127.0f;
+    const float ties[8] = {2.5f, 3.5f, -2.5f, -3.5f, 0.5f, 1.5f, -0.5f, -4.5f};
+    for (int i = 1; i < 32; ++i) x[32 + i] = ties[i % 8];
+    for (int i = 64; i < 96; ++i) x[(size_t) i] = rndf(1.0f) * 4.0f;
+    const size_t blk = (size_t) nb * 34, slack = 64;
+    Buf bx = ctx.alloc((size_t) n * 4), bb = ctx.alloc(blk + slack);
+    ctx.write(bx, x.data(), (size_t) n * 4);
+    std::vector<uint8_t> sent(blk + slack, 0xA5); ctx.write(bb, sent.data(), sent.size());
+    struct { int n_blocks; } pc{nb};
+    { VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0.spv", 2, 4);
+      ctx.dispatch(p, {&bx, &bb}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize)); }
+    std::vector<uint8_t> ref(blk + slack); ctx.read(bb, ref.data(), ref.size());
+    std::vector<uint8_t> want(blk, 0);
+    for (int b = 0; b < nb; ++b) q8_0_ggml_block(&x[(size_t) b * 32], &want[(size_t) b * 34]);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) { verdict("quantize_q8_0 entry: engine wrapper", false, 1, 1, 0, "no stream"); ctx.free(bx); ctx.free(bb); return; }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) n);
+    uint8_t* db = strata::vulkan::arena_alloc<uint8_t>(*s, blk);
+    strata::vulkan::stream_write(*s, dx, x.data(), (size_t) n * 4);
+    std::vector<uint8_t> init(blk, 0xA5); strata::vulkan::stream_write(*s, db, init.data(), blk);
+    strata::kernels::quantize_q8_0(dx, db, n, s);   // THE ENGINE WRAPPER
+    std::vector<uint8_t> got(blk); strata::vulkan::stream_read(*s, db, got.data(), blk);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0; for (size_t i = 0; i < blk; ++i) if (ref[i] != got[i]) ++bad_bw;
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "quantize_q8_0 entry (nb=%d): engine wrapper == shader path, bitwise", nb);
+    verdict(tag, bad_bw == 0, bad_bw, (int) blk, 0.0, "bytes differ - the wrapper's views/pipeline/dispatch mismatch");
+    int bad = 0; for (size_t i = 0; i < blk; ++i) if (got[i] != want[i]) ++bad;
+    std::snprintf(tag, sizeof tag, "quantize_q8_0 entry: engine wrapper vs the ggml Q8_0 rule (byte-exact)");
+    verdict(tag, bad == 0, bad, (int) blk, 0.0, "bytes differ from ggml's Q8_0 image");
+    ctx.free(bx); ctx.free(bb);
+}
+
+// #7 `quantize_q8_0_scaled` (session.cpp:868) -> quantize_q8_0_scaled.spv.  The CPU's fp32 scale beside the
+// blocks; the oracle is q8_0_cpu_block (half-away rounding, fp32 scales).  No fp64 needed.
+void case_quantize_q8_0_scaled_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_0_scaled.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("quantize_q8_0_scaled entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int nb = 3, n = nb * 32;
+    std::vector<float> x((size_t) n, 0.0f);
+    x[32] = 127.0f;
+    const float ties[8] = {2.5f, 3.5f, -2.5f, -3.5f, 0.5f, 1.5f, -0.5f, -4.5f};
+    for (int i = 1; i < 32; ++i) x[32 + i] = ties[i % 8];
+    for (int i = 64; i < 96; ++i) x[(size_t) i] = rndf(1.0f) * 4.0f;
+    const size_t blk = (size_t) nb * 34, slack = 64;
+    Buf bx = ctx.alloc((size_t) n * 4), bb = ctx.alloc(blk + slack), bs = ctx.alloc((size_t) nb * 4);
+    ctx.write(bx, x.data(), (size_t) n * 4);
+    std::vector<uint8_t> sent(blk + slack, 0xA5); ctx.write(bb, sent.data(), sent.size());
+    struct { int n_blocks; } pc{nb};
+    { VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0_scaled.spv", 3, 4);
+      ctx.dispatch(p, {&bx, &bb, &bs}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize)); }
+    std::vector<uint8_t> ref(blk + slack); ctx.read(bb, ref.data(), ref.size());
+    std::vector<float> refs((size_t) nb); ctx.read(bs, refs.data(), (size_t) nb * 4);
+    std::vector<uint8_t> want(blk, 0); std::vector<float> wsc((size_t) nb, 0.0f);
+    for (int b = 0; b < nb; ++b) q8_0_cpu_block(&x[(size_t) b * 32], &want[(size_t) b * 34], &wsc[(size_t) b]);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) { verdict("quantize_q8_0_scaled entry: engine wrapper", false, 1, 1, 0, "no stream"); ctx.free(bx); ctx.free(bb); ctx.free(bs); return; }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) n);
+    uint8_t* db = strata::vulkan::arena_alloc<uint8_t>(*s, blk);
+    float* ds = strata::vulkan::arena_alloc<float>(*s, (size_t) nb);
+    strata::vulkan::stream_write(*s, dx, x.data(), (size_t) n * 4);
+    std::vector<uint8_t> init(blk, 0xA5); strata::vulkan::stream_write(*s, db, init.data(), blk);
+    strata::kernels::quantize_q8_0_scaled(dx, db, ds, n, s);   // THE ENGINE WRAPPER
+    std::vector<uint8_t> got(blk); strata::vulkan::stream_read(*s, db, got.data(), blk);
+    std::vector<float> gsc((size_t) nb); strata::vulkan::stream_read(*s, ds, gsc.data(), (size_t) nb * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0, bad_s = 0;
+    for (size_t i = 0; i < blk; ++i) if (ref[i] != got[i]) ++bad_bw;
+    for (int b = 0; b < nb; ++b) { uint32_t a, c; std::memcpy(&a, &refs[(size_t) b], 4); std::memcpy(&c, &gsc[(size_t) b], 4); if (a != c) ++bad_s; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "quantize_q8_0_scaled entry (nb=%d): engine wrapper == shader path, bitwise", nb);
+    verdict(tag, bad_bw == 0 && bad_s == 0, bad_bw + bad_s, (int) (blk + nb * 4), 0.0, "bytes/scales differ from the shader path");
+    int bad = 0, bad_sc = 0;
+    for (size_t i = 0; i < blk; ++i) if (got[i] != want[i]) ++bad;
+    for (int b = 0; b < nb; ++b) { uint32_t a, c; std::memcpy(&a, &wsc[(size_t) b], 4); std::memcpy(&c, &gsc[(size_t) b], 4); if (a != c) ++bad_sc; }
+    std::snprintf(tag, sizeof tag, "quantize_q8_0_scaled entry: engine wrapper vs the CPU Q8_0 rule (bytes + fp32 scales)");
+    verdict(tag, bad == 0 && bad_sc == 0, bad + bad_sc, (int) (blk + nb * 4), 0.0, "bytes/scales differ from the CPU rule");
+    ctx.free(bx); ctx.free(bb); ctx.free(bs);
+}
+
+// #3 `native_quantize_q8_1` (layer.cpp:150) -> quantize_q8_1.spv.  The engine's q8_1 activation (fp16 d, fp16
+// sum, int8 qs[32]).  The oracle is the transcribed block; the driver's `/` may take either of the two forms
+// q81_arm accepts, so the byte-exact demand is "equals one of them" (the shader path IS the coupled reproduction).
+void case_native_quantize_q8_1_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_1.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("native_quantize_q8_1 entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int n_in = 512, ncols = 2;
+    const size_t n = (size_t) n_in * (size_t) ncols, nb = (size_t) ncols * (n_in / 32), bytes = nb * 36, slack = 64;
+    std::vector<float> x(n);
+    for (size_t b = 0; b < nb; ++b)
+        for (int l = 0; l < 32; ++l) {
+            const float amax = (((b % 3) == 0) ? 0.005f : 2.0f);
+            x[b * 32 + (size_t) l] = (((l % 5) == 0) ? -1.0f : 1.0f) * amax * (0.4f + 0.02f * (float) (l % 7));
+        }
+    std::vector<uint8_t> want(bytes, 0), want_alt(bytes, 0);
+    for (size_t b = 0; b < nb; ++b) {
+        int clamps[2] = {0, 0};
+        q81_block_host(&x[b * 32], &want[b * 36], clamps);
+        want_alt[b * 36] = want[b * 36]; want_alt[b * 36 + 1] = want[b * 36 + 1];
+        want_alt[b * 36 + 2] = want[b * 36 + 2]; want_alt[b * 36 + 3] = want[b * 36 + 3];
+        float amax = 0.0f;
+        for (int l = 0; l < 32; ++l) amax = std::max(amax, std::fabs(x[b * 32 + (size_t) l]));
+        const float inv_amax = 127.0f / amax;
+        for (int l = 0; l < 32; ++l) {
+            float r = q81_roundf_host(x[b * 32 + (size_t) l] * inv_amax);
+            r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+            want_alt[b * 36 + 4 + (size_t) l] = (uint8_t) ((int) r & 0xFF);
+        }
+    }
+    Buf bx = ctx.alloc(n * 4), by = ctx.alloc(bytes + slack);
+    ctx.write(bx, x.data(), n * 4);
+    std::vector<uint8_t> sent(bytes + slack, 0xC3); ctx.write(by, sent.data(), sent.size());
+    struct { int n_in; int ncols; } pc{n_in, ncols};
+    { VkPipeline p = ctx.pipeline(dir + "/quantize_q8_1.spv", 2, 8);
+      ctx.dispatch(p, {&bx, &by}, &pc, sizeof(pc), (uint32_t) (ncols * ((n_in + kLocalSize - 1) / kLocalSize))); }
+    std::vector<uint8_t> ref(bytes + slack); ctx.read(by, ref.data(), ref.size());
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) { verdict("native_quantize_q8_1 entry: engine wrapper", false, 1, 1, 0, "no stream"); ctx.free(bx); ctx.free(by); return; }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, n);
+    uint8_t* dy = strata::vulkan::arena_alloc<uint8_t>(*s, bytes);
+    strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+    std::vector<uint8_t> init(bytes, 0xC3); strata::vulkan::stream_write(*s, dy, init.data(), bytes);
+    strata::kernels::native_quantize_q8_1(dx, dy, n_in, ncols, s);   // THE ENGINE WRAPPER
+    std::vector<uint8_t> got(bytes); strata::vulkan::stream_read(*s, dy, got.data(), bytes);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0; for (size_t i = 0; i < bytes; ++i) if (ref[i] != got[i]) ++bad_bw;
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "native_quantize_q8_1 entry (n_in=%d ncols=%d): engine wrapper == shader path, bitwise", n_in, ncols);
+    verdict(tag, bad_bw == 0, bad_bw, (int) bytes, 0.0, "bytes differ - the wrapper's views/pipeline/dispatch mismatch");
+    int bad = 0, bad_alt = 0;
+    for (size_t i = 0; i < bytes; ++i) { if (got[i] != want[i]) ++bad; if (got[i] != want_alt[i]) ++bad_alt; }
+    std::snprintf(tag, sizeof tag, "native_quantize_q8_1 entry: engine wrapper vs the q8_1 rule (one of the two division forms)");
+    verdict(tag, bad == 0 || bad_alt == 0, std::min(bad, bad_alt), (int) bytes, 0.0, "bytes differ from BOTH q8_1 images");
+    ctx.free(bx); ctx.free(by);
+}
+
+// #4 `native_mmvq` (layer.cpp:151) -> SIX `*_mmvq` shaders.  THE COMPOSITE.  Fixture: case_iq2s_mmvq's (IQ2_S is
+// the arm that exercises the GRID path), one column.  Wrapper y must equal the iq2s shader path BITWISE, and the
+// shared oracle (which reads the supplied activation bytes, not the device's) bounds the values.
+void case_native_mmvq_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq2s_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("native_mmvq entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int n_in = 2560, n_out = 4, ncols = 1, nb = n_in / 256, row_bytes = nb * 82, bpc = n_in / 32;
+    const std::vector<uint8_t> w = iq2s_fill_blob((size_t) n_out, nb, n_in);
+    const std::vector<uint8_t> act = iq1m_fill_act(ncols * bpc);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c)
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, a_sum = 0.0;
+            for (int k = 0; k < nb * 8; ++k) {
+                const double v = iq2s_dot_host(w, (size_t) r * (size_t) row_bytes + (size_t) (k / 8) * 82, act,
+                                               (size_t) c * bpc * 36 + (size_t) k * 36, 2 * (k % 8));
+                acc += v; a_sum += std::fabs(v);
+            }
+            want[(size_t) c * n_out + r] = acc; want_abs[(size_t) c * n_out + r] = a_sum;
+        }
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size()), b_g = ctx.alloc(sizeof(strata::vkport::kIq2sGrid)), b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size()); ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_g, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3); ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    { VkPipeline p = ctx.pipeline(dir + "/iq2s_mmvq.spv", 4, (int) sizeof(pc));
+      ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out); }
+    std::vector<uint8_t> img(sink.size(), 0); ctx.read(b_y, img.data(), img.size());
+    const float* ref = reinterpret_cast<const float*>(img.data());
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) { verdict("native_mmvq entry: engine wrapper", false, 1, 1, 0, "no stream"); ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y); return; }
+    uint8_t* dw = (uint8_t*) strata::vulkan::arena_alloc(*s, w.size());
+    uint8_t* da = (uint8_t*) strata::vulkan::arena_alloc(*s, act.size());
+    float* dy = strata::vulkan::arena_alloc<float>(*s, n_y);
+    strata::vulkan::stream_write(*s, dw, w.data(), w.size());
+    strata::vulkan::stream_write(*s, da, act.data(), act.size());
+    strata::kernels::native_mmvq(22 /*IQ2_S*/, dw, da, dy, n_in, n_out, ncols, s);   // THE ENGINE WRAPPER
+    std::vector<float> got(n_y); strata::vulkan::stream_read(*s, dy, got.data(), n_y * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0, bad = 0, nonfinite = 0; double worst = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        uint32_t a, c; std::memcpy(&a, &ref[i], 4); std::memcpy(&c, &got[i], 4);
+        if (a != c) ++bad_bw;
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+    }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "native_mmvq entry (IQ2_S n_in=%d n_out=%d): engine wrapper == iq2s shader path, bitwise", n_in, n_out);
+    verdict(tag, bad_bw == 0, bad_bw, (int) n_y, 0.0, "words differ - the composite's type switch, grid binding or dispatch mismatch");
+    std::snprintf(tag, sizeof tag, "native_mmvq entry: engine wrapper vs the IQ2_S dot (double, terms bound)");
+    verdict(tag, bad == 0 && nonfinite == 0, bad + nonfinite, (int) n_y, worst, "rows outside the terms bound");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y);
+}
+
+// #8 `native_q5_k_f32` (native_head.cpp:78) -> quantize_q8_1.spv THEN native_q5_k_f32.spv.  The wrapper
+// quantises internally; the shader path is fed the SAME activation bytes (a standalone quantize_q8_1 dispatch on
+// the same input, the same shader), so y must match BITWISE.  Oracle: q5_dot_host on those activation bytes.
+void case_native_q5_k_f32_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_q5_k_f32.spv") || !have(dir, "quantize_q8_1.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("native_q5_k_f32 entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int n_in = 2560, n_out = 3, ncols = 1, nb = n_in / 256, row_bytes = nb * 176, bpc = n_in / 32;
+    const std::vector<uint8_t> w = q5_k_fill_blob((size_t) n_out, nb);
+    std::vector<float> xf((size_t) n_in);
+    for (float& v : xf) v = rndf(1.5f);
+    const size_t act_bytes = (size_t) ncols * bpc * 36, n_y = (size_t) n_out;
+
+    // (B) THE ENGINE WRAPPER FIRST.  It quantises internally, so its OWN q8_1 activation is the bytes BOTH
+    //     halves are held to.  Feeding the shader path a SEPARATELY quantised activation would compare two
+    //     runs of the quantiser, whose division form the driver may choose differently per pipeline instance
+    //     (measured: it does on RADV), and the port's own `case_native_q5_k_f32` supplies the activation the
+    //     same way for the same reason.  The quantiser half is gated by `case_native_quantize_q8_1_entry`.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) { verdict("native_q5_k_f32 entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
+    uint8_t* dw = (uint8_t*) strata::vulkan::arena_alloc(*s, w.size());
+    float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) n_in);
+    uint8_t* dsc = (uint8_t*) strata::vulkan::arena_alloc(*s, act_bytes);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, n_y);
+    strata::vulkan::stream_write(*s, dw, w.data(), w.size());
+    strata::vulkan::stream_write(*s, dx, xf.data(), (size_t) n_in * 4);
+    strata::kernels::native_q5_k_f32(dw, dx, dsc, dy, n_in, n_out, ncols, s);   // THE ENGINE WRAPPER
+    std::vector<float> got(n_y); strata::vulkan::stream_read(*s, dy, got.data(), n_y * 4);
+    std::vector<uint8_t> act(act_bytes); strata::vulkan::stream_read(*s, dsc, act.data(), act_bytes);
+    strata::vulkan::stream_close(s);
+
+    // (A) THE SHADER PATH on the SAME activation bytes.
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act_bytes), b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size()); ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3); ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    { VkPipeline p = ctx.pipeline(dir + "/native_q5_k_f32.spv", 3, (int) sizeof(pc));
+      ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out); }
+    std::vector<uint8_t> img(sink.size(), 0); ctx.read(b_y, img.data(), img.size());
+    const float* ref = reinterpret_cast<const float*>(img.data());
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int r = 0; r < n_out; ++r) {
+        double acc = 0.0, a_sum = 0.0;
+        for (int k = 0; k < nb * 16; ++k) {
+            const double v = q5_dot_host(w, (size_t) r * (size_t) row_bytes + (size_t) (k / 16) * 176, act,
+                                        (size_t) (k / 16) * 8 * 36, k % 16);
+            acc += v; a_sum += std::fabs(v);
+        }
+        want[(size_t) r] = acc; want_abs[(size_t) r] = a_sum;
+    }
+
+    int bad_bw = 0, bad = 0, nonfinite = 0; double worst = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        uint32_t a, c; std::memcpy(&a, &ref[i], 4); std::memcpy(&c, &got[i], 4);
+        if (a != c) ++bad_bw;
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+    }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "native_q5_k_f32 entry (n_in=%d n_out=%d): engine wrapper == quantise+Q5_K shader path, bitwise", n_in, n_out);
+    verdict(tag, bad_bw == 0, bad_bw, (int) n_y, 0.0, "words differ - the wrapper's internal quantise or dispatch mismatch");
+    std::snprintf(tag, sizeof tag, "native_q5_k_f32 entry: engine wrapper vs the packed Q5_K dot (double, terms bound)");
+    verdict(tag, bad == 0 && nonfinite == 0, bad + nonfinite, (int) n_y, worst, "rows outside the terms bound");
+    ctx.free(b_a); ctx.free(b_w); ctx.free(b_y);
+}
+
+// #5 `kv_append_q4_step` (layer.cpp:935) -> kv_q4_append.spv.  Fixture: case_kv_q4_rot's (a +-tie group, a
+// subnormal, an all-zero group, and a clamping group).  K and V share the grid, one group per thread.
+void case_kv_append_q4_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "kv_q4_append.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("kv_append_q4_step entry", "device lacks storageBuffer8BitAccess"); return; }
+    const uint32_t kv_heads = 2, head_dim = 256, page_size = 16, pages = 16, rows = pages * page_size;
+    const uint32_t gph = head_dim / 32, bph = gph * 18, pool_bytes = rows * kv_heads * bph;
+    std::vector<int32_t> table(pages);
+    for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) (pages - 1 - i);
+    std::vector<float> kcur((size_t) kv_heads * head_dim), vcur((size_t) kv_heads * head_dim);
+    for (float& v : kcur) v = rndf(1.0f);
+    for (float& v : vcur) v = rndf(1.0f);
+    for (uint32_t j = 0; j < 32; ++j) kcur[32 + j] = ((j % 2) == 0) ? 3.5f : -3.5f;    // the +-tie group
+    for (uint32_t j = 0; j < 32; ++j) kcur[64 + j] = 0.0f;                            // all-zero group
+    for (uint32_t j = 0; j < 32; ++j) kcur[128 + j] = 1.0e-6f * (float) (j + 1);
+    kcur[128] = 100.0f;                                                               // the clamping group
+    const int32_t pos = 40;
+    const std::vector<int32_t> step = {pos, pos + 1, pos / 4, 8, 0};
+
+    Buf bk = ctx.alloc(pool_bytes), bv = ctx.alloc(pool_bytes), bt = ctx.alloc(table.size() * 4), bst = ctx.alloc(20), bkc = ctx.alloc(kcur.size() * 4), bvc = ctx.alloc(vcur.size() * 4);
+    std::vector<uint8_t> sent(pool_bytes, 0xAB);
+    ctx.write(bk, sent.data(), sent.size()); ctx.write(bv, sent.data(), sent.size());
+    ctx.write(bt, table.data(), table.size() * 4); ctx.write(bst, step.data(), step.size() * 4);
+    ctx.write(bkc, kcur.data(), kcur.size() * 4); ctx.write(bvc, vcur.data(), vcur.size() * 4);
+    struct { int kv_heads, head_dim, page_size, host_layout; } pc{(int) kv_heads, (int) head_dim, (int) page_size, 0};
+    { VkPipeline p = ctx.pipeline(dir + "/kv_q4_append.spv", 6, 16);
+      ctx.dispatch(p, {&bk, &bv, &bt, &bst, &bkc, &bvc}, &pc, sizeof(pc), (uint32_t) ((2 * kv_heads * gph + kLocalSize - 1) / kLocalSize)); }
+    std::vector<uint8_t> refk(pool_bytes), refv(pool_bytes);
+    ctx.read(bk, refk.data(), refk.size()); ctx.read(bv, refv.data(), refv.size());
+
+    strata::kernels::QsaShapes sh;
+    sh.n_head_kv = kv_heads; sh.head_dim = head_dim; sh.page_size = page_size;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) { verdict("kv_append_q4_step entry: engine wrapper", false, 1, 1, 0, "no stream"); ctx.free(bk); ctx.free(bv); ctx.free(bt); ctx.free(bst); ctx.free(bkc); ctx.free(bvc); return; }
+    uint8_t* dk = (uint8_t*) strata::vulkan::arena_alloc(*s, pool_bytes);
+    uint8_t* dv = (uint8_t*) strata::vulkan::arena_alloc(*s, pool_bytes);
+    int32_t* dt = strata::vulkan::arena_alloc<int32_t>(*s, table.size());
+    int32_t* dst = strata::vulkan::arena_alloc<int32_t>(*s, 5);
+    float* dkc = strata::vulkan::arena_alloc<float>(*s, kcur.size());
+    float* dvc = strata::vulkan::arena_alloc<float>(*s, vcur.size());
+    strata::vulkan::stream_write(*s, dk, sent.data(), pool_bytes); strata::vulkan::stream_write(*s, dv, sent.data(), pool_bytes);
+    strata::vulkan::stream_write(*s, dt, table.data(), table.size() * 4); strata::vulkan::stream_write(*s, dst, step.data(), step.size() * 4);
+    strata::vulkan::stream_write(*s, dkc, kcur.data(), kcur.size() * 4); strata::vulkan::stream_write(*s, dvc, vcur.data(), vcur.size() * 4);
+    strata::kernels::kv_append_q4_step(dk, dv, dt, dst, dkc, dvc, sh, s, nullptr);   // THE ENGINE WRAPPER
+    std::vector<uint8_t> gotk(pool_bytes), gotv(pool_bytes);
+    strata::vulkan::stream_read(*s, dk, gotk.data(), pool_bytes); strata::vulkan::stream_read(*s, dv, gotv.data(), pool_bytes);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0; for (size_t i = 0; i < pool_bytes; ++i) { if (refk[i] != gotk[i]) ++bad_bw; if (refv[i] != gotv[i]) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "kv_append_q4_step entry (kv_heads=%u head_dim=%u): engine wrapper == shader path, bitwise", kv_heads, head_dim);
+    verdict(tag, bad_bw == 0, bad_bw, (int) (2 * pool_bytes), 0.0, "pool bytes differ - the wrapper's views/pipeline/dispatch mismatch");
+    int bad = 0, checked = 0;
+    for (uint32_t h = 0; h < kv_heads; ++h) {
+        const uint32_t row = (uint32_t) ((table[pos / (int32_t) page_size] * (int32_t) kv_heads + (int32_t) h) * (int32_t) page_size + (pos % (int32_t) page_size));
+        for (uint32_t b = 0; b < gph; ++b) {
+            uint16_t d_bits = 0; uint8_t codes[16];
+            q4_group_ref(d_bits, codes, &kcur[h * head_dim + b * 32]);
+            const size_t off = (size_t) row * bph + b * 18;
+            if ((uint16_t) (gotk[off] | (gotk[off + 1] << 8)) != d_bits) ++bad;
+            for (uint32_t j = 0; j < 16; ++j) if (gotk[off + 2 + j] != codes[j]) ++bad;
+            ++checked;
+        }
+    }
+    std::snprintf(tag, sizeof tag, "kv_append_q4_step entry: engine wrapper vs the Q4_0 group rule, bit-exact");
+    verdict(tag, bad == 0, bad, (int) (checked * 17), 0.0, "a scale or code byte differs from the rule");
+    ctx.free(bk); ctx.free(bv); ctx.free(bt); ctx.free(bst); ctx.free(bkc); ctx.free(bvc);
+}
+
+// #6 `kv_gather_q4_step` (layer.cpp:985) -> kv_q4_gather.spv.  The pool from the append above is gathered by
+// `ids`; both paths gather the same pool and the FP16 scratch must match BITWISE.  Oracle: the reader formula
+// (value = (code - 8) * f32(d), widened exactly), transcribed in double.
+void case_kv_gather_q4_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "kv_q4_append.spv") || !have(dir, "kv_q4_gather.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("kv_gather_q4_step entry", "device lacks storageBuffer8BitAccess"); return; }
+    const uint32_t kv_heads = 2, head_dim = 256, page_size = 16, pages = 16, rows = pages * page_size;
+    const uint32_t gph = head_dim / 32, bph = gph * 18, pool_bytes = rows * kv_heads * bph;
+    std::vector<int32_t> table(pages);
+    for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) i;
+    // fill the pool through the append shader at a handful of cells
+    const uint32_t cells = 4;
+    std::vector<int32_t> ids(cells);
+    for (uint32_t i = 0; i < cells; ++i) ids[i] = 5 + (int32_t) i * 3;
+    std::vector<float> kcur((size_t) kv_heads * head_dim), vcur((size_t) kv_heads * head_dim);
+    Buf bk = ctx.alloc(pool_bytes), bv = ctx.alloc(pool_bytes), bt = ctx.alloc(table.size() * 4), bst = ctx.alloc(20), bkc = ctx.alloc(kcur.size() * 4), bvc = ctx.alloc(vcur.size() * 4), bids = ctx.alloc(cells * 4);
+    std::vector<uint8_t> sent(pool_bytes, 0xAB);
+    ctx.write(bk, sent.data(), sent.size()); ctx.write(bv, sent.data(), sent.size());
+    ctx.write(bt, table.data(), table.size() * 4);
+    struct { int kv_heads, head_dim, page_size, host_layout; } apc{(int) kv_heads, (int) head_dim, (int) page_size, 0};
+    VkPipeline paq = ctx.pipeline(dir + "/kv_q4_append.spv", 6, 16);
+    const uint32_t aq_groups = (uint32_t) ((2 * kv_heads * gph + kLocalSize - 1) / kLocalSize);
+    for (uint32_t i = 0; i < cells; ++i) {
+        for (float& v : kcur) v = rndf(2.0f);
+        for (float& v : vcur) v = rndf(2.0f);
+        const std::vector<int32_t> step = {ids[i], ids[i] + 1, ids[i] / 4, (int32_t) cells, 0};
+        ctx.write(bst, step.data(), step.size() * 4);
+        ctx.write(bkc, kcur.data(), kcur.size() * 4); ctx.write(bvc, vcur.data(), vcur.size() * 4);
+        ctx.dispatch(paq, {&bk, &bv, &bt, &bst, &bkc, &bvc}, &apc, sizeof(apc), aq_groups);
+    }
+    ctx.write(bids, ids.data(), ids.size() * 4);
+    const size_t scratch = (size_t) cells * kv_heads * head_dim * 2;
+    Buf bks = ctx.alloc(scratch), bvs = ctx.alloc(scratch);
+    std::vector<uint8_t> ss(scratch, 0x5A); ctx.write(bks, ss.data(), ss.size()); ctx.write(bvs, ss.data(), ss.size());
+    const std::vector<int32_t> gstep = {0, 0, 0, (int32_t) cells, 0};
+    ctx.write(bst, gstep.data(), gstep.size() * 4);
+    struct { int kv_heads, head_dim, page_size; } gpc{(int) kv_heads, (int) head_dim, (int) page_size};
+    { VkPipeline p = ctx.pipeline(dir + "/kv_q4_gather.spv", 7, 12);
+      ctx.dispatch(p, {&bk, &bv, &bt, &bids, &bst, &bks, &bvs}, &gpc, sizeof(gpc), (uint32_t) ((cells * kv_heads * gph + kLocalSize - 1) / kLocalSize)); }
+    std::vector<uint8_t> refk(scratch), refv(scratch);
+    ctx.read(bks, refk.data(), refk.size()); ctx.read(bvs, refv.data(), refv.size());
+    std::vector<uint8_t> poolk(pool_bytes), poolv(pool_bytes);
+    ctx.read(bk, poolk.data(), poolk.size()); ctx.read(bv, poolv.data(), poolv.size());
+
+    strata::kernels::QsaShapes sh;
+    sh.n_head_kv = kv_heads; sh.head_dim = head_dim; sh.page_size = page_size;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) { verdict("kv_gather_q4_step entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
+    uint8_t* dk = (uint8_t*) strata::vulkan::arena_alloc(*s, pool_bytes);
+    uint8_t* dv = (uint8_t*) strata::vulkan::arena_alloc(*s, pool_bytes);
+    int32_t* dt = strata::vulkan::arena_alloc<int32_t>(*s, table.size());
+    int32_t* dids = strata::vulkan::arena_alloc<int32_t>(*s, cells);
+    int32_t* dst = strata::vulkan::arena_alloc<int32_t>(*s, 5);
+    uint16_t* dks = (uint16_t*) strata::vulkan::arena_alloc(*s, scratch);
+    uint16_t* dvs = (uint16_t*) strata::vulkan::arena_alloc(*s, scratch);
+    strata::vulkan::stream_write(*s, dk, poolk.data(), poolk.size());
+    strata::vulkan::stream_write(*s, dv, poolv.data(), poolv.size());
+    strata::vulkan::stream_write(*s, dt, table.data(), table.size() * 4);
+    strata::vulkan::stream_write(*s, dids, ids.data(), cells * 4);
+    strata::vulkan::stream_write(*s, dst, gstep.data(), gstep.size() * 4);
+    strata::vulkan::stream_write(*s, dks, ss.data(), scratch); strata::vulkan::stream_write(*s, dvs, ss.data(), scratch);
+    strata::kernels::kv_gather_q4_step(dk, dv, dt, dids, dst, (int64_t) cells, sh, dks, dvs, s);   // THE ENGINE WRAPPER
+    std::vector<uint8_t> gotk(scratch), gotv(scratch);
+    strata::vulkan::stream_read(*s, dks, gotk.data(), scratch); strata::vulkan::stream_read(*s, dvs, gotv.data(), scratch);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0; for (size_t i = 0; i < scratch; ++i) { if (refk[i] != gotk[i]) ++bad_bw; if (refv[i] != gotv[i]) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "kv_gather_q4_step entry (ids=%u kv_heads=%u): engine wrapper == shader path, bitwise", cells, kv_heads);
+    verdict(tag, bad_bw == 0, bad_bw, (int) (2 * scratch), 0.0, "scratch bytes differ - the wrapper's views/pipeline/dispatch mismatch");
+    // oracle: the reader rule on the SAME pool bytes, for K and V - (code-8)*f32(d) in f32, then fp16
+    int bad = 0, checked = 0;
+    for (int side = 0; side < 2; ++side) {
+        const std::vector<uint8_t>& pool = side ? poolv : poolk;
+        const std::vector<uint8_t>& got = side ? gotv : gotk;
+        for (uint32_t id = 0; id < cells; ++id) {
+            const int32_t cell = ids[id];
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                const uint32_t row = (uint32_t) ((table[cell / (int32_t) page_size] * (int32_t) kv_heads + (int32_t) h) * (int32_t) page_size + (cell % (int32_t) page_size));
+                for (uint32_t b = 0; b < gph; ++b) {
+                    const size_t off = (size_t) row * bph + b * 18;
+                    const float d = strata::kernels::f32_from_f16((uint16_t) (pool[off] | (pool[off + 1] << 8)));
+                    for (uint32_t j = 0; j < 32; ++j) {
+                        const uint8_t byte = pool[off + 2 + (j & 15)];
+                        const int code = (int) ((j < 16 ? (byte & 0x0F) : (byte >> 4))) - 8;
+                        const uint16_t want = strata::kernels::f16_from_f32((float) code * d);
+                        const size_t gi = ((size_t) id * kv_heads + h) * head_dim * 2 + b * 32 * 2 + (size_t) j * 2;
+                        const uint16_t gw = (uint16_t) (got[gi] | ((uint16_t) got[gi + 1] << 8));
+                        if (gw != want) ++bad;
+                        ++checked;
+                    }
+                }
+            }
+        }
+    }
+    std::snprintf(tag, sizeof tag, "kv_gather_q4_step entry: engine wrapper vs the Q4_0 reader rule (fp16, exact)");
+    verdict(tag, bad == 0, bad, (int) checked, 0.0, "gathered values differ from (code-8)*d");
+    ctx.free(bk); ctx.free(bv); ctx.free(bt); ctx.free(bst); ctx.free(bkc); ctx.free(bvc); ctx.free(bids); ctx.free(bks); ctx.free(bvs);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -16160,6 +16691,16 @@ int main(int argc, char** argv) {
     case_fused_gdn_step_norm_entry(ctx, dir);    // fused_gdn_step_norm  -> fused_gdn_step_norm.spv  (layer.cpp:322)
     case_native_gdn_out_norm_entry(ctx, dir);    // native_gdn_out_norm  -> native_gdn_out_norm.spv  (layer.cpp:324)
     case_gdn_out_norm_entry(ctx, dir);           // gdn_out_norm         -> gdn_out_norm.spv         (layer.cpp:325)
+    // I3: THE FIRST EIGHT MATVEC / GEMV / KV ENTRY POINTS (vulkan/src/kernels/matvec_vk.cpp), in the order the
+    // layer body reaches them.  APPENDED last for the same shared-RNG reason as every batch above.
+    case_quantize_q8_K_entry(ctx, dir);          // quantize_q8_K        -> quantize_q8_K.spv      (layer.cpp:236)
+    case_quantize_q8_0_entry(ctx, dir);          // quantize_q8_0        -> quantize_q8_0.spv      (layer.cpp:237)
+    case_native_quantize_q8_1_entry(ctx, dir);   // native_quantize_q8_1 -> quantize_q8_1.spv      (layer.cpp:150)
+    case_native_mmvq_entry(ctx, dir);            // native_mmvq          -> iq*_mmvq.spv (6)      (layer.cpp:151)
+    case_kv_append_q4_entry(ctx, dir);           // kv_append_q4_step    -> kv_q4_append.spv       (layer.cpp:935)
+    case_kv_gather_q4_entry(ctx, dir);           // kv_gather_q4_step    -> kv_q4_gather.spv       (layer.cpp:985)
+    case_quantize_q8_0_scaled_entry(ctx, dir);   // quantize_q8_0_scaled -> quantize_q8_0_scaled.spv (session.cpp:868)
+    case_native_q5_k_f32_entry(ctx, dir);        // native_q5_k_f32      -> native_q5_k_f32.spv    (native_head.cpp:78)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

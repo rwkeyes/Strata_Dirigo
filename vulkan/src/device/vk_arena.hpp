@@ -55,6 +55,17 @@ struct Stream {
     };
     CvecTables cvec_tables;
 
+    // THE I-QUANT GRID TABLES the `native_mmvq` composite's IQ arms read (I3).  On a CUDA build they are
+    // `__constant__` device globals inside native_mmvq.cu; on this build each is a storage buffer the shader
+    // indexes, and the ENGINE's TU (matvec_vk.cpp) places them HERE, lazily, the same way cvec_apply's tables
+    // live with the stream.  A per-dispatch upload would be both wasteful and fatal: `arena_alloc` never
+    // decreases, so a per-layer grid allocation would exhaust the arena.  Four grids (iq1s 2048, iq2s 2048,
+    // iq3s 512, iq3xxs 256 uint32) cover every IQ arm the port ships.
+    struct IqGrids {
+        Buf iq1s{}, iq2s{}, iq3s{}, iq3xxs{};
+        bool valid = false;
+    } iq_grids;
+
     // The synthetic device-address base and the alignment every carving starts on.  The alignment is the
     // device's OWN storage-buffer-offset limit raised to 256, so a view computed from an allocation is
     // bindable on every implementation the port runs on (the Arc measures 4 bytes; the limit is still a

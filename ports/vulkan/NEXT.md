@@ -100,6 +100,128 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I3 — THE FIRST EIGHT MATVEC / GEMV / KV ENTRY POINTS (the weight-side math + the KV cache) AND THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**THE BAR (the running line): `188 → 170` undefined references / `59 → 53` distinct full-signature
+`strata::kernels::` symbols / `57 → 51` under the parent's name-only pattern.**  The matvec/GEMV/KV group falls
+**21 → 15**; every other group is unchanged.  MEASURED with the STANDARD recipe - ONE build directory,
+**`$HOME/vkbuild-vulkan`**, RECONFIGURED AND REBUILT FROM THE CURRENT TREE FIRST (no stale library; the hazard
+I2e recorded):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 \
+        -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 170
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 53 (full signature)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 51 (name only)
+
+**THE EIGHT, IN THE ORDER `src/core/layer.cpp` AND ITS SIBLINGS REACH THEM** (the plan's I3 list is NOT an
+order).  Six are reached by `layer.cpp` itself, two by a sibling file:
+
+| # | symbol | call site | stage | shader |
+|---|---|---|---|---|
+| 1 | `quantize_q8_K` | layer.cpp:236 | gdn_layer stage 1 - the K-quant activation image | quantize_q8_K.spv |
+| 2 | `quantize_q8_0` | layer.cpp:237 | gdn_layer stage 1 - the Q8_0 activation image | quantize_q8_0.spv |
+| 3 | `native_quantize_q8_1` | layer.cpp:150 | gdn_layer stage 2 - the native qkv projection's activation | quantize_q8_1.spv |
+| 4 | `native_mmvq` | layer.cpp:151 | gdn_layer stage 2 - the native projection (COMPOSITE, six shaders) | iq1m/iq2s/iq3s/iq3xxs/iq4nl/iq4xs_mmvq.spv |
+| 5 | `kv_append_q4_step` | layer.cpp:935 | qsa_layer - the Q4_0 KV cache APPEND | kv_q4_append.spv |
+| 6 | `kv_gather_q4_step` | layer.cpp:985 | qsa_layer - the Q4_0 KV cache GATHER | kv_q4_gather.spv |
+| 7 | `quantize_q8_0_scaled` | session.cpp:868 (also expert_source.cpp:2327) | the MoE routed-expert activation | quantize_q8_0_scaled.spv |
+| 8 | `native_q5_k_f32` | native_head.cpp:78 | the head's native Q5_K matvec (the native sibling of #4) | quantize_q8_1.spv + native_q5_k_f32.spv |
+
+The increment's other two are DEFERRED, and that is a reachability statement rather than a choice:
+**`quantize_q8_1_rows`** is the PEER-expert pool's activation (`peer_experts.cpp:230`, `remote_experts.cpp:307`
+- the peer tier, not the single-GPU path) and **`s_gemv_split_async`** appears only in the standalone driver
+mains `overlap_main.cpp:118/142` and `concurrent_main.cpp:141`, never in `src/core/`.  Both have shaders and
+map rows; they are simply later in reach order than these eight.
+
+**EACH PROVED BY ITS CASE THROUGH THE ENGINE WRAPPER - BITWISE vs THE SHADER PATH AND vs THE EXPLICIT ORACLE.**
+A new `case_*_entry` in the port's gate runs the port's EXISTING case's fixture through (A) the shader path and
+(B) the ENGINE WRAPPER `strata::kernels::<symbol>` on its own engine stream (`EnginePin`-pinned to the harness
+device), then asserts (C) the wrapper's answer equals the shader path's **BITWISE**, and (D) equals the case's
+explicit oracle.  Raw lines (vega, `intel_icd`/Arc B70 arm):
+
+| # | symbol | wrapper == shader path (bitwise), worst | wrapper vs oracle, worst |
+|---|---|---|---|
+| 1 | `quantize_q8_K` | **876/876, w 0** | **876/876 w 0** (the Q8_K rule; one of the two scale forms) |
+| 2 | `quantize_q8_0` | **102/102, w 0** | **102/102 w 0** (ggml's Q8_0 image) |
+| 3 | `native_quantize_q8_1` | **1152/1152, w 0** | **1152/1152 w 0** (one of the two division forms) |
+| 4 | `native_mmvq` (IQ2_S) | **4/4, w 0** | **4/4 w 0.0435** (the IQ2_S dot, terms bound) |
+| 5 | `kv_append_q4_step` | **147456/147456, w 0** | **272/272 w 0** (the Q4_0 group rule, bit-exact) |
+| 6 | `kv_gather_q4_step` | **8192/8192, w 0** | **4096/4096 w 0** (the Q4_0 reader rule, fp16 exact) |
+| 7 | `quantize_q8_0_scaled` | **114/114, w 0** | **114/114 w 0** (the CPU Q8_0 rule + fp32 scales) |
+| 8 | `native_q5_k_f32` | **3/3, w 0** | **3/3 w 0.00796** (the packed Q5_K dot, terms bound) |
+
+**THE `host` ROWS THIS TU ANSWERS** (not a bare bind, and each with a measured reason):
+
+* **`iq_row_bytes(type, n)`** - the per-format ROW STRIDE the six `*_mmvq` shaders take as `row_bytes`, and the
+  weight-buffer size the wrapper range-checks.  A quantisation CONSTANT table (Q4_0/Q5_0/Q5_1/Q8_0 18/22/22/34 B
+  per 32; Q2_0 18 B per 64; IQ4_NL 18 B per 32; IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/Q3_K/Q4_K/Q5_K/Q6_K/
+  IQ4_XS 56/66/74/82/98/110/110/144/176/210/136 B per 256).  A type with no layout is a loud refusal, not a
+  guessed stride.
+* **`native_mmvq_supported(type)`** - THE CAPABILITY CHECK THAT GATES THE COMPOSITE, and the one this batch had
+  to keep honest: `native_mmvq` dispatches by ggml type and the port ships shaders for exactly SIX types, so the
+  check answers TRUE for those six and FALSE for every other type.  Answering TRUE for a type with no shader
+  would route the engine (`native_dense.cpp:53/166`, `native_head.cpp:34`) at an unported kernel.  There is NO
+  `*_enabled()` flag in this family to turn on (the six `native_caps_vk.cpp` getters are unrelated), so the caps
+  case needed no new arm - but the per-type answer is the same "capability == every gated symbol has a shader"
+  rule, and `case_native_mmvq_entry` exercises its dispatch.
+* **`native_mmvq_weight_bytes(type, n_in, n_out)`** and **`native_q8_1_bytes(n_in, ncols)`** - the weight and
+  q8_1-activation sizes the wrappers range-check against the arena (`native_q5_k_f32` sizes its internal
+  quantise scratch with the latter).
+* **The IQ grid tables** (`native_mmvq`'s four grid-taking arms) live in `Stream::iq_grids`
+  (`vulkan/src/device/vk_arena.hpp`), placed LAZILY from `vulkan/src/kernels/iq_grids_vk.hpp` - a verbatim copy
+  of the port's generated harness header, adopted exactly as I1 adopted `vk_compute.*`.  A per-dispatch upload
+  would EXHAUST the arena (`arena_alloc` never decreases), so it is a stream-lifetime cache, the cvec_apply
+  precedent.
+
+**THE BAR MOVE, HONESTLY ATTRIBUTED.**  Of the eight, SIX move the one-layer-body link (the six `layer.cpp`
+reaches); `quantize_q8_0_scaled` (session.cpp) and `native_q5_k_f32` (native_head.cpp) do NOT - they are reached
+by sibling TUs, exactly as I2c's `add_inplace`/`gather_rows`/`scatter_rows_f32`/`f32_to_f16_bulk` did not move
+it.  The raw-reference drop is larger than six because `quantize_q8_K` has 6 references and `quantize_q8_0` 4
+from `layer.cpp` alone.
+
+**THE REMAINING 53 `strata::kernels::` SYMBOLS, GROUPED.**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue (the I2 elementwise set)** | **0** | all answered |
+| **matvec / GEMV / KV** | **15** | `bf16_gemv`, `bf16_gemv_split`, `bf16_gemv_fp32_mmvf`, `bf16_gemv_fp32_mmvf_cols`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `s2_gemv_q8`, `kv_append_step`, `kv_append_q8_step`, `kv_gather_step`, `kv_gather_q8_step`, `kv_block_bytes`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve` |
+| **attention / QSA / MoE / GR / PLE / rope** | **36** | unchanged |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+(The 170 total also carries the 12 CUDA-runtime symbols and the engine's cross-TU `strata::core`/`main`
+references - the CUDA-runtime surface is the un-approved RE-SCOPE and this batch did NOT touch it.)
+
+**TWO CASE-CONSTRUCTION BUGS FOUND AND FIXED WHILE PROVING (recorded, because each was caught by the case and
+not hidden):** (1) the `quantize_q8_K` case's guard arm indexed the WRAPPER's buffer past its allocation (an
+out-of-bounds read that showed as `875/876` on the bitwise arm while the oracle arm passed) - the buffer is now
+allocated `blk + slack` and both guards are compared.  (2) `native_q5_k_f32`'s case first fed the shader path an
+INDEPENDENTLY quantised activation, which fails on RADV because the q8_1 quantiser's division form is chosen per
+pipeline instance (the same fact `case_quantize_q8_1` records) - the shader path is now fed the WRAPPER's OWN
+activation bytes, so the arm is a genuine dot-kernel comparison and the quantiser half is gated by
+`case_native_quantize_q8_1_entry`.  Neither case was weakened; both were corrected.
+
+**RESULTS (vega).**  Engine CONFIGURE + BUILD under `-DSTRATA_ENABLE_VULKAN=ON` clean.  Gate on `vega`:
+**Arc (intel_icd) 552/0/0 (exit 0), llvmpipe 540/0/3, Ryzen iGPU (radeon_icd) 543/0/2** - **+16 verdicts on every
+arm** (8 new cases x 2 verdicts), 0 failed.  ON THE RECORD: the radeon arm's FIRST run of this batch read
+**540/3/2** - the documented intermittent `budget: independent requery agrees` flake PLUS this batch's own
+`native_q5_k_f32` case bug (before fix 2 above); after the fix a re-run read **543/0/2**.  `strata_vk_entry_smoke`
+builds and runs on the Arc.  `check_port_map.py` passes (`168 - 78 kernel, 61 host, 29 todo; 111 shaders built,
+92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (the eight were already `kernel`
+rows, so the map does not move).  **`z820b` is PENDING** (no XTX/K620 number).  The CUDA-runtime host surface was
+NOT touched, and the plan was NOT re-scoped.
+
+**WHAT IS LEFT OF I3.**  The matvec/GEMV/KV group's remaining 15: the deferred pair above plus the `bf16_gemv`
+family, the two `s_gemv_*_split` siblings, `s2_gemv_q8`, the two other `kv_append_*`/`kv_gather_*` siblings and
+the four KV host rows (`kv_block_bytes`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve`).
+
 ## INCREMENT I2e — THE REMAINING EIGHT GDN / DELTANET MIXER ENTRY POINTS, **COMPLETING THE MIXER**, AND THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **THE MIXER IS COMPLETE: all FOURTEEN entry points `gdn_layer` reaches are wired and proved** (I2d's six + this

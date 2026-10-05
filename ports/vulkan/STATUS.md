@@ -15,6 +15,48 @@ stale input read (a single-element mutation of the previous/zero/byte-zeroed for
 a stale word would persist on re-dispatch). **The case is not skipped on radeon and the bound is not
 widened.** Full detail and evidence paths in `NEXT.md`'s top section.
 
+## INCREMENT I3 — the first eight MATVEC / GEMV / KV entry points (the weight-side math + the KV cache) + THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**THE EIGHT, in the order `src/core/layer.cpp` and its siblings reach them** (the plan's list is not an order):
+`quantize_q8_K` (:236), `quantize_q8_0` (:237), `native_quantize_q8_1` (:150), `native_mmvq` (:151, the
+COMPOSITE - six `*_mmvq` shaders by ggml type), `kv_append_q4_step` (:935), `kv_gather_q4_step` (:985),
+`quantize_q8_0_scaled` (session.cpp:868) and `native_q5_k_f32` (native_head.cpp:78).  Wired in the new
+`vulkan/src/kernels/matvec_vk.cpp`, engine headers unchanged; each proved by a new `case_*_entry` through the
+ENGINE WRAPPER, BITWISE against the port's shader path AND against the case's explicit oracle, `EnginePin`-pinned:
+
+| kernel | shader | wrapper == shader (bitwise), worst | wrapper vs oracle |
+|---|---|---|---|
+| `quantize_q8_K` | quantize_q8_K.spv | 876/876, w 0 | 876/876 w 0 (one of the two scale forms) |
+| `quantize_q8_0` | quantize_q8_0.spv | 102/102, w 0 | 102/102 w 0 (ggml's image) |
+| `native_quantize_q8_1` | quantize_q8_1.spv | 1152/1152, w 0 | 1152/1152 w 0 (one of the two division forms) |
+| `native_mmvq` | iq*_mmvq.spv (6) | 4/4, w 0 (IQ2_S) | 4/4 w 0.0435 (IQ2_S dot, terms bound) |
+| `kv_append_q4_step` | kv_q4_append.spv | 147456/147456, w 0 | 272/272 w 0 (Q4_0 group rule, bit-exact) |
+| `kv_gather_q4_step` | kv_q4_gather.spv | 8192/8192, w 0 | 4096/4096 w 0 (Q4_0 reader rule, fp16 exact) |
+| `quantize_q8_0_scaled` | quantize_q8_0_scaled.spv | 114/114, w 0 | 114/114 w 0 (CPU rule + fp32 scales) |
+| `native_q5_k_f32` | quantize_q8_1 + native_q5_k_f32 | 3/3, w 0 | 3/3 w 0.00796 (packed Q5_K dot, terms bound) |
+
+**THE `host` ROWS THIS TU ANSWERS (not a bare bind):** `iq_row_bytes` (the per-format row stride the `*_mmvq`
+shaders take as `row_bytes` - a quantisation constant table), `native_mmvq_supported` (the CAPABILITY CHECK that
+gates the composite: TRUE for exactly the six types with a shader, FALSE otherwise, so the native loader cannot
+route to an unported kernel), `native_mmvq_weight_bytes` and `native_q8_1_bytes` (the sizes the wrappers
+range-check); plus the IQ grid tables placed LAZILY per stream in `Stream::iq_grids`, from the new
+`vulkan/src/kernels/iq_grids_vk.hpp` (a verbatim copy of the port's generated harness header), because a
+per-dispatch upload would exhaust the arena.  There is NO `*_enabled()` in this family to flip, so the caps case
+needed no new arm.
+
+**THE LINK PROGRESS - the one-layer-body link: `188 → 170` undefined references / `59 → 53` distinct
+full-signature `strata::kernels::` symbols / `57 → 51` name-only.**  Six of the eight move THIS link (the two
+reached by sibling TUs do not, as I2c's non-`layer.cpp` symbols did not).  The matvec/GEMV/KV group falls
+**21 → 15**; glue 0, GDN mixer 0, attention/QSA/MoE/GR/PLE/rope 36, other 2.  Recipe + group table: `NEXT.md`'s
+I3 section.  MEASURED with `$HOME/vkbuild-vulkan` reconfigured + rebuilt from the current tree first.
+
+**RESULTS (vega).**  Gate: Arc (intel_icd) **552/0/0** (exit 0), llvmpipe 540/0/3, Ryzen iGPU (radeon_icd)
+**543/0/2** - **+16 verdicts per arm**, 0 failed.  ON THE RECORD: the radeon arm's first run read **540/3/2** (the
+documented `budget` flake plus this batch's own `native_q5_k_f32` case bug, since fixed); the re-run read
+543/0/2.  `strata_vk_entry_smoke` builds + runs on the Arc.  `check_port_map.py` passes (`168 — 78 kernel, 61
+host, 29 todo; 111 shaders built, 92 claimed`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.
+**`z820b` PENDING.**  CUDA-runtime host surface untouched; plan not re-scoped.
+
 ## INCREMENT I2e — the remaining eight GDN / DeltaNet MIXER entry points, COMPLETING the mixer + THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **THE MIXER IS COMPLETE: all fourteen entry points `gdn_layer` reaches are wired and proved** (I2d's six + I2e's

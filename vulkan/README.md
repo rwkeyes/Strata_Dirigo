@@ -142,6 +142,38 @@ user's call; `ports/vulkan/NEXT.md`'s I2-continued section reports it and does n
   glue/`doorbell_*` that `layer.cpp` also calls and the "backend answers 4" baseline predates.  The remaining 73
   are grouped in `ports/vulkan/NEXT.md`'s I2-continued-further section, with the reproducing command.
 
+## What I3 adds (2026-10-05)
+
+* `vulkan/src/kernels/matvec_vk.cpp` - the first EIGHT matvec/GEMV/KV entry points, in the order the layer body
+  reaches them (derived from `src/core/layer.cpp` and its siblings, NOT the plan's list): `quantize_q8_K`
+  (`layer.cpp:236`), `quantize_q8_0` (`:237`), `native_quantize_q8_1` (`:150`), `native_mmvq` (`:151`, the
+  COMPOSITE - six `*_mmvq` shaders chosen by ggml type), `kv_append_q4_step` (`:935`), `kv_gather_q4_step`
+  (`:985`), `quantize_q8_0_scaled` (`session.cpp:868`) and `native_q5_k_f32` (`native_head.cpp:78`).  The other
+  two of the increment's ten are DEFERRED because the single-GPU decode path does not reach them:
+  `quantize_q8_1_rows` (the peer-expert pool, `peer_experts.cpp:230`) and `s_gemv_split_async` (only the
+  standalone mains `overlap_main.cpp`/`concurrent_main.cpp`).
+* **The `host` rows this TU answers** (they are not a bare bind): `iq_row_bytes` (the per-format row stride the
+  six `*_mmvq` shaders take as `row_bytes` - a quantisation constant), `native_mmvq_supported` (the CAPABILITY
+  CHECK that gates the composite: TRUE for exactly the six types with a shader, FALSE otherwise, so the engine's
+  native loader cannot route to an unported kernel), `native_mmvq_weight_bytes` and `native_q8_1_bytes` (the
+  weight/activation sizes the wrappers range-check).
+* **The IQ grid tables** (`native_mmvq`'s four grid-taking arms) are placed per-stream in `Stream::iq_grids`
+  (lazily, `vulkan/src/device/vk_arena.hpp`), from `vulkan/src/kernels/iq_grids_vk.hpp` - a verbatim copy of the
+  port's generated harness header, adopted the way I1 adopted `vk_compute.*`.  A per-dispatch upload would
+  exhaust the arena (`arena_alloc` never decreases), so it is a stream-lifetime cache.
+* **The proof is the established one**: each is re-run through the ENGINE WRAPPER and required to agree BITWISE
+  with the shader path AND with the case's explicit oracle (`case_*_entry` in `ports/vulkan/harness/vk_gate.cpp`,
+  each pinned to the harness device with `EnginePin`).  `native_mmvq`'s case drives the IQ2_S arm (the grid
+  path); `native_q5_k_f32`'s feeds the shader path the wrapper's OWN activation bytes (the quantiser's division
+  form is chosen per pipeline instance - measured to differ on RADV - so comparing two quantiser runs would not
+  be a dot-kernel test; the quantiser half is gated by `case_native_quantize_q8_1_entry`).
+* **THE LINK PROGRESS (the port's progress bar toward a layer that LINKS):** the one-layer-body link moved
+  **188 → 170** undefined references / **59 → 53** distinct full-signature `strata::kernels::` symbols /
+  **57 → 51** under the parent's name-only pattern.  Six of the eight move THIS link (the two reached by sibling
+  files - `quantize_q8_0_scaled`, `native_q5_k_f32` - do not, exactly as I2c's `add_inplace`/`gather_rows` did
+  not).  The matvec/GEMV/KV group falls **21 → 15**; the other groups are unchanged.  The recipe and the group
+  table are in `ports/vulkan/NEXT.md`'s I3 section.
+
 ## What I2 continued-further-still and I2e add (2026-10-05)
 
 * `vulkan/src/kernels/gdn_vk.cpp` (new in I2d, completed in I2e) - **the GDN / DeltaNet MIXER entry points**, all

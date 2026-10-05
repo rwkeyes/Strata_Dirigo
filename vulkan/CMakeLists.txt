@@ -59,7 +59,8 @@ target_link_libraries(strata_vulkan_device PUBLIC Vulkan::Vulkan)
 strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp
   src/kernels/elementwise_vk.cpp
   src/kernels/doorbell_vk.cpp
-  src/kernels/gdn_vk.cpp)       # the GDN/DeltaNet mixer entry points (the layer body reaches all fourteen)
+  src/kernels/gdn_vk.cpp
+  src/kernels/matvec_vk.cpp)   # I3: the first eight matvec/GEMV/KV entry points (the weight-side math + the KV cache)
 add_library(strata_vulkan_kernels STATIC ${_kernels})
 target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
 
