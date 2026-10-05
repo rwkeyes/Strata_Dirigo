@@ -16,7 +16,7 @@ add_streams_broadcast	todo	class C - the --spec 4 --mtp DRAFTER config the port 
 bf16_gemv	kernel	bf16_gemv
 bf16_gemv_fp32_mmvf	kernel	bf16_mmvf_f32
 bf16_gemv_fp32_mmvf_cols	kernel	bf16_mmvf_f32
-bf16_gemv_fp32_mmvf_multi	shader	bf16_mmvf_f32_multi
+bf16_gemv_fp32_mmvf_multi	kernel	bf16_mmvf_f32_multi
 bf16_gemv_split	kernel	bf16_gemv
 broadcast_streams	todo	no shader in this tree yet
 build_rope_table	host	the engine builds the table; rope_neox is the kernel that reads it
@@ -69,8 +69,8 @@ gr_workspace_bytes	host	a size
 gr_workspace_init	host	a workspace hand-out
 gr_write	kernel	gr_write
 indexer_key_append	kernel	indexer_key_append
-iq_dequant_f32	shader	iq_dequant_f32
-iq_embed_rows	shader	iq_embed_rows
+iq_dequant_f32	kernel	iq_dequant_f32
+iq_embed_rows	kernel	iq_embed_rows
 iq_row_bytes	host	a size
 k	host	a constant
 kv_append_q4_step	kernel	kv_q4_append
@@ -92,12 +92,12 @@ map_ids	todo	class C - the --spec 4 --mtp DRAFTER config the port does not selec
 moe_combine	kernel	moe_combine_f32 moe_combine_f64
 moe_group_resident	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 moe_grouped_s2	shader	s2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped
-moe_hit_add	shader	moe_hit_add
-moe_hit_grouped_s2	shader	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
+moe_hit_add	kernel	moe_hit_add
+moe_hit_grouped_s2	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
 moe_hit_grouped_s2_cpu_order	shader	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
-moe_hit_grouped_s2_dev	shader	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
+moe_hit_grouped_s2_dev	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
 moe_hit_grouped_scratch_bytes	host	a size
-moe_hit_select	shader	moe_hit_select
+moe_hit_select	kernel	moe_hit_select
 mtp_select	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 native_expert_grouped	shader	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
 native_expert_layout	host	a layout description
@@ -166,7 +166,7 @@ row_top_prob	todo	class C - the --spec 4 --mtp DRAFTER config the port does not 
 s2_gemv_q8	kernel	s2_gemv_q8
 s_gemv_q8_0_split	kernel	s_gemv_q8_split
 s_gemv_q8k_split	kernel	s_gemv_q8_split
-s_gemv_split_async	shader	s_gemv_split
+s_gemv_split_async	kernel	s_gemv_split
 sample_tokens	shader	sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split
 scale_inplace	kernel	scale
 scatter_rows_f32	kernel	scatter_rows_f32

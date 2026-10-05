@@ -249,6 +249,12 @@ cudaError_t cudaFreeHost(void* hostPtr) {
     return cudaSuccess;
 }
 
+cudaError_t cudaMallocHost(void** ptr, size_t count) {
+    // CUDA's cudaMallocHost IS cudaHostAlloc with the default flags; realised here as the same call so the two
+    // cannot drift (the engine uses both - `peer_experts.cpp` cudaHostAlloc, `generate.cpp:1164` cudaMallocHost).
+    return cudaHostAlloc(ptr, count, cudaHostAllocDefault);
+}
+
 cudaError_t cudaMemGetInfo(size_t* freeBytes, size_t* totalBytes) {
     Stream* s = current_or(nullptr);
     if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
@@ -388,6 +394,57 @@ cudaError_t cudaGetDevice(int* device) {
 
 cudaError_t cudaSetDevice(int device) {
     if (device != 0) return fail(cudaErrorInvalidDevice);   // one device: refuse to pretend to switch
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp* prop, int device) {
+    if (prop == nullptr) return fail(cudaErrorInvalidValue);
+    if (device != 0) return fail(cudaErrorInvalidDevice);   // one device
+    Stream* s = current_or(nullptr);
+    // NO STREAM, NO DEVICE TO DESCRIBE: still answer with what is true of the machine (0/empty), because the
+    // engine calls this before its first stream exists in one path (`generate.cpp:1666`, before the arena).
+    std::memset(prop, 0, sizeof(*prop));
+    if (s != nullptr && s->ctx != nullptr) {
+        const strata::vulkan::DeviceInfo& di = s->ctx->info();
+        std::snprintf(prop->name, sizeof(prop->name), "%s", di.name.c_str());
+        prop->totalGlobalMem = (size_t) di.heap_device_local_bytes;   // the real DEVICE_LOCAL heap total
+    } else {
+        std::snprintf(prop->name, sizeof(prop->name), "(no Vulkan stream open)");
+    }
+    // major/minor, multiProcessorCount and clockRate stay 0 - a Vulkan device has none of the four; see the
+    // header's device-property note for what the engine does with each.
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetAttribute(int* value, enum cudaDeviceAttr attr, int device) {
+    if (value == nullptr) return fail(cudaErrorInvalidValue);
+    if (device != 0) return fail(cudaErrorInvalidDevice);
+    switch (attr) {
+    case cudaDevAttrMultiProcessorCount:
+    case cudaDevAttrClockRate:
+        // A Vulkan device exposes neither an SM count nor a clock rate.  REFUSE rather than fabricate: the one
+        // consumer is the multi-GPU layer-split heuristic (unreachable on this one-device backend).  See the
+        // header's device-property note.
+        return fail(cudaErrorInvalidValue);
+    case cudaDevAttrComputeCapabilityMajor:
+    case cudaDevAttrComputeCapabilityMinor:
+        *value = 0;                 // no CUDA compute capability exists on a Vulkan device - the honest value
+        break;
+    default:
+        *value = 0;                 // no CUDA SIMT geometry to report; the prefill TU that reads these is not built
+        break;
+    }
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaRuntimeGetVersion(int* runtimeVersion) {
+    if (runtimeVersion == nullptr) return fail(cudaErrorInvalidValue);
+    // There is no CUDA runtime here; the answer is this shim's own constant, so the engine's header-vs-runtime
+    // mismatch check cannot fire (see the CUDART_VERSION note in the header).
+    *runtimeVersion = CUDART_VERSION;
     g_last = cudaSuccess;
     return cudaSuccess;
 }

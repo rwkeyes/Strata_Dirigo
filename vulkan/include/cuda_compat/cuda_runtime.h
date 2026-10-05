@@ -72,6 +72,19 @@
 #error "the Vulkan CUDA-runtime compat header is for a -DSTRATA_ENABLE_VULKAN=1 build only"
 #endif
 
+// ---- the shim's CUDA version -------------------------------------------------------------------------------
+// `CUDART_VERSION` is a toolkit MACRO.  The engine uses it two ways: in `#if CUDART_VERSION >= 120xx` guards
+// (`src/core/verify.cpp` 12.3, `src/core/expert_cache.cpp` 12.5) and as a RUNTIME value in `generate.cpp`'s
+// libcudart-mismatch check (`CUDART_VERSION / 1000` vs `cudaRuntimeGetVersion`).  There is no CUDA toolkit on
+// this build, so the value is the shim's OWN: 12000 (CUDA 12.0).  Chosen so both `#if` guards stay FALSE (the
+// same branch an undefined macro took, since an undefined identifier is 0 in `#if`), and so
+// `cudaRuntimeGetVersion` can return the SAME constant - the mismatch check then cannot disagree with itself
+// or print its "GPU properties can read wrong" warning, which describes a CUDA-toolkit defect that cannot
+// exist here.  Stated rather than hidden: this is a version of the SHIM, not of a CUDA runtime.
+#ifndef CUDART_VERSION
+#define CUDART_VERSION 12000
+#endif
+
 // ---- host-compile decorations -----------------------------------------------------------------------------
 // The engine's headers carry `__host__ __device__` / `__forceinline__` on host-visible helpers (f16_bits.hpp,
 // rope.hpp, bf16_bits.hpp).  A host compiler has no such keywords; the toolkit's host_defines.h makes them
@@ -273,6 +286,111 @@ enum cudaEventFlags {
     cudaEventInterprocess  = 0x04,
 };
 
+// ============================================================================================================
+// THE DEVICE-PROPERTY SURFACE - AND THE HONEST ANSWER FOR WHAT A VULKAN DEVICE DOES NOT HAVE
+// ============================================================================================================
+//
+// `src/program/generate.cpp` asks CUDA for the device's properties and for two attributes (the SM count and the
+// clock rate) to size its multi-GPU `--layer-split` placement heuristic.  A Vulkan device is not a CUDA device
+// and exposes NEITHER an SM count NOR a clock rate - so the answer matters, and a lazy 1 or 0 that feeds a
+// heuristic is exactly the silently-wrong-number defect class this port has already paid for (a fabricated
+// figure reads as a real one forever).  What is reported, and why:
+//
+//   * `cudaGetDeviceProperties(&prop, 0)`:
+//       - `prop.name`           = the real `VkPhysicalDeviceProperties.deviceName` (e.g. "Intel(R) Arc(TM) Pro
+//                                 B70 Graphics").  The engine PRINTS it and uses it in the code-for-this-GPU
+//                                 error message (`generate.cpp:3083/3096/3111`).
+//       - `prop.totalGlobalMem` = the device's real `DEVICE_LOCAL` heap total (the same figure `cudaMemGetInfo`
+//                                 reports, from `VK_EXT_memory_budget`).  The engine uses it for the layer-split
+//                                 reserve check (`generate.cpp:1668`, `reserve_mib * 100 > 12 * total_mib`).
+//       - `prop.major`/`minor`  = 0.  A Vulkan device has NO CUDA compute capability; 0 is the honest value and
+//                                 is PRINTED (`generate.cpp:3096`, "compute capability 0.0").  It can also make
+//                                 the engine refuse to run (`device_code_error()`): that is the engine deciding
+//                                 it has no code for a card it cannot name, which is correct behaviour on a
+//                                 device that is not a CUDA card, not a Vulkan-port failure.
+//       - `prop.multiProcessorCount` / `prop.clockRate` = 0, with the same reasoning as the attributes below
+//                                 (the fields exist for ABI shape; the engine does not read them - it calls
+//                                 `cudaDeviceGetAttribute` for the two, which REFUSES).
+//
+//   * `cudaDeviceGetAttribute(v, attr, 0)`:
+//       - `cudaDevAttrComputeCapabilityMajor` / `...Minor` -> 0 (success): no CUDA compute capability exists.
+//       - `cudaDevAttrMultiProcessorCount` and `cudaDevAttrClockRate` -> **`cudaErrorInvalidValue`**: a Vulkan
+//         device exposes no SM count and no clock rate, and there is no Vulkan query that answers either (the
+//         VkPhysicalDeviceProperties limits describe maximum workgroup geometry, not a machine width).  Refusing
+//         is the port's rule; inventing a number is the defect.
+//         WHAT THE ENGINE DOES WITH IT: the ONLY consumer is `generate.cpp:2759-2766`, the multi-GPU
+//         `--layer-split` AUTO placement heuristic (`speed = std::max(1.0, sms * khz / 1e6)`).  That block runs
+//         only when `multi_gpu && split_auto`, and this backend reports ONE device
+//         (`cudaGetDeviceCount() == 1`) with no peer access, so `multi_gpu` is false and the block is NOT
+//         ENTERED.  Even if it were, the engine's own guards bound it: it ignores this call's return and uses
+//         the `std::max(1.0, ...)` floor, and it already treats a REFUSED clock as 1.8 GHz
+//         (`generate.cpp:2760`: `if (cudaDeviceGetAttribute(&khz, ...) != cudaSuccess || khz <= 0) khz = 1800000`).
+//         So a refusal here degrades a heuristic to its documented floor, never a kernel's geometry.
+//       - every other attribute (shared memory, warp size, ...) -> 0 (success): those describe a CUDA SIMT
+//         machine this backend is not, and the engine's prefill TU that reads them is not compiled here.
+//
+// `cudaMallocHost` is CUDA's `cudaHostAlloc(..., cudaHostAllocDefault)`; see the cudaHostAlloc note above for
+// what the device pointer it produces therefore is and is not.
+struct cudaDeviceProp {
+    char name[256];                       // the Vulkan deviceName
+    size_t totalGlobalMem;                // the DEVICE_LOCAL heap total (real; not a model budget)
+    size_t sharedMemPerBlock;
+    int regsPerBlock;
+    int warpSize;
+    size_t memPitch;
+    int maxThreadsPerBlock;
+    int maxThreadsDim[3];
+    int maxGridSize[3];
+    int clockRate;                        // 0: a Vulkan device has no clock rate (see the note above)
+    size_t totalConstMem;
+    int major, minor;                     // 0/0: no CUDA compute capability on a Vulkan device
+    size_t textureAlignment;
+    int deviceOverlap;
+    int multiProcessorCount;              // 0: a Vulkan device has no SM count (see the note above)
+    int kernelExecTimeoutEnabled;
+    int integrated;
+    int canMapHostMemory;
+    int computeMode;
+    int concurrentKernels;
+    int ECCEnabled;
+    int pciBusID, pciDeviceID, pciDomainID;
+    int tccDriver;
+    int asyncEngineCount;
+    int unifiedAddressing;
+    int memoryClockRate, memoryBusWidth;
+    int l2CacheSize;
+    int maxThreadsPerMultiProcessor;
+    int cooperativeLaunch;
+    int cooperativeMultiDeviceLaunch;
+    size_t sharedMemPerMultiprocessor;
+    int regsPerMultiprocessor;
+    int managedMemory;
+    int isMultiGpuBoard;
+    int multiGpuBoardGroupID;
+    char gcnArchName[256];                // HIP only; left empty here (the HIP branches are not compiled)
+    int reservedSharedMemPerBlock;
+    int hostNativeAtomicSupported;
+    int singleToDoublePrecisionPerfRatio;
+    int pageableMemoryAccess;
+    int concurrentManagedAccess;
+};
+
+// The attribute ids the engine names, at their toolkit VALUES (so an engine comparison against a numeric literal
+// would still mean what it meant).  See the note above for which two are refused.
+enum cudaDeviceAttr {
+    cudaDevAttrMaxSharedMemoryPerBlock          = 8,
+    cudaDevAttrWarpSize                         = 10,
+    cudaDevAttrClockRate                        = 13,
+    cudaDevAttrMultiProcessorCount              = 16,
+    cudaDevAttrIntegrated                       = 18,
+    cudaDevAttrComputeCapabilityMajor           = 75,
+    cudaDevAttrComputeCapabilityMinor           = 76,
+    cudaDevAttrMaxSharedMemoryPerMultiprocessor = 81,
+    cudaDevAttrCooperativeLaunch                = 95,
+    cudaDevAttrMaxSharedMemoryPerBlockOptin     = 97,
+    cudaDevAttrReservedSharedMemoryPerBlock     = 111,
+};
+
 extern "C" {
 
 // ---- memory ------------------------------------------------------------------------------------------------
@@ -281,6 +399,9 @@ extern "C" {
 // exactly one stream is live - that stream.  Refuses when there is no stream to allocate from.
 cudaError_t cudaMalloc(void** devPtr, size_t count);
 cudaError_t cudaFree(void* devPtr);
+// CUDA's `cudaMallocHost` == `cudaHostAlloc(..., cudaHostAllocDefault)`: a page-locked host region and (here) the
+// HOST_VISIBLE | HOST_COHERENT buffer behind it.  See the cudaHostAlloc note for what its device pointer is.
+cudaError_t cudaMallocHost(void** ptr, size_t count);
 // HOST-VISIBLE | HOST_COHERENT region; *hostPtr is the mapped host address.  See the header note on what the
 // device pointer from cudaHostGetDevicePointer therefore can and cannot be.
 cudaError_t cudaHostAlloc(void** hostPtr, size_t count, unsigned int flags);
@@ -292,12 +413,14 @@ cudaError_t cudaMemGetInfo(size_t* freeBytes, size_t* totalBytes);
 
 // ---- copies (staged through the device layer; see the header note) -----------------------------------------
 cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, enum cudaMemcpyKind kind);
+// The `stream` defaults to the shim's current stream, exactly as the toolkit's own `cudaStream_t stream = 0`
+// default reads (the engine calls the 4-argument form with no stream at `generate.cpp:1170`).
 cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count, enum cudaMemcpyKind kind,
-                            cudaStream_t stream);
+                            cudaStream_t stream = nullptr);
 cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width,
-                              size_t height, enum cudaMemcpyKind kind, cudaStream_t stream);
+                              size_t height, enum cudaMemcpyKind kind, cudaStream_t stream = nullptr);
 cudaError_t cudaMemset(void* devPtr, int value, size_t count);
-cudaError_t cudaMemsetAsync(void* devPtr, int value, size_t count, cudaStream_t stream);
+cudaError_t cudaMemsetAsync(void* devPtr, int value, size_t count, cudaStream_t stream = nullptr);
 
 // ---- the fence ---------------------------------------------------------------------------------------------
 // The submission fence (vacuous here - every submit already fenced; see the header note).
@@ -308,7 +431,7 @@ cudaError_t cudaStreamSynchronize(cudaStream_t stream);
 // ---- events (HOST-side wall-clock; see the header note) -----------------------------------------------------
 cudaError_t cudaEventCreate(cudaEvent_t* event);
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t* event, unsigned int flags);
-cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream);
+cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream = nullptr);
 cudaError_t cudaEventSynchronize(cudaEvent_t event);
 cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end);
 cudaError_t cudaEventDestroy(cudaEvent_t event);
@@ -326,6 +449,16 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned
 // This backend has ONE device, so it answers index 0 and REFUSES any other, rather than pretending to switch.
 cudaError_t cudaGetDevice(int* device);
 cudaError_t cudaSetDevice(int device);
+// The device's properties.  `device` must be 0 (the one device); any other is `cudaErrorInvalidDevice`.  See the
+// device-property note above for exactly what each field holds and, crucially, which two are zero because a
+// Vulkan device has no such quantity.
+cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp* prop, int device);
+// One device attribute.  `cudaDevAttrMultiProcessorCount` and `cudaDevAttrClockRate` are REFUSED
+// (`cudaErrorInvalidValue`) - see the note above for why, and for what the engine does with the answer.
+cudaError_t cudaDeviceGetAttribute(int* value, enum cudaDeviceAttr attr, int device);
+// The shim's CUDART_VERSION (12000).  There is no CUDA runtime to ask, so the answer is the compile-time
+// constant this shim defines; the engine's header-vs-runtime mismatch check therefore cannot fire.
+cudaError_t cudaRuntimeGetVersion(int* runtimeVersion);
 
 // ---- host callbacks enqueued on a stream -------------------------------------------------------------------
 // CUDA runs `fn(userData)` on the stream after the work already queued.  Every submit here is complete when its
@@ -400,6 +533,18 @@ cudaError_t cudaGetDriverEntryPoint(const char* symbol, void** funcPtr, unsigned
 cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long flags);
 cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, cudaGraphNode_t* errorNode,
                                  char* logBuffer, size_t bufferSize);
+
+// ---- the TYPED-pointer cudaMalloc (C++, non-extern-"C") -----------------------------------------------------
+// The toolkit declares `cudaMalloc` ONLY as `void**`.  The engine's own code is written as if it were typed -
+// `float* d; cudaMalloc(&d, n)` with no `(void**)` cast (`generate.cpp:3039/3875/3884`, and 39 more) - because
+// on the real toolkit `float**`->`void**` is accepted under the compiler's permissive rule that an engine build
+// already relies on.  Rather than require a cast the engine does not write, this shim provides the typed
+// overload the call sites imply.  The `void**` overload above still wins for an explicit `(void**)` cast (a
+// non-template is preferred over a template on an exact match), so no existing call changes meaning.
+template <typename T>
+inline cudaError_t cudaMalloc(T** devPtr, size_t count) {
+    return cudaMalloc(reinterpret_cast<void**>(devPtr), count);
+}
 
 // ---- the shim's own seam (NOT part of CUDA) ----------------------------------------------------------------
 namespace strata::vulkan {

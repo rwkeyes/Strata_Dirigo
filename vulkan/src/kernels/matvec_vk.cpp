@@ -411,6 +411,32 @@ void bf16_gemv_fp32_mmvf_cols(Stream& s, const float* x, const uint16_t* w, floa
         bf16_gemv_fp32_mmvf(s, x + (size_t) c * (size_t) n_in, w, y + (size_t) c * (size_t) n_out, n_in, n_out);
 }
 
+// ---- `bf16_gemv_fp32_mmvf_multi` -> bf16_mmvf_f32_multi.spv (X f32, W bf16 pairs, Y; push {n_in; n_out; n_tok;
+//        ldx; ldy}; ONE WORKGROUP PER OUTPUT ROW, the weight read ONCE).  The batched sibling of
+//        `bf16_gemv_fp32_mmvf`, with the SAME per-row bit-identity contract (`bf16_mmvf_f32_multi.comp` and the
+//        gate's `case_bf16_mmvf_f32_multi` prove it): each output row is its own single-row call's answer.  The
+//        CUDA takes the single-row entry for `n_tok == 1 && ldy >= n_out` (native_bf16.cu:137); this mirrors
+//        that fat path and otherwise dispatches the multi shader for the 1..8 rows it covers.
+void bf16_gemv_fp32_mmvf_multi(Stream& s, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                               int64_t n_in, int64_t n_out, int n_tok) {
+    if (n_in <= 0 || n_out <= 0 || n_tok <= 0) return;
+    if (n_tok > 8) refuse("bf16_gemv_fp32_mmvf_multi", "n_tok is above 8 (the CUDA's own bound)");
+    if ((n_in & 1) != 0 || (ldx & 1) != 0) refuse("bf16_gemv_fp32_mmvf_multi", "n_in and ldx must be even");
+    if (n_tok == 1 && ldy >= n_out) {   // the CUDA's own fast branch: the single-row entry
+        bf16_gemv_fp32_mmvf(s, x, w, y, n_in, n_out);
+        return;
+    }
+    Buf xv{}, wv{}, yv{};
+    if (!arena_resolve(s, x, ((uint64_t) (n_tok - 1) * (uint64_t) ldx + (uint64_t) n_in) * 4, xv) ||
+        !arena_resolve(s, w, (uint64_t) n_out * (uint64_t) n_in * 2, wv) ||
+        !arena_resolve(s, y, ((uint64_t) (n_tok - 1) * (uint64_t) ldy + (uint64_t) n_out) * 4, yv))
+        refuse("bf16_gemv_fp32_mmvf_multi", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/bf16_mmvf_f32_multi.spv", 3, 20);
+    struct { int32_t n_in; int32_t n_out; int32_t n_tok; int32_t ldx; int32_t ldy; } pc{
+        (int32_t) n_in, (int32_t) n_out, n_tok, (int32_t) ldx, (int32_t) ldy};
+    s.ctx->dispatch(pipe, {&xv, &wv, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
+}
+
 // ---- 4 `s2_gemv_q8` -> s2_gemv_q8.spv (ACT q8_0, CODES, SCALES, Y; push {int n_in; int n_out}; ONE WORKGROUP
 //        PER ROW).  The S2 (Q2_0) weight against a Q8_0 activation - the same parallelism decision as
 //        bf16_gemv_split, so `threads_per_row` is dropped too.
@@ -491,6 +517,50 @@ void s_gemv_q8_split(Stream& s, bool q8k, const uint8_t* act, const uint8_t* cod
         (int32_t) n_in, (int32_t) n_out, form.code_bits, byte_shift, form.code_bias, (int32_t) form.codebook,
         group_shift, form.has_offset ? 1 : 0, q8k ? 1 : 0};
     VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/s_gemv_q8_split.spv", 5, sizeof(pc));
+    s.ctx->dispatch(pipe, {&av, &cv, &sv, &ov, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
+}
+
+// ---- `s_gemv_split_async` -> s_gemv_split.spv (ACT fp16 pairs read as uint32, CODES, SCALES, OFFSET, Y; push
+//        {int n_in; int n_out; int code_bits; int byte_shift; int bias; int codebook; int group_shift;
+//         int has_offset}; ONE WORKGROUP PER OUTPUT ROW).  The FP16-ACTIVATION member of the S-family split
+//        GEMV - `s_gemv_split`'s own shader, which the port already grades (`case_s_gemv_split`).  The CUDA's
+//        `_async` differs from the synchronous `s_gemv_split` ONLY in that it does not synchronise the stream;
+//        this backend's `Ctx::dispatch` submits and WAITS a fence by construction, so the async-ness is NOT
+//        expressible here - STATED, not hidden.  The OUTPUT is the same computation, so the entry point is
+//        wired but its overlap property is lost (it is not reached by the decode path: only the standalone
+//        `overlap_main.cpp` / `concurrent_main.cpp` driver mains call it).
+void s_gemv_split_f16(Stream& s, const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
+                      float* y, int64_t n_in, int64_t n_out, const strata::kernels::SForm& form, const char* who) {
+    if (n_in <= 0 || n_out <= 0) return;
+    if (form.code_bits != 2 && form.code_bits != 4 && form.code_bits != 8)
+        refuse(who, "code_bits must be 2, 4 or 8 (the S-family canonical form)");
+    if (form.group_elems <= 0 || (form.group_elems & (form.group_elems - 1)) != 0)
+        refuse(who, "group_elems must be a power of two (the group index is a shift)");
+    if (n_in % form.group_elems != 0)
+        refuse(who, "n_in is not a multiple of group_elems");
+    const int64_t per_byte = 8 / form.code_bits;
+    const int64_t n_groups = n_in / form.group_elems;
+    const int64_t codes_per_row = n_in / per_byte;
+    int group_shift = 0;
+    while ((1 << group_shift) < form.group_elems) ++group_shift;
+    const int32_t byte_shift = (per_byte == 4) ? 2 : ((per_byte == 2) ? 1 : 0);
+
+    Buf av{}, cv{}, sv{}, ov{}, yv{};
+    if (!arena_resolve(s, x, (uint64_t) n_in * 2, av) ||
+        !arena_resolve(s, codes, (uint64_t) n_out * (uint64_t) codes_per_row, cv) ||
+        !arena_resolve(s, scales, (uint64_t) n_out * (uint64_t) n_groups * 4, sv) ||
+        !arena_resolve(s, y, (uint64_t) n_out * 4, yv))
+        refuse(who, "a pointer is not inside this stream's arena");
+    ov = sv;   // OFFSET is always bound (no null descriptor) and read only when has_offset
+    if (form.has_offset) {
+        if (offset == nullptr) refuse(who, "form says has_offset but offset is null");
+        if (!arena_resolve(s, offset, (uint64_t) n_out * (uint64_t) n_groups * 4, ov))
+            refuse(who, "the offset pointer is not inside this stream's arena");
+    }
+    struct { int32_t n_in, n_out, code_bits, byte_shift, bias, codebook, group_shift, has_offset; } pc{
+        (int32_t) n_in, (int32_t) n_out, form.code_bits, byte_shift, form.code_bias, (int32_t) form.codebook,
+        group_shift, form.has_offset ? 1 : 0};
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/s_gemv_split.spv", 5, sizeof(pc));
     s.ctx->dispatch(pipe, {&av, &cv, &sv, &ov, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
 }
 
@@ -757,6 +827,23 @@ void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64
     if (n_in <= 0 || n_out <= 0 || ncols <= 0) return;
     strata::vulkan::bf16_gemv_fp32_mmvf_cols(strata::vulkan::stream_for("bf16_gemv_fp32_mmvf_cols", stream), x, w, y,
                                              n_in, n_out, ncols);
+}
+// `bf16_gemv_fp32_mmvf_multi` (bf16_gemv.hpp): `n_tok` activation rows at ldx/ldy strides, the weight read once.
+void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (n_in <= 0 || n_out <= 0 || n_tok <= 0) return;
+    strata::vulkan::bf16_gemv_fp32_mmvf_multi(strata::vulkan::stream_for("bf16_gemv_fp32_mmvf_multi", stream), x, ldx,
+                                              w, y, ldy, n_in, n_out, n_tok);
+}
+// `s_gemv_split_async` (s_gemv.hpp): the FP16-activation split GEMV; the port's submit fences, so the CUDA's
+// async-ness is not expressible - the OUTPUT is the same computation (see s_gemv_split_f16's note).
+void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
+                        float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row,
+                        void* stream) {
+    (void) threads_per_row;   // the port's split IS one 256-wide workgroup per row: the CUDA knob is not connected
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::s_gemv_split_f16(strata::vulkan::stream_for("s_gemv_split_async", stream), x, codes, scales,
+                                     offset, y, n_in, n_out, form, "s_gemv_split_async");
 }
 void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, float* y, int64_t n_in, int64_t n_out,
                 int threads_per_row, void* stream) {

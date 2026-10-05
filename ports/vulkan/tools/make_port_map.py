@@ -24,7 +24,7 @@ TABLE = {
     'add_inplace':                    ('kernel', 'add'),
     'bf16_gemv_fp32_mmvf':            ('kernel', 'bf16_mmvf_f32'),
     'bf16_gemv_fp32_mmvf_cols':       ('kernel', 'bf16_mmvf_f32'),
-    'bf16_gemv_fp32_mmvf_multi':      ('shader', 'bf16_mmvf_f32_multi'),
+    'bf16_gemv_fp32_mmvf_multi':      ('kernel', 'bf16_mmvf_f32_multi'),
     # THE BF16-PROJECTION PAIR, the OTHER side of the `native_bf16_projections` setting (layer.cpp:91, default
     # FALSE; set by `--native`/`--native-bf16`).  `project_bf16` (layer.cpp:94-100) reaches them when the
     # setting is OFF, on the main forward path (layer.cpp:291/:292/:367/:918/:962); both are now ported so the
@@ -60,8 +60,8 @@ TABLE = {
     # The QSA indexer pair's LEGACY member: `native_qsa_indexer_enabled() == false` - the indexer's OWN check,
     # separate from `native_qsa_enabled()`, and the one `layer_verify_compatible()` reads.
     'indexer_key_append':             ('kernel', 'indexer_key_append'),
-    'iq_dequant_f32':                 ('shader', 'iq_dequant_f32'),
-    'iq_embed_rows':                  ('shader', 'iq_embed_rows'),
+    'iq_dequant_f32':                 ('kernel', 'iq_dequant_f32'),
+    'iq_embed_rows':                  ('kernel', 'iq_embed_rows'),
     'kv_append_q4_step':              ('kernel', 'kv_q4_append'),
     'kv_append_q8_step':              ('kernel', 'kv_q8_append'),
     'kv_append_step':                 ('kernel', 'kv_f16_append'),
@@ -70,11 +70,11 @@ TABLE = {
     'kv_gather_step':                 ('kernel', 'kv_f16_gather'),
     'moe_combine':                    ('kernel', 'moe_combine_f32 moe_combine_f64'),
     'moe_grouped_s2':                 ('shader', 's2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped'),
-    'moe_hit_add':                    ('shader', 'moe_hit_add'),
-    'moe_hit_grouped_s2':             ('shader', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
+    'moe_hit_add':                    ('kernel', 'moe_hit_add'),
+    'moe_hit_grouped_s2':             ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
     'moe_hit_grouped_s2_cpu_order':   ('shader', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
-    'moe_hit_grouped_s2_dev':         ('shader', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
-    'moe_hit_select':                 ('shader', 'moe_hit_select'),
+    'moe_hit_grouped_s2_dev':         ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
+    'moe_hit_select':                 ('kernel', 'moe_hit_select'),
     'native_expert_grouped':          ('shader', 'native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu'),
     'native_flash_attn_short_step':   ('kernel', 'attn_decode_short'),
     'native_mmvq':                    ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq'),
@@ -130,11 +130,11 @@ TABLE = {
     's_gemv_q8_0_split':              ('kernel', 's_gemv_q8_split'),
     's_gemv_q8k_split':               ('kernel', 's_gemv_q8_split'),
     # `s_gemv_split_async` is the fp16-activation sibling (`s_gemv_split_kernel`, NOT the q8 one) and is reached
-    # ONLY by the standalone driver mains (`overlap_main.cpp`/`concurrent_main.cpp`), never the layer body.  Its
-    # shader (`s_gemv_split`) IS built; the backend does NOT define the symbol.  That is a DISTINCT FACT from a
-    # `kernel` row, so it is kinded `shader` - "a shader exists, the backend does not answer it" - which
-    # `check_port_map.py` requires to be TRUE (a `shader` row that IS defined is a stale row and fails).
-    's_gemv_split_async':             ('shader', 's_gemv_split'),
+    # ONLY by the standalone driver mains (`overlap_main.cpp`/`concurrent_main.cpp`), never the layer body.  THIS
+    # BATCH WIRES IT (vulkan/src/kernels/matvec_vk.cpp, `s_gemv_split_f16`), so the backend now DEFINES the
+    # symbol and the row is `kernel`; the CUDA's async-ness is NOT expressible here (the port's submit fences) and
+    # is stated in the wrapper, but the OUTPUT is proved against the port's own `s_gemv_split.spv` path.
+    's_gemv_split_async':             ('kernel', 's_gemv_split'),
     'sample_tokens':                  ('shader', 'sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split'),
     'scale_inplace':                  ('kernel', 'scale'),
     'scatter_rows_f32':               ('kernel', 'scatter_rows_f32'),

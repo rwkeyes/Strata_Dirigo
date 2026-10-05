@@ -62,6 +62,8 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/doorbell_vk.cpp
   src/kernels/gdn_vk.cpp
   src/kernels/matvec_vk.cpp
+  src/kernels/iq_vk.cpp                        # iq_dequant_f32 + iq_embed_rows (the forward-path IQ readers)
+  src/kernels/moe_vk.cpp                       # the resident-expert (S2) tier: select / chain / add
   src/kernels/qsa_vk.cpp
   src/kernels/ple_vk.cpp
   src/kernels/shared_expert_vk.cpp

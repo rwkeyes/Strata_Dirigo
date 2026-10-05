@@ -54,6 +54,7 @@
 #include "strata/kernels/ple.hpp"            // PLE/GR batch: ple_block / ple_history_advance / ple_block_scratch_bytes
 #include "strata/kernels/ngram.hpp"          // MoE/PLE batch: ngram_rows (the PLE hash) + the artifact hash constants
 #include "strata/kernels/shared_expert.hpp"  // MoE/PLE batch: moe_combine / shared_expert_scratch_bytes
+#include "strata/kernels/s2_expert_grouped.hpp"  // this batch: moe_hit_select / moe_hit_grouped_s2(_dev) / moe_hit_add
 #include "strata/kernels/fused_gr.hpp"       // MoE/PLE batch: fused_gr_supported (the GR geometry predicate)
 #include "strata/kernels/router_top10.hpp"   // PLE/GR batch: router_top10 (the generic MoE router)
 #include "cuda_runtime.h"                      // this batch: the CUDA-runtime shim (incl. the graph API) over the port's recorded step
@@ -19801,6 +19802,670 @@ void case_cuda_graph_entry(Ctx& ctx, const std::string& dir) {
 }
 
 
+// ============================================================================================================
+// THIS BATCH: the ENGINE-WRAPPER cases for the newly wired decode-path symbols.  Each proves (i) the ENGINE
+// wrapper (the symbol the layer links against, via `strata::kernels::`) reproduces the port's OWN shader path
+// BITWISE on the same fixture, (ii) the answer against the engine's own rule / a double oracle, and (iii) the
+// CAPTURE arm - the symbol RECORDED into a block, replayed, bitwise against direct execution (or a LOUD
+// refusal).  APPENDED last for the shared-RNG reason every batch above states.
+// ============================================================================================================
+
+// THE CAPTURE ARM every entry case below shares.  `stage()` rewrites every mutable input (and re-sentinels the
+// output), `run()` calls the engine wrapper, and `out_dev` is the result region.  Direct execution and a
+// captured-then-replayed execution must agree BITWISE.  Returns the differing-byte count, or a negative code
+// when the capture itself failed or recorded nothing.
+template <class Stage, class Run>
+static int capture_replay_arm(strata::vulkan::Stream* s, Stage stage, Run run, void* out_dev, size_t out_bytes) {
+    strata::vulkan::cuda_compat_set_stream(s);
+    cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+    stage();
+    run();
+    std::vector<uint8_t> direct(out_bytes);
+    strata::vulkan::stream_read(*s, out_dev, direct.data(), out_bytes);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t be = cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal);
+    if (be != cudaSuccess) return -1000 - (int) be;
+    run();
+    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+    if (ce != cudaSuccess || graph == nullptr) { if (graph) cudaGraphDestroy(graph); return -1; }
+    if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess || exec == nullptr) { cudaGraphDestroy(graph); return -2; }
+    cudaGraphDestroy(graph);
+    stage();                                 // reset inputs/output between the two runs
+    if (cudaGraphLaunch(exec, cs) != cudaSuccess) { cudaGraphExecDestroy(exec); return -3; }
+    std::vector<uint8_t> got(out_bytes);
+    strata::vulkan::stream_read(*s, out_dev, got.data(), out_bytes);
+    cudaGraphExecDestroy(exec);
+    int bad = 0;
+    for (size_t i = 0; i < out_bytes; ++i) if (got[i] != direct[i]) ++bad;
+    return bad;
+}
+
+// 1. `bf16_gemv_fp32_mmvf_multi` -> bf16_mmvf_f32_multi.spv.  The contract is per-row BIT-identity with a
+//    single-row `bf16_gemv_fp32_mmvf`, so the comparison is (A) the port's multi shader path, (B) the engine
+//    wrapper, both bitwise, and (C) the double oracle the single-row case uses.  PADDED ldx/ldy, so a
+//    stride-equals-width bug is caught.
+void case_bf16_gemv_fp32_mmvf_multi_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "bf16_mmvf_f32_multi.spv")) return;
+    const int n_in = 2560, n_out = 48, n_tok = 3, ldx = n_in + 8, ldy = n_out + 4;
+    std::vector<uint16_t> xw, ww;
+    bf16_gemv_fixture(n_in, n_out, xw, ww);
+    std::vector<float> xf((size_t) n_tok * ldx, 0.0f);
+    for (int t = 0; t < n_tok; ++t)
+        for (int i = 0; i < n_in; ++i) xf[(size_t) t * ldx + i] = rndf(1.0f);
+
+    // (A) the shader path, straight on the harness ctx
+    const size_t ybytes = (size_t) n_tok * ldy * 4;
+    Buf bx = ctx.alloc((size_t) n_tok * ldx * 4), bw = ctx.alloc((size_t) n_out * n_in * 2);
+    Buf by = ctx.alloc(ybytes + 64);
+    ctx.write(bx, xf.data(), xf.size() * 4);
+    ctx.write(bw, ww.data(), (size_t) n_out * n_in * 2);
+    std::vector<uint8_t> sink(ybytes + 64, 0xA5);
+    ctx.write(by, sink.data(), sink.size());
+    struct { int32_t n_in, n_out, n_tok, ldx, ldy; } pc{n_in, n_out, n_tok, ldx, ldy};
+    VkPipeline p = ctx.pipeline(dir + "/bf16_mmvf_f32_multi.spv", 3, (int) sizeof(pc));
+    ctx.dispatch(p, {&bx, &bw, &by}, &pc, sizeof(pc), (uint32_t) n_out);
+    std::vector<uint8_t> ref(sink.size());
+    ctx.read(by, ref.data(), ref.size());
+
+    // (B) the ENGINE WRAPPER on its own engine stream
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) { verdict("bf16_gemv_fp32_mmvf_multi entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) n_tok * ldx);
+    uint16_t* dw = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) n_out * n_in);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, (size_t) n_tok * ldy);
+    auto stage = [&] {
+        strata::vulkan::stream_write(*s, dx, xf.data(), xf.size() * 4);
+        strata::vulkan::stream_write(*s, dw, ww.data(), (size_t) n_out * n_in * 2);
+        std::vector<uint8_t> s2(ybytes, 0xA5);
+        strata::vulkan::stream_write(*s, dy, s2.data(), s2.size());
+    };
+    auto run = [&] { strata::kernels::bf16_gemv_fp32_mmvf_multi(dx, ldx, dw, dy, ldy, n_in, n_out, n_tok, s); };
+    stage();
+    run();
+    std::vector<uint8_t> got(ybytes);
+    strata::vulkan::stream_read(*s, dy, got.data(), got.size());
+    int bad_bw = 0;
+    for (size_t i = 0; i < ybytes; ++i) if (got[i] != ref[i]) ++bad_bw;
+    verdict("bf16_gemv_fp32_mmvf_multi entry (n_in=2560 n_out=48 n_tok=3, padded ldx/ldy): wrapper == shader path, bitwise",
+            bad_bw == 0, bad_bw, (int) ybytes, 0, "output bytes differ - stride / view / push-constant mismatch");
+    // (C) the double oracle, per row
+    int bad = 0; double worst = 0, mass = 0;
+    const float* y = reinterpret_cast<const float*>(got.data());
+    for (int t = 0; t < n_tok; ++t) {
+        std::vector<float> xr(xf.begin() + (size_t) t * ldx, xf.begin() + (size_t) t * ldx + n_in);
+        for (int o = 0; o < n_out; ++o) {
+            double terms = 0;
+            const double want = bf16_mmvf_host_row(xr, ww, o, n_in, &terms);
+            const double g = (double) y[(size_t) t * ldy + o];
+            mass += std::fabs(want);
+            const double ratio = std::fabs(g - want) / gemv_bound(want, terms, 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+    }
+    verdict("bf16_gemv_fp32_mmvf_multi entry: wrapper vs the terms-bound oracle (double)", bad == 0 && mass > 1e-3, bad,
+            n_tok * n_out, worst, "rows outside the bound / vacuous oracle");
+    // (D) THE CAPTURE ARM
+    const int capbad = capture_replay_arm(s, stage, run, dy, ybytes);
+    verdict("bf16_gemv_fp32_mmvf_multi entry: records under capture, replay == direct (bitwise)",
+            capbad == 0, capbad < 0 ? 1 : capbad, (int) ybytes, capbad, "capbad<0 = capture itself failed; else differing bytes");
+    strata::vulkan::stream_close(s);
+    ctx.free(bx); ctx.free(bw); ctx.free(by);
+}
+
+// 2. `iq_dequant_f32` -> iq_dequant_f32.spv.  Shader path vs engine wrapper, bitwise, plus the host decoder the
+//    standalone case uses, plus a capture arm.
+void case_iq_dequant_f32_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq_dequant_f32.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("iq_dequant_f32 entry", "device lacks storageBuffer8BitAccess"); return; }
+    const IqFmt fmts[2] = {{30, "BF16", 512}, {22, "IQ2_S", 82}};
+    for (const IqFmt& f : fmts) {
+        const uint32_t n_sb = 4, n = n_sb * 256;
+        const std::vector<uint8_t> w = iq_fixture(f.ty, n_sb, f.sb, 7);
+        std::vector<float> want(n, 0.0f);
+        for (uint32_t b = 0; b < n_sb; ++b)
+            for (uint32_t tid = 0; tid < 32; ++tid) iq_dq_host(f.ty, w.data(), 0, b, tid, want.data() + b * 256);
+        Buf b_w = ctx.alloc(w.size()), b_y = ctx.alloc((size_t) n * 4 + 64);
+        Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq1sGrid)), b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+        Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid)), b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+        Buf b_g5 = ctx.alloc(sizeof(strata::vkport::kIq2xxsGrid)), b_g6 = ctx.alloc(sizeof(strata::vkport::kIq2xsGrid));
+        ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+        ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+        ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+        ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+        ctx.write(b_g5, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
+        ctx.write(b_g6, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
+        ctx.write(b_w, w.data(), w.size());
+        std::vector<uint8_t> sink((size_t) n * 4 + 64, 0xC3);
+        ctx.write(b_y, sink.data(), sink.size());
+        struct { int ty; } pc{f.ty};
+        VkPipeline p = ctx.pipeline(dir + "/iq_dequant_f32.spv", 8, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_y}, &pc, sizeof(pc), n_sb);
+        std::vector<uint8_t> ref(sink.size());
+        ctx.read(b_y, ref.data(), ref.size());
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+        if (s == nullptr) { verdict("iq_dequant_f32 entry", false, 1, 1, 0, "the engine stream did not open"); continue; }
+        uint8_t* dw = strata::vulkan::arena_alloc<uint8_t>(*s, w.size());
+        float* dy = strata::vulkan::arena_alloc<float>(*s, n);
+        auto stage = [&] {
+            strata::vulkan::stream_write(*s, dw, w.data(), w.size());
+            std::vector<uint8_t> s2((size_t) n * 4, 0xC3);
+            strata::vulkan::stream_write(*s, dy, s2.data(), s2.size());
+        };
+        auto run = [&] { strata::kernels::iq_dequant_f32(f.ty, dw, (int64_t) n, dy, s); };
+        stage(); run();
+        std::vector<uint8_t> got((size_t) n * 4);
+        strata::vulkan::stream_read(*s, dy, got.data(), got.size());
+        int bad_bw = 0;
+        for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+        char lab[160];
+        std::snprintf(lab, sizeof lab, "iq_dequant_f32 entry (%s, n=%u): wrapper == shader path, bitwise", f.name, n);
+        verdict(lab, bad_bw == 0, bad_bw, (int) got.size(), 0, "output bytes differ - grid layout / ty mismatch");
+        int bad = 0; double worst = 0, mass = 0;
+        const float* y = reinterpret_cast<const float*>(got.data());
+        for (uint32_t i = 0; i < n; ++i) {
+            mass += std::fabs((double) want[i]);
+            const double tol = 1e-5 * std::fabs((double) want[i]) + 1e-6;
+            const double ratio = std::fabs((double) y[i] - (double) want[i]) / tol;
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+        std::snprintf(lab, sizeof lab, "iq_dequant_f32 entry (%s): wrapper vs the oracles", f.name);
+        verdict(lab, bad == 0 && mass > 1e-3, bad, (int) n, worst, "values outside tolerance / vacuous oracle");
+        const int capbad = capture_replay_arm(s, stage, run, dy, (size_t) n * 4);
+        std::snprintf(lab, sizeof lab, "iq_dequant_f32 entry (%s): records under capture, replay == direct (bitwise)", f.name);
+        verdict(lab, capbad == 0, capbad < 0 ? 1 : capbad, (int) n * 4, capbad, "capbad<0 = capture failed; else differing bytes");
+        strata::vulkan::stream_close(s);
+        ctx.free(b_w); ctx.free(b_y); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_g5); ctx.free(b_g6);
+    }
+}
+
+// 3. `iq_embed_rows` -> iq_embed_rows.spv.  2-D grid (superblock, token), a DERANGED token list, and a capture arm.
+void case_iq_embed_rows_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq_embed_rows.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("iq_embed_rows entry", "device lacks storageBuffer8BitAccess"); return; }
+    const IqFmt f{22, "IQ2_S", 82};
+    const uint32_t n_embd = 512, n_tok = 4, n_sb_row = n_embd / 256, n_rows = 6;
+    const std::vector<int32_t> toks = {5, 0, 4, 1};
+    const uint32_t row_bytes = n_sb_row * f.sb;
+    std::vector<uint8_t> table((size_t) n_rows * row_bytes);
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        const std::vector<uint8_t> row = iq_fixture(f.ty, n_sb_row, f.sb, 1 + r);
+        std::memcpy(table.data() + (size_t) r * row_bytes, row.data(), row.size());
+    }
+    std::vector<float> want((size_t) n_tok * n_embd, 0.0f);
+    for (uint32_t t = 0; t < n_tok; ++t)
+        for (uint32_t b = 0; b < n_sb_row; ++b)
+            for (uint32_t tid = 0; tid < 32; ++tid)
+                iq_dq_host(f.ty, table.data(), (size_t) toks[t] * row_bytes, b, tid, want.data() + (size_t) t * n_embd + b * 256);
+    // (A) shader path
+    const size_t n = (size_t) n_tok * n_embd;
+    Buf b_w = ctx.alloc(table.size()), b_t = ctx.alloc(n_tok * 4), b_y = ctx.alloc(n * 4 + 64);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq1sGrid)), b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid)), b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_g5 = ctx.alloc(sizeof(strata::vkport::kIq2xxsGrid)), b_g6 = ctx.alloc(sizeof(strata::vkport::kIq2xsGrid));
+    ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    ctx.write(b_g5, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
+    ctx.write(b_g6, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
+    ctx.write(b_w, table.data(), table.size());
+    ctx.write(b_t, toks.data(), toks.size() * 4);
+    std::vector<uint8_t> sink(n * 4 + 64, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int ty; int n_embd; uint32_t row_bytes; } pc{f.ty, (int) n_embd, row_bytes};
+    VkPipeline p = ctx.pipeline(dir + "/iq_embed_rows.spv", 9, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_t, &b_y}, &pc, sizeof(pc), n_sb_row, n_tok);
+    std::vector<uint8_t> ref(sink.size());
+    ctx.read(b_y, ref.data(), ref.size());
+    // (B) engine wrapper
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) { verdict("iq_embed_rows entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+    uint8_t* dw = strata::vulkan::arena_alloc<uint8_t>(*s, table.size());
+    int32_t* dt = strata::vulkan::arena_alloc<int32_t>(*s, n_tok);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, n);
+    auto stage = [&] {
+        strata::vulkan::stream_write(*s, dw, table.data(), table.size());
+        strata::vulkan::stream_write(*s, dt, toks.data(), toks.size() * 4);
+        std::vector<uint8_t> s2(n * 4, 0xC3);
+        strata::vulkan::stream_write(*s, dy, s2.data(), s2.size());
+    };
+    auto run = [&] { strata::kernels::iq_embed_rows(f.ty, dw, row_bytes, dt, n_tok, n_embd, dy, s); };
+    stage(); run();
+    std::vector<uint8_t> got(n * 4);
+    strata::vulkan::stream_read(*s, dy, got.data(), got.size());
+    int bad_bw = 0;
+    for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+    verdict("iq_embed_rows entry (IQ2_S, deranged tokens): wrapper == shader path, bitwise", bad_bw == 0, bad_bw,
+            (int) got.size(), 0, "output bytes differ - row stride / token index / grid-y mismatch");
+    int bad = 0; double worst = 0, mass = 0;
+    const float* y = reinterpret_cast<const float*>(got.data());
+    for (size_t i = 0; i < n; ++i) {
+        mass += std::fabs((double) want[i]);
+        const double tol = 1e-5 * std::fabs((double) want[i]) + 1e-6;
+        const double ratio = std::fabs((double) y[i] - (double) want[i]) / tol;
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+    }
+    verdict("iq_embed_rows entry: wrapper vs the oracles", bad == 0 && mass > 1e-3, bad, (int) n, worst,
+            "values outside tolerance / vacuous oracle");
+    {   // RIVAL: the IDENTITY token list (row t, not tokens[t]) - its own oracle must differ.
+        double moved = 0;
+        for (uint32_t t = 0; t < n_tok; ++t)
+            for (uint32_t b = 0; b < n_sb_row; ++b) {
+                std::vector<float> ident(256, 0.0f);   // iq_dq_host writes a WHOLE 256-value superblock
+                for (uint32_t tid = 0; tid < 32; ++tid)
+                    iq_dq_host(f.ty, table.data(), (size_t) t * row_bytes, b, tid, ident.data());
+                for (uint32_t k = 0; k < 256; ++k)
+                    moved = std::max(moved, std::fabs((double) ident[k] - (double) want[(size_t) t * n_embd + b * 256 + k]));
+            }
+        verdict("iq_embed_rows entry: the identity row rule MOVES the reference", moved > 1e-3, 0, 1, moved,
+                "the derangement must make tokens[t] != t observable");
+    }
+    const int capbad = capture_replay_arm(s, stage, run, dy, n * 4);
+    verdict("iq_embed_rows entry: records under capture, replay == direct (bitwise)", capbad == 0,
+            capbad < 0 ? 1 : capbad, (int) n * 4, capbad, "capbad<0 = capture failed; else differing bytes");
+    strata::vulkan::stream_close(s);
+    ctx.free(b_w); ctx.free(b_t); ctx.free(b_y); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4);
+    ctx.free(b_g5); ctx.free(b_g6);
+}
+
+// 4. `s_gemv_split_async` -> s_gemv_split.spv (the FP16-activation S-family split GEMV).  Same fixture family as
+//    `case_s_gemv_f16_split`, driven through the ENGINE WRAPPER and compared bitwise, plus a capture arm.  NOTE
+//    the stated divergence: the port's submit fences, so the CUDA's async-ness is not expressible - the OUTPUT
+//    is what is proved here.
+void case_s_gemv_split_async_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s_gemv_split.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("s_gemv_split_async entry", "device lacks storageBuffer8BitAccess"); return; }
+    struct Form { int bits, bias, group, codebook, n_in, n_out; bool has_offset; const char* note; };
+    const Form forms[2] = {
+        {2, -1, 64, 0, 2560, 8, false, "S2, group 64 (Q2_0 shapes)"},
+        {4, 0, 32, 1, 640, 8, false, "IQ4_NL codebook, n_in 640"}};
+    for (const Form& f : forms) {
+        const int per_byte = 8 / f.bits, n_groups = f.n_in / f.group, codes_per_row = f.n_in / per_byte;
+        std::vector<uint16_t> x(f.n_in);
+        for (int i = 0; i < f.n_in; ++i) {
+            const float v = (i % 5 == 0) ? 5.9604645e-08f : ((i % 5 == 1) ? 0.0f : rndf(1.0f));
+            x[i] = strata::kernels::f16_from_f32(v);
+        }
+        std::vector<uint8_t> codes((size_t) f.n_out * codes_per_row);
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) ((i * 37 + 11) & 0xFF);
+        std::vector<float> scales((size_t) f.n_out * n_groups, 0.0f), offsets((size_t) f.n_out * n_groups, 0.0f);
+        for (int o = 0; o < f.n_out; ++o)
+            for (int g = 0; g < n_groups; ++g) {
+                const float mag = 0.015625f * (float) (g + 1);
+                scales[(size_t) o * n_groups + g] = ((g % 7) == 5) ? -mag : mag;
+                offsets[(size_t) o * n_groups + g] = 0.5f * (float) (o + 1) - 0.25f * (float) g;
+            }
+        const int byte_shift = (per_byte == 4) ? 2 : ((per_byte == 2) ? 1 : 0);
+        int group_shift = 0; while ((1 << group_shift) < f.group) ++group_shift;
+        // (A) shader path
+        Buf b_x = ctx.alloc((size_t) f.n_in * 2), b_c = ctx.alloc(codes.size()), b_s = ctx.alloc(scales.size() * 4);
+        Buf b_o = ctx.alloc(offsets.size() * 4), b_y = ctx.alloc((size_t) f.n_out * 4 + 64);
+        ctx.write(b_x, x.data(), x.size() * 2);
+        ctx.write(b_c, codes.data(), codes.size());
+        ctx.write(b_s, scales.data(), scales.size() * 4);
+        ctx.write(b_o, offsets.data(), offsets.size() * 4);
+        std::vector<uint8_t> sink((size_t) f.n_out * 4 + 64, 0x9A);
+        ctx.write(b_y, sink.data(), sink.size());
+        struct { int n_in, n_out, code_bits, byte_shift, bias, codebook, group_shift, has_offset; } pc{
+            f.n_in, f.n_out, f.bits, byte_shift, f.bias, f.codebook, group_shift, f.has_offset ? 1 : 0};
+        VkPipeline p = ctx.pipeline(dir + "/s_gemv_split.spv", 5, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_x, &b_c, &b_s, &b_o, &b_y}, &pc, sizeof(pc), (uint32_t) f.n_out);
+        std::vector<uint8_t> ref(sink.size());
+        ctx.read(b_y, ref.data(), ref.size());
+        // (B) engine wrapper
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+        if (s == nullptr) { verdict("s_gemv_split_async entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+        uint16_t* dx = strata::vulkan::arena_alloc<uint16_t>(*s, f.n_in);
+        uint8_t* dc = strata::vulkan::arena_alloc<uint8_t>(*s, codes.size());
+        float* ds = strata::vulkan::arena_alloc<float>(*s, scales.size());
+        float* dof = strata::vulkan::arena_alloc<float>(*s, offsets.size());
+        float* dy = strata::vulkan::arena_alloc<float>(*s, f.n_out);
+        auto stage = [&] {
+            strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 2);
+            strata::vulkan::stream_write(*s, dc, codes.data(), codes.size());
+            strata::vulkan::stream_write(*s, ds, scales.data(), scales.size() * 4);
+            strata::vulkan::stream_write(*s, dof, offsets.data(), offsets.size() * 4);
+            std::vector<uint8_t> s2((size_t) f.n_out * 4, 0x9A);
+            strata::vulkan::stream_write(*s, dy, s2.data(), s2.size());
+        };
+        strata::kernels::SForm sf;
+        sf.code_bits = f.bits; sf.code_bias = f.bias; sf.group_elems = f.group;
+        sf.codebook = f.codebook ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;
+        sf.has_offset = f.has_offset;
+        auto run = [&] { strata::kernels::s_gemv_split_async(dx, dc, ds, f.has_offset ? dof : nullptr, dy, f.n_in, f.n_out, sf, 256, s); };
+        stage(); run();
+        std::vector<uint8_t> got((size_t) f.n_out * 4);
+        strata::vulkan::stream_read(*s, dy, got.data(), got.size());
+        int bad_bw = 0;
+        for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+        char lab[200];
+        std::snprintf(lab, sizeof lab, "s_gemv_split_async entry (%s): wrapper == shader path, bitwise", f.note);
+        verdict(lab, bad_bw == 0, bad_bw, (int) got.size(), 0, "output bytes differ - form / descriptor / push mismatch");
+        int bad = 0; double worst = 0, mass = 0;
+        const float* y = reinterpret_cast<const float*>(got.data());
+        for (int o = 0; o < f.n_out; ++o) {
+            double abs_sum = 0;
+            const double want = s_gemv_f16_host_row(x, codes, scales, offsets, f.has_offset, f.bits, f.bias, f.codebook, f.group, o, f.n_in, &abs_sum);
+            mass += std::fabs(want);
+            const double ratio = std::fabs((double) y[o] - want) / gemv_bound(want, abs_sum, 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+        std::snprintf(lab, sizeof lab, "s_gemv_split_async entry (%s): wrapper vs the explicit oracle", f.note);
+        verdict(lab, bad == 0 && mass > 1e-3, bad, f.n_out, worst, "rows outside the bound / vacuous oracle");
+        const int capbad = capture_replay_arm(s, stage, run, dy, (size_t) f.n_out * 4);
+        std::snprintf(lab, sizeof lab, "s_gemv_split_async entry (%s): records under capture, replay == direct (bitwise)", f.note);
+        verdict(lab, capbad == 0, capbad < 0 ? 1 : capbad, f.n_out * 4, capbad, "capbad<0 = capture failed; else differing bytes");
+        strata::vulkan::stream_close(s);
+        ctx.free(b_x); ctx.free(b_c); ctx.free(b_s); ctx.free(b_o); ctx.free(b_y);
+    }
+}
+
+// 5. `moe_hit_select` -> moe_hit_select.spv.  The two rules (only resident, and dst = the ROUTING POSITION) are
+//    checked by a host oracle on a scrambled fixture; then a capture arm.
+void case_moe_hit_select_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "moe_hit_select.spv")) return;
+    const int k = 10, n_expert = 8;
+    const std::vector<int32_t> ids = {3, 0, 5, 6, 2, 4, 1, 3, 7, 9};   // an OOR id (9) and a repeat
+    std::vector<int32_t> res((size_t) k, 0);
+    const int32_t rv[8] = {5, -1, 2, 7, -1, 0, 3, -1};
+    for (int e = 0; e < 8; ++e) res[(size_t) e] = rv[e];
+    // oracle
+    std::vector<int32_t> wslot, wdst; int wcount = 0;
+    for (int lane = 0; lane < k; ++lane) {
+        const int e = ids[(size_t) lane];
+        const int sl = (e >= 0 && e < n_expert) ? res[(size_t) e] : -1;
+        if (sl >= 0) { wslot.push_back(sl); wdst.push_back(lane); ++wcount; }
+    }
+    // (A) shader path
+    Buf b_ids = ctx.alloc(k * 4), b_res = ctx.alloc(k * 4), b_slot = ctx.alloc(k * 4), b_dst = ctx.alloc(k * 4), b_cnt = ctx.alloc(4);
+    ctx.write(b_ids, ids.data(), ids.size() * 4);
+    ctx.write(b_res, res.data(), res.size() * 4);
+    struct { int32_t k, n_expert; } pc{k, n_expert};
+    VkPipeline p = ctx.pipeline(dir + "/moe_hit_select.spv", 5, (int) sizeof(pc));
+    std::vector<int32_t> z(k, -77); ctx.write(b_slot, z.data(), z.size() * 4); ctx.write(b_dst, z.data(), z.size() * 4);
+    int32_t zc = -77; ctx.write(b_cnt, &zc, 4);
+    ctx.dispatch(p, {&b_ids, &b_res, &b_slot, &b_dst, &b_cnt}, &pc, sizeof(pc), 1);
+    std::vector<int32_t> ref_slot(k), ref_dst(k); int32_t ref_cnt = 0;
+    ctx.read(b_slot, ref_slot.data(), k * 4); ctx.read(b_dst, ref_dst.data(), k * 4); ctx.read(b_cnt, &ref_cnt, 4);
+    // (B) engine wrapper
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) { verdict("moe_hit_select entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+    int32_t* d_ids = strata::vulkan::arena_alloc<int32_t>(*s, k);
+    int32_t* d_res = strata::vulkan::arena_alloc<int32_t>(*s, k);
+    int32_t* d_slot = strata::vulkan::arena_alloc<int32_t>(*s, k);
+    int32_t* d_dst = strata::vulkan::arena_alloc<int32_t>(*s, k);
+    int32_t* d_cnt = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+    auto stage = [&] {
+        strata::vulkan::stream_write(*s, d_ids, ids.data(), ids.size() * 4);
+        strata::vulkan::stream_write(*s, d_res, res.data(), res.size() * 4);
+        strata::vulkan::stream_write(*s, d_slot, z.data(), z.size() * 4);
+        strata::vulkan::stream_write(*s, d_dst, z.data(), z.size() * 4);
+        strata::vulkan::stream_write(*s, d_cnt, &zc, 4);
+    };
+    auto run = [&] { strata::kernels::moe_hit_select(d_ids, d_res, k, n_expert, d_slot, d_dst, d_cnt, s); };
+    stage(); run();
+    std::vector<int32_t> got_slot(k), got_dst(k); int32_t got_cnt = 0;
+    strata::vulkan::stream_read(*s, d_slot, got_slot.data(), k * 4);
+    strata::vulkan::stream_read(*s, d_dst, got_dst.data(), k * 4);
+    strata::vulkan::stream_read(*s, d_cnt, &got_cnt, 4);
+    int bad_bw = (got_cnt != ref_cnt);
+    for (int i = 0; i < ref_cnt; ++i) { if (got_slot[(size_t) i] != ref_slot[(size_t) i]) ++bad_bw; if (got_dst[(size_t) i] != ref_dst[(size_t) i]) ++bad_bw; }
+    verdict("moe_hit_select entry: wrapper == shader path, bitwise", bad_bw == 0, bad_bw, k + 1, 0, "slot/dst/count differ");
+    int bad = 0;
+    if (got_cnt != wcount) ++bad;
+    for (int i = 0; i < wcount; ++i) { if (got_slot[(size_t) i] != wslot[(size_t) i]) ++bad; if (got_dst[(size_t) i] != wdst[(size_t) i]) ++bad; }
+    verdict("moe_hit_select entry: wrapper vs the engine's own rule (resident + routing position)", bad == 0, bad, k + 1, 0,
+            "the compaction / dst rule differs from the source");
+    // RIVAL: writing the SLOT into dst (the two-roles confusion) must MOVE the observable.
+    int moved = 0; for (int i = 0; i < wcount; ++i) if (wslot[(size_t) i] != wdst[(size_t) i]) ++moved;
+    verdict("moe_hit_select entry: the slot==dst confusion MOVES the reference", moved > 0, 0, 1, (double) moved,
+            "the fixture must make the slot and the routing position differ");
+    const int capbad = capture_replay_arm(s, stage, run, d_cnt, 4);
+    verdict("moe_hit_select entry: records under capture, replay == direct (bitwise)", capbad == 0, capbad < 0 ? 1 : capbad, 4,
+            capbad, "capbad<0 = capture failed; else differing bytes");
+    strata::vulkan::stream_close(s);
+    ctx.free(b_ids); ctx.free(b_res); ctx.free(b_slot); ctx.free(b_dst); ctx.free(b_cnt);
+}
+
+// 6. `moe_hit_add` -> moe_hit_add.spv.  `+=` (not `=`), dst = the routing position, and rows past the device
+//    count untouched.  Host oracle with non-zero priors, then a capture arm.
+void case_moe_hit_add_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "moe_hit_add.spv")) return;
+    const int n_embd = 2560, cap = 4, count = 3;
+    const std::vector<int32_t> dst = {2, 0, 3, 1};
+    const float SENT = -12345.5f;
+    std::vector<float> parts((size_t) cap * n_embd, SENT), hit((size_t) cap * n_embd, 0.0f);
+    for (int h = 0; h < count; ++h) {
+        const int r = dst[(size_t) h];
+        for (int i = 0; i < n_embd; ++i) {
+            parts[(size_t) r * n_embd + i] = 0.25f + 0.001f * (float) i + 0.5f * (float) r;
+            hit[(size_t) r * n_embd + i] = 1.5f + 0.0001f * (float) i - 0.25f * (float) r;
+        }
+    }
+    std::vector<float> want = parts;
+    for (int h = 0; h < count; ++h) {
+        const int r = dst[(size_t) h];
+        for (int i = 0; i < n_embd; ++i) want[(size_t) r * n_embd + i] += hit[(size_t) r * n_embd + i];
+    }
+    // (A) shader path
+    Buf b_p = ctx.alloc((size_t) cap * n_embd * 4 + 64), b_h = ctx.alloc((size_t) cap * n_embd * 4);
+    Buf b_d = ctx.alloc(cap * 4), b_c = ctx.alloc(4);
+    ctx.write(b_p, parts.data(), parts.size() * 4);
+    ctx.write(b_h, hit.data(), hit.size() * 4);
+    ctx.write(b_d, dst.data(), dst.size() * 4);
+    ctx.write(b_c, &count, 4);
+    struct { int32_t n_embd; } pc{n_embd};
+    VkPipeline p = ctx.pipeline(dir + "/moe_hit_add.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_p, &b_h, &b_d, &b_c}, &pc, sizeof(pc), 1u, (uint32_t) cap);
+    std::vector<float> ref((size_t) cap * n_embd);
+    ctx.read(b_p, ref.data(), ref.size() * 4);
+    // (B) engine wrapper
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) { verdict("moe_hit_add entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+    float* dp = strata::vulkan::arena_alloc<float>(*s, (size_t) cap * n_embd);
+    float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) cap * n_embd);
+    int32_t* dd = strata::vulkan::arena_alloc<int32_t>(*s, cap);
+    int32_t* dc = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+    auto stage = [&] {
+        strata::vulkan::stream_write(*s, dp, parts.data(), parts.size() * 4);
+        strata::vulkan::stream_write(*s, dh, hit.data(), hit.size() * 4);
+        strata::vulkan::stream_write(*s, dd, dst.data(), dst.size() * 4);
+        strata::vulkan::stream_write(*s, dc, &count, 4);
+    };
+    auto run = [&] { strata::kernels::moe_hit_add(dp, dh, dd, dc, cap, n_embd, s); };
+    stage(); run();
+    std::vector<float> got((size_t) cap * n_embd);
+    strata::vulkan::stream_read(*s, dp, got.data(), got.size() * 4);
+    int bad_bw = 0; for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+    verdict("moe_hit_add entry (cap=4 count=3 n_embd=2560): wrapper == shader path, bitwise", bad_bw == 0, bad_bw,
+            (int) got.size(), 0, "output bytes differ");
+    int bad = 0; double moved = 0;
+    for (size_t i = 0; i < got.size(); ++i) if (got[i] != want[i]) ++bad;
+    for (int i = 0; i < cap * n_embd; ++i) if (want[(size_t) i] != SENT) moved += 1.0;
+    verdict("moe_hit_add entry: wrapper vs the engine's own rule (+=, dst[dst], sentinels intact)",
+            bad == 0 && moved > 0, bad, (int) got.size(), 0, "a row wrong or a sentinel overwritten");
+    const int capbad = capture_replay_arm(s, stage, run, dp, (size_t) cap * n_embd * 4);
+    verdict("moe_hit_add entry: records under capture, replay == direct (bitwise)", capbad == 0, capbad < 0 ? 1 : capbad,
+            (int) cap * n_embd * 4, capbad, "capbad<0 = capture failed; else differing bytes");
+    strata::vulkan::stream_close(s);
+    ctx.free(b_p); ctx.free(b_h); ctx.free(b_d); ctx.free(b_c);
+}
+
+// 7. `moe_hit_grouped_s2` / `moe_hit_grouped_s2_dev` -> the four-launch per-hit chain.  The fixture mirrors
+//    `case_moe_hit_grouped_s2` (3 hits, scrambled slots/destinations, modest gate scales so the fp16
+//    intermediate is finite).  Both the UNSCALED and the SCALED (R4.2h) paths are proved against the port's own
+//    shader path bitwise, and the down rows against the double oracle; then the capture arms - the per-hit
+//    entry RECORDS, the `_dev` entry must REFUSE LOUDLY under capture (it reads the count on the host).
+void case_moe_hit_grouped_s2_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s2expert_gu.spv") || !have(dir, "s2expert_swiglu.spv") || !have(dir, "quantize_q8_0.spv") ||
+        !have(dir, "s2expert_down.spv") || !have(dir, "quantize_q8_0_scaled.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("moe_hit_grouped_s2 entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int H = 2560, FF = 640;
+    const S2ExpertGeom g = s2expert_geom(H, FF);
+    const std::vector<int32_t> slot_index = {2, 0, 1};
+    const std::vector<int32_t> dst_index = {1, 2, 0};
+    const int n_hits = (int) slot_index.size(), n_slots = 3;
+    const int nch_gu = H / 32, nch_d = FF / 32;
+    std::vector<uint8_t> blob = s2expert_blob((size_t) n_slots, g);
+    for (size_t e = 0; e < (size_t) n_slots; ++e) {   // modest gate/up scales (see the shader case's note)
+        uint8_t* base = blob.data() + e * g.blob_bytes;
+        for (size_t i = 0; i < (size_t) (2 * FF); ++i) {
+            const float dw = 0.008f * (float) (1 + ((i + e) % 3));
+            for (size_t j = 0; j < g.sc_gu; ++j) s2_put16(base + g.o_gu_scales + i * g.sc_gu * 2 + j * 2, strata::kernels::f16_from_f32(dw));
+        }
+    }
+    const std::vector<uint8_t> act = s2expert_q8_0_rows(1, nch_gu);
+    std::vector<float> xsc((size_t) (H / 32));
+    for (int b = 0; b < H / 32; ++b) xsc[(size_t) b] = 0.001953125f * (float) (1 + (b % 3));
+    const size_t gu_bytes = ((uint64_t) n_hits * (2 * FF) * 4 + 15) & ~(uint64_t) 15;
+    const size_t q8_bytes = ((uint64_t) n_hits * nch_d * 34 + 15) & ~(uint64_t) 15;
+    const size_t scratch_bytes = strata::kernels::moe_hit_grouped_scratch_bytes(n_hits, H, FF);
+    const size_t n_out = (size_t) n_slots * H;
+
+    for (int scaled = 0; scaled < 2; ++scaled) {
+        const char* stag = scaled ? "scaled (R4.2h)" : "unscaled";
+        // (A) the port's own shader path (the same four launches), on the harness ctx
+        Buf b_blob = ctx.alloc(blob.size()), b_act = ctx.alloc(act.size());
+        Buf b_xs = ctx.alloc(xsc.size() * 4 + (scaled ? 0 : 16));
+        Buf b_hs = ctx.alloc((size_t) n_hits * nch_d * 4 + 16);
+        Buf b_slot = ctx.alloc(n_hits * 4), b_dst = ctx.alloc(n_hits * 4);
+        Buf b_scratch = ctx.alloc(scratch_bytes + 64), b_out = ctx.alloc(n_out * 4 + 64);
+        ctx.write(b_blob, blob.data(), blob.size());
+        ctx.write(b_act, act.data(), act.size());
+        ctx.write(b_xs, xsc.data(), xsc.size() * 4);
+        ctx.write(b_slot, slot_index.data(), slot_index.size() * 4);
+        ctx.write(b_dst, dst_index.data(), dst_index.size() * 4);
+        std::vector<uint8_t> sink(scratch_bytes + 64, 0xC3), sinko(n_out * 4 + 64, 0xC3);
+        ctx.write(b_scratch, sink.data(), sink.size());
+        ctx.write(b_out, sinko.data(), sinko.size());
+        const float* xs_ptr = scaled ? xsc.data() : nullptr;
+        auto chain = [&](Buf& blob_b, Buf& act_b, Buf& xs_b, Buf& hq_b, Buf& hs_b, Buf& out_b, Buf& scr_b) {
+            struct { int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales; } pc{n_hits, H, FF, (int) g.blob_bytes, scaled ? 1 : 0};
+            VkPipeline pgu = ctx.pipeline(dir + "/s2expert_gu.spv", 5, (int) sizeof(pc));
+            ctx.dispatch(pgu, {&blob_b, &act_b, &xs_b, &b_slot, &scr_b}, &pc, sizeof(pc), (uint32_t) (n_hits * 2 * FF));
+            struct { int n_pairs; } pcs{n_hits * FF};
+            VkPipeline psw = ctx.pipeline(dir + "/s2expert_swiglu.spv", 1, (int) sizeof(pcs));
+            ctx.dispatch(psw, {&scr_b}, &pcs, sizeof(pcs), groups_for((uint64_t) (n_hits * FF)));
+            if (scaled) {
+                struct { int n_blocks; } pcq{n_hits * nch_d};
+                VkPipeline pq = ctx.pipeline(dir + "/quantize_q8_0_scaled.spv", 3, (int) sizeof(pcq));
+                ctx.dispatch(pq, {&scr_b, &hq_b, &hs_b}, &pcq, sizeof(pcq), groups_for((uint64_t) (n_hits * nch_d)));
+            } else {
+                struct { int n_blocks; } pcq{n_hits * nch_d};
+                VkPipeline pq = ctx.pipeline(dir + "/quantize_q8_0.spv", 2, (int) sizeof(pcq));
+                ctx.dispatch(pq, {&scr_b, &hq_b}, &pcq, sizeof(pcq), groups_for((uint64_t) (n_hits * nch_d)));
+            }
+            VkPipeline pdn = ctx.pipeline(dir + "/s2expert_down.spv", 6, (int) sizeof(pc));
+            Buf& dnxs = scaled ? hs_b : xs_b;
+            ctx.dispatch(pdn, {&blob_b, &hq_b, &dnxs, &b_slot, &b_dst, &out_b}, &pc, sizeof(pc), (uint32_t) (n_hits * H));
+        };
+        Buf b_hq = ctx.alloc(q8_bytes + 64);
+        std::vector<uint8_t> sinkq(q8_bytes + 64, 0xC3);
+        ctx.write(b_hq, sinkq.data(), sinkq.size());
+        chain(b_blob, b_act, b_xs, b_hq, b_hs, b_out, b_scratch);
+        std::vector<uint8_t> ref(sinko.size());
+        ctx.read(b_out, ref.data(), ref.size());
+        std::vector<uint8_t> ref_scratch(sink.size());
+        ctx.read(b_scratch, ref_scratch.data(), ref_scratch.size());
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(128ull << 20, dir); }
+        if (s == nullptr) { verdict("moe_hit_grouped_s2 entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+        uint8_t* d_blob = strata::vulkan::arena_alloc<uint8_t>(*s, blob.size());
+        uint8_t* d_act = strata::vulkan::arena_alloc<uint8_t>(*s, act.size());
+        float* d_xs = strata::vulkan::arena_alloc<float>(*s, xsc.size());
+        int32_t* d_slot = strata::vulkan::arena_alloc<int32_t>(*s, n_hits);
+        int32_t* d_dst = strata::vulkan::arena_alloc<int32_t>(*s, n_hits);
+        uint8_t* d_scratch = strata::vulkan::arena_alloc<uint8_t>(*s, scratch_bytes);
+        float* d_out = strata::vulkan::arena_alloc<float>(*s, n_out + 16);   // + the sentinel guard past the answer
+        int32_t* d_count = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        const int32_t nd = n_hits;
+        auto stage = [&] {
+            strata::vulkan::stream_write(*s, d_blob, blob.data(), blob.size());
+            strata::vulkan::stream_write(*s, d_act, act.data(), act.size());
+            strata::vulkan::stream_write(*s, d_xs, xsc.data(), xsc.size() * 4);
+            strata::vulkan::stream_write(*s, d_slot, slot_index.data(), slot_index.size() * 4);
+            strata::vulkan::stream_write(*s, d_dst, dst_index.data(), dst_index.size() * 4);
+            strata::vulkan::stream_write(*s, d_scratch, sink.data(), sink.size());
+            strata::vulkan::stream_write(*s, d_out, sinko.data(), sinko.size());
+            strata::vulkan::stream_write(*s, d_count, &nd, 4);
+        };
+        auto run = [&] {
+            strata::kernels::moe_hit_grouped_s2(d_blob, d_slot, d_dst, n_hits, (int64_t) g.blob_bytes, d_act, d_scratch,
+                                                d_out, s, xs_ptr ? d_xs : nullptr);
+        };
+        stage(); run();
+        std::vector<uint8_t> got(n_out * 4);
+        strata::vulkan::stream_read(*s, d_out, got.data(), got.size());
+        int bad_bw = 0; for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+        char lab[220];
+        std::snprintf(lab, sizeof lab, "moe_hit_grouped_s2 entry (%s, 3 hits): wrapper == shader path, bitwise", stag);
+        verdict(lab, bad_bw == 0, bad_bw, (int) got.size(), 0, "output bytes differ - chain wiring / scratch layout");
+        // the engine's own rule: the down rows from the DEVICE's intermediate, at the scrambled destinations
+        std::vector<uint8_t> got_scratch(scratch_bytes);
+        strata::vulkan::stream_read(*s, d_scratch, got_scratch.data(), got_scratch.size());
+        const uint8_t* hq = got_scratch.data() + gu_bytes;
+        const float* hscale_dev = scaled ? reinterpret_cast<const float*>(got_scratch.data() + gu_bytes + q8_bytes)
+                                         : nullptr;   // R4.2h: the intermediate's OWN fp32 scales
+        int bad = 0; double worst = 0, mass = 0;
+        for (int h = 0; h < n_hits; ++h) {
+            const uint8_t* slotsrc = blob.data() + (size_t) slot_index[(size_t) h] * g.blob_bytes;
+            const uint8_t* hrow = hq + (size_t) h * (size_t) nch_d * 34u;
+            const float* hsc = scaled ? hscale_dev + (size_t) h * nch_d : nullptr;
+            for (int r = 0; r < H; r += 137) {
+                double abs_sum = 0;
+                const double want = s2_row_dot_host(slotsrc, g.o_d_codes + (size_t) r * g.row_d, g.o_d_scales + (size_t) r * g.sc_d * 2,
+                                                    hrow, hsc, scaled, nch_d, abs_sum);
+                const double gotv = (double) reinterpret_cast<const float*>(got.data())[(size_t) dst_index[(size_t) h] * H + (size_t) r];
+                mass += std::fabs(want);
+                const double ratio = std::fabs(gotv - want) / gemv_bound(want, abs_sum, 1e-6);
+                worst = std::max(worst, ratio);
+                if (!(ratio <= 1.0)) ++bad;
+            }
+        }
+        std::snprintf(lab, sizeof lab, "moe_hit_grouped_s2 entry (%s): wrapper vs the engine's own rule (double)", stag);
+        verdict(lab, bad == 0 && mass > 1e-3, bad, H + 1, worst, "down rows outside the bound / vacuous oracle");
+        const int capbad = capture_replay_arm(s, stage, run, d_out, n_out * 4);
+        std::snprintf(lab, sizeof lab, "moe_hit_grouped_s2 entry (%s): records under capture, replay == direct (bitwise)", stag);
+        verdict(lab, capbad == 0, capbad < 0 ? 1 : capbad, (int) n_out * 4, capbad, "capbad<0 = capture failed; else differing bytes");
+        // ---- `_dev`: the same count-3 result, then a LOUD capture refusal --------------------------------
+        stage();
+        strata::kernels::moe_hit_grouped_s2_dev(d_blob, d_slot, d_dst, d_count, (int64_t) n_hits, (int64_t) g.blob_bytes,
+                                                d_act, d_scratch, d_out, s, xs_ptr ? d_xs : nullptr);
+        std::vector<uint8_t> got_dev(n_out * 4);
+        strata::vulkan::stream_read(*s, d_out, got_dev.data(), got_dev.size());
+        int bad_dev = 0; for (size_t i = 0; i < got_dev.size(); ++i) if (got_dev[i] != ref[i]) ++bad_dev;
+        std::snprintf(lab, sizeof lab, "moe_hit_grouped_s2_dev entry (%s): device-count chain == the per-hit chain", stag);
+        verdict(lab, bad_dev == 0, bad_dev, (int) got_dev.size(), 0, "the device-count path differs from the host-count one");
+        {   // the capture refusal
+            cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+            cudaGraph_t g2 = nullptr;
+            cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal);
+            strata::kernels::moe_hit_grouped_s2_dev(d_blob, d_slot, d_dst, d_count, (int64_t) n_hits, (int64_t) g.blob_bytes,
+                                                    d_act, d_scratch, d_out, s, xs_ptr ? d_xs : nullptr);
+            const cudaError_t xe = cudaStreamEndCapture(cs, &g2);
+            const bool ok = (xe == cudaErrorStreamCaptureUnsupported) && (g2 == nullptr);
+            std::snprintf(lab, sizeof lab, "moe_hit_grouped_s2_dev entry (%s): REFUSED LOUDLY under capture (host count read)", stag);
+            verdict(lab, ok, ok ? 0 : 1, 1, 0, "must invalidate the recording (cudaErrorStreamCaptureUnsupported)");
+        }
+        strata::vulkan::stream_close(s);
+        ctx.free(b_blob); ctx.free(b_act); ctx.free(b_xs); ctx.free(b_hs); ctx.free(b_slot); ctx.free(b_dst);
+        ctx.free(b_scratch); ctx.free(b_out); ctx.free(b_hq);
+    }
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -20132,6 +20797,16 @@ int main(int argc, char** argv) {
     // THIS BATCH: the CUDA GRAPH API over the port's OWN recorded step (the engine's recorder, `session_capture`).
     // APPENDED last for the shared-RNG reason every batch above names.
     case_cuda_graph_entry(ctx, dir);                 // cudaStreamBeginCapture/EndCapture + cudaGraphInstantiate/Launch/Destroy
+    // THIS BATCH: the ENGINE-WRAPPER cases for the newly wired shader-row symbols (iq_dequant_f32, iq_embed_rows,
+    // bf16_gemv_fp32_mmvf_multi, s_gemv_split_async, moe_hit_select, moe_hit_add, moe_hit_grouped_s2/_dev), each
+    // with its capture arm.  APPENDED last for the shared-RNG reason every batch above states.
+    case_bf16_gemv_fp32_mmvf_multi_entry(ctx, dir);
+    case_iq_dequant_f32_entry(ctx, dir);
+    case_iq_embed_rows_entry(ctx, dir);
+    case_s_gemv_split_async_entry(ctx, dir);
+    case_moe_hit_select_entry(ctx, dir);
+    case_moe_hit_add_entry(ctx, dir);
+    case_moe_hit_grouped_s2_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

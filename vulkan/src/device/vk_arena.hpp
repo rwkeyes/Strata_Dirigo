@@ -62,7 +62,7 @@ struct Stream {
     // decreases, so a per-layer grid allocation would exhaust the arena.  Four grids (iq1s 2048, iq2s 2048,
     // iq3s 512, iq3xxs 256 uint32) cover every IQ arm the port ships.
     struct IqGrids {
-        Buf iq1s{}, iq2s{}, iq3s{}, iq3xxs{};
+        Buf iq1s{}, iq2s{}, iq3s{}, iq3xxs{}, iq2xxs{}, iq2xs{};
         bool valid = false;
     } iq_grids;
 

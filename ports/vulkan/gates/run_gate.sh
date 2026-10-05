@@ -219,6 +219,7 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
     "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
     "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
     "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
+    "$TREE/vulkan/src/kernels/iq_vk.cpp" "$TREE/vulkan/src/kernels/moe_vk.cpp" \
     "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
     "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
     "$TREE/vulkan/src/kernels/rope_vk.cpp" \

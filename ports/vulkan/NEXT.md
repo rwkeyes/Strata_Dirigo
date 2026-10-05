@@ -1,5 +1,38 @@
 # Start here next session
 
+## THE 14 `shader` ROWS: EIGHT WIRED (+ their capture arms) AND THE CUDA SURFACE THAT LETS generate.cpp COMPILE (2026-10-05, `vega`)
+
+**THE MAP now reads 168 = 74 kernel + 6 shader + 61 host + 27 todo** (was 66/14/61/27): eight of the fourteen
+`shader` rows are now `kernel` — `bf16_gemv_fp32_mmvf_multi`, `iq_dequant_f32`, `iq_embed_rows`, `moe_hit_select`,
+`moe_hit_add`, `moe_hit_grouped_s2`, `moe_hit_grouped_s2_dev`, `s_gemv_split_async` — each with an ENGINE-WRAPPER
+gate case (wrapper == the port's own shader path bitwise, AND the engine's own rule, AND a CAPTURE arm).  The
+remaining six `shader` rows did NOT get a definition THIS batch (a missing one is worse than none; see the report):
+`coupled_draft_sample`, `moe_grouped_s2`, `moe_hit_grouped_s2_cpu_order`, `native_expert_grouped`,
+`sample_tokens`, `shared_expert_multi`.  New backend TUs `vulkan/src/kernels/{iq_vk,moe_vk}.cpp`;
+`bf16_gemv_fp32_mmvf_multi` + `s_gemv_split_async` landed in `matvec_vk.cpp`.
+
+**THE ENGINE BAR (`154` → **`138` raw / `64` → `56` distinct / `50` → `42` kernels-ns / CUDA stays `0`**)** — the
+eight symbols are the drop.  The ONE-LAYER-BODY bar is UNCHANGED (`18` raw / `0` kernels-ns).  `generate.cpp`
+now COMPILES against the shim (was 34 errors).
+
+**THE CUDA SURFACE (deliverable C)** — `vulkan/include/cuda_compat/cuda_runtime.h` + `.../compat/cuda_runtime.cpp`
+add `cudaDeviceProp`/`cudaGetDeviceProperties`/`cudaDeviceGetAttribute`/`cudaDevAttr*`, `cudaMallocHost`, a typed
+`cudaMalloc` template, `cudaRuntimeGetVersion`+`CUDART_VERSION`, and default `stream = nullptr` on
+`cudaMemcpyAsync`/`cudaMemsetAsync`/`cudaEventRecord`.  **THE DEVICE-PROPERTY ANSWER, stated in the header:** a
+Vulkan device has no SM count and no clock rate, so `cudaDevAttrMultiProcessorCount` and `cudaDevAttrClockRate`
+are **REFUSED** (`cudaErrorInvalidValue`) rather than fabricated; `prop.name`/`totalGlobalMem` are the REAL
+deviceName / DEVICE_LOCAL heap; `major`/`minor` are 0 (no CUDA compute capability).  The only consumer of the two
+refused attributes is the multi-GPU `--layer-split` AUTO heuristic (`generate.cpp:2759-2766`), unreachable on this
+one-device backend (`cudaGetDeviceCount() == 1`), and the engine already has the `std::max(1.0, …)` / 1.8 GHz
+fallbacks if it were reached.
+
+**THE CAPTURE DISCIPLINE.**  Every wrapper uses `Ctx::dispatch`, which RECORDS under capture, so all eight record;
+`moe_hit_grouped_s2_dev` is the exception — its contract needs the DEVICE's live hit count and the port's
+`s2expert_gu`/`s2expert_down` take the count as a PUSH CONSTANT, so it reads the count on the host and REFUSES
+LOUDLY under capture (invalidates the recording → `cudaErrorStreamCaptureUnsupported`).  Each of the eight is
+proved by a case that records a block containing it, replays, and requires bitwise equality with direct execution;
+the `_dev` refusal is its own arm.
+
 ## THE CUDA GRAPH API OVER THE PORT'S OWN RECORDED STEP — the recorder COMPILES and REPLAYS (2026-10-05, `vega`)
 
 **THE NEW BAR (the engine executable, not just the layer body): `154` undefined references / `64` distinct =
