@@ -1,0 +1,167 @@
+// ports/vulkan/shaders/qsa_block_topk.comp - the QSA selection: which cells the attention is allowed to look at.
+// Ported from src/kernels/cuda/qsa_select.cu (`block_topk_kernel`, the file's original kernel - the engine keeps it
+// as `qsa_block_topk_ref` for tests and for STRATA_TOPK_OLD=1).  The contract is the engine's own header,
+// include/strata/kernels/qsa_select.hpp:
+//
+//     ids [nq, cap] - CELLS, ASCENDING.  The selection is the `width` cells with the largest block scores, each
+//     block weighted by its CELL COUNT, with ties going to the lowest cell index.
+//
+// One workgroup per query, 256 threads, and the shared histogram the source uses.  Four 8-bit radix passes find
+// `thr`, the largest key whose cell weight reaches `width`; blocks above it are taken whole, then cells of the
+// blocks AT it are taken lowest-cell-first until the budget is spent.  The emission loop walks blocks in ascending
+// order and each thread owns a contiguous block range with an exclusive prefix, so the ids come out ASCENDING - a
+// real part of the contract, not an accident: the gather downstream treats the POSITION as the window row, and the
+// attention's mask is indexed by that position.
+//
+// THE WEIGHT IS THE CELL COUNT, NOT R: `b < n_bid` holds R = 4 cells, and the tail block n_bid holds `n_kv % R`
+// - WHICH CAN BE ZERO.  A weight of 0 is skipped everywhere, so a tail block whose cells are already counted (a
+// complete last block) cannot be selected even if its score is enormous, and the budget arithmetic must use its 1
+// cell, not 4, when it holds one.  Both are gate arms.
+//
+// THE ATOMICS are shared-memory uint (core in Vulkan) and they are what the source does: this is a faithful port of
+// an atomic-histogram radix select, not a re-derivation.  They are also why this shader belongs in the gate's
+// barrier list rather than its empty-census branch.
+//
+// `order_key` is the source's float -> uint32 order preserving map, with one thing spelled out that the source
+// leaves to the compiler: `s + 0.0f` cancels the sign of zero, so -0.0 and +0.0 compare EQUAL (a folded `+ 0.0`
+// would be an implementation detail - an optimiser is free to drop it).  NaN maps to 0, the lowest key.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SCORES { float y[]; } SCORES_;
+layout(set = 0, binding = 1, std430) readonly buffer STEPS { int s[]; } STEPS_;
+layout(set = 0, binding = 2, std430) buffer IDS { int o[]; } IDS_;
+
+shared uint hist[256];
+shared int s_a[256];
+shared int s_b[256];
+shared int s_digit;
+shared int s_above;
+
+const int TOPK_T = 256;
+const int R = 4;              // cells per block
+const int kStepNKv = 1;
+const int kStepNBid = 2;
+const int kStepWidth = 3;
+
+layout(push_constant) uniform Pc {
+    int max_blocks;
+    int cap;
+} pc;
+
+uint order_key(float s) {
+    const float v = (s == 0.0) ? 0.0 : s;        // -0.0 -> +0.0, as the source's `s + 0.0f` does
+    if (!(v == v)) return 0u;                    // NaN -> the lowest key
+    const uint b = floatBitsToUint(v);
+    return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+
+void main() {
+    const uint t = gl_LocalInvocationIndex;
+    const int qi = int(gl_WorkGroupID.x);
+    const int n_kv = STEPS_.s[qi * 4 + kStepNKv];
+    const int n_bid = STEPS_.s[qi * 4 + kStepNBid];
+    const int width = STEPS_.s[qi * 4 + kStepWidth];
+
+    // THE IDENTITY PATH: while the context is no longer than the window, every cell is selected, ascending.
+    if (n_kv <= width) {
+        for (int j = int(t); j < n_kv; j += TOPK_T) IDS_.o[qi * pc.cap + j] = j;
+        return;
+    }
+
+    const int nb = n_bid + 1;                          // blocks 0..n_bid; the last may be empty
+    const int per = (nb + TOPK_T - 1) / TOPK_T;
+    const int b0 = int(t) * per;
+    const int b1 = (b0 + per < nb) ? b0 + per : nb;
+    // The weight of a block is its CELL COUNT.  `b == n_bid` is the tail: n_kv - n_bid*R cells, possibly none.
+    const int tail_weight = n_kv - n_bid * R;
+
+    // ---- the radix select: the largest key thr whose cells still reach `width`, 8 bits at a time -----------
+    uint prefix = 0u;
+    int above = 0;                                     // cells of blocks strictly above the digits fixed so far
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = int(t); i < 256; i += TOPK_T) hist[i] = 0u;
+        barrier();
+        const uint hi_mask = (shift == 24) ? 0u : (0xffffffffu << uint(shift + 8));
+        for (int b = b0; b < b1; ++b) {
+            const int w = (b < n_bid) ? R : tail_weight;
+            if (w == 0) continue;                      // an empty block can never be selected
+            const uint k = order_key(SCORES_.y[qi * pc.max_blocks + b]);
+            if ((k & hi_mask) == (prefix & hi_mask)) atomicAdd(hist[(k >> uint(shift)) & 255u], uint(w));
+        }
+        barrier();
+        if (t == 0u) {
+            int cum = above, d = 255;
+            for (; d > 0; --d) {
+                if (cum + int(hist[d]) >= width) break;
+                cum += int(hist[d]);
+            }
+            s_digit = d;
+            s_above = cum;
+        }
+        barrier();
+        prefix |= uint(s_digit) << uint(shift);
+        above = s_above;
+        barrier();
+    }
+
+    const uint thr = prefix;
+    const int eq_budget = width - above;               // cells equal to thr that still fit, lowest cell first
+
+    // ---- per-thread counts above and at the threshold, then their exclusive prefixes -----------------------
+    int gt = 0, eq = 0;
+    for (int b = b0; b < b1; ++b) {
+        const int w = (b < n_bid) ? R : tail_weight;
+        if (w == 0) continue;
+        const uint k = order_key(SCORES_.y[qi * pc.max_blocks + b]);
+        if (k > thr) gt += w;
+        else if (k == thr) eq += w;
+    }
+    s_a[int(t)] = gt;
+    s_b[int(t)] = eq;
+    barrier();
+    if (t == 0u) {
+        int ag = 0, ae = 0;
+        for (int i = 0; i < TOPK_T; ++i) {
+            const int g = s_a[i], e = s_b[i];
+            s_a[i] = ag;
+            s_b[i] = ae;
+            ag += g;
+            ae += e;
+        }
+    }
+    barrier();
+    const int eq_before = s_b[int(t)];
+    int my_eq = eq_budget - eq_before;
+    if (my_eq < 0) my_eq = 0;
+    if (my_eq > eq) my_eq = eq;
+    const int sel = gt + my_eq;
+    barrier();                                         // the source's own barrier before reusing s_a as prefixes
+    s_a[int(t)] = sel;
+    barrier();
+    if (t == 0u) {
+        int a = 0;
+        for (int i = 0; i < TOPK_T; ++i) {
+            const int c = s_a[i];
+            s_a[i] = a;
+            a += c;
+        }
+    }
+    barrier();
+
+    // ---- emit: blocks in ascending order, cells within a block ascending - so the ids ARE ascending ----------
+    int wpos = s_a[int(t)];
+    int eq_left = my_eq;
+    for (int b = b0; b < b1; ++b) {
+        const int w = (b < n_bid) ? R : tail_weight;
+        if (w == 0) continue;
+        const uint k = order_key(SCORES_.y[qi * pc.max_blocks + b]);
+        if (k > thr) {
+            for (int c = 0; c < w; ++c) IDS_.o[qi * pc.cap + wpos++] = b * R + c;
+        } else if (k == thr) {
+            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) IDS_.o[qi * pc.cap + wpos++] = b * R + c;
+        }
+    }
+}

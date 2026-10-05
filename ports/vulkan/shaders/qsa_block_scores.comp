@@ -1,0 +1,78 @@
+// ports/vulkan/shaders/qsa_block_scores.comp - the QSA indexer's block scores.
+// Ported from src/kernels/cuda/qsa_select.cu (`block_scores_kernel`); the contract is the engine's own header,
+// include/strata/kernels/qsa_select.hpp:
+//
+//     score(q, b) = sum over the 4 indexer heads of relu(dot(key[b], q_idx[h]))          FP32
+//     block n_bid - the incomplete TAIL block - scores the `dead` key instead of its pooled row, and gets +1e9
+//     when it has cells.  That is not a tie-break nicety: the tail holds the MOST RECENT cells, so forcing it in
+//     is how the selection always sees the newest positions, and the +1e9 only applies when n_kv % R != 0, i.e.
+//     when the tail actually holds cells.
+//
+// ONE WORKGROUP PER (QUERY, BLOCK), 256 threads.  The source uses one WARP per (query, block) - 32 lanes, each
+// holding 4 consecutive dims, reduced by `__shfl_xor_sync` - and 8 warps per CTA.  This port's reductions are
+// barrier trees by design (subgroup ops fail its gate), so the 128 index dims are spread over the workgroup and the
+// four per-head dot products are four `wg_sum` reductions.  The per-head order is preserved (head 0 first, as the
+// source sums them); the WITHIN-head summation order is not, so a score can differ from the CUDA's in its last bits.
+// That is measured against a double-precision oracle in the gate rather than asserted away - and it is the same
+// caveat the engine's own tensor-core variant carries in its header ("another summation order: not bitwise").
+//
+// THE GRID MAY BE THE CAPACITY: the guard below reads n_bid from the step buffer, so dispatching over max_blocks is
+// correct and is what a captured/recorded launch needs (the engine's `active_blocks = -1` default is exactly that).
+// Sizing the grid by the batch's largest n_bid + 1 is a host-side optimisation - the engine's header says so, "not for
+// a captured graph".
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer POOLED { float p[]; } POOLED_;
+layout(set = 0, binding = 1, std430) readonly buffer DEAD { float d[]; } DEAD_;
+layout(set = 0, binding = 2, std430) readonly buffer QIDX { float q[]; } QIDX_;
+layout(set = 0, binding = 3, std430) readonly buffer STEPS { int s[]; } STEPS_;
+layout(set = 0, binding = 4, std430) buffer SCORES { float y[]; } SCORES_;
+
+#include "common/wg_reduce.glsl"
+
+const int IDX_DIM = 128;      // the indexer's key dimension
+const int IDX_HEADS = 4;      // indexer query heads: relu is applied per head, then summed
+const int R = 4;              // cells per pooled block
+const int kStepNKv = 1;       // the engine's step record: {pos, n_kv, n_bid, width}
+const int kStepNBid = 2;
+
+layout(push_constant) uniform Pc {
+    int max_blocks;
+} pc;
+
+void main() {
+    const int qi = int(gl_WorkGroupID.y);
+    const int b = int(gl_WorkGroupID.x);
+    const int n_kv = STEPS_.s[qi * 4 + kStepNKv];
+    const int n_bid = STEPS_.s[qi * 4 + kStepNBid];
+    if (b > n_bid || b >= pc.max_blocks) return;      // the grid may be the capacity; the surplus exits here
+
+    const uint lid = gl_LocalInvocationIndex;
+    const bool tail = (b == n_bid);
+    // The tail block's key is `dead`, NOT pooled[n_bid]: at this moment that row holds the dead key (the engine's
+    // header says so, and in a batched chunk it may already hold a block completed later - which is why the tail is
+    // scored here and not by the tensor-core variant).
+    const uint kbase = tail ? 0u : uint(b * IDX_DIM);
+    const uint qbase = uint(qi * IDX_HEADS * IDX_DIM);
+
+    float p0 = 0.0, p1 = 0.0, p2 = 0.0, p3 = 0.0;
+    if (lid < uint(IDX_DIM)) {
+        const float k = tail ? DEAD_.d[lid] : POOLED_.p[kbase + lid];
+        p0 = k * QIDX_.q[qbase + 0u * uint(IDX_DIM) + lid];
+        p1 = k * QIDX_.q[qbase + 1u * uint(IDX_DIM) + lid];
+        p2 = k * QIDX_.q[qbase + 2u * uint(IDX_DIM) + lid];
+        p3 = k * QIDX_.q[qbase + 3u * uint(IDX_DIM) + lid];
+    }
+    // Only the first 128 of the 256 threads contribute; the rest pass 0.0, so the tree is over the workgroup.
+    const float h0 = wg_sum(p0), h1 = wg_sum(p1), h2 = wg_sum(p2), h3 = wg_sum(p3);
+
+    if (lid == 0u) {
+        // relu PER HEAD, then sum - a head that points away from the key contributes nothing.
+        float score = max(h0, 0.0) + max(h1, 0.0) + max(h2, 0.0) + max(h3, 0.0);
+        if (tail && (n_kv % R) != 0) score += 1e9;
+        SCORES_.y[qi * pc.max_blocks + b] = score;
+    }
+}

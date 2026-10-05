@@ -77,7 +77,7 @@ for f in "${comps[@]}"; do
     fail "$name (subgroup op in the SPIR-V: $census - the reductions are barrier trees by design; see wg_reduce.glsl)"
   fi
   case "$name" in
-    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down|iq1m_mmvq|quantize_q8_1|swiglu_quantize_q8_1|iq2s_mmvq|iq3xxs_mmvq|iq4nl_mmvq|q2_0_mmvq|iq3s_mmvq|iq4xs_mmvq|native_gu_iq2s|native_down_iq4nl|attn_decode_short)
+    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down|iq1m_mmvq|quantize_q8_1|swiglu_quantize_q8_1|iq2s_mmvq|iq3xxs_mmvq|iq4nl_mmvq|q2_0_mmvq|iq3s_mmvq|iq4xs_mmvq|native_gu_iq2s|native_down_iq4nl|attn_decode_short|qsa_block_scores|qsa_block_topk)
       # A shared-memory exchange needs at least a write barrier and a read barrier; one barrier means the value
       # was exchanged through something else (a subgroup op, or nothing), which is what this arm exists to catch.
       # The census prints "N OpName" run-length PAIRS on one line, so the literal appears once - read the COUNT,

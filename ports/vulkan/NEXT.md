@@ -369,9 +369,65 @@ them, which is the boundary the port has drawn so far.
 
 
 
+## THE ATTENTION BLOCK, KERNEL 3: the selection - and the first chain that runs the whole decode step
+
+**What was ported.**  `block_scores_kernel` and `block_topk_kernel` (`src/kernels/cuda/qsa_select.cu`; the engine keeps
+the second as `qsa_block_topk_ref`), i.e. the QSA indexer's block scores and the weighted top-k that produces the very
+`ids` the gather now consumes.  The decode step's data path is complete end to end: pool -> scores -> selection ->
+gather -> attention, all four in the port, all four gated.
+
+**The contract, from the engine's header, is unusually complete and the port follows it literally:**
+
+    scores: one warp per (query, block); relu PER INDEXER HEAD, summed; the tail block n_bid scores the `dead` key
+            (not its pooled row) and takes +1e9 WHEN IT HAS CELLS (n_kv % R != 0).  R = 4 cells per block,
+            IDX_DIM = 128, IDX_HEADS = 4.
+    ids:    [nq, cap], CELLS, ASCENDING; the `width` cells with the largest block scores, each block WEIGHTED BY ITS
+            CELL COUNT, ties to the lowest cell index.  While n_kv <= width the selection is the identity.
+
+**THE WEIGHT IS THE CELL COUNT, NOT R.**  A complete last block holds `n_kv % R == 0` cells: it is SKIPPED everywhere,
+so its score cannot make it selectable, and a 1-cell tail contributes 1 to the budget, not 4.  Getting this wrong
+selects cells that do not exist - the danger is silent, because those ids then index a cache row beyond the live
+range.  Both are gate arms, and the injection "every block weighs R" fails four arms plus the chain.
+
+**The ordering is part of the contract.**  The ids come out ascending because the emission loop walks blocks upward
+and each thread owns a contiguous range with an exclusive prefix.  Downstream, the POSITION is the window row and the
+attention's mask is indexed by it, so an id list with the right cells in the wrong order is a different output.  The
+injection "cells at the threshold taken from the TOP of the block" fails five topk arms and all three chain arms.
+
+**Two things the port had to decide, both documented in the shaders.**  `order_key`'s `s + 0.0f` in the source
+cancels the sign of zero, so -0.0 and +0.0 compare EQUAL; the port spells that out as a comparison rather than
+leaving it to an optimiser that may fold the addition away, and the gate's oracle orders by the same keys (otherwise
+a tie in f32 becomes a coin flip between two implementations that are both right).  And the scores' reduction is a
+barrier tree over the workgroup instead of the source's `__shfl_xor` tree - this port's rule - so a score can differ
+from the CUDA's in its last bits: measured against a double oracle at worst rel 1.32e-06, which is the same caveat
+the engine's own tensor-core variant carries ("another summation order: not bitwise").
+
+**Evidence.**  Arc: **221 passed / 0 failed / 0 skipped**.  Scores: 3 queries x 24 blocks, the dead key deliberately
+far from every pooled row, the blocks past n_bid checked for having been left alone.  Selection: SEVEN arms - a
+budget landing inside a block, three equal keys at the boundary, a zero-weight tail with the biggest possible score,
+a 1-cell tail, both identity cases (n_kv < width and n_kv == width), and the everything-but-one-cell case - each
+compared entry for entry against the rule implemented directly, with the ids past `width` required to stay sentinel.
+Chain: scores -> 6 ids -> gather -> attention, with the ids, the gathered window and the attention output all
+compared against oracles built from the POOL.
+
+**Falsified (three injections, each applying to every site):**  weight = R for all blocks -> 4 arms + 3 chain arms;
+`+1e9` without the has-cells test -> the scores arm (worst rel 8.55e+06); ties from the top of the block -> 5 arms +
+3 chain arms.  One caution recorded for the port's own falsification scripts: an anchor that appears more than once
+must be replaced at EVERY site, and the script must fail loudly if it is not - the first run of the weight injection
+silently patched nothing and reported the unmodified kernel passing, which is a false negative wearing the costume of
+a clean result.
+
+**What the selection still needs.**  `qsa_block_scores_tc` / `_wmma` (the tensor-core variants, prompt path only -
+the engine's header notes they are NOT bitwise with the warp kernel), the register and cluster top-k variants
+(`block_topk_reg_kernel`, `block_topk_wide_kernel`, `block_topk_cluster_kernel` - the engine asserts they produce the
+SAME ids, which is exactly the parity the port would gate them against), and `qsa_index_kernel` / `kv_q8_append`'s
+siblings in the per-token path.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
-**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 60 kernels, 18 shared includes, one
+**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 62 kernels, 18 shared includes, one
 generated table file (four IQ grids). The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh`,
 which compiles every shader from source - and this line has gone stale three times in two days, so run it rather
 than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 / 0 on RADV and on radeon, 154 /

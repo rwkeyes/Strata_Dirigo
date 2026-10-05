@@ -1165,6 +1165,365 @@ void case_kv_f16_gather(Ctx& ctx, const std::string& dir) {
     ctx.free(b_tab); ctx.free(b_ids); ctx.free(b_step);
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE QSA SELECTION: the block scores and the weighted top-k (src/kernels/cuda/qsa_select.cu)
+// ----------------------------------------------------------------------------------------------------------
+
+constexpr int kQsaR = 4;          // cells per pooled block (the source's R)
+constexpr int kQsaDim = 128;      // the indexer's key dimension
+constexpr int kQsaHeads = 4;      // indexer query heads: relu per head, then summed
+
+static uint32_t f32_bits(float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, 4);
+    return b;
+}
+
+// The source's float -> uint32 order-preserving key, with the sign of zero cancelled exactly as `s + 0.0f` does
+// there.  The gate's oracle has to order by the SAME keys, or a tie in f32 becomes a coin flip between two
+// implementations that are both "right".
+static uint32_t qsa_order_key(float s) {
+    const float v = (s == 0.0f) ? 0.0f : s;
+    if (!(v == v)) return 0u;
+    const uint32_t b = f32_bits(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// THE SELECTION'S DOCUMENTED RULE, implemented independently of the kernel's radix machinery:
+// "the `width` cells with the largest block scores, each block weighted by its CELL COUNT, ties to the lowest cell
+// index, emitted ASCENDING".  The oracle sorts the candidate cells by (key desc, cell asc), takes `width`, and
+// sorts what it took ascending - which is what the kernel's threshold plus budget arithmetic has to produce.
+static void qsa_select_want(std::vector<int32_t>& ids, const std::vector<float>& scores, uint32_t n_kv,
+                            uint32_t n_bid, uint32_t width) {
+    struct Cand { uint32_t key, cell; };
+    std::vector<Cand> cand;
+    for (uint32_t b = 0; b <= n_bid; ++b) {
+        const uint32_t w = (b < n_bid) ? (uint32_t) kQsaR : (n_kv - n_bid * kQsaR);   // the tail can be EMPTY
+        if (w == 0) continue;
+        const uint32_t key = qsa_order_key(scores[b]);
+        for (uint32_t c = 0; c < w; ++c) cand.push_back({key, b * kQsaR + c});
+    }
+    std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) {
+        if (a.key != b.key) return a.key > b.key;         // higher score first
+        return a.cell < b.cell;                           // ties to the lowest CELL
+    });
+    ids.clear();
+    for (uint32_t i = 0; i < width && i < cand.size(); ++i) ids.push_back((int32_t) cand[i].cell);
+    std::sort(ids.begin(), ids.end());                    // the ids come out ASCENDING
+}
+
+// The attention oracle for a [width][kv_head][256] window, shared by this case and the gather's composed arm so the
+// two cannot drift.  q is [24][256] f32, mask is [256] f16 additive logits, and `limit` is the number of live rows.
+static void attn_ref_24x256(std::vector<double>& want, const std::vector<float>& q, const std::vector<uint16_t>& kw,
+                            const std::vector<uint16_t>& vw, const std::vector<uint16_t>& mask, uint32_t limit) {
+    const uint32_t kv_heads = 2;
+    std::vector<double> sc(limit);
+    for (uint32_t head = 0; head < 24; ++head) {
+        const uint32_t kv = head / 12;
+        double mx = -1e300;
+        for (uint32_t c = 0; c < limit; ++c) {
+            double dot = 0.0;
+            for (uint32_t d = 0; d < 256; ++d)
+                dot += (double) (q[(size_t) head * 256 + d] * 0.0625f) *
+                       (double) strata::kernels::f32_from_f16(kw[((size_t) c * kv_heads + kv) * 256 + d]);
+            sc[c] = dot + (double) strata::kernels::f32_from_f16(mask[c]);
+            mx = std::max(mx, sc[c]);
+        }
+        double den = 0.0;
+        for (uint32_t c = 0; c < limit; ++c) den += std::exp(sc[c] - mx);
+        for (uint32_t d = 0; d < 256; ++d) {
+            double acc = 0.0;
+            for (uint32_t c = 0; c < limit; ++c)
+                acc += std::exp(sc[c] - mx) *
+                       (double) strata::kernels::f32_from_f16(vw[((size_t) c * kv_heads + kv) * 256 + d]);
+            want[(size_t) head * 256 + d] = acc / den;
+        }
+    }
+}
+
+void case_qsa_select(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "qsa_block_scores.spv") || !have(dir, "qsa_block_topk.spv")) return;
+    const uint32_t max_blocks = 24, cap = 128, nq = 3;   // cap >= the widest arm's width: the kernel writes `width` ids
+    const uint16_t SENT = 0x7FFEu;                      // a valid f16 that no score or id ever equals
+
+    // ---- (1) THE BLOCK SCORES ---------------------------------------------------------------------------
+    // One workgroup per (query, block); the tail block n_bid scores the DEAD key and takes +1e9 when it has cells.
+    // The fixture makes the dead key look nothing like any pooled row, so scoring the pooled row for the tail -
+    // which is what the per-token path could get away with - is visibly wrong here.
+    {
+        std::vector<float> pooled((size_t) max_blocks * kQsaDim), dead(kQsaDim), qidx((size_t) nq * kQsaHeads * kQsaDim);
+        for (float& x : pooled) x = rndf(1.0f);
+        for (float& x : dead) x = rndf(1.0f) * 8.0f;    // deliberately far from every pooled row
+        for (float& x : qidx) x = rndf(1.0f);
+        // (n_kv, n_bid): the first has a 1-cell tail, the second a COMPLETE last block (no +1e9), the third a
+        // 1-block cache whose tail has cells.
+        const uint32_t nkv[3] = {37, 64, 5};
+        std::vector<int32_t> steps((size_t) nq * 4, 0);
+        for (uint32_t i = 0; i < nq; ++i) {
+            steps[i * 4 + 0] = (int32_t) nkv[i] - 1;                     // kStepPos
+            steps[i * 4 + 1] = (int32_t) nkv[i];                         // kStepNKv
+            steps[i * 4 + 2] = (int32_t) (nkv[i] / kQsaR);                // kStepNBid = completed blocks
+            steps[i * 4 + 3] = 16;                                       // kStepWidth (unused here)
+        }
+        Buf b_pool = ctx.alloc(pooled.size() * 4), b_dead = ctx.alloc(dead.size() * 4);
+        Buf b_q = ctx.alloc(qidx.size() * 4), b_step = ctx.alloc(steps.size() * 4);
+        Buf b_sc = ctx.alloc((size_t) nq * max_blocks * 4);
+        ctx.write(b_pool, pooled.data(), pooled.size() * 4);
+        ctx.write(b_dead, dead.data(), dead.size() * 4);
+        ctx.write(b_q, qidx.data(), qidx.size() * 4);
+        ctx.write(b_step, steps.data(), steps.size() * 4);
+        std::vector<float> sentf((size_t) nq * max_blocks, -12345.0f);
+        ctx.write(b_sc, sentf.data(), sentf.size() * 4);
+        VkPipeline ps = ctx.pipeline(dir + "/qsa_block_scores.spv", 5, 4);
+        struct { int max_blocks; } spc{(int) max_blocks};
+        ctx.dispatch(ps, {&b_pool, &b_dead, &b_q, &b_step, &b_sc}, &spc, sizeof(spc), max_blocks, nq);
+
+        std::vector<float> got(sentf.size());
+        ctx.read(b_sc, got.data(), got.size() * 4);
+        int bad = 0;
+        double worst = 0;
+        for (uint32_t qi = 0; qi < nq; ++qi) {
+            const uint32_t n_kv = nkv[qi], n_bid = n_kv / kQsaR;
+            for (uint32_t b = 0; b <= n_bid; ++b) {
+                const bool tail = (b == n_bid);
+                double want = 0.0;
+                for (uint32_t h = 0; h < kQsaHeads; ++h) {
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < kQsaDim; ++d) {
+                        const double key = tail ? (double) dead[d] : (double) pooled[(size_t) b * kQsaDim + d];
+                        dot += key * (double) qidx[((size_t) qi * kQsaHeads + h) * kQsaDim + d];
+                    }
+                    want += std::max(dot, 0.0);
+                }
+                if (tail && (n_kv % kQsaR) != 0) want += 1e9;
+                const double g = (double) got[(size_t) qi * max_blocks + b];
+                const double rel = std::fabs(g - want) / (std::fabs(want) + 1e-30);
+                worst = std::max(worst, rel);
+                if (!(rel <= 1e-5 || std::fabs(g - want) <= 1e-4)) ++bad;
+            }
+            // the blocks past n_bid are never written: the guard, and the reason a capacity-sized grid is safe
+            for (uint32_t b = n_bid + 1; b < max_blocks; ++b) {
+                if (got[(size_t) qi * max_blocks + b] != -12345.0f) ++bad;
+            }
+        }
+        std::printf("      scores: %u queries x %u blocks, tail scored against `dead` (+1e9 when it has cells); "
+                    "worst rel %.3g\n", nq, max_blocks, worst);
+        verdict("qsa_block_scores: relu per head, the dead key and +1e9 for a non-empty tail", bad == 0, bad,
+                (int) got.size(), worst, "scores outside tolerance (or a block past n_bid was written)");
+        ctx.free(b_pool); ctx.free(b_dead); ctx.free(b_q); ctx.free(b_step); ctx.free(b_sc);
+    }
+
+    // ---- (2) THE SELECTION, against the documented rule ---------------------------------------------------
+    {
+        struct Arm { const char* what; uint32_t n_kv, width, n_bid; float s[24]; };
+        const float LOW = -1000.0f;
+        auto base = [&](uint32_t nb, float f) {
+            std::vector<float> v(max_blocks, LOW);
+            for (uint32_t b = 0; b <= nb; ++b) v[b] = f - 0.5f * (float) b;   // distinct, in a known order
+            return v;
+        };
+        std::vector<Arm> arms;
+        {
+            Arm a{"a plain selection: the budget lands inside a block", 64, 6, 16, {}};
+            const std::vector<float> v = base(16, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            a.s[3] = 100.0f; a.s[7] = 90.0f; a.s[11] = 80.0f;
+            arms.push_back(a);
+        }
+        {
+            Arm a{"ties at the budget boundary go to the LOWEST cells", 64, 6, 16, {}};
+            const std::vector<float> v = base(16, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            a.s[5] = 50.0f; a.s[9] = 50.0f; a.s[13] = 50.0f;     // three equal keys, six cells wanted
+            arms.push_back(a);
+        }
+        {
+            Arm a{"a zero-weight tail with the biggest score is NOT selectable", 64, 6, 16, {}};
+            const std::vector<float> v = base(16, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            a.s[2] = 100.0f; a.s[6] = 90.0f; a.s[16] = 1e9f;      // the tail (b == n_bid) is empty: n_kv % 4 == 0
+            arms.push_back(a);
+        }
+        {
+            Arm a{"a 1-cell tail IS selectable, and its weight is 1, not R", 37, 3, 9, {}};
+            const std::vector<float> v = base(9, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            a.s[2] = 100.0f; a.s[9] = 1e9f;
+            arms.push_back(a);
+        }
+        {
+            Arm a{"the context is shorter than the window: the identity", 5, 6, 1, {}};
+            const std::vector<float> v = base(1, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            arms.push_back(a);
+        }
+        {
+            Arm a{"the context EQUALS the window: the identity", 64, 64, 16, {}};
+            const std::vector<float> v = base(16, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            arms.push_back(a);
+        }
+        {
+            Arm a{"one cell short of everything: the lowest block gives up its last cell", 64, 63, 16, {}};
+            const std::vector<float> v = base(16, 10.0f);
+            std::copy(v.begin(), v.end(), a.s);
+            a.s[0] = -500.0f;                                     // block 0 is the lowest, so it loses a cell
+            arms.push_back(a);
+        }
+
+        VkPipeline pt = ctx.pipeline(dir + "/qsa_block_topk.spv", 3, 8);
+        struct { int max_blocks, cap; } tpc{(int) max_blocks, (int) cap};
+        int total_bad = 0, total_vals = 0;
+        for (const Arm& a : arms) {
+            std::vector<float> sc(a.s, a.s + max_blocks);
+            std::vector<int32_t> st = {(int32_t) (a.n_kv - 1), (int32_t) a.n_kv, (int32_t) a.n_bid, (int32_t) a.width};
+            Buf b_sc = ctx.alloc(max_blocks * 4), b_st = ctx.alloc(16), b_ids = ctx.alloc((size_t) cap * 4);
+            ctx.write(b_sc, sc.data(), max_blocks * 4);
+            ctx.write(b_st, st.data(), 16);
+            std::vector<int32_t> sent((size_t) cap, -1);
+            ctx.write(b_ids, sent.data(), sent.size() * 4);
+            ctx.dispatch(pt, {&b_sc, &b_st, &b_ids}, &tpc, sizeof(tpc), 1);
+            std::vector<int32_t> got(cap);
+            ctx.read(b_ids, got.data(), got.size() * 4);
+            std::vector<int32_t> want;
+            qsa_select_want(want, sc, a.n_kv, a.n_bid, a.width);
+            int bad = 0;
+            for (uint32_t i = 0; i < a.width; ++i) {
+                // Past the oracle's own list the kernel writes NOTHING (the identity path emits n_kv cells when the
+                // window is wider than the context), so the entry must still be the sentinel - not a made-up id.
+                const int32_t w = (i < want.size()) ? want[i] : -1;
+                if (got[i] != w) ++bad;
+            }
+            for (uint32_t i = a.width; i < cap; ++i)
+                if (got[i] != -1) ++bad;                          // the ids past `width` must stay untouched
+            bool ascending = true;
+            for (uint32_t i = 1; i < a.width && i < want.size(); ++i)
+                if (got[i] <= got[i - 1]) ascending = false;
+            std::printf("      %-58s width %2u -> %2u ids, first %d, ascending %s\n", a.what, a.width,
+                        (unsigned) want.size(), got[0], ascending ? "yes" : "NO");
+            char label[200];
+            std::snprintf(label, sizeof label, "qsa_block_topk: %s", a.what);
+            verdict(label, bad == 0, bad, (int) cap, 0.0, "ids not equal to the selection rule's");
+            total_bad += bad;
+            total_vals += (int) cap;
+            ctx.free(b_sc); ctx.free(b_st); ctx.free(b_ids);
+        }
+        verdict("qsa_block_topk: seven arms together", total_bad == 0, total_bad, total_vals, 0.0, "wrong ids");
+    }
+
+    // ---- (3) THE COMPOSED CHAIN: scores -> selection -> gather -> attention --------------------------------
+    // The three kernels' shared contract is a short list of numbers - how many cells, which ones, in what order -
+    // and the only way to test a contract is to run both sides of it.  The mask is position-dependent, so a
+    // selection that returned the right CELLS in the wrong ORDER fails here even though the ids would look fine.
+    {
+        const uint32_t rows = 256, kv_heads = 2, head_dim = 256, page_size = 16, pages = 16;
+        const uint32_t n_kv = 252;                     // 63 complete blocks + an EMPTY tail (n_kv % 4 == 0)
+        const uint32_t n_bid = n_kv / kQsaR;
+        const uint32_t width = 6;
+        std::vector<uint16_t> pool((size_t) rows * kv_heads * head_dim);
+        f16_pool_fill(pool, pages, kv_heads, page_size, head_dim);
+        std::vector<int32_t> table(pages);
+        for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) (pages - 1 - i);
+        std::vector<int32_t> st = {(int32_t) (n_kv - 1), (int32_t) n_kv, (int32_t) n_bid, (int32_t) width};
+        std::vector<float> sc(64, -1000.0f);
+        sc[10] = 100.0f;                                // the highest real block
+        sc[40] = 90.0f;                                 // the block the budget cuts in half
+        sc[63] = 1e9f;                                  // the EMPTY tail: weight 0, so it must not be selected
+        for (uint32_t b = 0; b < 64; ++b)
+            if (b != 10 && b != 40 && b != 63) sc[b] = 5.0f - 0.01f * (float) b;
+        uint32_t sel_width = width;
+        Buf b_sc = ctx.alloc(sc.size() * 4), b_st = ctx.alloc(st.size() * 4);
+        Buf b_ids = ctx.alloc((size_t) rows * 4);
+        ctx.write(b_sc, sc.data(), sc.size() * 4);
+        ctx.write(b_st, st.data(), st.size() * 4);
+        std::vector<int32_t> sent((size_t) rows, -1);
+        ctx.write(b_ids, sent.data(), sent.size() * 4);
+        VkPipeline pt = ctx.pipeline(dir + "/qsa_block_topk.spv", 3, 8);
+        struct { int max_blocks, cap; } tpc{64, (int) rows};
+        ctx.dispatch(pt, {&b_sc, &b_st, &b_ids}, &tpc, sizeof(tpc), 1);
+        std::vector<int32_t> ids(rows);
+        ctx.read(b_ids, ids.data(), ids.size() * 4);
+        std::vector<int32_t> want_ids;
+        qsa_select_want(want_ids, sc, n_kv, n_bid, sel_width);
+
+        // the gather, with the SELECTION's own ids
+        Buf b_tab = ctx.alloc(table.size() * 4), b_ids_k = ctx.alloc(sel_width * 4);
+        ctx.write(b_tab, table.data(), table.size() * 4);
+        ctx.write(b_ids_k, ids.data(), sel_width * 4);
+        const uint32_t per4 = head_dim / 4;
+        const uint32_t capacity_groups = (uint32_t) (((size_t) rows * kv_heads * per4 + kLocalSize - 1) / kLocalSize);
+        struct { int kv_heads, head_dim, page_size; } gpc{(int) kv_heads, (int) head_dim, (int) page_size};
+        VkPipeline pg = ctx.pipeline(dir + "/kv_f16_gather.spv", 5, 12);
+        Buf b_pool = ctx.alloc(pool.size() * 2), b_k = ctx.alloc((size_t) rows * kv_heads * head_dim * 2);
+        Buf b_v = ctx.alloc((size_t) rows * kv_heads * head_dim * 2);
+        ctx.write(b_pool, pool.data(), pool.size() * 2);
+        std::vector<uint16_t> sent_win((size_t) rows * kv_heads * head_dim, SENT);
+        ctx.write(b_k, sent_win.data(), sent_win.size() * 2);
+        ctx.write(b_v, sent_win.data(), sent_win.size() * 2);
+        // The gather reads its live count from the step buffer - the SAME one the selection wrote, which is the
+        // shared contract between them.
+        ctx.dispatch(pg, {&b_pool, &b_tab, &b_ids_k, &b_st, &b_k}, &gpc, sizeof(gpc), capacity_groups);
+        ctx.dispatch(pg, {&b_pool, &b_tab, &b_ids_k, &b_st, &b_v}, &gpc, sizeof(gpc), capacity_groups);
+
+        // The oracle's window, built from the POOL rows the selection named - and the ids themselves checked
+        // first, so a chain failure can be attributed to a stage rather than to "the pipeline".
+        std::vector<uint16_t> kwo((size_t) rows * kv_heads * head_dim, SENT), vwo((size_t) rows * kv_heads * head_dim, SENT);
+        f16_window_want(kwo, pool, table, want_ids, kv_heads, head_dim, page_size, SENT);
+        f16_window_want(vwo, pool, table, want_ids, kv_heads, head_dim, page_size, SENT);
+        int ids_bad = 0;
+        for (uint32_t i = 0; i < sel_width; ++i)
+            if (ids[i] != want_ids[i]) ++ids_bad;
+        {
+            char label[200];
+            std::snprintf(label, sizeof label, "qsa chain: the selection's ids (%u cells, ascending)", sel_width);
+            verdict(label, ids_bad == 0, ids_bad, (int) sel_width, 0.0, "ids not equal to the selection rule's");
+        }
+        std::vector<uint16_t> got_k((size_t) rows * kv_heads * head_dim);
+        ctx.read(b_k, got_k.data(), got_k.size() * 2);
+        int win_bad = 0;
+        for (uint32_t c = 0; c < sel_width; ++c)
+            for (uint32_t h = 0; h < kv_heads; ++h)
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t i = ((size_t) c * kv_heads + h) * head_dim + d;
+                    if (got_k[i] != kwo[i]) ++win_bad;
+                }
+        std::printf("      chain: scores -> %u ids -> gather -> attention (ids %d,%d,...,%d; %d window mismatches)\n",
+                    sel_width, ids[0], ids[1], ids[sel_width - 1], win_bad);
+        verdict("qsa chain: the gathered window is the pool rows the selection named", win_bad == 0, win_bad,
+                (int) (sel_width * kv_heads * head_dim), 0.0, "window values not equal to the named pool rows");
+
+        std::vector<float> q((size_t) 24 * 256);
+        for (float& x : q) x = rndf(1.0f);
+        std::vector<uint16_t> mb(256);
+        for (uint32_t c = 0; c < 256; ++c) mb[c] = f16_from_f32(rndf(0.6f));   // position-dependent: order matters
+        std::vector<double> want((size_t) 24 * 256, 0.0);
+        attn_ref_24x256(want, q, kwo, vwo, mb, sel_width);
+        Buf b_q = ctx.alloc(q.size() * 4), b_m = ctx.alloc(512), b_o = ctx.alloc((size_t) 24 * 256 * 4);
+        ctx.write(b_q, q.data(), q.size() * 4);
+        ctx.write(b_m, mb.data(), 512);
+        std::vector<float> nanp((size_t) 24 * 256, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(b_o, nanp.data(), nanp.size() * 4);
+        VkPipeline pa = ctx.pipeline(dir + "/attn_decode_short.spv", 5, 8);
+        struct { uint32_t width, use_mask; } apc{sel_width, 1u};
+        ctx.dispatch(pa, {&b_q, &b_k, &b_v, &b_m, &b_o}, &apc, sizeof(apc), 24);
+        std::vector<float> got((size_t) 24 * 256);
+        ctx.read(b_o, got.data(), got.size() * 4);
+        int bad = 0;
+        double worst = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double g = (double) got[i];
+            const double rel = std::fabs(g - want[i]) / (std::fabs(want[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 1e-4 || std::fabs(g - want[i]) <= 1e-5)) ++bad;
+        }
+        verdict("qsa chain: selection -> gather -> attention, end to end", bad == 0, bad, (int) got.size(), worst,
+                "values outside tolerance (worst rel err)");
+        ctx.free(b_q); ctx.free(b_m); ctx.free(b_o);
+        ctx.free(b_pool); ctx.free(b_k); ctx.free(b_v); ctx.free(b_tab); ctx.free(b_ids_k);
+        ctx.free(b_sc); ctx.free(b_st); ctx.free(b_ids);
+    }
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -6752,6 +7111,7 @@ int main(int argc, char** argv) {
     case_gemm_prefill(ctx, dir);           // THE prefill GEMM: engine layout, both kernels (stage 5)
     case_attn_decode_short(ctx, dir);      // the short-step decode attention (the attention block's first kernel)
     case_kv_f16_gather(ctx, dir);          // the f16 KV gather: the window the attention reads, and the grid rule
+    case_qsa_select(ctx, dir);             // the selection: block scores + the weighted top-k, and the chain to attention
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);
