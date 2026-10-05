@@ -160,33 +160,21 @@ TREE="$(cd "$ROOT/../.." && pwd)"                 # the engine tree (for the rea
 # choice).  Both are real falsifications, so both must rebuild the artifact they change - an injection that does
 # not rebuild runs the stale binary and reports a clean result.
 rebuild_harness() {
-  # THE ENGINE-SIDE BACKEND IS PART OF THE HARNESS NOW: case_fwht256_entry drives the engine's own entry point
-  # (strata::kernels::fwht256_cuda) through vulkan/src/device/, so a change to any of those sources must rebuild
-  # the gate (a device-layer injection that skipped this would run a stale binary and report a clean result).
-  g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
-      -I"$TREE/vulkan/include" -I"$TREE/vulkan/include/cuda_compat" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 -o "$GATE" \
-      "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" "$ROOT/harness/vk_stack.cpp" \
-      "$ROOT/harness/vk_gate.cpp" \
-      "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
-      "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
-      "$TREE/vulkan/src/device/sync.cpp" \
-      "$TREE/vulkan/src/compat/cuda_runtime.cpp" \
-      "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
-      "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
-      "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
-      "$TREE/vulkan/src/kernels/iq_vk.cpp" "$TREE/vulkan/src/kernels/moe_vk.cpp" \
-      "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
-      "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
-      "$TREE/vulkan/src/kernels/rope_vk.cpp" "$TREE/vulkan/src/kernels/sampler_vk.cpp" \
-      "$TREE/src/kernels/ngram.cpp" "$TREE/src/ngram/ple_reader.cpp" "$TREE/src/platform/direct_file.cpp" \
-      -lpthread -lvulkan
+  # THE ENGINE-SIDE BACKEND IS PART OF THE HARNESS: a case can drive the engine's own entry points through
+  # vulkan/src/, so a change to any of those sources must rebuild the gate.  THE SOURCE LIST IS DERIVED
+  # (gates/harness_sources.sh), never hand-kept - see that file for why a literal list went stale three batches
+  # running and silently weakened every injection.  The guard there fails loudly if a vulkan/src/**/*.cpp is
+  # missing from the list it hands the compiler.
+  source "$ROOT/gates/harness_sources.sh"
+  build_harness
 }
 # A source that must be rebuilt into the GATE (the harness proper, or the engine-side backend the harness links).
+# ANY file under the backend tree counts, at ANY depth: the list is globbed recursively, so the match here is
+# recursive too (a nested vulkan/src/<a>/<b>/c.cpp that skipped this would not trigger a rebuild).
 is_harness_src() {
   case "$1" in
     "$ROOT"/harness/*.cpp|"$ROOT"/harness/*.hpp) return 0 ;;
-    "$TREE"/vulkan/src/*.cpp|"$TREE"/vulkan/src/*.hpp) return 0 ;;
-    "$TREE"/vulkan/src/*/*.cpp|"$TREE"/vulkan/src/*/*.hpp) return 0 ;;
+    "$TREE"/vulkan/src/*) return 0 ;;
     *) return 1 ;;
   esac
 }

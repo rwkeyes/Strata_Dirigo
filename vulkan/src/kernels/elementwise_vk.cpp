@@ -325,15 +325,72 @@ void add_inplace(Stream& s, float* dst, const float* src, int64_t n) {
     s.ctx->dispatch(pipe, {&dv, &sv}, &pc, sizeof(pc), groups_for((uint64_t) n));
 }
 
-// `copy_i32_from_mapped` (elementwise.hpp:126) - the QSA per-token step/positions upload, `layer.cpp:913/914`.
-// The CUDA launches `copy_i32_from_mapped_kernel` (elementwise.cu:369), one block that reads the SOURCE through
-// a `const volatile int32_t*` - because the source is MAPPED, PINNED HOST memory: the layer obtains it with
-// `cudaHostGetDevicePointer` (layer.cpp:911), and the kernel carries it into device memory from INSIDE the layer.
-// Vulkan cannot dereference a host pointer from a shader (vk_backend.hpp's mapped-memory note; the shim's
-// `cudaHostGetDevicePointer` returns the host address, and there is no device address space for host memory in
-// this layer), so the backend renders the SAME transfer as a STAGED host->device copy: the source bytes are read
-// on the host and the arena buffer bound at `dst` receives them.  `dst[0..n)` still becomes the mapped image's
-// `n` int32 and the layer's compute stays on the device - the staging is the transfer, not a CPU shortcut.
+// `copy_from_mapped` (elementwise.hpp:104) - the MoE parts copy the engine's SESSION makes (`session.cpp:875`),
+// the #1 reached-but-unported symbol of a single-token decode.  Its CUDA body reads MAPPED, PINNED host memory
+// (`elementwise.cu:226` `copy_from_mapped_kernel`), which a Vulkan SHADER cannot dereference.  THE HANDSHAKE:
+// the shim's `cudaHostAlloc` returns the mapping of a HOST_VISIBLE|HOST_COHERENT device block, so the region's
+// `host` pointer and its device buffer are ONE allocation - the host's store into the mapping IS the publish.
+// This binds the BUFFER (not the host address) as the shader's source, so a RECORDED copy re-reads whatever the
+// host published before the launch.  See vk_arena.hpp's "MAPPED HOST REGIONS" for the ordering contract.
+//
+// WHY A SHADER AND NOT `capture_copy`.  The engine chose a kernel over a memcpy node ("a copy-engine node splits
+// the WDDM submission").  A Vulkan shader bound to the mapped region's buffer does exactly the engine's
+// `dst4[i] = src4[i]`, records under capture, and re-reads the buffer at submit - the graph.hpp property "a
+// replay re-reads its input BUFFERS".  `case_copy_from_mapped_entry` proves the wrapper bitwise against this
+// shader path AND against the engine's own rule, directly AND through a recorded graph replayed after a second
+// publish.
+void copy_from_mapped(Stream& s, float* dst, const float* src, int64_t n) {
+    if (n <= 0) return;
+    if (src == nullptr) {
+        std::fprintf(stderr, "strata::vulkan::copy_from_mapped: a null mapped source\n");
+        std::exit(2);
+    }
+    Buf dv{};
+    if (!arena_resolve(s, dst, (uint64_t) n * 4, dv)) {
+        std::fprintf(stderr, "strata::vulkan::copy_from_mapped: dst is not inside this stream's arena (n=%lld) - "
+                             "refusing rather than binding a wrong view\n", (long long) n);
+        std::exit(2);
+    }
+    // THE SOURCE IS THE MAPPED REGION'S DEVICE-VISIBLE BUFFER.  A host pointer the shim did not hand out (or one
+    // whose published size does not cover `n` floats) is refused: binding it as if it were mapped would read
+    // bytes the caller never published.
+    Buf sv{};
+    if (!mapped_resolve(src, (uint64_t) n * 4, sv)) {
+        std::fprintf(stderr,
+                     "strata::vulkan::copy_from_mapped: the source %p is not a live MAPPED region covering %lld "
+                     "floats.  A shader cannot dereference host memory, so this refuses rather than binding bytes "
+                     "the caller never published (session.cpp:875, the captured per-layer parts copy)\n",
+                     (const void*) src, (long long) n);
+        std::exit(2);
+    }
+    if (n > INT32_MAX) {
+        std::fprintf(stderr, "strata::vulkan::copy_from_mapped: n=%lld overflows the shader's int\n", (long long) n);
+        std::exit(2);
+    }
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/copy.spv", 2, sizeof(int32_t));
+    struct Push {
+        int32_t n;
+    } pc{};
+    pc.n = (int32_t) n;
+    // `Ctx::dispatch` RECORDS under capture (the host's write is re-read at every replay) and submits+fences
+    // otherwise.  The host's store into the mapping must precede this call's submit - that is the publish edge.
+    s.ctx->dispatch(pipe, {&sv, &dv}, &pc, sizeof(pc), groups_for((uint64_t) n));
+}
+
+// `copy_i32_from_mapped` (elementwise.hpp:126) - the QSA per-token step/positions upload, `layer.cpp:913/914`,
+// ALSO inside the captured per-layer block.  The CUDA launches `copy_i32_from_mapped_kernel` (elementwise.cu:369),
+// one block that reads the SOURCE through a `const volatile int32_t*` - MAPPED, PINNED HOST memory.
+//
+// **A LATENT DEFECT WAS FIXED HERE WHILE WIRING `copy_from_mapped`.**  The old body did a fenced HOST-STAGED
+// copy (`stream_write`) UNCONDITIONALLY.  That is right OUTSIDE a capture, but this call site is INSIDE one: a
+// host->device transfer is not a recordable device command, so under capture it executed ONCE (at capture, on
+// the live command buffer's queue) and recorded NOTHING - every replay then ran with the CAPTURE-TIME step/pos,
+// the exact "EVERY TOKEN AFTER THE FIRST REPLAYED POSITION 0" the engine's own `session.cpp` comment describes.
+// The fix: UNDER CAPTURE, RECORD a device command (`capture_copy`, a byte copy) that re-reads the mapped
+// region's buffer at submit; outside capture, keep the fenced host-staged copy.  Both are BYTE copies, so the
+// int32 payload is bit-exact either way (the engine's own kernel copies 4-byte words; a copy shader is
+// deliberately NOT used here because copy.spv is float-typed and an int bit-pattern must not pass through a
+// float load/store).
 void copy_i32_from_mapped(Stream& s, int32_t* dst, const int32_t* src, int64_t n) {
     if (n <= 0) return;
     if (src == nullptr) {
@@ -345,6 +402,18 @@ void copy_i32_from_mapped(Stream& s, int32_t* dst, const int32_t* src, int64_t n
         std::fprintf(stderr, "strata::vulkan::copy_i32_from_mapped: dst is not inside this stream's arena (n=%lld) - "
                              "refusing rather than binding a wrong view\n", (long long) n);
         std::exit(2);
+    }
+    if (s.ctx != nullptr && s.ctx->capturing()) {
+        // RECORD, do not run: the mapped region's buffer is the source, re-read at every replay.
+        Buf sv{};
+        if (!mapped_resolve(src, (uint64_t) n * 4, sv)) {
+            std::fprintf(stderr, "strata::vulkan::copy_i32_from_mapped: the source %p is not a live MAPPED region "
+                                 "covering %lld int32 - refusing under capture rather than recording stale bytes\n",
+                         (const void*) src, (long long) n);
+            std::exit(2);
+        }
+        s.ctx->capture_copy(dv, sv, (uint64_t) n * 4);
+        return;
     }
     stream_write(s, dst, src, (uint64_t) n * 4);
 }
@@ -618,6 +687,18 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
         std::exit(2);
     }
     strata::vulkan::add_inplace(*s, dst, src, n);
+}
+
+// elementwise.hpp: `void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);`
+// The captured per-layer parts copy (`session.cpp:875`) - the ONLY remaining reached symbol of a single-token
+// decode.  See the backend note at `strata::vulkan::copy_from_mapped` for the publish ordering.
+void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
+    strata::vulkan::Stream* s = strata::vulkan::stream_of(stream);
+    if (s == nullptr) {
+        std::fprintf(stderr, "copy_from_mapped: the stream handle is not a live Vulkan stream; refusing\n");
+        std::exit(2);
+    }
+    strata::vulkan::copy_from_mapped(*s, dst, src, n);
 }
 
 // elementwise.hpp: `void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);`

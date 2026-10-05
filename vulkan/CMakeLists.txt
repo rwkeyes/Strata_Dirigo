@@ -69,7 +69,9 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/shared_expert_vk.cpp
   src/kernels/rope_vk.cpp                     # the RoPE host rows: build_rope_table + rope_table_set/_for/_release
   src/kernels/sampler_vk.cpp                  # sample_tokens - the step that PRODUCES A TOKEN (the decode tail)
-  src/kernels/refusals_vk.cpp)  # shared_expert (the MoE shared stage) + the LOUD REFUSALS (unreachable symbols)
+  src/kernels/refusals_vk.cpp                 # the kernels-namespace LOUD REFUSALS (unreachable symbols)
+  src/kernels/refusals_engine_vk.cpp          # + the engine-LEVEL refusals (RemoteExpertOpt) + device_code_error
+  src/kernels/refusals_prefill_vk.cpp)  # + the PROMPT-path kernel refusals (src/prefill/*.cu, not ported)
                             # + the PLE/GR shared stages and the MoE routing rows (ple_vk.cpp)
 # THE ENGINE'S OWN HOST SOURCES the layer body crosses for the PLE table: `PleTable` (collect/is_open/issue)
 # is a pure host class whose ONE definition is `src/kernels/ngram.cpp` (with its `ple_reader.cpp` +
@@ -166,11 +168,21 @@ target_compile_features(strata_vulkan_core PRIVATE cxx_std_20)   # the engine's 
 target_include_directories(strata_vulkan_core PUBLIC ${STRATA_ROOT}/include)
 target_link_libraries(strata_vulkan_core PUBLIC strata_vulkan_cudart strata_vulkan_kernels)
 
+# THE PROMPT PATH (`src/prefill/prefill.cpp`) is HOST orchestration over `src/prefill/*.cu` kernels.  It joins
+# the engine target so the program LINKS; the batched kernels it calls are the port's own refusals (a bare
+# single-token decode never enters `Prefill`, whose statics the VRAM plan reaches only under `--prefill`).
 strata_vulkan_resolve(_vengine
   src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
   src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-  src/core/conversation_memory.cpp src/core/peer_experts.cpp)
+  src/core/conversation_memory.cpp src/core/peer_experts.cpp
+  src/prefill/prefill.cpp
+  src/core/pinned.cu)
+# `pinned.cu` is the engine's PINNED-ARENA / expert-FILE loader.  It has NO CUDA kernels (0 `__global__`, 0
+# launches) - it is host code that talks to the CUDA runtime, so on this backend it COMPILES AS C++ against the
+# shim, exactly as the recorder TUs do.  It is the MODEL-LOAD path (load_experts_*/PinnedArena/fnv1a64), so it is
+# WIRED, not refused.
+set_source_files_properties(${STRATA_ROOT}/src/core/pinned.cu PROPERTIES LANGUAGE CXX)
 add_library(strata_vulkan_engine STATIC EXCLUDE_FROM_ALL ${_vengine})
 target_compile_features(strata_vulkan_engine PRIVATE cxx_std_20)
 target_link_libraries(strata_vulkan_engine PUBLIC strata_vulkan_core strata_vulkan_kernels_cpu)

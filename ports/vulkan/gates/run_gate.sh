@@ -204,28 +204,14 @@ printf '  %-42s %s\n' "fp64 arithmetic / transcendentals" "$fp64"
 echo "  (a capability reported absent here is a TOOLCHAIN limit, not a port defect - see STACK-COMPAT.md)"
 
 echo "== building the harness (-Werror: hygiene is part of the gate)"
-# The ENGINE-side backend (vulkan/src/device/ + the fwht256 kernel TU) is linked IN, because one case drives the
-# engine's own entry point (strata::kernels::fwht256_cuda) through it - see case_fwht256_entry.  Its device layer
-# is a separate copy with its own namespace (strata::vulkan), so it does not clash with this harness's portvk.
-g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
-    -I"$TREE/vulkan/include" -I"$TREE/vulkan/include/cuda_compat" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 \
-    -o "$BUILD/vk_gate" "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" \
-    "$ROOT/harness/vk_stack.cpp" \
-    "$ROOT/harness/vk_gate.cpp" \
-    "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
-    "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
-    "$TREE/vulkan/src/device/sync.cpp" \
-    "$TREE/vulkan/src/compat/cuda_runtime.cpp" \
-    "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
-    "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
-    "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
-    "$TREE/vulkan/src/kernels/iq_vk.cpp" "$TREE/vulkan/src/kernels/moe_vk.cpp" \
-    "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
-    "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
-    "$TREE/vulkan/src/kernels/rope_vk.cpp" \
-    "$TREE/vulkan/src/kernels/sampler_vk.cpp" \
-    "$TREE/src/kernels/ngram.cpp" "$TREE/src/ngram/ple_reader.cpp" "$TREE/src/platform/direct_file.cpp" \
-    -lpthread -lvulkan || exit 1
+# The ENGINE-side backend (vulkan/src/device/, vulkan/src/kernels/, vulkan/src/compat/) is linked IN, because
+# cases drive the engine's own entry points through it - see case_fwht256_entry / case_cuda_graph_entry.  Its
+# device layer is a separate copy with its own namespace (strata::vulkan), so it does not clash with this
+# harness's portvk.  THE SOURCE LIST IS DERIVED (gates/harness_sources.sh), never hand-kept: a literal list went
+# stale three batches running and silently weakened every injection and gate run.
+source "$ROOT/gates/harness_sources.sh"
+GATE="$BUILD/vk_gate"
+build_harness || exit 1
 
 echo "== numeric gate"
 # The gate needs a few MiB of buffers, so it runs with the reserve and its floor at 0: this box's resident local

@@ -157,4 +157,59 @@ void stream_read(const Stream& s, const void* dev, void* host, uint64_t bytes) {
     s.ctx->read(v, host, bytes, v.offset);
 }
 
+// ---- MAPPED HOST REGIONS (see vk_arena.hpp) ----------------------------------------------------------------
+namespace {
+struct MappedRegion {
+    void* host = nullptr;   // the mapping cudaHostAlloc returned
+    Buf buf{};              // the HOST_VISIBLE | HOST_COHERENT device block behind it
+    uint64_t bytes = 0;
+};
+std::vector<MappedRegion>& mapped_regions() {
+    static std::vector<MappedRegion> v;
+    return v;
+}
+}  // namespace
+
+bool mapped_register(void* host, const Buf& buf, uint64_t bytes) {
+    if (host == nullptr) return false;
+    for (const MappedRegion& r : mapped_regions())
+        if (r.host == host) return false;               // already live: a double registration is a defect
+    mapped_regions().push_back(MappedRegion{host, buf, bytes});
+    return true;
+}
+
+void mapped_unregister(void* host) {
+    auto& v = mapped_regions();
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].host == host) {
+            v[i] = v.back();
+            v.pop_back();
+            return;
+        }
+    }
+}
+
+bool mapped_resolve(const void* host, uint64_t bytes, Buf& out) {
+    if (host == nullptr || bytes == 0) return false;
+    for (const MappedRegion& r : mapped_regions()) {
+        if (r.host == host) {
+            // The view must fit INSIDE the region the shim handed out: binding the whole block and letting the
+            // shader read past `bytes` would read bytes the caller never published.  Refuse rather than bind a
+            // view the caller's size does not cover.
+            if (bytes > r.bytes) {
+                std::fprintf(stderr,
+                             "strata::vulkan: mapped_resolve: %llu bytes asked of a %llu-byte mapped region - "
+                             "refusing rather than reading past the published block\n",
+                             (unsigned long long) bytes, (unsigned long long) r.bytes);
+                return false;
+            }
+            out = r.buf;                                // offset 0: the region's own base
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t mapped_live_regions() { return (uint64_t) mapped_regions().size(); }
+
 }  // namespace strata::vulkan

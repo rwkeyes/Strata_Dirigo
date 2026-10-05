@@ -215,6 +215,13 @@ cudaError_t cudaHostAlloc(void** hostPtr, size_t count, unsigned int flags) {
     r.bytes = count;
     r.buf = b;
     r.stream = s;
+    // Register the region with the device layer so `copy_from_mapped` can bind its DEVICE-VISIBLE buffer (a
+    // shader cannot dereference `host`).  A failure here means the same mapping was registered twice - a defect,
+    // so refuse loudly rather than hand back a region binds cannot resolve.
+    if (!strata::vulkan::mapped_register(r.host, r.buf, r.bytes)) {
+        std::fprintf(stderr, "cudaHostAlloc: the mapping %p is already a live region - refusing\n", r.host);
+        return fail(cudaErrorMemoryAllocation);
+    }
     host_regions().push_back(r);
     *hostPtr = r.host;
     g_last = cudaSuccess;
@@ -237,6 +244,7 @@ cudaError_t cudaFreeHost(void* hostPtr) {
     HostRegion* r = host_region_of(hostPtr);
     if (r == nullptr) return fail(cudaErrorInvalidValue);
     Stream* s = r->stream;
+    strata::vulkan::mapped_unregister(r->host);      // the device layer's view of the mapping goes with it
     if (s != nullptr && s->ctx != nullptr) s->ctx->free(r->buf);
     for (size_t i = 0; i < host_regions().size(); ++i) {
         if (&host_regions()[i] == r) {
@@ -493,6 +501,14 @@ cudaError_t cudaDeviceCanAccessPeer(int* canAccessPeer, int device, int peerDevi
 
 cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags) {
     (void) peerDevice; (void) flags;
+    return fail(cudaErrorNotSupported);
+}
+
+cudaError_t cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src, int srcDevice, size_t count,
+                                cudaStream_t stream) {
+    (void) dst; (void) dstDevice; (void) src; (void) srcDevice; (void) count; (void) stream;
+    // No peer access between one device and anything, so a peer copy cannot be realised.  Refuse rather than
+    // fake a copy (which would silently DROP the bytes on a path that is never selected here).
     return fail(cudaErrorNotSupported);
 }
 

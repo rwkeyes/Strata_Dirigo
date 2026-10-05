@@ -1,5 +1,49 @@
 # Status — what is done, what is verified, what is not
 
+## `copy_from_mapped` WIRED + the PUBLISH HANDSHAKE; THE PROGRAM LINKS; the `refused` MAP KIND (2026-10-05, `vega`)
+
+**THE ENGINE BAR: `134` raw / `55` distinct / `41` `strata::kernels::` / `0` cuda → `0` / `0` / `0` / `0`** (the
+exact whole-archive recipe: the four engine libs vs the backend `cudart`/`device`, `-lvulkan -lpthread`).  **The
+`strata` PROGRAM LINKS** (`make strata_vulkan` exit 0).  That is linkability, NOT a run - see the RUN line below.
+
+**THE MAP: `168 = 74 kernel + 0 shader + 47 host + 0 todo + 47 refused`** (was `75/5/61/27`).  `copy_from_mapped`
+moved `host → kernel` (shader `copy`); a FIFTH KIND **`refused`** now marks every symbol the backend defines ONLY
+as a loud refusal - enforced by `check_port_map.py` (a `refused` row with no definition FAILS).  A `refused` symbol
+is a HOLE, NEVER a capability.  `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.
+
+**DELIVERABLE A - `copy_from_mapped` (`session.cpp:875`, the captured per-layer parts copy).**  A Vulkan shader
+cannot dereference mapped host memory, so the backend binds the mapped region's DEVICE-VISIBLE buffer (the shim
+maps a HOST_VISIBLE|HOST_COHERENT block in `cudaHostAlloc`; `mapped_register`/`mapped_resolve` in `vk_arena.*`).
+THE HANDSHAKE: the host's store into the mapping is the publish, and it must sit AFTER capture and BEFORE each
+launch - a store made only at capture is the STALE BLOCK.  **A latent defect of exactly that class was found and
+fixed:** `copy_i32_from_mapped` (`layer.cpp:913/914`, also captured) did a host-staged write unconditionally,
+which under capture records NOTHING; it now RECORDS a `vkCmdCopyBuffer` re-reading the region.  **Proved by
+`case_copy_from_mapped_entry`** (6 verdicts, green on Arc / llvmpipe / Ryzen iGPU): direct == engine's rule; wrapper
+== the port's shader path (rival buffer); a recorded replay after a re-publish sees the new bytes; no stale block;
+live publish (the capture-freeze falsifier); a non-mapped source REFUSED.
+
+**DELIVERABLE B - THE LOUD REFUSALS.**  `refusals_vk.cpp` gains the ~40 kernels-namespace holes (drafter class C,
+P6 verifier class D, the A/B arm, the `kernels_cpu` prefetch); `refusals_engine_vk.cpp` (new) answers
+`RemoteExpertOpt` + defines `device_code_error` as its REAL answer; `refusals_prefill_vk.cpp` (new) answers the
+prompt-path kernels.  Unconditionally-run ctors/dtors are REAL empty bodies, not refusals.  `pinned.cu` (0 kernels;
+host code) is WIRED as C++ against the shim - the MODEL-LOAD path.
+
+**DELIVERABLE C - THE RUN.**  `strata_vulkan --help` runs (program start); `--pack DIR --tokens 1,2,3` stops at
+**MODEL LOAD**: the engine loads a PACK (`<dir>/index.txt`) and this box holds only raw IQ1_M GGUF shards (58 GB);
+exact error `strata generate: cannot open /home/bob/strata-models/IQ1_M/index.txt` (exit 1).  **NO TOKEN.**  Packing
+was not attempted (26 GB free on `/` for a 58 GB model; "no artifact bakes").
+
+**DELIVERABLE D - the instrument fix.**  `run_gate.sh` AND `inject-verify.sh` compiled the gate from a HAND-KEPT
+TU list that went stale three batches running; both now source `gates/harness_sources.sh`, which GLOBS
+`vulkan/src/**/*.cpp` and fails LOUDLY if the count on disk differs from the list.  The guard is proven to fire
+(a `#error` TU in a new `vulkan/src/guardprobe/` subdirectory made `build_harness` fail with it).
+
+**Gate (vega):** Arc `intel_icd` **741/0/0** (exit 0); llvmpipe **729/0/3**; Ryzen iGPU **729/3/2** - the 3 FAILs
+are the documented platform-level non-deterministic wrong-value defect (`budget: independent requery`,
+`bf16_gemv_fp32_mmvf_cols`, `bf16_gemv_fp32_mmvf_multi`), not this batch's cases.  **`z820b` PENDING.**  Detail in
+`NEXT.md`.
+
+
 ## `sample_tokens` WIRED and the ORDERED DECODE-PATH LIST (2026-10-05, `vega`)
 
 **THE MAP now reads 168 = 75 kernel + 5 shader + 61 host + 27 todo** (was 74/6/61/27): `sample_tokens` — the step

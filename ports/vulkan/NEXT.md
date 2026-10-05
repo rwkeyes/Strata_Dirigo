@@ -1,5 +1,99 @@
 # Start here next session
 
+## `copy_from_mapped` WIRED (THE LAST REACHED SYMBOL) + THE PUBLISH HANDSHAKE; THE PROGRAM LINKS (0 undefined); THE MAP GAINS A `refused` KIND (2026-10-05, `vega`)
+
+**THE ENGINE BAR MOVED `134` raw / `55` distinct / `41` `strata::kernels::` / `0` cuda → `0` / `0` / `0` / `0`.**
+Measured with the exact whole-archive recipe (four engine libs - `strata_vulkan_engine/core/kernels/kernels_cpu` -
+vs the backend `cudart`/`device`; `-lvulkan -lpthread`).  **THE `strata` PROGRAM NOW LINKS** (`make strata_vulkan`
+→ exit 0, `strata_vulkan` 2.5 MB).  The drop is the refusals (below) + `pinned.cu`; it is NOT a claim that the
+engine RUNS (see DELIVERABLE C).
+
+**THE MAP now reads `168 = 74 kernel + 0 shader + 47 host + 0 todo + 47 refused`** (was `75/5/61/27`).  Two moves:
+(1) **`copy_from_mapped` is `host → kernel`** (shader `copy`): its CUDA body is a DEVICE kernel, the port DEFINES
+it as a shader dispatch, and `case_copy_from_mapped_entry` proves it.  (2) **A FIFTH KIND, `refused`** - every
+symbol the backend defines ONLY as a loud refusal.  `check_port_map.py` enforces it (a `refused` row whose symbol
+the backend does NOT define FAILS, like a `kernel` row with no definition), and `make_port_map.py` carries the
+`REFUSED` set.  **NEVER read `refused` as a capability - it works for nothing.**  The five former `shader` rows
+(`coupled_draft_sample`, `moe_grouped_s2`, `moe_hit_grouped_s2_cpu_order`, `native_expert_grouped`,
+`shared_expert_multi`) had to be re-kinded because the checker refuses a defined `shader` row; two `kernel` rows
+(`embedding_gather_dev`, `native_flash_attn_short_step`) were ALREADY lies of this class (kinded `kernel` with no
+working definition - the `embedding_gather_dev` "engine-header inline" exception was false: the linker named it).
+
+## DELIVERABLE A - `copy_from_mapped` and the PUBLISH HANDSHAKE it needs
+
+`vulkan/src/kernels/elementwise_vk.cpp` defines `strata::kernels::copy_from_mapped` (`session.cpp:875`, the
+captured per-layer parts copy, the #1 reached symbol).  **A VULKAN SHADER CANNOT DEREFERENCE MAPPED HOST MEMORY,
+so this is not a wrapper - it is the handshake `sync.hpp` kept the seam for.**  The shim's `cudaHostAlloc` maps a
+HOST_VISIBLE|HOST_COHERENT device block, so the region's `host` pointer and its device view are ONE allocation.
+The port registers each region (`mapped_register`, in `vk_arena.*`, called from `cudaHostAlloc`) and
+`copy_from_mapped` binds **the region's device-visible buffer** as the shader's source (`copy.spv`), NOT the host
+address.  A host pointer the shim did not hand out, or one whose published size does not cover `n` floats, is
+REFUSED (proved by a child process).
+
+**WHERE THE PUBLISH SITS, and what the wrong side is.**  The host's store into the mapping IS the publish; its
+edge to the device is the NEXT SUBMISSION.  A recorded step re-reads its BUFFERS at submit time (the `graph.hpp`
+property), so the store must sit **AFTER `capture_end` and BEFORE each `cudaGraphLaunch`** - never at capture.
+Wrong side = a store made only at capture: the recorded node reads the mapping LIVE, so a replay would copy the
+CAPTURE-TIME bytes (a stale block).  The trap is not hypothetical: the OLD `copy_i32_from_mapped` did a fenced
+HOST-STAGED `stream_write` unconditionally, which under capture executes ONCE and records NOTHING - the exact
+"EVERY TOKEN AFTER THE FIRST REPLAYED POSITION 0" the engine's own `session.cpp` comment describes.  **FIXED
+while wiring: under capture `copy_i32_from_mapped` now RECORDS a `vkCmdCopyBuffer`** (`Ctx::capture_copy`)
+re-reading the mapped region; outside capture it keeps the fenced host-staged copy.  Both are BYTE copies, so the
+int32 payload is bit-exact either way (copy.spv is float-typed and an int bit-pattern must not pass a float
+load/store).
+
+**PROVED BY `case_copy_from_mapped_entry`** (6 verdicts, all green on Arc `intel_icd`, llvmpipe and the Ryzen
+iGPU): direct == the engine's own rule bitwise; the wrapper == the port's own shader path bitwise (a SEPARATE
+rival buffer, so a wrapper that wrote nothing cannot pass); **a recorded graph replayed after a re-publish sees
+the NEW bytes**; replay twice with no stale block; the live publish (not the capture-time block) - the arm that
+BITES if the publish had been frozen at capture; and a non-mapped source REFUSED (child exit 2 + the message).
+
+## DELIVERABLE B - THE LOUD REFUSALS, so the PROGRAM links
+
+Three refusal TUs, all with the established discipline (a real definition whose only behaviour is to abort,
+naming the flag chain): `refusals_vk.cpp` gains the **~40 kernels-namespace holes** the program link wanted
+(the drafter class C, the P6-verifier class D, the `--expert-cache-cpu-order` A/B arm, the `kernels_cpu`
+`RouterLookahead` prefetch); **`refusals_engine_vk.cpp`** (new) answers `strata::core::RemoteExpertOpt` (~11
+methods, the remote/peer tier, `--expert-cache-remote`/`--peer-device`) and defines `device_code_error` as its
+REAL answer (`""` - a Vulkan device has no CUDA arch to mismatch); **`refusals_prefill_vk.cpp`** (new) answers the
+prompt-path kernels (`src/prefill/*.cu`) after `src/prefill/prefill.cpp` was WIRED into the engine target (it
+compiles against the shim once `cudaMemcpyPeerAsync` is refused there).  Constructors/destructors that the
+request path runs UNCONDITIONALLY (`Prefill`, `Gemm`, `RemoteExpertOpt`) are REAL EMPTY bodies, not refusals -
+refusing them would abort a decode that never used the object.  **`pinned.cu` is WIRED, not refused**: 0 kernels,
+0 launches, host code that compiles as C++ against the shim - it is the MODEL-LOAD path (`load_experts_*`,
+`PinnedArena`, `fnv1a64`).  Every refused map symbol has its triage class + flag chain in
+`plan/DECODE-PATH-TRIAGE.md` and its chain IN the `refuse_unreachable` call.
+
+## DELIVERABLE C - THE RUN: how far it got
+
+`strata_vulkan` LINKS (0 undefined).  RUN: **program start reached** - `--help` prints the CLI, arg parsing works,
+and the engine then stops at **MODEL LOAD**: it needs a PACK directory (`--pack DIR`, `WeightTable::load` opens
+`<dir>/index.txt`), and **this box holds only raw IQ1_M GGUF shards** (`~/strata-models/IQ1_M/…-of-00002.gguf`,
+58 GB); there is no `pack/`.  Exact output: `strata generate: cannot open /home/bob/strata-models/IQ1_M/index.txt`
+(exit 1).  **NO TOKEN.**  Packing was NOT attempted: `tools/iq_pack.py` needs ~the model's size in free space and
+`/` has **26 GB free on a 58 GB model** (and "no artifact bakes" is a batch constraint).  So the stopping point is
+**program start → model open/load (no pack)**, and the tokens `1,2,3`, the sampler, capture and every decode step
+were NOT exercised.
+
+## DELIVERABLE D - the instrument fix at the cause
+
+`run_gate.sh` AND `inject-verify.sh` each compiled the gate from a HAND-KEPT TU list, which went stale three
+batches running (most recently `iq_vk.cpp`/`moe_vk.cpp`/`sampler_vk.cpp`): an injection into a TU not in the list
+rebuilt a gate that could not link, ran the OLD binary, and reported "NOT FALSIFIED".  **Both now source
+`gates/harness_sources.sh`**, which GLOBS `vulkan/src/**/*.cpp` and FAILS LOUDLY if the count on disk differs from
+the count in the list it hands the compiler.  **The guard is PROVEN to fire**: a `#error` TU dropped into a NEW
+`vulkan/src/guardprobe/` subdirectory (a blind spot of the old literal list) made `build_harness` fail with that
+`#error`, i.e. the new TU was COMPILED.
+
+## RESULTS (vega)
+
+Gate (`run_gate.sh`, background): Arc (`intel_icd`) **741/0/0** (exit 0); llvmpipe **729/0/3**; Ryzen iGPU
+(`radeon_icd`) **729/3/2** - the 3 FAILs are the documented platform-level non-deterministic wrong-value defect
+(`budget: independent requery`, `bf16_gemv_fp32_mmvf_cols`, `bf16_gemv_fp32_mmvf_multi`), NOT this batch's cases;
+all six `copy_from_mapped entry` verdicts PASS on all three arms.  `check_port_map.py` passes (`168 - 74 kernel,
+0 shader, 47 host, 0 todo, 47 refused`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.
+**`z820b` is PENDING** (suspended, no WoL - no XTX/K620 number claimed).
+
 ## `sample_tokens` WIRED — THE STEP THAT PRODUCES A TOKEN — AND THE ORDERED DECODE-PATH LIST THAT SAYS ONLY TWO OF THE 41 REMAINING kernels-NAMESPACE SYMBOLS ARE ON A SINGLE-TOKEN DECODE (2026-10-05, `vega`)
 
 **THE MAP now reads 168 = 75 kernel + 5 shader + 61 host + 27 todo** (was 74/6/61/27): `sample_tokens` moved

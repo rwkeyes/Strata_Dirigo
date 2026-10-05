@@ -19802,6 +19802,153 @@ void case_cuda_graph_entry(Ctx& ctx, const std::string& dir) {
     strata::vulkan::stream_close(s);
 }
 
+// ============================================================================================================
+// DELIVERABLE A - `copy_from_mapped`: the captured per-layer parts copy (`session.cpp:875`), the LAST symbol a
+// single-token decode reaches, and THE HANDSHAKE its Vulkan form needs.
+// ============================================================================================================
+// A Vulkan shader cannot dereference MAPPED HOST memory.  The shim's `cudaHostAlloc` maps a HOST_VISIBLE |
+// HOST_COHERENT device block, so the region's `host` pointer and its device view are ONE allocation: the host's
+// store into the mapping IS the publish, and the region's BUFFER is what the shader binds.  The ordering a
+// RECORDED block needs is therefore a property of WHERE the host publishes, and this case pins it:
+//
+//   * DIRECT: the wrapper reproduces the engine's own rule (`dst[i] == src[i]`, `elementwise.cu:226`) BITWISE,
+//     against a SEPARATE rival buffer.
+//   * THE SHADER PATH: the same copy driven ON THE ENGINE STREAM via the port's own `copy.spv` bound to the
+//     mapped region's buffer - a distinct observable (`dst2`), so a wrapper that wrote nothing cannot pass.
+//   * RECORDED: capture, then PUBLISH AFTER the capture and BEFORE the launch.  The replay must copy the NEW
+//     bytes, not the capture-time ones.  **This is the arm that BITES if the publish is frozen at capture**
+//     into a private staging buffer (the old `copy_i32_from_mapped` defect): it would replay the capture-time
+//     block.  A second replay after a different publish must show that pattern and no stale bytes.
+//   * REFUSAL: a source that is not a live mapped region is refused LOUDLY (a child process, since it exits),
+//     never bound as if it were mapped.
+void case_copy_from_mapped_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "copy.spv")) return;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("copy_from_mapped entry", false, 1, 1, 0, "the backend could not open a stream");
+        return;
+    }
+    strata::vulkan::cuda_compat_set_stream(s);
+    const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+    strata::vulkan::Ctx& ectx = *s->ctx;
+
+    const int64_t N = 4096;                 // floats: a multiple of 4, 16-byte aligned (the engine's own requirement)
+    float* hsrc = nullptr;
+    if (cudaHostAlloc((void**)&hsrc, (size_t) N * 4, cudaHostAllocMapped) != cudaSuccess || hsrc == nullptr) {
+        strata::vulkan::cuda_compat_set_stream(nullptr);
+        strata::vulkan::stream_close(s);
+        verdict("copy_from_mapped entry", false, 1, 1, 0, "cudaHostAlloc failed");
+        return;
+    }
+    float* dsrc = nullptr;
+    if (cudaHostGetDevicePointer((void**)&dsrc, hsrc, 0) != cudaSuccess || dsrc == nullptr) dsrc = hsrc;
+    float* dst = nullptr;
+    float* dst2 = nullptr;
+    cudaMalloc((void**)&dst, (size_t) N * 4);
+    cudaMalloc((void**)&dst2, (size_t) N * 4);
+
+    auto download = [&](float* d, std::vector<float>& v) {
+        v.assign((size_t) N, 0.0f);
+        return cudaMemcpy(v.data(), d, (size_t) N * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+
+    std::vector<float> A(N), B(N), C(N);
+    for (int64_t i = 0; i < N; ++i) { A[(size_t) i] = rndf(2.0f); B[(size_t) i] = rndf(2.0f) + 7.0f; C[(size_t) i] = rndf(2.0f) - 5.0f; }
+    std::memcpy(hsrc, A.data(), (size_t) N * 4);      // the publish (a plain host store into the mapping)
+
+    // ---- (A) DIRECT: wrapper == the engine's own rule, bitwise -------------------------------------------------
+    strata::kernels::copy_from_mapped(dst, dsrc, N, (void*) cs);
+    std::vector<float> got(N);
+    int bad = (int) N;
+    if (download(dst, got)) { bad = 0; for (int64_t i = 0; i < N; ++i) if (got[(size_t) i] != A[(size_t) i]) ++bad; }
+    verdict("copy_from_mapped entry: direct == src (engine rule)", bad == 0, bad, (int) N, 0, "elements differ");
+
+    // ---- (B) THE PORT'S OWN SHADER PATH on the SAME stream must agree BITWISE (a rival, separate buffer) -------
+    strata::vulkan::Buf sv{};
+    strata::vulkan::Buf dv{};
+    const bool resolved = strata::vulkan::mapped_resolve(hsrc, (uint64_t) N * 4, sv);
+    const bool dres = strata::vulkan::arena_resolve(*s, dst2, (uint64_t) N * 4, dv);
+    int bad2 = (int) N;
+    if (resolved && dres) {
+        VkPipeline pipe = ectx.pipeline(dir + "/copy.spv", 2, sizeof(int32_t));
+        struct Push { int32_t n; } pc{};
+        pc.n = (int32_t) N;
+        ectx.dispatch(pipe, {&sv, &dv}, &pc, sizeof(pc), (uint32_t) ((N + 255) / 256));
+        std::vector<float> got2;
+        if (download(dst2, got2)) { bad2 = 0; for (int64_t i = 0; i < N; ++i) if (got2[(size_t) i] != got[(size_t) i]) ++bad2; }
+    }
+    verdict("copy_from_mapped entry: wrapper == port shader path (bitwise)", bad2 == 0, bad2, (int) N, 0, "elements differ");
+
+    // ---- (C) THE RECORDED ARM: capture, then RE-PUBLISH before the launch -------------------------------------
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ex = nullptr;
+    bool captured = false;
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        strata::kernels::copy_from_mapped(dst, dsrc, N, (void*) cs);     // RECORDS; the host's store is NOT frozen
+        captured = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != nullptr;
+    }
+    if (captured) { cudaGraphInstantiate(&ex, g, 0); cudaGraphDestroy(g); }
+    std::memcpy(hsrc, C.data(), (size_t) N * 4);          // THE RE-PUBLISH: after capture, before launch
+    int badc = (int) N;
+    if (ex != nullptr && cudaGraphLaunch(ex, cs) == cudaSuccess) {
+        std::vector<float> gotc;
+        if (download(dst, gotc)) { badc = 0; for (int64_t i = 0; i < N; ++i) if (gotc[(size_t) i] != C[(size_t) i]) ++badc; }
+    }
+    verdict("copy_from_mapped entry: recorded replay sees the re-publish", badc == 0, badc, (int) N, 0, "elements differ");
+
+    // ---- (D) publish A again, replay -> A: no stale bytes carried from the previous publish -------------------
+    std::memcpy(hsrc, A.data(), (size_t) N * 4);
+    int bada = (int) N;
+    if (ex != nullptr && cudaGraphLaunch(ex, cs) == cudaSuccess) {
+        std::vector<float> gota;
+        if (download(dst, gota)) { bada = 0; for (int64_t i = 0; i < N; ++i) if (gota[(size_t) i] != A[(size_t) i]) ++bada; }
+    }
+    verdict("copy_from_mapped entry: replay twice, no stale block", bada == 0, bada, (int) N, 0, "elements differ");
+
+    // ---- (E) THE WRONG-SIDE OBSERVABLE.  The recorded node must copy what is LIVE at launch.  Publish B, launch
+    //          -> B (NOT the A that was live at capture).  If the port had snapshotted at capture this reads A.
+    std::memcpy(hsrc, B.data(), (size_t) N * 4);
+    int badb = (int) N;
+    if (ex != nullptr && cudaGraphLaunch(ex, cs) == cudaSuccess) {
+        std::vector<float> gotb;
+        if (download(dst, gotb)) { badb = 0; for (int64_t i = 0; i < N; ++i) if (gotb[(size_t) i] != B[(size_t) i]) ++badb; }
+    }
+    verdict("copy_from_mapped entry: live publish, not the capture-time block", badb == 0, badb, (int) N, 0, "elements differ");
+
+    if (ex != nullptr) cudaGraphExecDestroy(ex);
+    cudaFree(dst2);
+    cudaFree(dst);
+    cudaFreeHost(hsrc);
+    strata::vulkan::cuda_compat_set_stream(nullptr);
+    strata::vulkan::stream_close(s);
+
+    // ---- (F) A SOURCE THAT IS NOT A LIVE MAPPED REGION IS REFUSED LOUDLY ---------------------------------------
+    {
+        char self[4096];
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (n > 0) {
+            self[n] = '\0';
+            const std::string cmd = std::string(self) + " --expect-copy-refusal 2>&1";
+            FILE* f = popen(cmd.c_str(), "r");
+            std::string out;
+            if (f != nullptr) {
+                char line[512];
+                while (std::fgets(line, sizeof line, f)) out += line;
+                const int st = pclose(f);
+                const int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                const bool refused = (code == 2) && (out.find("not a live MAPPED region") != std::string::npos);
+                verdict("copy_from_mapped entry: a non-mapped source is REFUSED", refused, refused ? 0 : 1, 1,
+                        (double) code, "child exit status");
+            } else {
+                skip("copy_from_mapped entry: a non-mapped source is REFUSED", "could not spawn the child process");
+            }
+        } else {
+            skip("copy_from_mapped entry: a non-mapped source is REFUSED", "cannot resolve /proc/self/exe");
+        }
+    }
+}
+
 
 // ============================================================================================================
 // THIS BATCH: the ENGINE-WRAPPER cases for the newly wired decode-path symbols.  Each proves (i) the ENGINE
@@ -20620,6 +20767,7 @@ int main(int argc, char** argv) {
     bool expect_refusal = false;
     bool expect_ledger_refuse = false, expect_ledger_ok = false;
     bool expect_rope_table = false;
+    bool expect_copy_refusal = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--list") list = true;
@@ -20627,6 +20775,7 @@ int main(int argc, char** argv) {
         else if (a == "--device" && i + 1 < argc) dev = std::atoi(argv[++i]);
         else if (a == "--selftest") { /* accepted: the suite is the test */ }
         else if (a == "--expect-refusal") expect_refusal = true;   // the refusal case's child modes
+        else if (a == "--expect-copy-refusal") expect_copy_refusal = true;   // copy_from_mapped's refusal child
         else if (a == "--expect-ledger-refuse") expect_ledger_refuse = true;
         else if (a == "--expect-ledger-ok") expect_ledger_ok = true;
         else if (a == "--expect-rope-table") expect_rope_table = true;   // case_rope_table_set_entry's child
@@ -20696,6 +20845,20 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "child: stored=%d matched=%d cleared=%d\n", (int) stored, (int) matched, (int) cleared);
         return 1;
+    }
+    if (expect_copy_refusal) {
+        // The child for `case_copy_from_mapped_entry`'s refusal arm: a source that is NOT a live mapped region
+        // must make the wrapper REFUSE (exit 2) rather than bind it as if it were mapped (a shader cannot read
+        // host memory).  An ordinary heap pointer is exactly such a source.
+        strata::vulkan::Stream* s = strata::vulkan::stream_open(1ull << 20, dir);
+        if (s == nullptr) return 7;
+        strata::vulkan::cuda_compat_set_stream(s);
+        const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+        float* dst = nullptr;
+        cudaMalloc((void**)&dst, (size_t) 64 * 4);
+        std::vector<float> junk(64, 1.0f);                        // not a cudaHostAlloc mapping
+        strata::kernels::copy_from_mapped(dst, junk.data(), 64, (void*) cs);   // must exit(2)
+        return 5;   // reached only if the wrapper did NOT refuse
     }
 
     Ctx ctx(dev, false);
@@ -20941,6 +21104,7 @@ int main(int argc, char** argv) {
     // THIS BATCH: the CUDA GRAPH API over the port's OWN recorded step (the engine's recorder, `session_capture`).
     // APPENDED last for the shared-RNG reason every batch above names.
     case_cuda_graph_entry(ctx, dir);                 // cudaStreamBeginCapture/EndCapture + cudaGraphInstantiate/Launch/Destroy
+    case_copy_from_mapped_entry(ctx, dir);           // the captured per-layer parts copy (session.cpp:875) + the publish handshake
     // THIS BATCH: the ENGINE-WRAPPER cases for the newly wired shader-row symbols (iq_dequant_f32, iq_embed_rows,
     // bf16_gemv_fp32_mmvf_multi, s_gemv_split_async, moe_hit_select, moe_hit_add, moe_hit_grouped_s2/_dev), each
     // with its capture arm.  APPENDED last for the shared-RNG reason every batch above states.

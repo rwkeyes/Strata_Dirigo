@@ -6,7 +6,10 @@
     define the symbol the engine calls -- BOTH facts, which is the fix for the conflation this file used to
     have (see below)
   * every `shader` row must name a BUILT shader and must NOT be defined by the backend (a `shader` row that
-    IS defined is stale -- promote it to `kernel`)
+    IS defined is stale -- promote it to `kernel`, or to `refused` if the definition is a LOUD REFUSAL)
+  * every `refused` row must name a symbol the backend DOES define in vulkan/src/ -- the definition is a loud
+    refusal (refusals_vk.cpp), so it is NOT a capability; an aspirational `refused` row fails like a `kernel`
+    row with no definition
   * every built shader must be named by some row (no orphan shaders)
   * every kernels-namespace symbol src/core/ REACHES must be in the map (the map stays complete over the
     decode path) -- whether it is written `kernels::X` or BARE `X`
@@ -99,11 +102,11 @@ defined = backend_definitions()
 
 built = {p.stem for p in (PORT / 'shaders').glob('*.spv')}
 claimed = set()
-n_kernel, n_shaderonly, n_kernel_undef = 0, 0, 0
+n_kernel, n_shaderonly, n_kernel_undef, n_refused = 0, 0, 0, 0
 undef_named = []
 for sym, kind, what in rows:
-    if kind not in ('kernel', 'shader', 'host', 'todo'):
-        fail.append(f"PORT-MAP.tsv: {sym} has kind {kind!r} (not kernel/shader/host/todo)")
+    if kind not in ('kernel', 'shader', 'host', 'todo', 'refused'):
+        fail.append(f"PORT-MAP.tsv: {sym} has kind {kind!r} (not kernel/shader/host/todo/refused)")
     # A symbol ending in `_` is a macro-concatenation prefix (`kernels::quantize_q8_##T`), so it has no word
     # boundary after it; every other symbol must appear whole.
     pat = r'\b' + re.escape(sym) + ('' if sym.endswith('_') else r'\b')
@@ -114,6 +117,13 @@ for sym, kind, what in rows:
             if sh not in built:
                 fail.append(f"PORT-MAP.tsv: {sym} names shader {sh!r}, which is not built")
             claimed.add(sh)
+    elif kind == 'refused':
+        # A `refused` row's `what` is prose (a flag chain) that MAY also name shaders the refused symbol's CUDA
+        # body would have driven.  Claim any token that IS a built shader, but do not treat prose words as
+        # missing shaders - the refusal is the backend's whole answer.
+        for sh in what.split():
+            if sh in built:
+                claimed.add(sh)
     if kind == 'kernel':
         n_kernel += 1
         # FACT 2: the backend must define the symbol the engine calls (the conflation's fix).  `fwht256_inplace_cuda`
@@ -126,7 +136,14 @@ for sym, kind, what in rows:
         n_shaderonly += 1
         if sym in defined:
             fail.append(f"PORT-MAP.tsv: {sym} is kinded `shader` but the backend DOES define it - promote it to "
-                        f"`kernel` (a stale row)")
+                        f"`kernel` (if it works) or `refused` (if the definition is a LOUD REFUSAL) - a stale row")
+    elif kind == 'refused':
+        n_refused += 1
+        # FACT 2 for `refused`: the backend MUST define it.  An aspirational refusal row (a `refused` kind with
+        # no definition) is the same class of hole as a `kernel` row with no definition.
+        if sym not in defined:
+            fail.append(f"PORT-MAP.tsv: {sym} is kinded `refused` but the backend does NOT define it - either wire "
+                        f"the refusal in vulkan/src/kernels/refusals_vk.cpp or kind it `todo`")
 unclaimed = sorted(built - claimed)      # prefill-path kernels and shared primitives: reported, not failures
 
 for sym in sorted(core_syms):
@@ -141,10 +158,12 @@ k = sum(1 for r in rows if r[1] == 'kernel')
 s = sum(1 for r in rows if r[1] == 'shader')
 h = sum(1 for r in rows if r[1] == 'host')
 t = sum(1 for r in rows if r[1] == 'todo')
+rf = sum(1 for r in rows if r[1] == 'refused')
 # THE TWO FACTS, PRINTED SEPARATELY.  `kernel` = shader built + backend defines it; `shader` = shader built,
 # backend does NOT.  A `kernel` row the backend does not define is a HOLE unless it is an engine-header inline.
+# `refused` = the backend defines it, but ONLY as a loud refusal (NOT a working kernel).
 n_backend_defs = len([r for r in rows if r[0] in defined])
-print(f"port map: {len(rows)} decode-path symbols - {k} kernel, {s} shader, {h} host, {t} todo; "
+print(f"port map: {len(rows)} decode-path symbols - {k} kernel, {s} shader, {h} host, {t} todo, {rf} refused; "
       f"{len(built)} shaders built, {len(claimed)} claimed by the decode path")
 print(f"          backend definitions: {n_backend_defs}; engine-header inlines: "
       f"{sorted(ENGINE_HEADER_INLINES & mapped)}")

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Write ports/vulkan/PORT-MAP.tsv: the DECODE PATH's kernels-namespace symbols, each classified as
 
-    kernel  GPU work this port has, naming the shader(s)
+    kernel  GPU work this port has, naming the shader(s) - the backend defines it AND IT WORKS
+    shader  a shader exists but the backend does not define the symbol (the wrapper is missing)
     host    the engine's own host side (a size, a check, a table, a sync primitive) - no dispatch to port
     todo    GPU work this port has NOT done - the honest hole list
+    refused the backend DEFINES it, but ONLY as a LOUD REFUSAL (vulkan/src/kernels/refusals_vk.cpp): it aborts
+            naming the flag chain that reaches it, so a non-selected path is a NAMED error.  `refused` is NOT
+            `kernel` - it works for nothing - and it is a HOLE, not a capability.
 
 The table is checked, not decorative: gates/run_gate.sh fails if a symbol is invented (absent from the engine's
-sources), if a `kernel` row names a shader that is not built, if a built shader is named by no row, or if src/core/
-reaches a kernels-namespace symbol the table does not mention.  The symbol set comes from tools/port_map_lib.py,
-which finds the qualified AND the BARE (using-namespace) call sites alike - the blind spot this file used to have.
+sources), if a `kernel` row names a shader that is not built, if a built shader is named by no row, if src/core/
+reaches a kernels-namespace symbol the table does not mention, or if a `refused` row names a symbol the backend
+does not actually define.  The symbol set comes from tools/port_map_lib.py, which finds the qualified AND the
+BARE (using-namespace) call sites alike - the blind spot this file used to have.
 """
 import pathlib, sys
 
@@ -143,7 +148,12 @@ TABLE = {
     'silu_inplace':                   ('kernel', 'silu_f32'),
     # ---- the engine's own host side: no dispatch for the port to supply ----
     'build_rope_table':               ('host', 'the engine builds the table; rope_neox is the kernel that reads it'),
-    'copy_from_mapped':               ('host', 'a mapped-buffer copy'),
+    # `copy_from_mapped` - the captured per-layer parts copy (session.cpp:875).  Its CUDA body is a DEVICE kernel
+    # (`elementwise.cu:226` `copy_from_mapped_kernel`), so the old `host` kind was a MIS-KIND; the port now DEFINES
+    # it as a shader dispatch (`ports/vulkan/shaders/copy.comp`, the same copy `sync_copy_fenced` uses), binding
+    # the mapped region's device-visible buffer.  Proved by `case_copy_from_mapped_entry` (direct + a recorded
+    # graph replayed after a re-publish).  See NEXT.md.
+    'copy_from_mapped':               ('kernel', 'copy'),
     'copy_i32_from_mapped':           ('host', 'a mapped-buffer copy'),
     'copy_i32_from_mapped_unless':    ('host', 'a mapped-buffer copy'),
     'copy_indexed':                   ('host', 'a device-indexed copy'),
@@ -241,25 +251,59 @@ extra = [s for s in TABLE if s not in syms]
 assert not missing, f"unclassified symbols src/core/ reaches: {missing}"
 assert not extra, f"table rows that src/core/ does not reach: {extra}"
 
-rows = [(s, *TABLE[s]) for s in syms]
-counts = {k: sum(1 for r in rows if r[1] == k) for k in ('kernel', 'shader', 'host', 'todo')}
+# ---- THE LOUD REFUSALS: a symbol the backend DEFINES only so the program LINKS ---------------------------------
+# `vulkan/src/kernels/refusals_vk.cpp` gives each of these a real definition whose ONLY behaviour is to abort,
+# naming the flag chain that reaches it.  That is NOT `kernel` - `kernel` means "a shader exists AND the backend
+# defines the symbol", i.e. IT WORKS.  A refused symbol WORKS for nothing; it exists so a non-selected path is a
+# NAMED error instead of a link failure or a silent degradation.  So it gets its own kind, and check_port_map
+# requires each `refused` row to actually BE defined by the backend (an aspirational refusal row fails).  This is
+# the vocabulary the batch brief asks to keep honest: NEVER read `refused` as a capability.
+REFUSED = {
+    # the QSA/flash-attention tail
+    'native_flash_attn_short_step', 'qsa_attend_step', 'qsa_index_step', 'topk_512_step',
+    'native_qsa_indexer_append', 'fused_gr_read',
+    # the KV streaming resident tier
+    'kv_stream_reset', 'kv_ring_table', 'kv_stream_resolve', 'kv_ring_restore',
+    # the speculative drafter (class C)
+    'add_streams_broadcast', 'fused_gr_read_multi', 'moe_grouped_s2', 'moe_group_resident', 'coupled_draft_sample',
+    'coupled_draft_stage', 'coupled_draft_scratch_bytes', 'row_top_prob', 'map_ids', 'window_ids', 'mtp_select',
+    'embedding_gather_dev', 'qsa_decode_attn_batch',
+    # the A/B arm defaulting off (class C)
+    'moe_hit_grouped_s2_cpu_order',
+    # the P6 verifier (class D)
+    'broadcast_streams', 'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
+    'copy_rows_from_mapped', 'fetch_blobs', 'fused_gr_check', 'gdn_ab_multi', 'gdn_conv_commit', 'gdn_conv_l2_multi',
+    'gdn_step_norm_multi', 'gpu_stamp', 'native_moe_combine_multi', 'native_router_top10_multi',
+    'native_expert_grouped', 'native_expert_layout', 'native_expert_scratch_bytes', 'ple_block_projected',
+    'rebase_ptrs', 'resident_plan', 'shared_expert_multi', 'wait_flag_ge', 'wait_flag_ge_or',
+}
+_stale_refusals = sorted(REFUSED - set(syms))
+assert not _stale_refusals, f"REFUSED names symbols src/core/ does not reach: {_stale_refusals}"
+
+rows = [(s, ('refused' if s in REFUSED else TABLE[s][0]), TABLE[s][1]) for s in syms]
+counts = {k: sum(1 for r in rows if r[1] == k) for k in ('kernel', 'shader', 'host', 'todo', 'refused')}
 out = ROOT / 'ports/vulkan/PORT-MAP.tsv'
 with out.open('w') as f:
     f.write("# ports/vulkan/PORT-MAP.tsv - the DECODE PATH's kernels-namespace symbols (every one src/core/ reaches), classified.\n")
-    f.write("# kernel = a shader exists in this tree AND the Vulkan backend defines the symbol the engine calls;\n")
+    f.write("# kernel = a shader exists in this tree AND the Vulkan backend defines the symbol the engine calls (IT WORKS);\n")
     f.write("# shader = a shader exists in this tree but the backend does NOT define the symbol (the wrapper is missing);\n")
     f.write("# host = the engine's own host side; todo = GPU work not ported (no shader).\n")
+    f.write("# refused = the backend DEFINES the symbol, but ONLY as a LOUD REFUSAL (vulkan/src/kernels/refusals_vk.cpp):\n")
+    f.write("#   it aborts naming the flag chain that reaches it, so a non-selected path is a NAMED error rather than a\n")
+    f.write("#   link failure or a silent degradation.  `refused` is NOT `kernel`: it works for nothing.  NEVER read it as\n")
+    f.write("#   a capability.  The reachability classes and the flag chains are in plan/DECODE-PATH-TRIAGE.md.\n")
     f.write("# The `kernel` kind states TWO facts, and check_port_map.py enforces BOTH: a row read as \"kernel\"\n")
     f.write("# whose symbol the backend does not define is the defect that let indexer_key_append sit LANDED with no\n")
-    f.write("# definition; a `shader` row that IS defined is a stale row.  Never read `kernel` as merely \"a shader\n")
-    f.write("# exists\".\n")
+    f.write("# definition; a `shader` row that IS defined is a stale row; a `refused` row that is NOT defined is stale.\n")
+    f.write("# Never read `kernel` as merely \"a shader exists\".\n")
     f.write("# A symbol is in scope whether src/core/ writes it `kernels::X` or bare `X` (a using-directive in scope).\n")
     f.write("# gates/run_gate.sh checks this file against the engine's sources, the built shaders AND the backend's own\n")
     f.write("# definitions: an invented symbol, a shader that is not built, an unclaimed shader, an unlisted src/core/\n")
-    f.write("# symbol, a `kernel` row with no backend definition, or a `shader` row WITH one all fail.\n")
+    f.write("# symbol, a `kernel` row with no backend definition, a `shader` row WITH one, or a `refused` row with no\n")
+    f.write("# definition all fail.\n")
     f.write("# symbol\tkind\tshader(s) or reason\n")
     for s, kind, what in rows:
         f.write(f"{s}\t{kind}\t{what}\n")
 print(f"PORT-MAP.tsv: {len(rows)} decode-path symbols - {counts['kernel']} kernel, {counts['shader']} shader, "
-      f"{counts['host']} host, {counts['todo']} todo")
-print("the holes, named:", ' '.join(s for s, k, _ in ((r[0], r[1], None) for r in rows) if k == 'todo'))
+      f"{counts['host']} host, {counts['todo']} todo, {counts['refused']} refused")
+print("the holes, named:", ' '.join(s for s, k, _ in ((r[0], r[1], None) for r in rows) if k in ('todo', 'refused')))

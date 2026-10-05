@@ -515,6 +515,12 @@ cudaError_t cudaGetDeviceCount(int* count);
 // NO peer access exists between one device and anything: answer 0, and refuse to enable it.
 cudaError_t cudaDeviceCanAccessPeer(int* canAccessPeer, int device, int peerDevice);
 cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags);
+// A device-to-device peer copy: refused for the same reason (no peer access).  `src/prefill/prefill.cpp` guards
+// it with `P.p2p`, which is false on a one-device backend, so the refusal is never reached at run time - but the
+// symbol must EXIST for the prompt TU to LINK (the same discipline as the rest of this surface).  Signature is
+// CUDA's, so the engine TU is checked against it.
+cudaError_t cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src, int srcDevice, size_t count,
+                                cudaStream_t stream);
 // `cudaInitDevice`'s flags (spin scheduling, mapped host) describe a CUDA runtime this backend does not have;
 // device 0 is accepted (there is one device), any other refused.
 cudaError_t cudaInitDevice(int device, unsigned int flags, unsigned int flags2);

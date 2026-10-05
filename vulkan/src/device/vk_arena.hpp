@@ -111,4 +111,25 @@ bool arena_resolve(const Stream& s, const void* p, uint64_t bytes, Buf& out);
 void stream_write(Stream& s, void* dev, const void* host, uint64_t bytes);
 void stream_read(const Stream& s, const void* dev, void* host, uint64_t bytes);
 
+// ---- MAPPED HOST REGIONS: the `copy_from_mapped` seam -----------------------------------------------------
+// A Vulkan SHADER cannot dereference a HOST pointer.  `cudaHostAlloc` in this shim returns the mapping of a
+// HOST_VISIBLE | HOST_COHERENT DEVICE BLOCK, so the bytes the host stores at `host` are the bytes the buffer
+// at `buf` holds - the mapping and the device view are ONE allocation, not two that need synchronising.  So a
+// symbol whose CUDA body reads MAPPED, PINNED host memory (elementwise.cu:226 `copy_from_mapped_kernel`) is
+// answered by BINDING THE REGION'S DEVICE-VISIBLE BUFFER, not the host address.  Registration happens at
+// `cudaHostAlloc` (the shim) and is looked up here by `copy_from_mapped` (the kernel TU).
+//
+// THE ORDERING CONTRACT, stated where it is relied on: the host's store into the mapping IS the publish, and
+// its edge to the device is the NEXT SUBMISSION.  A recorded step re-reads the buffer at SUBMIT time, so the
+// store must sit AFTER `capture_end`/the recording and BEFORE each launch - NEVER at capture.  A store made
+// only at capture is the STALE BLOCK this API exists to prevent (a replay would copy the capture-time bytes).
+bool mapped_register(void* host, const Buf& buf, uint64_t bytes);   // false if `host` is already live
+void mapped_unregister(void* host);
+// Resolve a mapped host pointer (or a pointer the caller derived from one) to its device-visible buffer.
+// `bytes` must lie inside the live region.  False - binding nothing - when it is not a live region, so a
+// caller cannot get a token for bytes this layer cannot show the device.
+bool mapped_resolve(const void* host, uint64_t bytes, Buf& out);
+// How many regions are live: the gate's leak instrument, and the FIFO handshake's own count.
+uint64_t mapped_live_regions();
+
 }  // namespace strata::vulkan

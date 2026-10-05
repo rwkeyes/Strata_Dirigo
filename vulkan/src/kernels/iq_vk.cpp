@@ -134,4 +134,23 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
                                   tokens, n_tok, n_embd, out);
 }
 
+// ---- THE IQ CAPABILITY PREDICATES (model load, not decode) ---------------------------------------------------
+// `embed_type_supported` (`native_head.cpp:119`) validates the token-embedding type before NativeEmbed loads it;
+// `iq_supported` (`iq_parity.cpp`, excluded from this build) is its dequant-only sibling.  The engine's rule is
+// `is_iq(t) || t == 30` (iq_kernels.cu:1777-1778).  This backend must answer its OWN coverage, and the answer
+// is MEASURED off the shader the two entry points above drive: `shaders/common/iq_dequant.glsl`'s `dq_dispatch`
+// switches on exactly this set of types (30 BF16, 20 IQ4_NL, 23 IQ4_XS, 8 Q8_0, 6 Q5_0, 7 Q5_1, 42 Q2_0,
+// 12 Q4_K, 13 Q5_K, 11 Q3_K, 18 IQ3_XXS, 21 IQ3_S, 22 IQ2_S, 29 IQ1_M, 16 IQ2_XXS, 17 IQ2_XS) - the SAME set
+// the engine's `is_iq()` names, so the port answers TRUE for exactly the types its dequantizer implements.
+// NOTE: this is the engine's type TABLE, verified case-by-case against the port's shader above; the port's
+// `sample_tokens`/decode path is unaffected (the predicates are load-time only).
+namespace {
+bool iq_type_covered(int t) {
+    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 ||
+           t == 11 || t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+}
+}  // namespace
+bool iq_supported(int ggml_type) noexcept { return iq_type_covered(ggml_type); }
+bool embed_type_supported(int ggml_type) noexcept { return iq_type_covered(ggml_type) || ggml_type == 30; }
+
 }  // namespace strata::kernels
