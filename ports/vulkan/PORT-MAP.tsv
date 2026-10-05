@@ -42,8 +42,8 @@ kv_ring_table	host	ring bookkeeping
 kv_stream_map_bytes	host	the expert file tier: a size
 kv_stream_reset	host	the expert file tier: bookkeeping
 kv_stream_resolve	host	the expert file tier: whether a row is resident
-moe_grouped_s2	todo	the grouped S2 MoE, not ported
-moe_hit_add	todo	the hit accumulator, not ported
+moe_grouped_s2	kernel	s2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped
+moe_hit_add	kernel	moe_hit_add
 moe_hit_grouped_s2	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
 moe_hit_grouped_s2_cpu_order	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
 moe_hit_grouped_s2_dev	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64

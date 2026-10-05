@@ -103,6 +103,26 @@ counts a NaN output as a failure, so it did not pass over garbage; the chain now
 **318/0/1**, lvp 310/0/3, nvidia 313/0/2.  **M-A is 8 of the ten**; the two `todo` symbols are `moe_grouped_s2`
 and `moe_hit_add`.  The port map reads **77 symbols - 26 kernel, 49 host, 2 todo**.
 
+**M-A IS CLOSED: the decode path's last two symbols landed together (9/10 + 10/10, one commit, sharing
+`harness/vk_gate.cpp` - the `4/10 + 5/10` precedent).**  **`moe_grouped_s2`** turns out NOT to be a reuse of the
+per-hit chain: it is the same four-launch composition, but its gu and down halves are the GROUPED kernels, and the
+per-hit `s2expert_gu`/`s2expert_down` cannot express a per-GROUP blob or a per-ENTRY activation row - so the
+increment adds `s2expert_gu_grouped.comp` and `s2expert_down_grouped.comp` (one weights buffer + a per-group byte
+offset table replacing the source's `grp_ptr` device pointers) and reuses `s2expert_swiglu` and `quantize_q8_0`.
+The case gates the WIRING with an oracle independent of the device's quantiser and down step (up rows against the
+group's blob at the ENTRY's token; the device's intermediate decoded against the device's own post-SwiGLU floats;
+down rows from the device's intermediate at the scrambled `ent_dst[e]`), over three grid.y arms including the
+device-count stride and an EMPTY group; falsified by `moe-grouped-s2-entry-token` -> `FAIL ... 5270/5638 worst
+3.78e+05`.  **`moe_hit_add`** (`add_hits_kernel`, `s2_expert_grouped.cu:666`) is `parts[dst[h]] += hit_out[dst[h]]`
+for every LIVE hit - `dst[h]` is the ROUTING POSITION and the operator is `+=`; four arms (count<cap, count==cap,
+`n_embd=37`, count 0), falsified by `moe-hit-add-accumulate` (`+=` -> `=`) -> `FAIL ... 2624/10304 worst 0`.  The
+count-0 arm itself was the one defect found (a liveness guard that assumed something MOVED, which that contract
+inverts); the guard now reads `moved == 0` for count 0 and the arm was not loosened.  The port map now reads
+**77 symbols - 28 kernel, 49 host, 0 todo**, and the drifted generator `tools/make_port_map.py` was fixed to
+regenerate it exactly.  **Measured: vega Arc 329/0/0** (`run_gate.sh` exit 0), intel_icd 329/0/0, llvmpipe 317/0/3,
+radeon-iGPU 320/0/2; box `radeon_icd` (7900 XTX) **325/0/1** (the pre-existing M8 `prefill split` skip), lvp
+317/0/3, nvidia 320/0/2.  The two new symbols add 7 verdicts (322 -> 329 on the Arc).
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the

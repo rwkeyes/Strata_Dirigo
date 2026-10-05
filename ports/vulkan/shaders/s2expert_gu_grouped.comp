@@ -1,0 +1,74 @@
+// ports/vulkan/shaders/s2expert_gu_grouped.comp - the GROUPED gate+up of the resident S2 expert tier.
+//
+// `gu_grouped_kernel` / `gu_grouped_t_kernel` (src/kernels/cuda/s2_expert_grouped.cu:783 / :918), the entry point
+// `moe_grouped_s2` (s2_expert_grouped.cu:1099) launches.  It is the GROUPED sibling of `s2expert_gu.comp`: the
+// per-hit kernel took one activation and a `slot_index[h]` into a single base buffer; this one is handed a LIST OF
+// GROUPS, each carrying its own blob and a range of ENTRIES, and each ENTRY reads its OWN token's activation row.
+// That per-entry activation is the whole difference and the reason this is a separate shader rather than a call
+// into the per-hit one.
+//
+// THE ONE INTERFACE DECISION IS THE SAME ONE `native_gu_iq2s.comp` MADE: the source passes `grp_ptr`, an array of
+// DEVICE POINTERS to per-expert blobs, and Vulkan has no device pointers.  The port takes one weights storage
+// buffer plus a per-group byte OFFSET table (`grp_off[g]`), so `grp_ptr[g] + off` becomes `grp_off[g] + off` and
+// nothing else changes (see the long note in native_gu_iq2s.comp for why offset table over descriptor indexing).
+//
+// The layout, all of it the source's:
+//   * `grp_start[g] .. grp_start[g+1]` is the group's entry range; entries are global (`e`), not per-group.
+//   * row-SLOT `i` of the `2*n_ff` interleaved rows is gate row `i/2` when `i` is even and up row `(i-1)/2` when
+//     odd; the row's codes are at `grp_off[g] + i*ROW_GU` and its scales at `+ O_GU_SCALES + i*SC_GU*2`.
+//   * entry `e`'s activation row is `ent_tok[e]` (`n_embd/32` block_q8_0 blocks).
+//   * THE OUTPUT IS GATE-MAJOR *AND* ENTRY-MAJOR, and the UP half starts at `cap_entries*n_ff`, NOT at the live
+//     entry count: the SwiGLU that follows pairs `gate[i]` with `up[i]` over `cap_entries*n_ff` floats, so the up
+//     region must begin at the CAPACITY.  The source's own launch writes `gate_up[cap_entries*FF + e*FF + r]`.
+//
+// THE GROUP COUNT IS A DEVICE VALUE, so the grid cannot be sized to it: the source strides
+// (`for (g = blockIdx.y; g < ng; g += gridDim.y)`) and so does this, with the caller free to launch fewer blocks
+// in y than there are groups.  One WORKGROUP owns a row-slot here (the CUDA used one warp per row-slot), which is
+// the port's shape everywhere; the entry loop's bounds are workgroup-uniform, so the reduction's barriers are legal.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BLOB { uint8_t b[]; } blob_b;   // the expert weights
+layout(set = 0, binding = 1, std430) readonly buffer ACT { uint8_t b[]; } act_b;       // x_q8_0, one row per token
+layout(set = 0, binding = 2, std430) readonly buffer XS { float v[]; } xscale_v;       // fp32 scales (optional)
+layout(set = 0, binding = 3, std430) readonly buffer GO { uint v[]; } grp_off;         // per-group byte offset
+layout(set = 0, binding = 4, std430) readonly buffer GS { int v[]; } grp_start;        // n_groups + 1 entries
+layout(set = 0, binding = 5, std430) readonly buffer NG { int v[]; } n_groups;
+layout(set = 0, binding = 6, std430) readonly buffer ET { int v[]; } ent_tok;
+layout(set = 0, binding = 7, std430) buffer GU { float v[]; } gate_up;
+
+#include "common/s2_row_dot.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_embd; int n_ff; int cap_entries; int use_xscales; } pc;
+
+void main() {
+    const uint H = uint(pc.n_embd), FF = uint(pc.n_ff);
+    const uint ROW_GU = H / 4u;                       // 2 bits per element
+    const uint SC_GU = H / 64u;                       // one fp16 scale per 64 elements
+    const uint O_D_CODES = 2u * FF * ROW_GU;
+    const uint O_GU_SCALES = O_D_CODES + H * (FF / 4u);
+    const uint i = gl_WorkGroupID.x;                  // row-SLOT, interleaved gate/up
+    if (i >= 2u * FF) return;                         // workgroup-uniform: the reduction's barriers stay legal
+    const uint nch = H / 32u;
+    const bool use_xs = pc.use_xscales != 0;
+    const uint ng = uint(n_groups.v[0]);
+
+    for (uint g = gl_WorkGroupID.y; g < ng; g += gl_NumWorkGroups.y) {
+        const uint off = grp_off.v[g];
+        const int e0 = grp_start.v[g], e1 = grp_start.v[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const uint tok = uint(ent_tok.v[e]);      // THIS entry's token, not the group's
+            const float acc = s2_row_dot(off + i * ROW_GU, off + O_GU_SCALES + i * SC_GU * 2u, tok * nch * 34u,
+                                         nch, tok * nch, use_xs);
+            const float s = wg_sum(acc);
+            if (gl_LocalInvocationIndex == 0u) {
+                const uint r = i >> 1u;
+                const uint base = ((i & 1u) != 0u) ? (uint(pc.cap_entries) * FF + uint(e) * FF) : (uint(e) * FF);
+                gate_up.v[base + r] = s;
+            }
+        }
+    }
+}

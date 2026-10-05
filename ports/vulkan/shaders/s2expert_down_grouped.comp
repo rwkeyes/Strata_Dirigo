@@ -1,0 +1,55 @@
+// ports/vulkan/shaders/s2expert_down_grouped.comp - the GROUPED down projection of the resident S2 expert tier.
+//
+// `down_grouped_kernel` / `down_grouped_t_kernel` (src/kernels/cuda/s2_expert_grouped.cu:845 / :984), the last of
+// the four launches `moe_grouped_s2` issues.  Same interface decision as `s2expert_gu_grouped.comp` (a per-group
+// byte OFFSET table instead of the source's `grp_ptr` device pointers).
+//
+// WHAT DIFFERS FROM THE GATE/UP SIDE, all of it the source's:
+//   * a row here is a row of the DOWN matrix (`n_embd` of them), at `O_D_CODES + r*ROW_D` inside the group's blob;
+//   * the row it multiplies is `e`-th row of `h_q8_0` - THE ENTRY INDEX, one row per entry, NOT `ent_tok[e]`;
+//   * the destination row is `ent_dst[e]`, the entry's token, because several entries can write the same token.
+//
+// One workgroup per output row (the CUDA used one warp per row), striding groups in y like the gu side.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BLOB { uint8_t b[]; } blob_b;   // the expert weights
+layout(set = 0, binding = 1, std430) readonly buffer ACT { uint8_t b[]; } act_b;       // h_q8_0, one row per entry
+layout(set = 0, binding = 2, std430) readonly buffer XS { float v[]; } xscale_v;       // fp32 scales (optional)
+layout(set = 0, binding = 3, std430) readonly buffer GO { uint v[]; } grp_off;
+layout(set = 0, binding = 4, std430) readonly buffer GS { int v[]; } grp_start;
+layout(set = 0, binding = 5, std430) readonly buffer NG { int v[]; } n_groups;
+layout(set = 0, binding = 6, std430) readonly buffer ED { int v[]; } ent_dst;
+layout(set = 0, binding = 7, std430) buffer OO { float v[]; } y;                       // NOT `out`: a GLSL keyword
+
+#include "common/s2_row_dot.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_embd; int n_ff; int use_xscales; } pc;
+
+void main() {
+    const uint H = uint(pc.n_embd), FF = uint(pc.n_ff);
+    const uint ROW_GU = H / 4u, ROW_D = FF / 4u;
+    const uint SC_GU = H / 64u, SC_D = FF / 64u;
+    const uint O_D_CODES = 2u * FF * ROW_GU;
+    const uint O_GU_SCALES = O_D_CODES + H * (FF / 4u);
+    const uint O_D_SCALES = O_GU_SCALES + 2u * FF * SC_GU * 2u;
+    const uint row = gl_WorkGroupID.x;
+    if (row >= H) return;                             // workgroup-uniform: the reduction's barriers stay legal
+    const uint nch = FF / 32u;                        // block_q8_0 blocks per entry of h_q8_0
+    const bool use_xs = pc.use_xscales != 0;
+    const uint ng = uint(n_groups.v[0]);
+
+    for (uint g = gl_WorkGroupID.y; g < ng; g += gl_NumWorkGroups.y) {
+        const uint off = grp_off.v[g];
+        const int e0 = grp_start.v[g], e1 = grp_start.v[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const float acc = s2_row_dot(off + O_D_CODES + row * ROW_D, off + O_D_SCALES + row * SC_D * 2u,
+                                         uint(e) * nch * 34u, nch, uint(e) * nch, use_xs);
+            const float s = wg_sum(acc);
+            if (gl_LocalInvocationIndex == 0u) y.v[uint(ent_dst.v[e]) * H + row] = s;
+        }
+    }
+}

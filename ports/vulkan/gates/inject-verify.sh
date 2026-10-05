@@ -26,6 +26,10 @@
 #                                       -> must FAIL  "moe_hit_select"
 #   inject-verify.sh moe-hit-grouped-s2-hit0-intermediate  s2expert_down.comp  every hit reads hit 0's intermediate
 #                                       -> must FAIL  "moe_hit_grouped_s2"
+#   inject-verify.sh moe-grouped-s2-entry-token  s2expert_gu_grouped.comp  every entry reads token 0's activation
+#                                       -> must FAIL  "moe_grouped_s2"
+#   inject-verify.sh moe-hit-add-accumulate      moe_hit_add.comp  `+=` -> `=` (the CPU's prior value dropped)
+#                                       -> must FAIL  "moe_hit_add"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -94,6 +98,21 @@ case "$name" in
     old=$'    const uint x_off = h * (FF / 32u) * 34u;'
     new=$'    const uint x_off = 0u;   // INJECTION: every hit reads hit 0\'s intermediate'
     want="FAIL  moe_hit_grouped_s2" ;;
+  moe-grouped-s2-entry-token)
+    # The grouped gu's distinguishing rule is that EVERY ENTRY reads ITS OWN token's activation row (`ent_tok[e]`).
+    # Making every entry read token 0's row is the plausible wrong rule the per-hit sibling's single activation
+    # makes tempting - and it changes the UP rows, which the composed case pins against the blob.
+    file="$SH/s2expert_gu_grouped.comp"; spv="s2expert_gu_grouped"
+    old=$'            const uint tok = uint(ent_tok.v[e]);      // THIS entry\'s token, not the group\'s'
+    new=$'            const uint tok = 0u;   // INJECTION: every entry reads token 0\'s activation'
+    want="FAIL  moe_grouped_s2" ;;
+  moe-hit-add-accumulate)
+    # The accumulator's rule is `+=`: `parts` holds what the CPU left there.  `=` drops that prior value, and the
+    # case gives every named row a NON-ZERO prior, so it is caught on the first row.
+    file="$SH/moe_hit_add.comp"; spv="moe_hit_add"
+    old=$'        parts.v[row + i] += hit_out.v[row + i];'
+    new=$'        parts.v[row + i] = hit_out.v[row + i];   // INJECTION: the accumulate dropped'
+    want="FAIL  moe_hit_add" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

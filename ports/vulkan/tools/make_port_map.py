@@ -72,7 +72,7 @@ TABLE = {
     'kv_q4_bytes_per_head':        ('host', 'a size'),
     'kv_q8_bytes_per_cell':        ('host', 'a size'),
     'iq_row_bytes':                ('host', 'a size'),
-    'iq_embed_rows':               ('todo', 'the IQ/BF16 token-embedding dequant, not ported - iq_kernels.hpp declares it'),
+    'iq_embed_rows':               ('kernel', 'iq_embed_rows'),
     'native_expert_layout':        ('host', 'a layout description'),
     'native_expert_scratch_bytes': ('host', 'a size'),
     'native_q8_1_bytes':           ('host', 'a size'),
@@ -93,10 +93,10 @@ TABLE = {
 
     # ---- GPU work this port has NOT done: the honest hole list ----
     'embedding_gather':            ('kernel', 'embedding_gather'),
-    'iq_dequant_f32':              ('todo', 'a standalone IQ dequantiser (this port has the FUSED iq*_mmvq)'),
+    'iq_dequant_f32':              ('kernel', 'iq_dequant_f32'),
     'native_q5_k_f32':             ('kernel', 'native_q5_k_f32'),
-    'moe_grouped_s2':              ('todo', 'the grouped S2 MoE, not ported'),
-    'moe_hit_add':                 ('todo', 'the hit accumulator, not ported'),
+    'moe_grouped_s2':              ('kernel', 's2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped'),
+    'moe_hit_add':                 ('kernel', 'moe_hit_add'),
     'moe_hit_select':              ('kernel', 'moe_hit_select'),
     'moe_hit_grouped_s2':          ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
 }

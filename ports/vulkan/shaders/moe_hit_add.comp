@@ -1,0 +1,34 @@
+// ports/vulkan/shaders/moe_hit_add.comp - the hit accumulator: fold each hit's row of `hit_out` into `parts`.
+//
+// `add_hits_kernel` (src/kernels/cuda/s2_expert_grouped.cu:666), the last step of the device hit path: the CPU
+// zeroed the hit rows of `parts`, the device wrote each hit's row into `hit_out` at its ROUTED slot
+// (`dst[h]`), and this ADDS the two, so `moe_combine` needs no special case for which half produced a row.
+//
+// TWO RULES, and both are the kind a paraphrase drops:
+//   * the row is `dst[h]` - the ROUTING POSITION, not `h` - the same two-roles confusion the KV gather's `ids[id]`
+//     and `moe_hit_select`'s `dst[at]` carry;
+//   * the operator is `+=`, not `=`: `parts` holds what the CPU left there (a hit row is zero, but the kernel's
+//     contract is an ACCUMULATION and the zeros are a property of this caller, not of the kernel).
+//
+// The live hit count lives on the DEVICE, so the grid is sized to the CAPACITY and rows past the count return
+// without writing - a captured step re-reads the count at dispatch time, which is what makes the capacity grid
+// correct under replay.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer PARTS { float v[]; } parts;
+layout(set = 0, binding = 1, std430) readonly buffer HIT { float v[]; } hit_out;
+layout(set = 0, binding = 2, std430) readonly buffer DST { int v[]; } dst;
+layout(set = 0, binding = 3, std430) readonly buffer CNT { int v[]; } count;
+
+layout(push_constant, std430) uniform PC { int n_embd; } pc;
+
+void main() {
+    const uint h = gl_WorkGroupID.y;                  // one workgroup per hit slot
+    if (h >= uint(count.v[0])) return;                // the live count, from the device
+    const uint n = uint(pc.n_embd);
+    const uint row = uint(dst.v[h]) * n;              // dst[h] is the routing POSITION, not h
+    for (uint i = gl_LocalInvocationIndex; i < n; i += gl_WorkGroupSize.x) {
+        parts.v[row + i] += hit_out.v[row + i];
+    }
+}

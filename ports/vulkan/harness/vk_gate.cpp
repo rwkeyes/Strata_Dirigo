@@ -5962,6 +5962,306 @@ void case_moe_hit_grouped_s2(Ctx& ctx, const std::string& dir) {
 }
 
 // -----------------------------------------------------------------------------------------------------------
+// `moe_grouped_s2` - the GROUPED S2 expert entry: the resident sibling of `moe_hit_grouped_s2`, and a COMPOSITION.
+//
+// The engine's body (src/kernels/cuda/s2_expert_grouped.cu:1099) is the same four-launch chain as the per-hit one
+// (`gu -> swiglu -> quantize_q8_0 -> down`), but its gu and down halves are the GROUPED kernels
+// (`gu_grouped_kernel`, `down_grouped_kernel`), NOT the per-hit ones `s2expert_gu` / `s2expert_down`: the input is a
+// LIST OF GROUPS, each carrying its own blob and its own entry range, and EVERY ENTRY reads ITS OWN token's
+// activation row (`ent_tok[e]`) and writes entry-major (`out[ent_dst[e]]`).  That is a per-ENTRY activation and a
+// per-GROUP blob, neither of which the per-hit kernels can express (they take one activation and a `slot_index`
+// into a single base), so this increment adds the two grouped shaders `s2expert_gu_grouped` /
+// `s2expert_down_grouped` and REUSES `s2expert_swiglu` and `quantize_q8_0` unchanged - the same gate-major,
+// capacity-strided layout the per-hit chain uses.  The port map names all four.
+//
+// WHAT THE CASE GATES IS THE WIRING, not the dots (each dot is gated by its own case): the group/entry walk
+// (`grp_start[g]..grp_start[g+1]`, including an EMPTY group), the per-group byte offset, the per-entry activation
+// row, and the `cap_entries`-based gate-major split (the up half starts at the CAPACITY, not the live entry count,
+// because the SwiGLU that follows pairs over `cap_entries*n_ff`).
+//
+// The oracle is INDEPENDENT of the device's quantiser and down step: (a) the UP rows are compared against the
+// group's blob at the ENTRY's token - which pins grp_off, the per-entry activation and the capacity split;
+// (b) the device's intermediate must DECODE to the device's own post-SwiGLU floats (a value check); (c) the down
+// rows are compared against a double reference from the DEVICE's intermediate at the scrambled `ent_dst[e]`.
+struct S2GroupedCase {
+    std::vector<int> grp_start;   // n_groups + 1 entries
+    std::vector<int> ent_tok;     // entries -> activation token (gu)
+    std::vector<int> ent_dst;     // entries -> output row (down)
+    int n_tokens;
+    int cap_entries;              // >= entries: the gate-major split uses the CAPACITY
+};
+
+static void s2grouped_arm(Ctx& ctx, const std::string& dir, int H, int FF, const S2GroupedCase& c, int grid_y,
+                          const char* what) {
+    const S2ExpertGeom g = s2expert_geom(H, FF);
+    const int n_groups = (int) c.grp_start.size() - 1;
+    const int n_entries = c.grp_start.back();
+    const int nch_gu = H / 32, nch_d = FF / 32;
+
+    // Group blobs.  The gate/up scales are overridden to a MODEST value: `s2expert_blob`'s *1000 makes the GATE rows
+    // ~1e5, and `silu(gate)*up` at that magnitude overflows fp16 - the intermediate's `d16` becomes inf and every
+    // down row is NaN (the silent failure the per-hit increment recorded).  The down region is left as it is.
+    std::vector<uint8_t> blob = s2expert_blob((size_t) n_groups, g);
+    for (int e = 0; e < n_groups; ++e) {
+        uint8_t* base = blob.data() + (size_t) e * g.blob_bytes;
+        for (size_t i = 0; i < (size_t) (2 * FF); ++i) {
+            const float dw = 0.008f * (float) (1 + (((int) i + e) % 3));
+            for (size_t j = 0; j < g.sc_gu; ++j)
+                s2_put16(base + g.o_gu_scales + i * g.sc_gu * 2 + j * 2, strata::kernels::f16_from_f32(dw));
+        }
+    }
+    const std::vector<uint8_t> act = s2expert_q8_0_rows((size_t) c.n_tokens, nch_gu);
+
+    std::vector<int> group_of((size_t) n_entries, 0);
+    for (int gg = 0; gg < n_groups; ++gg)
+        for (int e = c.grp_start[(size_t) gg]; e < c.grp_start[(size_t) gg + 1]; ++e) group_of[(size_t) e] = gg;
+
+    const size_t gu_floats = (size_t) c.cap_entries * (size_t) (2 * FF);
+    const size_t hq_bytes = (size_t) c.cap_entries * (size_t) nch_d * 34u;
+    const size_t n_dst = 1 + (size_t) *std::max_element(c.ent_dst.begin(), c.ent_dst.begin() + n_entries);
+    const size_t n_out = n_dst * (size_t) H;
+
+    std::vector<uint32_t> grp_off((size_t) n_groups);
+    for (int gg = 0; gg < n_groups; ++gg) grp_off[(size_t) gg] = (uint32_t) gg * (uint32_t) g.blob_bytes;
+
+    Buf b_blob = ctx.alloc(blob.size());
+    Buf b_act = ctx.alloc(act.size());
+    Buf b_xs = ctx.alloc(4u);
+    Buf b_go = ctx.alloc(grp_off.size() * 4u);
+    Buf b_gs = ctx.alloc(c.grp_start.size() * 4u);
+    Buf b_ng = ctx.alloc(4u);
+    Buf b_et = ctx.alloc(c.ent_tok.size() * 4u);
+    Buf b_ed = ctx.alloc(c.ent_dst.size() * 4u);
+    Buf b_gu = ctx.alloc(gu_floats * 4u + 64u);
+    Buf b_hq = ctx.alloc(hq_bytes + 64u);
+    Buf b_out = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_blob, blob.data(), blob.size());
+    ctx.write(b_act, act.data(), act.size());
+    ctx.write(b_go, grp_off.data(), grp_off.size() * 4u);
+    ctx.write(b_gs, c.grp_start.data(), c.grp_start.size() * 4u);
+    const int ngv = n_groups;
+    ctx.write(b_ng, &ngv, 4u);
+    ctx.write(b_et, c.ent_tok.data(), c.ent_tok.size() * 4u);
+    ctx.write(b_ed, c.ent_dst.data(), c.ent_dst.size() * 4u);
+    std::vector<uint8_t> sinkg(gu_floats * 4u + 64u, 0xC3), sinkh(hq_bytes + 64u, 0xC3),
+        sinko(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_gu, sinkg.data(), sinkg.size());
+    ctx.write(b_hq, sinkh.data(), sinkh.size());
+    ctx.write(b_out, sinko.data(), sinko.size());
+
+    // 1. grouped gate+up, 2. SwiGLU, 3. the intermediate's own quantiser, 4. grouped down - the four launches.
+    {
+        struct { int n_embd; int n_ff; int cap_entries; int use_xscales; } pc{H, FF, c.cap_entries, 0};
+        VkPipeline p = ctx.pipeline(dir + "/s2expert_gu_grouped.spv", 8, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_blob, &b_act, &b_xs, &b_go, &b_gs, &b_ng, &b_et, &b_gu}, &pc, sizeof(pc),
+                     (uint32_t) (2 * FF), (uint32_t) grid_y);
+    }
+    {
+        struct { int n_pairs; } pc{c.cap_entries * FF};
+        VkPipeline p = ctx.pipeline(dir + "/s2expert_swiglu.spv", 1, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_gu}, &pc, sizeof(pc), groups_for((uint64_t) (c.cap_entries * FF)));
+    }
+    {
+        struct { int n_blocks; } pc{c.cap_entries * nch_d};
+        VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_gu, &b_hq}, &pc, sizeof(pc), groups_for((uint64_t) (c.cap_entries * nch_d)));
+    }
+    {
+        struct { int n_embd; int n_ff; int use_xscales; } pc{H, FF, 0};
+        VkPipeline p = ctx.pipeline(dir + "/s2expert_down_grouped.spv", 8, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_blob, &b_hq, &b_xs, &b_go, &b_gs, &b_ng, &b_ed, &b_out}, &pc, sizeof(pc),
+                     (uint32_t) H, (uint32_t) grid_y);
+    }
+
+    std::vector<uint8_t> igu(sinkg.size(), 0), ihq(sinkh.size(), 0), iout(sinko.size(), 0);
+    ctx.read(b_gu, igu.data(), igu.size());
+    ctx.read(b_hq, ihq.data(), ihq.size());
+    ctx.read(b_out, iout.data(), iout.size());
+    const float* gu = reinterpret_cast<const float*>(igu.data());
+    const float* out = reinterpret_cast<const float*>(iout.data());
+
+    int bad = 0, checked = 0;
+    double worst = 0, mass = 0;
+    // (a) the UP rows against the group's blob at the ENTRY's token - pins grp_off, the per-entry activation and the
+    //     capacity split (the up base is cap_entries*FF, not the live entry count).
+    for (int e = 0; e < n_entries; ++e) {
+        const uint8_t* slot = blob.data() + (size_t) group_of[(size_t) e] * g.blob_bytes;
+        const uint8_t* arow = act.data() + (size_t) c.ent_tok[(size_t) e] * (size_t) nch_gu * 34u;
+        for (int rr = 0; rr < FF; rr += 7) {
+            double abs_sum = 0.0;
+            const double want = s2_row_dot_host(slot, (size_t) (2 * rr + 1) * g.row_gu,
+                                                g.o_gu_scales + (size_t) (2 * rr + 1) * g.sc_gu * 2, arow, nullptr,
+                                                false, nch_gu, abs_sum);
+            const double got = (double) gu[(size_t) c.cap_entries * FF + (size_t) e * FF + (size_t) rr];
+            const double ratio = std::fabs(got - want) / gemv_bound(want, abs_sum, 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+            ++checked;
+        }
+    }
+    // (b) the DEVICE's intermediate must DECODE to the DEVICE's own post-SwiGLU floats at the same entry.
+    for (int e = 0; e < n_entries; ++e) {
+        for (int cc = 0; cc < nch_d; ++cc) {
+            const uint8_t* blk = ihq.data() + ((size_t) e * nch_d + cc) * 34u;
+            const double d16 = (double) strata::kernels::f32_from_f16(s2_le16(blk));
+            double amax = 0.0;
+            for (int i = 0; i < 32; ++i)
+                amax = std::max(amax, std::fabs((double) gu[(size_t) e * FF + (size_t) cc * 32 + (size_t) i]));
+            const double d32 = amax / 127.0;
+            const double bound = 0.5 * d32 + 128.0 * std::fabs(d16 - d32) + 1e-6 * amax + 1e-30;
+            for (int i = 0; i < 32; ++i) {
+                const int raw = (int) blk[2 + i];
+                const double q = (double) (raw > 127 ? raw - 256 : raw) * d16;
+                const double x = (double) gu[(size_t) e * FF + (size_t) cc * 32 + (size_t) i];
+                if (std::fabs(q - x) > bound) ++bad;
+                ++checked;
+            }
+        }
+    }
+    // (c) the down rows from the DEVICE's intermediate, written at the scrambled `ent_dst[e]`.
+    for (int e = 0; e < n_entries; ++e) {
+        const uint8_t* slot = blob.data() + (size_t) group_of[(size_t) e] * g.blob_bytes;
+        const uint8_t* hrow = ihq.data() + (size_t) e * (size_t) nch_d * 34u;
+        for (int r = 0; r < H; r += 13) {
+            double abs_sum = 0.0;
+            const double want = s2_row_dot_host(slot, g.o_d_codes + (size_t) r * g.row_d,
+                                                g.o_d_scales + (size_t) r * g.sc_d * 2, hrow, nullptr, false, nch_d,
+                                                abs_sum);
+            const double got = (double) out[(size_t) c.ent_dst[(size_t) e] * H + (size_t) r];
+            const double ratio = std::fabs(got - want) / gemv_bound(want, abs_sum, 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+            mass += std::fabs(want);
+            ++checked;
+        }
+    }
+    for (size_t i = n_out * 4u; i < iout.size(); ++i) {
+        if (iout[i] != 0xC3) ++bad;
+        ++checked;
+    }
+    char label[224];
+    std::snprintf(label, sizeof label,
+                  "moe_grouped_s2 (gu->swiglu->q8_0->down, %d groups, %d entries, cap %d, grid.y=%d)", n_groups,
+                  n_entries, c.cap_entries, grid_y);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected down value is ~zero: this chain proves nothing (%s)\n", what);
+    std::printf("      gu[up base] = %.6g | checked %d | worst err/tol %.3g | mass %.6g\n",
+                (double) gu[(size_t) c.cap_entries * FF], checked, worst, mass);
+    verdict(label, bad == 0 && live, bad, checked, worst, "chain rows/bytes wrong (worst err/tol)");
+    ctx.free(b_blob); ctx.free(b_act); ctx.free(b_xs); ctx.free(b_go); ctx.free(b_gs); ctx.free(b_ng); ctx.free(b_et);
+    ctx.free(b_ed); ctx.free(b_gu); ctx.free(b_hq); ctx.free(b_out);
+}
+
+void case_moe_grouped_s2(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s2expert_gu_grouped.spv") || !have(dir, "s2expert_down_grouped.spv") ||
+        !have(dir, "s2expert_swiglu.spv") || !have(dir, "quantize_q8_0.spv"))
+        return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("moe_grouped_s2", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    const int H = 2560, FF = 640;
+    // four groups (group 2 is EMPTY), six entries, per-entry tokens and destinations, capacity (8) above the live
+    // entry count (6) so the gate-major split is exercised at the capacity rather than at the count.
+    S2GroupedCase c;
+    c.grp_start = {0, 2, 3, 3, 6};
+    c.ent_tok = {1, 3, 0, 2, 1, 0};
+    c.ent_dst = {3, 0, 4, 1, 5, 2};
+    c.n_tokens = 4;
+    c.cap_entries = 8;
+    s2grouped_arm(ctx, dir, H, FF, c, 4, "grid.y equals the group count");
+    s2grouped_arm(ctx, dir, H, FF, c, 1, "grid.y BELOW the group count: the stride is under test");
+    s2grouped_arm(ctx, dir, H, FF, c, 7, "grid.y above the group count");
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// `moe_hit_add` - the hit accumulator: `parts[dst[h]] += hit_out[dst[h]]` for every LIVE hit.
+//
+// `add_hits_kernel` (src/kernels/cuda/s2_expert_grouped.cu:666), the last step of the device hit path: the CPU
+// zeroed the hit rows of `parts`, the device wrote each hit's row of `hit_out` at its ROUTED slot, and this folds
+// them together so `moe_combine` needs no special case for which half produced a row.
+//
+// TWO RULES, both paraphrase traps: the row is `dst[h]` (the ROUTING POSITION, not `h` - the same two-roles
+// confusion the KV gather's `ids[id]` and `moe_hit_select`'s `dst[at]` carry), and the operator is `+=`, not `=`.
+// Every named row is given a NON-ZERO prior value here, so `=` is caught on the first row; the rows the hit list
+// does not name, and the rows past the device count, carry a sentinel that must survive untouched - which is what
+// catches a kernel that used the CAPACITY instead of the count.
+static void moe_hit_add_arm(Ctx& ctx, const std::string& dir, int n_embd, int cap, int count,
+                            const std::vector<int>& dst, const char* what) {
+    const size_t row = (size_t) n_embd;
+    const float SENT = -12345.5f;
+    std::vector<float> parts((size_t) cap * row, SENT), hit((size_t) cap * row, SENT);
+    std::vector<int> dstv((size_t) cap, 0);
+    for (int h = 0; h < count; ++h) dstv[(size_t) h] = dst[(size_t) h];
+    std::vector<char> named((size_t) cap, 0);
+    for (int h = 0; h < count; ++h) {
+        const int r = dst[(size_t) h];
+        if (named[(size_t) r]) continue;                 // distinct destinations by construction
+        named[(size_t) r] = 1;
+        for (int i = 0; i < n_embd; ++i) {
+            parts[(size_t) r * row + (size_t) i] = 0.25f + 0.001f * (float) i + 0.5f * (float) r;
+            hit[(size_t) r * row + (size_t) i] = 1.5f + 0.0001f * (float) i - 0.25f * (float) r;
+        }
+    }
+    std::vector<float> want = parts;
+    for (int h = 0; h < count; ++h) {
+        const int r = dst[(size_t) h];
+        for (int i = 0; i < n_embd; ++i) want[(size_t) r * row + (size_t) i] += hit[(size_t) r * row + (size_t) i];
+    }
+
+    const size_t bytes = (size_t) cap * row * 4u;
+    Buf b_parts = ctx.alloc(bytes + 64u);
+    Buf b_hit = ctx.alloc(bytes);
+    Buf b_dst = ctx.alloc(dstv.size() * 4u);
+    Buf b_cnt = ctx.alloc(4u);
+    std::vector<uint8_t> pbuf(bytes + 64u, 0xC3), hbuf(bytes, 0);
+    std::memcpy(pbuf.data(), parts.data(), bytes);
+    std::memcpy(hbuf.data(), hit.data(), bytes);
+    ctx.write(b_parts, pbuf.data(), pbuf.size());
+    ctx.write(b_hit, hbuf.data(), hbuf.size());
+    ctx.write(b_dst, dstv.data(), dstv.size() * 4u);
+    ctx.write(b_cnt, &count, 4u);
+    struct { int n_embd; } pc{n_embd};
+    VkPipeline p = ctx.pipeline(dir + "/moe_hit_add.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_parts, &b_hit, &b_dst, &b_cnt}, &pc, sizeof(pc), 1u, (uint32_t) cap);
+
+    std::vector<uint8_t> img(pbuf.size(), 0);
+    ctx.read(b_parts, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, checked = (int) (cap * (int) row);
+    double worst = 0, moved = 0;
+    for (int i = 0; i < cap * n_embd; ++i) {
+        if (std::memcmp(&got[i], &want[(size_t) i], 4) != 0) ++bad;
+        if (want[(size_t) i] != SENT) moved += 1.0;
+    }
+    for (size_t i = bytes; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+        ++checked;
+    }
+    char label[192];
+    std::snprintf(label, sizeof label, "moe_hit_add (cap=%d, count=%d, n_embd=%d, %s)", cap, count, n_embd, what);
+    // The liveness guard is "the kernel MOVED something", and it does not apply to the count-0 arm: that arm's
+    // contract is the opposite (nothing may be touched), so it is LIVE when moved == 0, not when moved > 0.
+    const bool live = (count == 0) ? (moved == 0.0) : (moved > 0.0);
+    if (!live)
+        std::printf("      liveness: %s (%d named rows, %.0f elements expected to move)\n",
+                    count == 0 ? "a row moved under count 0" : "nothing moved", (int) (moved / (double) n_embd), moved);
+    std::printf("      parts[0] = %.6g | named rows %d | moved %.0f\n", (double) got[0],
+                (int) (moved / (double) n_embd), moved);
+    verdict(label, bad == 0 && live, bad, checked, worst, "a row wrong or a sentinel overwritten");
+    ctx.free(b_parts); ctx.free(b_hit); ctx.free(b_dst); ctx.free(b_cnt);
+}
+
+void case_moe_hit_add(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "moe_hit_add.spv")) return;
+    // the decode shape, count == cap, a width that is not a multiple of the workgroup size, and a zero count
+    moe_hit_add_arm(ctx, dir, 2560, 4, 3, {2, 0, 3}, "count < cap: rows past the count and rows the list skips");
+    moe_hit_add_arm(ctx, dir, 2560, 4, 4, {1, 3, 0, 2}, "count == cap: every row written");
+    moe_hit_add_arm(ctx, dir, 37, 3, 2, {2, 0}, "n_embd 37: the workgroup's stride loop");
+    moe_hit_add_arm(ctx, dir, 2560, 4, 0, {0, 1, 2, 3}, "count 0: nothing may be touched");
+}
+
+// -----------------------------------------------------------------------------------------------------------
 // IQ3_XXS: the resident model's SECOND most common expert gate/up format (17 of 48 layers, behind IQ2_S's 20).
 //
 // The oracle transcribes `vec_dot_iq3_xxs_q8_1`.  It carries its OWN copy of the two per-byte helpers (the
@@ -9864,6 +10164,8 @@ int main(int argc, char** argv) {
     case_native_q5_k_f32(ctx, dir);        // M-A: the native head's Q5_K matvec (the packed aux scale/min dot)
     case_moe_hit_select(ctx, dir);         // M-A: the MoE hit selection (resident experts + the routing position)
     case_moe_hit_grouped_s2(ctx, dir);     // M-A: the composed per-hit S2 expert entry (gu->swiglu->q8_0->down)
+    case_moe_grouped_s2(ctx, dir);         // M-A: the composed GROUPED S2 expert entry (groups + per-entry tokens)
+    case_moe_hit_add(ctx, dir);            // M-A: the hit accumulator (parts[dst[h]] += hit_out[dst[h]])
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

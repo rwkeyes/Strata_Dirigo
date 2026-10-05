@@ -344,6 +344,82 @@ that pre-existing skip.  Positive controls: `moe_hit_select` adds **4** verdicts
 `moe_hit_add` (the hit accumulator, `:1138`) - the batch after this one, and then M-A is closed.  The port map
 reads **77 decode-path symbols - 26 kernel, 49 host, 2 todo** and passes.
 
+## M-A 9/10 + 10/10 (ONE commit - the two share `vk_gate.cpp`): `moe_grouped_s2` + `moe_hit_add` - **M-A CLOSED**
+
+**These two land as one commit because their cases and their registrations are the SAME file region of
+`harness/vk_gate.cpp`** - the precedent `4/10 + 5/10` and `7/10 + 8/10` used, and it is stated here for that reason.
+
+### 9/10 `moe_grouped_s2` - the GROUPED S2 expert entry: a COMPOSITION, but two of its four launches are NEW shaders
+
+`moe_grouped_s2` (`src/kernels/cuda/s2_expert_grouped.cu:1099`) is the resident sibling of `moe_hit_grouped_s2`:
+the same four-launch chain (`gu -> swiglu -> quantize_q8_0 -> down`).  **Whether it "composes" was CHECKED before
+writing anything, as the sibling's own increment instructs.**  The middle two launches ARE the per-hit chain's
+kernels (`s2expert_swiglu`, `quantize_q8_0`), but the gu and down halves are the GROUPED kernels
+(`gu_grouped_kernel` / `down_grouped_kernel`, `:783` / `:845`), and those are NOT what `s2expert_gu` /
+`s2expert_down` implement: the per-hit kernels take ONE activation row and a `slot_index[h]` into a single base
+buffer, while the grouped ones take a LIST OF GROUPS - each with its own blob (`grp_ptr[g]`) - and EVERY ENTRY reads
+ITS OWN token's activation row (`ent_tok[e]`) and writes entry-major (`ent_dst[e]`).  Neither is expressible with
+the per-hit kernels, so this increment adds **`s2expert_gu_grouped.comp`** and **`s2expert_down_grouped.comp`**
+(the S2 dot itself is the unchanged `common/s2_row_dot.glsl`) and reuses the other two; the port-map row names all
+four.
+
+The grouped `grp_ptr` is an array of DEVICE POINTERS and Vulkan has none, so the port takes the SAME interface
+decision `native_gu_iq2s.comp` already made: ONE weights buffer plus a per-group BYTE OFFSET table (`grp_off[g]`),
+so `grp_ptr[g] + off` becomes `grp_off[g] + off`.  The group count lives on the device, so the grid strides in y
+(`for (g = WorkGroupID.y; g < ng; g += gl_NumWorkGroups.y)`) exactly as the source does - and the case arms the
+stride three ways.
+
+**Two rules the case pins that the per-hit sibling has no counterpart for**: the per-ENTRY activation token, and the
+CAPACITY-strided gate-major split (the up half starts at `cap_entries*n_ff`, NOT the live entry count, because the
+SwiGLU that follows pairs over `cap_entries*n_ff`).  The fixture is four groups (one EMPTY), six entries, capacity 8
+above the live count 6, per-entry tokens, scrambled destinations, and three grid.y arms (== the count, BELOW it -
+the stride - and above it).
+
+**The oracle is independent of the device's quantiser and down step**: (a) the UP rows (the half the SwiGLU leaves
+alone) against the group's blob at the ENTRY's token - pins grp_off, the per-entry activation and the capacity
+split; (b) the device's intermediate must DECODE to the device's own post-SwiGLU floats; (c) the down rows against
+a double reference from the DEVICE's intermediate at the scrambled `ent_dst[e]`.  The gate/up scales are overridden
+to a MODEST value here: the shared `s2expert_blob` makes gate rows ~1e5, which overflows fp16 through `silu*up` -
+the NaN trap the per-hit increment recorded.
+
+**Falsified.**  `gates/inject-verify.sh moe-grouped-s2-entry-token` makes every entry read token 0's activation
+(`tok = ent_tok.v[e]` -> `tok = 0u`): `FAIL  moe_grouped_s2 (...)  5270/5638  worst 3.78e+05` (the faithful form
+reads 5638/5638, worst 0.0525).
+
+### 10/10 `moe_hit_add` - the hit accumulator
+
+`add_hits_kernel` (`src/kernels/cuda/s2_expert_grouped.cu:666`), the last step of the device hit path:
+`parts[dst[h]*n_embd + i] += hit_out[dst[h]*n_embd + i]` for every LIVE hit.  Two rules, both paraphrase traps:
+the row is `dst[h]` (the ROUTING POSITION, not `h` - the same two-roles confusion the KV gather's `ids[id]` and
+`moe_hit_select`'s `dst[at]` carry), and the operator is `+=` (parts holds what the CPU left there).  The live count
+is on the DEVICE, so the grid is the CAPACITY and rows past it return unwritten.
+
+Four arms: count < cap (rows past the count and rows the list skips keep a sentinel), count == cap, `n_embd = 37`
+(the workgroup's stride loop), and count 0 (nothing may be touched).  Every named row carries a NON-ZERO prior
+value, so `+=` -> `=` is caught on the first row.
+
+**One defect the arms produced, recorded because it is a class - and it was the ARM, not the kernel.**  The count-0
+arm first read `FAIL ... 10304/10304 worst 0`: "every element bad" beside "worst deviation 0" is self-
+contradictory, and the cause was the shared liveness guard - "the kernel MOVED something" - which the count-0
+contract INVERTS (its claim is that nothing moved).  The guard is now `moved == 0` for count 0 and `moved > 0`
+otherwise.  The arm was NOT loosened: count 0 still requires the whole buffer bit-identical to the sentinel, and it
+is LIVE only when nothing moved.
+
+**Falsified.**  `gates/inject-verify.sh moe-hit-add-accumulate` drops the accumulate (`+=` -> `=`):
+`FAIL  moe_hit_add (cap=4, count=3, ...)  2624/10304  worst 0`.
+
+### M-A IS CLOSED
+
+`python3 ports/vulkan/tools/check_port_map.py` reads **77 decode-path symbols - 28 kernel, 49 host, 0 todo**: the
+decode path's `todo` column is **ZERO**.  (The generator `tools/make_port_map.py` had drifted - it still classified
+the two landed IQ rows as `todo` - and is fixed in this commit, so it regenerates `PORT-MAP.tsv` exactly.)
+
+**Measured, this commit.**  vega: **Intel Arc (BMG G31) 329 passed / 0 failed / 0 skipped** (`run_gate.sh` exit 0),
+intel_icd 329/0/0, llvmpipe **317/0/3**, radeon-iGPU **320/0/2**.  z820b (7900 XTX): **radeon_icd 325/0/1** (the 1
+skip is the pre-existing M8 `prefill split (aligned + remainder)` case - "this device offers no M8 cooperative-matrix
+config"), lvp **317/0/3**, nvidia (K620) **320/0/2**; the box's script exits 1 on that pre-existing skip, as at HEAD.
+Positive controls: `moe_grouped_s2` adds **3** verdicts and `moe_hit_add` **4** (322 -> 329 on the Arc).
+
 
 
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
