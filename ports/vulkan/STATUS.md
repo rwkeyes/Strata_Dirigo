@@ -17,7 +17,11 @@ shader count falls 37 → 19 — but the same scan surfaces **52 GPU symbols thi
 was measured on a 77-symbol map, not on the decode path**; the dated "port map ... 0 todo" lines
 lower down are records of the map as it then stood, not the current count.  Full detail, the rule and
 the falsification (the HEAD checker passes the same file the new one fails) are in `NEXT.md`'s top
-section.
+section.  **M-A is therefore NOT closed**, and the corrected map's 52 `todo` rows are triaged per symbol in
+`plan/DECODE-PATH-TRIAGE.md`: **19 are genuine forward-path holes with no ported fallback** (the GDN / DeltaNet
+mixer for 36 of the 48 layers, the QSA gate and indexer for the 12 QSA layers, and `gr_write`), 4 are
+capability-gated with a ported fallback, 7 are the non-native configuration the shipped `--native` launch does
+not select, and 22 are the P6-verifier / speculative-drafter / tooling path.
 
 ## The engine integration has STARTED: increment I1 (device layer + arena + the first entry point) — DONE AND VERIFIED 2026-10-05
 
@@ -47,8 +51,9 @@ and dispatch move together and cancel) — the dispatch's offset is the one that
 post-commit: default XTX 356/0/1 (the 1 is the pre-existing M8 `prefill split` skip), lvp 348/0/3, nvidia
 351/0/2, exit 1 (the skip).  The first box run read 355/1/1: `budget: independent requery agrees` failed on the
 XTX — the KNOWN intermittent flake (that same run's named `radeon_icd` arm read 356/0/1 clean, and the re-run
-cleared it), so 0 failed is the result.  New case 1024/1024 bitwise on every box arm.  Port map unchanged: 77
-decode-path symbols — 28 kernel, 49 host, 0 todo.**
+cleared it), so 0 failed is the result.  New case 1024/1024 bitwise on every box arm.  Port map **77
+decode-path symbols — 28 kernel, 49 host, 0 todo** - that `0 todo` was read on the qualifier-only map; CORRECTED
+2026-10-05 to **168 — 53 kernel, 63 host, 52 todo**, and **M-A is not closed** (see the top section).**
 
 ## Done and verified in this session
 
@@ -153,7 +158,12 @@ counts a NaN output as a failure, so it did not pass over garbage; the chain now
 **318/0/1**, lvp 310/0/3, nvidia 313/0/2.  **M-A is 8 of the ten**; the two `todo` symbols are `moe_grouped_s2`
 and `moe_hit_add`.  The port map reads **77 symbols - 26 kernel, 49 host, 2 todo**.
 
-**M-A IS CLOSED: the decode path's last two symbols landed together (9/10 + 10/10, one commit, sharing
+**M-A's LAST TWO *VISIBLE* SYMBOLS landed together - but M-A is NOT closed (CORRECTED 2026-10-05, `7c317c4`).**
+The "CLOSED" reading below was taken on the qualifier-only 77-symbol map, which could not see the bare-name call
+sites; the corrected map reads **168 symbols - 53 kernel, 63 host, 52 todo**, of which **19 are class-A
+forward-path holes** (`plan/DECODE-PATH-TRIAGE.md`).  The two symbols that landed here did land, and the increment
+is real - it is the "*last two visible*" that is now the historical claim.  What follows is that record.
+**the decode path's last two symbols landed together (9/10 + 10/10, one commit, sharing
 `harness/vk_gate.cpp` - the `4/10 + 5/10` precedent).**  **`moe_grouped_s2`** turns out NOT to be a reuse of the
 per-hit chain: it is the same four-launch composition, but its gu and down halves are the GROUPED kernels, and the
 per-hit `s2expert_gu`/`s2expert_down` cannot express a per-GROUP blob or a per-ENTRY activation row - so the
@@ -168,8 +178,9 @@ for every LIVE hit - `dst[h]` is the ROUTING POSITION and the operator is `+=`; 
 `n_embd=37`, count 0), falsified by `moe-hit-add-accumulate` (`+=` -> `=`) -> `FAIL ... 2624/10304 worst 0`.  The
 count-0 arm itself was the one defect found (a liveness guard that assumed something MOVED, which that contract
 inverts); the guard now reads `moved == 0` for count 0 and the arm was not loosened.  The port map now reads
-**77 symbols - 28 kernel, 49 host, 0 todo**, and the drifted generator `tools/make_port_map.py` was fixed to
-regenerate it exactly.  **Measured: vega Arc 329/0/0** (`run_gate.sh` exit 0), intel_icd 329/0/0, llvmpipe 317/0/3,
+**77 symbols - 28 kernel, 49 host, 0 todo** - that `0 todo` was the qualifier-only map; CORRECTED 2026-10-05 to
+**168 - 53 kernel, 63 host, 52 todo**, and the drifted generator `tools/make_port_map.py` was fixed to regenerate
+it exactly (see the top section and `plan/DECODE-PATH-TRIAGE.md`).  **M-A is not closed.**  **Measured: vega Arc 329/0/0** (`run_gate.sh` exit 0), intel_icd 329/0/0, llvmpipe 317/0/3,
 radeon-iGPU 320/0/2; box `radeon_icd` (7900 XTX) **325/0/1** (the pre-existing M8 `prefill split` skip), lvp
 317/0/3, nvidia 320/0/2.  The two new symbols add 7 verdicts (322 -> 329 on the Arc).
 

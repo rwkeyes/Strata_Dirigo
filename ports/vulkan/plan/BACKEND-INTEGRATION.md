@@ -1,8 +1,10 @@
 # Backend integration — the engine side of the Vulkan port (HANDOFF §4.2)
 
-Written 2026-10-05 on `vega`, HEAD `f878e34`, branch `vulkan-arc-port`, tree clean.  Milestone **M-A is closed**:
-`PORT-MAP.tsv`'s `todo` column is zero, so every GPU entry point the decode path reaches is ported and gated.
-This document is the *engine-side* plan — milestone M-B's precondition — and it is deliberately **not** a build.
+Written 2026-10-05 on `vega`, HEAD `f878e34`, branch `vulkan-arc-port`, tree clean.  **M-A is NOT closed** (corrected
+2026-10-05, HEAD `7c317c4`): the port map's `todo` column reads **52**, not 0 — the earlier "closed" was measured on
+a map that could not see the symbols `src/core/` calls BARE.  See `plan/DECODE-PATH-TRIAGE.md`: 19 of the 52 are
+genuine forward-path holes with no ported fallback.  This document is the *engine-side* plan — milestone M-B's
+precondition — and it is deliberately **not** a build.
 Increment 0 (the skeleton below) is the only thing that has landed with it: the macro, the tree, and one entry
 point wired at the build-system level.  The estimate in §6 is what the next step is approved on.
 
@@ -10,38 +12,51 @@ point wired at the build-system level.  The estimate in §6 is what the next ste
 
 ## 1. Where the entry-point list comes from (not a guess)
 
-`ports/vulkan/PORT-MAP.tsv` classifies **every** `kernels::` symbol `src/core/` calls, and
+`ports/vulkan/PORT-MAP.tsv` classifies **every** kernels-namespace symbol `src/core/` calls — written
+`kernels::X` **or** bare `X` (a `using namespace strata::kernels;` in scope) — and
 `ports/vulkan/tools/check_port_map.py` (run by `gates/run_gate.sh`) fails if the map drifts from the engine or
-from the built shaders.  Parsed at HEAD:
+from the built shaders.  Parsed at HEAD `7c317c4` (the corrected rule, `tools/port_map_lib.py`):
 
 | kind | rows | what it means here |
 |---|---|---|
-| `kernel` | **28** | GPU work with a ported shader — the backend must dispatch it |
-| `host` | **49** | the engine's own host side — a backend swap mostly does not touch it |
-| `todo` | **0** | M-A closed; nothing left unported on the decode path |
-| **total** | **77** | every decode-path symbol |
+| `kernel` | **53** | GPU work with a ported shader — the backend must dispatch it |
+| `host` | **63** | the engine's own host side — a backend swap mostly does not touch it |
+| `todo` | **52** | GPU work not ported — **M-A is not closed**; triaged in `plan/DECODE-PATH-TRIAGE.md` |
+| **total** | **168** | every decode-path symbol |
 
-The 28 `kernel` rows are the **backend surface**: each is an engine entry point (a thin wrapper in
+(The previous revision of this table read `28 / 49 / 0 / 77` — the qualifier-only map.  The bare-name half of the
+decode path was invisible to it.)
+
+The 53 `kernel` rows are the **backend surface**: each is an engine entry point (a thin wrapper in
 `include/strata/kernels/*.hpp`) whose body launches a shader.  Several rows are *composite* — one entry point
-that launches several shaders — so the 28 rows name **49 shader dispatches** (e.g. `native_mmvq` → six
+that launches several shaders — so the 53 rows name more shader dispatches (e.g. `native_mmvq` → six
 `*_mmvq` shaders, `native_expert_grouped` → five, `ple_block` → four).
 
-The 49 `host` rows split by where their body lives:
+The 63 `host` rows split by where their body lives:
 
-* **37 are pure host** — sizes (`*_scratch_bytes`, `iq_row_bytes`, `kv_*_bytes_per_*`, `qsa_step_bytes`),
+* **45 are pure host** — sizes (`*_scratch_bytes`, `iq_row_bytes`, `kv_*_bytes_per_*`, `qsa_step_bytes`),
   capability checks (`native_mmvq_supported`, `fused_gr_supported`, `native_gdn_enabled`,
-  `native_qsa_indexer_enabled`, `embed_type_supported`), shapes (`qsa_real_shapes`, `qsa_selection_width`,
-  `native_expert_layout`, `rope_scaling`), host bookkeeping (`ngram_rows`, `kv_stream_*`, `kv_ring_restore`,
-  `penalty_rows`) and pure conversions (`f16_from_f32`, `f32_from_f16`).  A backend swap does not touch these.
-* **12 live in a CUDA translation unit and cross the device runtime**, so they need a Vulkan home (verified by
-  grepping their definitions — the file each one is defined in is given):
+  `native_qsa_indexer_enabled`, `native_rope_enabled`, `native_router_enabled`, `embed_type_supported`),
+  shapes (`qsa_real_shapes`, `qsa_selection_width`, `native_expert_layout`, `rope_scaling`), host bookkeeping
+  (`ngram_rows`, `kv_stream_*`, `kv_ring_restore`, `penalty_rows`) and pure conversions (`f16_from_f32`,
+  `f32_from_f16`).  A backend swap does not touch these.  **The `*_enabled()` capability checks are load-bearing
+  for class B**: the backend owns them, and four of the 52 `todo` symbols are dodged by returning false from
+  one (`DECODE-PATH-TRIAGE.md`).
+* **18 live in a CUDA translation unit and cross the device runtime**, so they need a Vulkan home (verified by
+  grepping their definitions — the file each one is defined in is given).  Twelve were in the old list; the
+  corrected bare-name scan adds six:
 
   | symbol | defined in | why it crosses the runtime |
   |---|---|---|
   | `copy_from_mapped` | `src/kernels/cuda/elementwise.cu` | mapped-pinned copy in the layer chain |
   | `copy_i32_from_mapped` | `src/kernels/cuda/elementwise.cu` | ditto (QSA step/positions) |
+  | `copy_rows_from_mapped` | `src/kernels/cuda/elementwise.cu` | ditto (row copy) |
+  | `copy_i32_from_mapped_unless` | `src/kernels/cuda/verify_kernels.cu` | ditto (conditional) |
   | `copy_or_zero_from_mapped` | `src/kernels/cuda/verify_kernels.cu` | ditto (verify window) |
+  | `copy_indexed` | `src/kernels/cuda/verify_kernels.cu` | a device-indexed copy |
+  | `coupled_draft_stage` | `src/kernels/cuda/sampler.cu` | the coupled round's mapped staging |
   | `doorbell_publish` | `src/kernels/cuda/elementwise.cu` | host/device handshake, **no Vulkan equivalent** |
+  | `doorbell_publish_res` / `doorbell_publish_value` | `src/kernels/cuda/elementwise.cu` | ditto |
   | `doorbell_ring` | `src/kernels/cuda/elementwise.cu` | ditto |
   | `doorbell_wait` | `src/kernels/cuda/elementwise.cu` | a kernel that SPINS on host memory |
   | `build_rope_table` | `src/kernels/cuda/rope.cu` | builds + uploads the RoPE table |
@@ -50,13 +65,19 @@ The 49 `host` rows split by where their body lives:
   | `kv_stream_reset` | `src/kernels/cuda/kv_stream.cu` | device-side reset |
   | `gr_workspace_init` | `src/kernels/cuda/gr.cu` | hands out a carve of the arena (pure carve; moves to host) |
 
-The `doorbell_*` rows are the three the plan refuses to translate: `elementwise.cu`'s doorbell is a kernel that
+The `doorbell_*` rows are the ones the plan refuses to translate: `elementwise.cu`'s doorbell is a kernel that
 spins until the host answers, ordered by `__threadfence_system()`, and **Vulkan has no equivalent** (PORT-PLAN
 §2.3).  On the display card a hung compute kernel is a KMD timeout at best and a Battlemage wedge at worst, so
 the Vulkan path must replace it with fences/timeline semaphores, never a waiting kernel.
 
-**So the backend must implement 28 kernel entry points + 12 device-crossing host rows = 40 entry points,
-dispatching 49 shaders.**  That is the number this plan prices.
+**So the backend must implement 53 kernel entry points + 18 device-crossing host rows = 71 entry points — and
+the milestone owes a further 19 class-A entry points (the `todo` GPU work with no ported fallback), for 90
+entry points.**  The old revision priced this at `28 kernel + 12 host = 40`, on the qualifier-only map: it was
+low by more than half, and it did not contain the 19 class-A holes at all.  The class-B four are satisfied by
+forcing their `*_enabled()` false and dispatching the already-ported fallback; the class-C seven are not needed
+for the shipped `--native` launch; the class-D twenty-two are the P6/speculative/tooling path (`--spec 0`).
+See `plan/DECODE-PATH-TRIAGE.md` for the per-symbol basis.  **I2–I5 are not re-scoped here** — that is their own
+checkpoint; only the count and the basis change.
 
 Two entry points already exist and are easiest to over-count: `fwht256_inplace_cuda` is the wrapper for the
 `fwht256` shader (its body calls `fwht256_cuda`), and `sample_tokens` chooses between the two samplers

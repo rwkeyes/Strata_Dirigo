@@ -40,7 +40,19 @@ the verify/P6 device helpers (`add_streams_broadcast`, `broadcast_streams`, `fet
 `wait_flag_ge(_or)`, `window_ids`).  The 14 new `host` rows are the bare-name host side (the
 `*_enabled` capability checks, the mapped copies, `doorbell_publish_res`/`_value`,
 `coupled_draft_stage`).  **This is the honest hole list M-A claimed to have emptied**, and it
-supersedes the "the map's `todo` column is 0" line in `HANDOFF.md` §6.3 and `STATUS.md`.
+supersedes the "the map's `todo` column is 0" line in `HANDOFF.md` §6.3 and `STATUS.md` — and every dated
+"77 symbols … 0 todo" line below in this file, which are records of the map as it then stood.
+
+**M-A IS NOT CLOSED, and the 52 `todo` rows are now triaged per symbol** in `plan/DECODE-PATH-TRIAGE.md`:
+**19 are class A** — genuine forward-path holes with no ported fallback on either branch (the **GDN / DeltaNet
+mixer**, which runs on **36 of the 48 layers**, the **QSA gate and indexer** on the other 12, and `gr_write`) —
+and those 19 are the M-A remainder; **4 are class B** — capability-gated with a ported fallback the backend
+satisfies by forcing `*_enabled()` false (`native_rope_apply`, `native_router_top10`,
+`native_qsa_rms_norm_weighted`, `native_moe_combine`); **7 are class C** — the non-native configuration the
+shipped `setup.py` launch (`--pack … --native …`, `generate.cpp:1805-1807`) does not select; **22 are class D** —
+the P6 verifier, the speculative MTP drafter, and tooling.  **The headline is the GDN family: the port's plan
+never enumerated it** (`PORT-PLAN.md` wave 1 lists only `gdn_gate`), the qualifier-only scan could not see the
+bare `gdn_*` calls in `layer.cpp`'s `gdn_layer`, and no GDN kernel but `gdn_gate` is ported.
 
 **FALSIFIED - and the OLD checker is shown blind on the SAME file.**  Drop the `coupled_draft_sample`
 row (the blind-spot symbol):
@@ -670,7 +682,7 @@ that pre-existing skip.  Positive controls: `moe_hit_select` adds **4** verdicts
 `moe_hit_add` (the hit accumulator, `:1138`) - the batch after this one, and then M-A is closed.  The port map
 reads **77 decode-path symbols - 26 kernel, 49 host, 2 todo** and passes.
 
-## M-A 9/10 + 10/10 (ONE commit - the two share `vk_gate.cpp`): `moe_grouped_s2` + `moe_hit_add` - **M-A CLOSED**
+## M-A 9/10 + 10/10 (ONE commit - the two share `vk_gate.cpp`): `moe_grouped_s2` + `moe_hit_add` - the last two symbols the OLD map could see (**CORRECTED 2026-10-05: M-A is NOT closed** - see the triage in `plan/DECODE-PATH-TRIAGE.md`)
 
 **These two land as one commit because their cases and their registrations are the SAME file region of
 `harness/vk_gate.cpp`** - the precedent `4/10 + 5/10` and `7/10 + 8/10` used, and it is stated here for that reason.
@@ -734,10 +746,15 @@ is LIVE only when nothing moved.
 **Falsified.**  `gates/inject-verify.sh moe-hit-add-accumulate` drops the accumulate (`+=` -> `=`):
 `FAIL  moe_hit_add (cap=4, count=3, ...)  2624/10304  worst 0`.
 
-### M-A IS CLOSED
+### M-A IS **NOT** CLOSED (corrected 2026-10-05)
 
-`python3 ports/vulkan/tools/check_port_map.py` reads **77 decode-path symbols - 28 kernel, 49 host, 0 todo**: the
-decode path's `todo` column is **ZERO**.  (The generator `tools/make_port_map.py` had drifted - it still classified
+`python3 ports/vulkan/tools/check_port_map.py` reads **168 decode-path symbols - 53 kernel, 63 host, 52 todo**:
+the decode path's `todo` column is **52, not ZERO**.  **The "CLOSED" this heading used to read was measured on the
+qualifier-only 77-symbol map**, which could not see the bare-name call sites; the corrected map and the per-symbol
+triage (`plan/DECODE-PATH-TRIAGE.md`) show **19 class-A forward-path holes** (the GDN / DeltaNet mixer for 36 of
+the 48 layers, the QSA gate and indexer for the 12 QSA layers, and `gr_write`), 4 dodgeable, 7 non-selected, 22
+out of the forward pass.  The 9/10 + 10/10 increment below did land and is real; it was the last two symbols the
+old map could see, not the last on the decode path.  (The generator `tools/make_port_map.py` had drifted - it still classified
 the two landed IQ rows as `todo` - and is fixed in this commit, so it regenerates `PORT-MAP.tsv` exactly.)
 
 **Measured, this commit.**  vega: **Intel Arc (BMG G31) 329 passed / 0 failed / 0 skipped** (`run_gate.sh` exit 0),

@@ -22,6 +22,12 @@ expert streaming path, and a first run cannot be a "load it all into VRAM" run.
 
 Only after M5 does the deferred work matter (below).
 
+**CORRECTION 2026-10-05.**  The **M2** row above reads "the decode path is complete", and `RUN-ON-B70.md`'s
+inventory counted only the `kernels::`-qualified symbols.  The corrected port map (`7c317c4`) and the per-symbol
+triage (`plan/DECODE-PATH-TRIAGE.md`) show the decode path is **not** complete: 19 class-A forward-path holes
+remain, chiefly the **GDN / DeltaNet mixer** on 36 of the 48 layers and the **QSA gate and indexer** on the other
+12 - none of which `layer.cpp`'s bare-name `gdn_layer`/`qsa_layer` calls let the old scan see.
+
 ## What the port already covers for a decode step
 
 The gate reports **238 cases, 0 failed, 0 skipped on the Arc**.  Among them, the whole decode data path and both

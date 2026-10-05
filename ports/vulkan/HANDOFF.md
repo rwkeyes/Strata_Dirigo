@@ -75,16 +75,20 @@ injection, three implementations, and the docs kept current.
 
 ## 4. HOW MUCH FURTHER TO SOMETHING THAT GENERATES TOKENS
 
-`PORT-MAP.tsv` (checked by the gate) classifies **every** `kernels::` symbol the decode path (`src/core/`) calls:
-**77 symbols - 18 kernel, 49 host, 10 todo.**  (Later, 2026-10-05: the scan also sees BARE-name call sites, and the
-map reads **168 symbols - 53 kernel, 63 host, 52 todo** - see `NEXT.md`'s top section.)  The inference core is done and gated: attention, the KV cache in all
-four modes (f16 / q8 / q4 / hybrid), the QSA block selection, the embedding gather, the router top-10, the quantised
-matvec family, rms_norm / rope / silu / swiglu - and **both samplers, so the port can turn logits into a token**.
+`PORT-MAP.tsv` (checked by the gate) classifies **every** kernels-namespace symbol the decode path (`src/core/`)
+reaches, written `kernels::X` or BARE `X`.  **Corrected 2026-10-05 (`7c317c4`): the map reads
+`168 symbols - 53 kernel, 63 host, 52 todo`** - the earlier `77 symbols - 28 kernel, 49 host, 0 todo` was measured
+by a scan that keyed on the `kernels::` qualifier and could not see the bare-name call sites; see `NEXT.md`'s top
+section and `plan/DECODE-PATH-TRIAGE.md`.  The port has landed a lot of the inference core and it is gated:
+attention, the KV cache in all four modes (f16 / q8 / q4 / hybrid), the QSA block selection, the embedding gather,
+the router top-10, the quantised matvec family, rms_norm / rope / silu / swiglu - and **both samplers, so the port
+can turn logits into a token**.  But the corrected map shows **M-A is NOT closed**: 52 rows are `todo`, of which
+**19 are genuine forward-path holes with no ported fallback** - the GDN / DeltaNet mixer (36 of the 48 layers),
+the QSA gate and indexer (12 layers), and `gr_write`.
 
-**The ten holes, all GPU work this port has not done:**
-
-    cvec_apply  gather_rows  scatter_rows_f32  iq_dequant_f32  iq_embed_rows
-    native_q5_k_f32  moe_grouped_s2  moe_hit_add  moe_hit_select  moe_hit_grouped_s2
+**The ten holes section 4 used to list are all landed** (`cvec_apply`, `gather_rows`, `scatter_rows_f32`,
+`iq_dequant_f32`, `iq_embed_rows`, `native_q5_k_f32`, `moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`,
+`moe_hit_grouped_s2`) - but they were only the visible tip, and the class-A 19 above are the real remainder.
 
 **Three things stand between here and tokens, in order:**
 
@@ -103,7 +107,9 @@ matvec family, rms_norm / rope / silu / swiglu - and **both samplers, so the por
 
 **Milestones worth judging:**
 
-* **M-A** - the decode path's last kernels gated: the map's `todo` column reaches zero for the inference half.
+* **M-A** - the decode path's last kernels gated: the map's `todo` column reaches zero for the forward-path
+  work.  **NOT closed** - it still reads 52 `todo`, of which 19 are class-A forward-path holes
+  (`plan/DECODE-PATH-TRIAGE.md`).
 * **M-B** - **ONE LAYER, end to end, on the GPU with random weights.**  The first thing that proves the BACKEND
   rather than the kernels, and it needs no model at all.  Make it a gate case: a Vulkan-backed single-layer forward
   pass.
@@ -161,7 +167,9 @@ the target is the 7900 XTX.**  Do not re-open it.
      not over-tight and was not loosened.  Fixed in the SHADER: `roundEven(double)` is replaced by an explicit
      ties-to-even (`floor` + parity), which the older lavapipe and every other implementation already agreed on.
      A skipped case would be a different matter; this one is a real divergence, recorded.
-2. **The sampler's remaining variants** (CLOSED - see item 3) and the ten kernels of section 4 (CLOSED by M-A).
+2. **The sampler's remaining variants** (CLOSED - see item 3) and the ten kernels of section 4 (all landed - but
+   they were not the whole hole: **M-A is NOT closed**; corrected 2026-10-05 the map's `todo` column reads 52, of
+   which 19 are class-A forward-path holes, see `plan/DECODE-PATH-TRIAGE.md`).
 3. **The sampler's remaining variants - CLOSED 2026-10-05.**  All four landed, each with a shader, a gated case, a
    registered falsification and docs, and the full gate green on both boxes:
    * **the split sampler** (`sampler_split.comp`, the engine's DEFAULT sampled path: 4096-logit partitions, each
@@ -174,10 +182,13 @@ the target is the 7900 XTX.**  Do not re-open it.
      shaderFloat64 that Intel's own article describes) - `06ae153`.
    The tail and the partition+merge selection now live ONCE in `common/sampler_tail.glsl` /
    `common/sampler_select.glsl`, so the three sampled paths cannot drift.  `PORT-MAP.tsv` still reads 77 symbols -
-   28 kernel, 49 host, **0 todo**, and regenerates identically.  `NEXT.md`'s top four sections carry the rule,
-   the traps, the evidence and every falsification.  The sampler item is DONE.  (The ten holes §4 lists were
-   closed by M-A - the map's `todo` column is 0; §4 is stale on that point.  What remains on this list is the
-   backend integration of §4.2, a different effort.)
+  28 kernel, 49 host, **0 todo**, and regenerates identically.  `NEXT.md`'s top four sections carry the rule,
+  the traps, the evidence and every falsification.  The sampler item is DONE.  (**CORRECTED 2026-10-05,
+  `7c317c4`:** that `0 todo` was read on the qualifier-only map; the map actually reads **168 symbols - 53
+  kernel, 63 host, 52 todo**, and **M-A is NOT closed** - 19 of the 52 are class-A forward-path holes with no
+  ported fallback, triaged per symbol in `plan/DECODE-PATH-TRIAGE.md`.  The ten holes §4 lists were landed, but
+  they were not the whole hole; §4 above is corrected.  What remains on this list is the backend integration of
+  §4.2 plus the class-A 19, two different efforts.)
 4. **The ten kernels** of section 4, in whatever order the first-token path wants them.
 
 ---
