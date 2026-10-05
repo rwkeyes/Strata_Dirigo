@@ -2845,6 +2845,244 @@ void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// THE GDN (DeltaNet) MIXER - CLASS A OF THE DECODE-PATH TRIAGE.  36 of the model's 48 layers run `gdn_layer`
+// (src/core/layer.cpp:223), and with the backend's branch policy `native_gdn_enabled() == false` (documented
+// in NEXT.md) the layer takes the LEGACY chain conv -> l2_norm -> beta_gate -> gate -> step -> out_norm.
+// `gdn_gate` (the gate pair's legacy member) is already ported above; the three cases below land the next
+// three legacy kernels the layer's own sequence reaches.  Each oracle is transcribed from the ENGINE'S OWN
+// rule - the CUDA kernel plus its parity reference `src/kernels/gdn_parity.cpp` - not invented here.
+// ---------------------------------------------------------------------------------------------------------
+
+// GDN class-A #1: the LEGACY four-tap convolution, `gdn_conv_step` (src/kernels/cuda/gdn.cu:99-111, :174-187;
+// contract include/strata/kernels/gdn.hpp:59-73).  Call site src/core/layer.cpp:255.
+//
+// Two arms carry the kernel's two NAMED traps (gdn_parity.cpp §2 names both):
+//   * the fixture's state rows are LABELLED (`10*(i+1)+(c%90)`) and its taps have DISTINCT magnitudes, so a
+//     reversed slide or a reversed tap order is an O(1) error, not a rounding-level one;
+//   * the slid STATE is compared BIT FOR BIT, because the kernel only MOVES and APPENDS values - it does no
+//     arithmetic on them, and `close_enough` would accept a kernel that did.
+// The artifact's d_conv is 4; d_conv = 2 (one history column) is gated too because the slide loop and the
+// append index then address the same slot.  300 channels = two workgroups, 24 = one, 10 = a short one.
+void case_gdn_conv_step(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_conv_step.spv")) return;
+    struct Shape { int C, dc; };
+    const Shape shapes[] = {{24, 4}, {10, 2}, {300, 4}};
+    for (const Shape& sh : shapes) {
+        const int C = sh.C, dc = sh.dc;
+        const size_t hist = (size_t) C * (dc - 1);
+        std::vector<float> cs(hist), x(C), kw((size_t) C * dc);
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc - 1; ++i) cs[(size_t) c * (dc - 1) + i] = (float) (10 * (i + 1) + (c % 90));
+        for (int c = 0; c < C; ++c) x[c] = 100.0f + (float) c;
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc; ++i)
+                kw[(size_t) c * dc + i] = ((i & 1) ? -1.0f : 1.0f) * (float) (i + 1) * rndf(1.5f);
+
+        // ORACLE: the engine's rule (gdn.cu:99-111), transcribed from gdn_parity.cpp's ref_conv, in double.
+        std::vector<float> want_out(C), want_cs = cs;
+        for (int c = 0; c < C; ++c) {
+            double acc = 0;
+            for (int i = 0; i < dc - 1; ++i)
+                acc += (double) want_cs[(size_t) c * (dc - 1) + i] * (double) kw[(size_t) c * dc + i];
+            acc += (double) x[c] * (double) kw[(size_t) c * dc + dc - 1];
+            want_out[c] = (float) acc;
+            for (int i = 0; i < dc - 2; ++i)
+                want_cs[(size_t) c * (dc - 1) + i] = want_cs[(size_t) c * (dc - 1) + i + 1];
+            want_cs[(size_t) c * (dc - 1) + dc - 2] = x[c];
+        }
+        // the RIVAL reading (reversed tap order, the injected defect) must move the output, so the fixture's
+        // margin serves the claim instead of being asserted.
+        double rival_d = 0, rival_m = 0;
+        for (int c = 0; c < C; ++c) {
+            double bad = 0;
+            for (int i = 0; i < dc - 1; ++i)
+                bad += (double) cs[(size_t) c * (dc - 1) + i] * (double) kw[(size_t) c * dc + (dc - 1 - i)];
+            bad += (double) x[c] * (double) kw[(size_t) c * dc + 0];
+            rival_d += std::fabs(bad - (double) want_out[c]);
+            rival_m += std::fabs((double) want_out[c]);
+        }
+        const bool rival_moves = rival_m > 0 && (rival_d / rival_m) > 0.05;
+
+        Buf bcs = ctx.alloc(hist * 4), bx = ctx.alloc((size_t) C * 4), bkw = ctx.alloc((size_t) C * dc * 4),
+            bo = ctx.alloc((size_t) C * 4);
+        ctx.write(bcs, cs.data(), hist * 4);
+        ctx.write(bx, x.data(), (size_t) C * 4);
+        ctx.write(bkw, kw.data(), (size_t) C * dc * 4);
+        VkPipeline p = ctx.pipeline(dir + "/gdn_conv_step.spv", 4, 8);
+        struct { int32_t channels; int32_t d_conv; } pc{C, dc};
+        ctx.dispatch(p, {&bcs, &bx, &bkw, &bo}, &pc, sizeof(pc), groups_for((uint64_t) C));
+        std::vector<float> got_o(C), got_cs(hist);
+        ctx.read(bo, got_o.data(), (size_t) C * 4);
+        ctx.read(bcs, got_cs.data(), hist * 4);
+
+        int bad_out = 0, bad_state = 0;
+        double worst = 0;
+        for (int c = 0; c < C; ++c) {
+            if (!close_enough(got_o[c], want_out[c], 4e-6, 1e-6)) ++bad_out;
+            const double r = std::fabs((double) got_o[c] - (double) want_out[c]) / (std::fabs((double) want_out[c]) + 1e-30);
+            worst = std::max(worst, r);
+        }
+        for (size_t i = 0; i < hist; ++i) if (got_cs[i] != want_cs[i]) ++bad_state;
+
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "gdn_conv_step C=%d d_conv=%d", C, dc);
+        const bool ok = bad_out == 0 && bad_state == 0 && rival_moves;
+        verdict(tag, ok, bad_out + bad_state + (rival_moves ? 0 : 1), C + (int) hist, worst,
+                "out vs double ref + state bit-exact (fixture margin checked)");
+        if (!ok) {
+            int printed = 0;
+            for (int c = 0; c < C && printed < 4; ++c) {
+                if (close_enough(got_o[c], want_out[c], 4e-6, 1e-6)) continue;
+                std::printf("      offender c=%d want=%.9g got=%.9g\n", c, (double) want_out[c], (double) got_o[c]);
+                ++printed;
+            }
+            for (size_t i = 0; i < hist && printed < 8; ++i)
+                if (got_cs[i] != want_cs[i]) {
+                    std::printf("      state[%zu] want=%.9g got=%.9g\n", i, (double) want_cs[i], (double) got_cs[i]);
+                    ++printed;
+                }
+            if (!rival_moves) std::printf("      FIXTURE: the reversed-tap reading does not move the output\n");
+        }
+        ctx.free(bcs);
+        ctx.free(bx);
+        ctx.free(bkw);
+        ctx.free(bo);
+    }
+}
+
+// GDN class-A #2: the LEGACY L2 normalisation, `gdn_l2_norm` (src/kernels/cuda/gdn.cu:118-130, :189-203;
+// contract include/strata/kernels/gdn.hpp:75-80).  Call site src/core/layer.cpp:269-270.
+//
+// The rule is `x *= 1/sqrt(sum(x^2) + eps)` with the eps an ABSOLUTE floor on the SQUARED NORM.  The rival
+// reading (the same eps on the MEAN) differs by sqrt(cols) = 11.3x at cols = 128 - gdn_parity.cpp §3 names it -
+// and the case checks host-side that its fixture SEES it before judging the kernel.
+//
+// The CUDA accumulates in DOUBLE (`ref/gdn.py` does); this port accumulates in F32 because the target device
+// has no shaderFloat64, so the comparison is a tolerance and the printed `worst` IS the measured gap against
+// the engine's double oracle - not a bit-exactness claim (the same honest form as `silu_inplace`).
+void case_gdn_l2_norm(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_l2_norm.spv")) return;
+    struct Shape { int rows, cols; };
+    const Shape shapes[] = {{1, 128}, {16, 128}, {3, 128}};
+    for (const Shape& sh : shapes) {
+        const int rows = sh.rows, cols = sh.cols;
+        const uint64_t n = (uint64_t) rows * cols;
+        const uint64_t padded = n + 2u * cols + 8;         // slack so an over-dispatch is DETECTED
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> x(padded, NaN), ref(padded, NaN);
+        for (uint64_t i = 0; i < n; ++i) x[i] = rndf(3.0f);
+        // row 0 is NEAR ZERO: the regime where `+ eps` is the whole answer, the rival reading is only ~1.5x
+        // away rather than 11.3x, and the f32-vs-double accumulation gap is largest relative to the result.
+        for (int c = 0; c < cols; ++c) x[c] = 1e-4f * rndf(1.0f);
+        const float eps = 1e-6f;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const float inv = (float) (1.0 / std::sqrt(acc + (double) eps));
+            for (int c = 0; c < cols; ++c)
+                ref[(uint64_t) r * cols + c] = (float) ((double) x[(uint64_t) r * cols + c] * (double) inv);
+        }
+        double rival_d = 0, rival_m = 0;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const float inv = (float) (1.0 / std::sqrt(acc / (double) cols + (double) eps));
+            for (int c = 0; c < cols; ++c) {
+                const double a = (double) x[(uint64_t) r * cols + c] * inv;
+                rival_d += std::fabs(a - (double) ref[(uint64_t) r * cols + c]);
+                rival_m += std::fabs((double) ref[(uint64_t) r * cols + c]);
+            }
+        }
+        const bool rival_moves = rival_m > 0 && (rival_d / rival_m) > 0.05;
+
+        Buf bx = ctx.alloc(padded * 4);
+        ctx.write(bx, x.data(), padded * 4);
+        VkPipeline p = ctx.pipeline(dir + "/gdn_l2_norm.spv", 1, 12);
+        struct { int32_t rows; int32_t cols; float eps; } pc{rows, cols, eps};
+        ctx.dispatch(p, {&bx}, &pc, sizeof(pc), (uint32_t) rows);
+        std::vector<float> got(padded);
+        ctx.read(bx, got.data(), padded * 4);
+
+        int bad = 0, guard_bad = 0;
+        double worst = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 1e-5, 1e-6)) ++bad;
+            const double r = std::fabs((double) got[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30);
+            worst = std::max(worst, r);
+        }
+        for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got[i]) || got[i] == 0.0f)) ++guard_bad;
+
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "gdn_l2_norm r=%d c=%d (f32 vs double)", rows, cols);
+        const bool ok = bad == 0 && guard_bad == 0 && rival_moves;
+        verdict(tag, ok, bad + guard_bad + (rival_moves ? 0 : 1), (int) (n + (padded - n)), worst,
+                "relative vs engine double oracle (tol 1e-5) + row-guard NaN check");
+        if (!ok) {
+            int printed = 0;
+            for (uint64_t i = 0; i < n && printed < 4; ++i)
+                if (!close_enough(got[i], ref[i], 1e-5, 1e-6)) {
+                    std::printf("      offender i=%llu want=%.9g got=%.9g\n",
+                                (unsigned long long) i, (double) ref[i], (double) got[i]);
+                    ++printed;
+                }
+            if (!rival_moves) std::printf("      FIXTURE: the eps-on-the-mean reading does not move the output\n");
+        }
+        ctx.free(bx);
+    }
+}
+
+// GDN class-A #3: `gdn_beta_gate` (src/kernels/cuda/gdn.cu:217-233; contract
+// include/strata/kernels/gdn.hpp:82-88).  Call site src/core/layer.cpp:299.
+//
+// Rule: `beta[i] = sigmoid(beta[i]) = 1/(1+exp(-x))`, in place - the fraction `gdn_step`'s contract demands.
+// The oracle is the engine's own `sigmoid_f`, evaluated in double.  The fixture spans the sigmoid's whole range
+// (large negative -> ~0, large positive -> ~1, mid-range) and the case checks host-side that the RAW (identity)
+// reading differs, so the margin serves the claim - the injection that drops the sigmoid must bite.
+void case_gdn_beta_gate(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_beta_gate.spv")) return;
+    const int h_v = 48;                                   // the artifact's ssm_v_heads
+    std::vector<float> b(h_v), want(h_v);
+    for (int h = 0; h < h_v; ++h) {
+        if (h % 3 == 0) b[h] = -25.0f + (float) (h % 7);          // -> ~0
+        else if (h % 3 == 1) b[h] = 25.0f - (float) (h % 7);      // -> ~1
+        else b[h] = rndf(4.0f);                                   // mid-range
+    }
+    for (int h = 0; h < h_v; ++h) want[h] = (float) (1.0 / (1.0 + std::exp(-(double) b[h])));
+    double raw_d = 0, mag = 0;
+    for (int h = 0; h < h_v; ++h) { raw_d += std::fabs((double) b[h] - (double) want[h]); mag += std::fabs((double) want[h]); }
+    const bool raw_moves = mag > 0 && (raw_d / mag) > 0.05;
+
+    Buf bb = ctx.alloc(h_v * 4);
+    ctx.write(bb, b.data(), h_v * 4);
+    VkPipeline p = ctx.pipeline(dir + "/gdn_beta_gate.spv", 1, 4);
+    struct { int32_t n; } pc{h_v};
+    ctx.dispatch(p, {&bb}, &pc, sizeof(pc), groups_for((uint64_t) h_v));
+    std::vector<float> got(h_v);
+    ctx.read(bb, got.data(), h_v * 4);
+
+    int bad = 0;
+    double worst = 0;
+    for (int h = 0; h < h_v; ++h) {
+        if (!close_enough(got[h], want[h], 2e-6, 1e-7)) ++bad;
+        worst = std::max(worst, std::fabs((double) got[h] - (double) want[h]) / (std::fabs((double) want[h]) + 1e-30));
+    }
+    const bool ok = bad == 0 && raw_moves;
+    verdict("gdn_beta_gate (sigmoid)", ok, bad + (raw_moves ? 0 : 1), h_v, worst,
+            "relative vs engine double sigmoid (tol 2e-6) + fixture margin");
+    if (!ok) {
+        int printed = 0;
+        for (int h = 0; h < h_v && printed < 4; ++h)
+            if (!close_enough(got[h], want[h], 2e-6, 1e-7)) {
+                std::printf("      offender h=%d raw=%.9g want=%.9g got=%.9g\n", h, (double) b[h],
+                            (double) want[h], (double) got[h]);
+                ++printed;
+            }
+        if (!raw_moves) std::printf("      FIXTURE: the raw (identity) reading does not move the output\n");
+    }
+    ctx.free(bb);
+}
+
 // rms_norm, INCLUDING the regression the CUDA source documents: the buffer is allocated with one extra
 // rounded-up workgroup's worth of rows, filled with NaN.  If the row guard is missing, the extra rows are
 // overwritten and this case fails - which is exactly how the QSA bug reached a running engine.
@@ -10777,6 +11015,9 @@ int main(int argc, char** argv) {
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);
     case_gdn_gate(ctx, dir);
+    case_gdn_conv_step(ctx, dir);      // GDN class-A #1: the legacy four-tap conv (native_gdn_enabled() == false)
+    case_gdn_l2_norm(ctx, dir);        // GDN class-A #2: the legacy L2 norm (eps on the SQUARED NORM)
+    case_gdn_beta_gate(ctx, dir);      // GDN class-A #3: beta = sigmoid(beta), the fraction gdn_step needs
     case_rms_norm(ctx, dir);
     case_exp_probe(ctx, dir);
     case_silu(ctx, dir);

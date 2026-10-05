@@ -39,6 +39,13 @@
 #                                       (this is the ENGINE-side backend, a non-shader/non-harness source, so the
 #                                       script rebuilds the gate - which links vulkan/src/device/ + the kernel TU)
 #
+#   inject-verify.sh gdn-conv-tap-order     gdn_conv_step.comp  reverse the tap order in the four-tap conv
+#                                       -> must FAIL  "gdn_conv_step"
+#   inject-verify.sh gdn-l2-norm-eps-on-mean  gdn_l2_norm.comp  put eps on the MEAN instead of the squared norm
+#                                       -> must FAIL  "gdn_l2_norm"
+#   inject-verify.sh gdn-beta-gate-drop-sigmoid  gdn_beta_gate.comp  drop the sigmoid (the raw projection)
+#                                       -> must FAIL  "gdn_beta_gate"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -215,6 +222,30 @@ case "$name" in
     old=$'            if (cum >= top_p) { cut = i + 1; break; }'
     new=$'            if (cum > top_p) { cut = i + 1; break; }   // INJECTION: the >= boundary dropped'
     want="FAIL  sampler_kernel_f32: one survivor (top_p cut of one)" ;;
+  gdn-conv-tap-order)
+    # `gdn_conv_step`'s rule reads tap i from `kW[c*d_conv+i]` (GGML-NATIVE, tap fastest).  Reversing the tap
+    # order is the plausible wrong layout (the reference's (d_conv, C) row-major), and the fixture gives each tap
+    # a DISTINCT magnitude so a reversal cannot hide in rounding noise.
+    file="$SH/gdn_conv_step.comp"; spv="gdn_conv_step"
+    old=$'    for (uint i = 0u; i + 1u < dc; ++i) acc += cs.v[sb + i] * w.v[wb + i];   // OLDEST state row is tap 0'
+    new=$'    for (uint i = 0u; i + 1u < dc; ++i) acc += cs.v[sb + i] * w.v[wb + (dc - 1u - i)];   // INJECTION: tap order reversed'
+    want="FAIL  gdn_conv_step" ;;
+  gdn-l2-norm-eps-on-mean)
+    # The kernel's distinguishing rule: `eps` is an ABSOLUTE floor on the SQUARED NORM (`sqrt(sum + eps)`).  The
+    # rival reading puts the same eps on the MEAN and differs by sqrt(cols) = 11.3x at cols = 128 - which
+    # gdn_parity.cpp §3 pins, and which the fixture's near-zero row also exercises in a ~1.5x regime.
+    file="$SH/gdn_l2_norm.comp"; spv="gdn_l2_norm"
+    old=$'    const float inv = inversesqrt(wg_sum(acc) + pc.eps);'
+    new=$'    const float inv = inversesqrt(wg_sum(acc) / float(pc.cols) + pc.eps);   // INJECTION: eps on the MEAN'
+    want="FAIL  gdn_l2_norm" ;;
+  gdn-beta-gate-drop-sigmoid)
+    # THE C1 bug this kernel exists to prevent: handing the recurrence the raw `ssm_beta @ cur` instead of the
+    # fraction `gdn_step`'s contract demands (`d = (v - sk) * beta`).  The fixture spans the sigmoid's whole range
+    # (large negative -> ~0, large positive -> ~1), so an identity reading moves every value.
+    file="$SH/gdn_beta_gate.comp"; spv="gdn_beta_gate"
+    old=$'    b.v[i] = 1.0f / (1.0f + exp(-b.v[i]));'
+    new=$'    b.v[i] = b.v[i];   // INJECTION: the sigmoid dropped - the raw projection handed to the recurrence'
+    want="FAIL  gdn_beta_gate" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

@@ -1,0 +1,51 @@
+#version 450
+// ports/vulkan/shaders/gdn_l2_norm.comp - the LEGACY GDN L2 normalisation, over the LAST axis.
+//
+// Transcribed from `gdn_l2_kernel` / `gdn_l2_norm` (src/kernels/cuda/gdn.cu:118-130, :189-203); the contract is
+// include/strata/kernels/gdn.hpp:75-80 and the rule is re-pinned by src/kernels/gdn_parity.cpp §3.
+//
+// THE RULE:
+//
+//     x[r][i] *= 1 / sqrt( sum_i x[r][i]^2 + eps )        // `+ eps` is an ABSOLUTE floor on the SQUARED NORM
+//
+// `gdn.hpp` and gdn_parity.cpp both single out the rival reading: `x / sqrt(mean(x^2) + eps)` puts the SAME eps
+// on the MEAN, differs by sqrt(cols) = 11.3x at cols = 128, and is why the parity test asserts the two are
+// distinguishable.  The gate's fixture checks that same claim host-side before it judges the kernel.
+//
+// THE BRANCH POLICY.  `gdn_layer` (src/core/layer.cpp:264-272) calls `native_gdn_l2_norm` when
+// `native_gdn_enabled()`, else THIS legacy kernel; the layer runs this kernel because the Vulkan backend answers
+// `native_gdn_enabled() == false` (see NEXT.md).  The whole `fused_pre` block that would have folded q/k/v's two
+// norms into `fused_gdn_conv_l2` is off the path under the same flag.
+//
+// WHAT DIFFERS FROM THE CUDA, and why:
+//  * the CUDA reduces with a 32-lane `__shfl_down_sync` tournament and hardcodes the width; that is a lane
+//    width, not the rule.  Here it is the workgroup barrier tree in common/wg_reduce.glsl, ONE WORKGROUP PER ROW
+//    (so the dispatch is exactly `rows` groups and the driver's per-kernel subgroup width cannot size a grid
+//    wrongly - the `rms_norm` lesson).  A barrier tree has a fixed summation order, so the last bits of the sum
+//    are this file's and not the driver's.
+//  * the CUDA accumulates the sum of squares in DOUBLE (`ref/gdn.py` does: `l2_norm(q.astype(np.float64), eps)`).
+//    The target device has no shaderFloat64, so the port accumulates in F32 and the gate MEASURES the gap
+//    against the engine's own double oracle instead of assuming it is exact - the honest form this port already
+//    uses for `silu_inplace` (shaders/blocked/README.md).  The measured gap is printed by the case.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;
+layout(push_constant, std430) uniform PC { int rows; int cols; float eps; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.rows)) return;   // workgroup-uniform, so every barrier below is reached by everyone
+    const uint cols = uint(pc.cols);
+    const uint base = row * cols;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint c = lid; c < cols; c += gl_WorkGroupSize.x) {
+        const float t = x.v[base + c];
+        acc += t * t;
+    }
+    // `inversesqrt(sum + eps)`: the eps is on the SQUARED NORM, not on the mean (see the header).
+    const float inv = inversesqrt(wg_sum(acc) + pc.eps);
+    for (uint c = lid; c < cols; c += gl_WorkGroupSize.x) x.v[base + c] *= inv;
+}

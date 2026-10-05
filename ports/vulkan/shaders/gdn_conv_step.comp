@@ -1,0 +1,49 @@
+#version 450
+// ports/vulkan/shaders/gdn_conv_step.comp - the LEGACY GDN four-tap causal convolution (`ggml_ssm_conv`).
+//
+// Transcribed from `gdn_conv_kernel` / `gdn_conv_step` (src/kernels/cuda/gdn.cu:99-111, :174-187); the header's
+// contract is include/strata/kernels/gdn.hpp:59-73 and the rule is re-pinned by src/kernels/gdn_parity.cpp §2.
+//
+// THE RULE, and the two places a paraphrase inverts it:
+//
+//     out[c] = sum_{i<d_conv-1} conv_state[c*(d_conv-1)+i] * kW[c*d_conv+i]   // tap 0 reads the OLDEST state row
+//              + x[c] * kW[c*d_conv + d_conv-1]                               // the new input is the LAST tap
+//     slide:  conv_state[c*(d_conv-1)+i] = conv_state[c*(d_conv-1)+i+1]   for i < d_conv-2
+//             conv_state[c*(d_conv-1)+d_conv-2] = x[c]
+//
+//   * `kW` is GGML-NATIVE: `kW[c*d_conv+i]` is tap i of channel c.  The manifest's `ssm_conv1d.weight` has
+//     ne = [d_conv, 10240], so ne0 = d_conv is the FAST axis - this is the device layout, and it is NOT the
+//     reference's row-major (d_conv, C).  The mapping between the two is gdn_parity.cpp's concern, written out
+//     there; the port takes the device layout directly.
+//   * the SLIDE DIRECTION: `kernel[0]` reads the OLDEST state row and the new input lands in the LAST state row.
+//     Reversing either is invisible on a symmetric state, so gdn_parity.cpp labels its state rows - and the
+//     gate's fixture labels them too, and compares the slid state BIT FOR BIT (the kernel only MOVES values).
+//
+// THE BRANCH POLICY this kernel belongs to.  `gdn_layer` (src/core/layer.cpp:247-259) takes the fused
+// `fused_gdn_conv_l2` only when `g_fused_gdn && native_gdn_enabled() && native_bf16_projections && ssm_d_conv==4
+// && ssm_state_size==128`, and the non-fused `native_gdn_conv_silu` when `native_gdn_enabled()`.  The Vulkan
+// backend answers `native_gdn_enabled() == false` (the policy in NEXT.md), so the layer runs THIS legacy kernel
+// and both the fused path and the native sibling are off the forward path.  No CPU fallback is involved.
+//
+// One thread per channel, as the CUDA; the grid is sized to `channels` (a grid sized to the work writes the
+// same bytes).  No barrier, no subgroup op, no atomic - the whole computation per channel is independent.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer CS { float v[]; } cs;          // (channels, d_conv-1), c fastest
+layout(set = 0, binding = 1, std430) readonly buffer XI { float v[]; } xin;
+layout(set = 0, binding = 2, std430) readonly buffer W { float v[]; } w;   // (channels, d_conv), tap fastest
+layout(set = 0, binding = 3, std430) buffer OUT { float v[]; } outb;
+layout(push_constant, std430) uniform PC { int channels; int d_conv; } pc;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= uint(pc.channels)) return;
+    const uint dc = uint(pc.d_conv);
+    const uint sb = c * (dc - 1u);      // this channel's slice of the carried state
+    const uint wb = c * dc;             // this channel's slice of the weight
+    float acc = 0.0f;
+    for (uint i = 0u; i + 1u < dc; ++i) acc += cs.v[sb + i] * w.v[wb + i];   // OLDEST state row is tap 0
+    acc += xin.v[c] * w.v[wb + dc - 1u];                                     // the new column is the LAST tap
+    outb.v[c] = acc;
+    for (uint i = 0u; i + 1u < dc - 1u; ++i) cs.v[sb + i] = cs.v[sb + i + 1u];   // slide: drop the oldest
+    cs.v[sb + dc - 2u] = xin.v[c];                                              // append the newest
+}

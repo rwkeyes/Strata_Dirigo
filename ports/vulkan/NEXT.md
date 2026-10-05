@@ -1,5 +1,79 @@
 # Start here next session
 
+## THE GDN (DeltaNet) MIXER'S FIRST THREE KERNELS — class A of the decode-path triage — **DONE 2026-10-05**
+
+The corrected map (`plan/DECODE-PATH-TRIAGE.md`) puts **19 class-A symbols** on the shipped model's forward path
+with no ported fallback on either branch, and 36 of the 48 layers run the **GDN / DeltaNet mixer**
+(`gdn_layer`, `src/core/layer.cpp:223`) — the port's own plan never enumerated it. This increment lands the FIRST
+THREE kernels of the mixer's chain, in the order the layer's own sequence reaches them, under the branch policy
+below.
+
+**THE BRANCH POLICY, and the contract it puts on the backend's capability checks.** Every class-A GDN symbol is
+one member of a native/legacy pair written `if (native_gdn_enabled()) native_gdn_X(...) else gdn_X(...)`
+(`layer.cpp:253/255`, `266/269`, `296/299`, `308/309`, `324/325`), and in most pairs BOTH members are unported.
+The port implements the **LEGACY** branch and requires the Vulkan backend to answer
+**`native_gdn_enabled() == false`** (at init: `strata::kernels::native_gdn_set_enabled(false)`). Three
+consequences make ONE implementation per pair sufficient:
+
+* the layer takes the `else` of every pair, so only the `gdn_*` member needs a shader;
+* the **three fused paths** `fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm` are gated on
+  `g_fused_gdn && native_gdn_enabled() && …` (`layer.cpp:247, 306`), so the flag removes them from the path
+  entirely — they are neither implemented nor needed;
+* the legacy branch is the one whose contract the engine's own header documents in full (`gdn.hpp`), and whose
+  beta/gate branch's second half `gdn_gate` this port ALREADY has — so that branch is completed by adding
+  `gdn_beta_gate` alone, where the native branch would still need `native_gdn_gate`.
+
+**A CONTRACT, stated because it is real:** `layer_verify_compatible()` (`layer.cpp:476-486`) demands
+`native_gdn && g_fused_gdn` and `native_qsa_indexer_enabled()`, so a backend that answers these off makes the P6
+verifier refuse to init — i.e. it disables speculative verification (class D). A `--spec 0` run is unaffected.
+The same policy applies to the QSA pair (`native_qsa_enabled()` / `native_qsa_indexer_enabled()` answer false →
+`qsa_gate_apply_f32` / `indexer_key_append`) when that increment lands.
+
+**RE-CHECKED: the class-A count.** The parent's reading is right in substance but its arithmetic was off by two.
+The accurate decomposition of the 19: **15 are native/legacy pair members** (11 GDN + 4 QSA), **3 are the fused
+GDN paths** the flag removes, **1 (`gr_write`) is unconditional** — 15 + 3 + 1 = 19. Collapsed under the policy
+the 19 need **9 kernel implementations**: 6 GDN legacy (`gdn_conv_step`, `gdn_l2_norm`, `gdn_beta_gate`,
+`gdn_gate` — already ported —, `gdn_step`, `gdn_out_norm`), 2 QSA (`qsa_gate_apply_f32`, `indexer_key_append`),
+and `gr_write`. **8 are still to write**; this increment lands 3 of them. Recorded in `plan/DECODE-PATH-TRIAGE.md`.
+
+**THE THREE, in the layer's sequence.** `gdn_layer` runs conv → l2_norm → beta/gate → step → out_norm
+(`layer.cpp:244-327`); the first unported step is the conv, then the norm, then the beta half of the beta/gate
+pair (the gate half is already ported).
+
+* **`gdn_conv_step`** — the four-tap causal convolution (`gdn.cu:99-111`, `gdn.hpp:59-73`), the legacy `else` at
+  `layer.cpp:255`. Shader `shaders/gdn_conv_step.comp`. Oracle: the engine's own rule transcribed from
+  `gdn_parity.cpp`'s `ref_conv` (double). Case `case_gdn_conv_step`, 3 arms (C/d_conv = 24/4, 10/2, 300/4); the
+  fixture's state rows are LABELLED and its taps have DISTINCT magnitudes (the two traps `gdn_parity.cpp`
+  names), and the slid STATE is compared **bit for bit** because the kernel only moves and appends values.
+  **Measured: PASS 96/96 worst 7.09e-08, 20/20 worst 0, 1200/1200 worst 3.62e-06.** Falsified by
+  `gates/inject-verify.sh gdn-conv-tap-order` (reverse the tap order) → `FAIL gdn_conv_step C=24 d_conv=4
+  72/96 worst 2.28`.
+* **`gdn_l2_norm`** — `x *= 1/sqrt(sum(x^2) + eps)`, the eps an ABSOLUTE floor on the SQUARED NORM
+  (`gdn.cu:118-130`, `gdn.hpp:75-80`), the legacy `else` at `layer.cpp:269-270`. Shader
+  `shaders/gdn_l2_norm.comp` (one workgroup per row, the barrier-tree reduction in `common/wg_reduce.glsl`).
+  Oracle: `gdn_parity.cpp` §3, double. **HONEST LIMIT:** the CUDA sums in DOUBLE; the target device has no
+  shaderFloat64, so this port sums in F32 and the case MEASURES the gap against the double oracle rather than
+  claiming bit-exactness (the `silu_inplace` form). Case `case_gdn_l2_norm`, 3 arms; a NaN-padded tail makes a
+  missing row guard DETECTED, and the rival reading (eps on the MEAN) is checked host-side to move the fixture.
+  **Measured: PASS 392/392 worst 0, 2312/2312 worst 1.66e-07, 648/648 worst 1.56e-07.** Falsified by
+  `gdn-l2-norm-eps-on-mean` → `FAIL gdn_l2_norm r=1 c=128 265/392 worst 0.446`.
+* **`gdn_beta_gate`** — `beta = sigmoid(beta)`, in place (`gdn.cu:217-233`, `gdn.hpp:82-88`), the legacy leaf at
+  `layer.cpp:299`; the fraction `gdn_step`'s contract (`d = (v-sk)*beta`) demands. Shader
+  `shaders/gdn_beta_gate.comp`. Oracle: the engine's own `sigmoid_f`, double. Case `case_gdn_beta_gate`
+  (48 heads spanning → ~0 / mid / → ~1). **Measured: PASS 48/48 worst 1.42e-06.** Falsified by
+  `gdn-beta-gate-drop-sigmoid` → `FAIL gdn_beta_gate 0/48 worst 1.8e+12`.
+
+**THE MAP DROPS BY THREE.** `PORT-MAP.tsv` moved `168 — 53 kernel, 63 host, 52 todo` → `168 — 56 kernel, 63
+host, 49 todo` (the three symbols are now `kernel` rows naming their shaders); `check_port_map.py` passes and
+`make_port_map.py` regenerates the file BYTE-IDENTICALLY. `gdn_l2_norm` was added to `run_gate.sh`'s
+barrier-census whitelist, because it carries a shared-memory reduction and the gate requires >= 2 barriers.
+
+**GATE TOTALS, after the change. vega:** intel_icd (Arc B70) **367 / 0 / 0**, llvmpipe **355 / 0 / 3**,
+radeon_icd (Ryzen iGPU) **357 / 1 / 2** — the 1 is the KNOWN intermittent `budget: independent requery agrees`
+flake, and the 3 / 2 skips are pre-existing (coopmat + the M8 prefill split). The increment adds **+7 verdicts**
+(3 conv + 3 l2_norm + 1 beta_gate) on each implementation. `run_gate.sh` exits 1 because of the skips and the
+flake, which is the documented state — the gate's printed per-implementation totals are the authority.
+
 ## THE PORT MAP'S BLIND SPOT IS CLOSED - bare-name decode-path symbols - **DONE 2026-10-05**
 
 `tools/check_port_map.py` keyed on the `kernels::` QUALIFIER, so a kernels-namespace symbol that

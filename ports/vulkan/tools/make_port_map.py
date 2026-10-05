@@ -33,6 +33,11 @@ TABLE = {
     'fwht256_inplace_cuda':           ('kernel', 'fwht256'),
     'gather_rows':                    ('kernel', 'gather_rows'),
     'gdn_gate':                       ('kernel', 'gdn_gate'),
+    # The GDN (DeltaNet) mixer's LEGACY branch, landed under the branch policy `native_gdn_enabled() == false`
+    # (see NEXT.md): the layer's own sequence reaches conv -> l2_norm -> beta_gate -> gate -> step -> out_norm.
+    'gdn_conv_step':                  ('kernel', 'gdn_conv_step'),
+    'gdn_l2_norm':                    ('kernel', 'gdn_l2_norm'),
+    'gdn_beta_gate':                  ('kernel', 'gdn_beta_gate'),
     'iq_dequant_f32':                 ('kernel', 'iq_dequant_f32'),
     'iq_embed_rows':                  ('kernel', 'iq_embed_rows'),
     'kv_append_q4_step':              ('kernel', 'kv_q4_append'),
@@ -149,11 +154,8 @@ TABLE = {
     'fused_gdn_step_norm':            ('todo', 'no shader in this tree yet'),
     'fused_gr_read_multi':            ('todo', 'no shader in this tree yet'),
     'gdn_ab_multi':                   ('todo', 'no shader in this tree yet'),
-    'gdn_beta_gate':                  ('todo', 'no shader in this tree yet'),
     'gdn_conv_commit':                ('todo', 'no shader in this tree yet'),
     'gdn_conv_l2_multi':              ('todo', 'no shader in this tree yet'),
-    'gdn_conv_step':                  ('todo', 'no shader in this tree yet'),
-    'gdn_l2_norm':                    ('todo', 'no shader in this tree yet'),
     'gdn_out_norm':                   ('todo', 'no shader in this tree yet'),
     'gdn_step':                       ('todo', 'no shader in this tree yet'),
     'gdn_step_norm_multi':            ('todo', 'no shader in this tree yet'),

@@ -96,6 +96,42 @@ token (the append at `:917-948` precedes the selection at `:964-1005`), so it is
 |---|---|---|
 | `gr_write` | `layer.cpp:1195,1261,1329,1332` (and `mtp.cpp:605`, `verify.cpp:661`) | the fused alternative is `fused_gr_read` (`layer.cpp:1253,1276`), which the map marks `host` but which is a device op with **no shader** (`src/kernels/cuda/fused_gr.cu:1168` launches `gr_down_kernel`/`gr_up_kernel`) — see *Map caveat* below |
 
+## The implementation count behind the 19 class-A symbols (2026-10-05)
+
+This section does not change the classification above; it records the count that makes the class tractable, and
+corrects one number in the working brief.
+
+Of the **19** class-A symbols: **15 are native/legacy pair members** — `native_gdn_conv_silu`/`gdn_conv_step`,
+`native_gdn_l2_norm`/`gdn_l2_norm`, `native_gdn_beta_gate`/`gdn_beta_gate`, `native_gdn_gate` (its partner
+`gdn_gate` is already ported), `native_gdn_step`/`gdn_step`, `native_gdn_out_norm`/`gdn_out_norm` (11 GDN) and
+`native_qsa_gate_apply`/`qsa_gate_apply_f32`, `native_qsa_indexer_append`/`indexer_key_append` (4 QSA); **3 are
+the fused GDN paths** `fused_gdn_conv_l2`/`fused_gdn_ab`/`fused_gdn_step_norm`; and **1, `gr_write`, is
+unconditional**. 15 + 3 + 1 = 19. The brief's "14 of the 19 are native/legacy pairs" undercounts the pair
+members by one and does not account for the 3 + 1.
+
+Under the branch policy **`native_gdn_enabled() == false`** (and, for QSA, `native_qsa_enabled() == false` /
+`native_qsa_indexer_enabled() == false`), one implementation per pair is sufficient: the layer takes the legacy
+`else` of every pair, and the flag removes the three fused paths from the forward path entirely (they are gated
+on `native_gdn_enabled() && …`, `layer.cpp:247, 306`). So the 19 symbols need **9 kernel implementations**:
+
+| # | symbol | branch | state |
+|---|---|---|---|
+| 1 | `gdn_conv_step` | legacy | **LANDED 2026-10-05** |
+| 2 | `gdn_l2_norm` | legacy | **LANDED 2026-10-05** |
+| 3 | `gdn_beta_gate` | legacy | **LANDED 2026-10-05** |
+| 4 | `gdn_gate` | legacy | already ported (`gdn_gate.comp`) |
+| 5 | `gdn_step` | legacy | todo |
+| 6 | `gdn_out_norm` | legacy | todo |
+| 7 | `qsa_gate_apply_f32` | legacy | todo |
+| 8 | `indexer_key_append` | legacy | todo |
+| 9 | `gr_write` | unconditional | todo |
+
+**8 remain** (3 of them now landed). Contract this puts on the backend's capability checks: `native_gdn_enabled()`
+must answer **false** on Vulkan, and (when the QSA increment lands) `native_qsa_enabled()` and
+`native_qsa_indexer_enabled()` must too. `layer_verify_compatible()` (`src/core/layer.cpp:476-486`) requires the
+native GDN and the native QSA indexer, so answering them off disables the P6 verify window — speculative
+verification only; a `--spec 0` run is unaffected.
+
 ## Class B — capability-gated, ported fallback (4)
 
 All four are the **shipped** branch; the backend forces the `*_enabled()` to false and the engine uses the

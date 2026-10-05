@@ -1,5 +1,43 @@
 # Status — what is done, what is verified, what is not
 
+## THE GDN (DeltaNet) MIXER'S FIRST THREE KERNELS LANDED — class A of the decode-path triage (2026-10-05)
+
+The corrected map's **19 class-A forward-path holes** are dominated by the **GDN / DeltaNet mixer**, which runs
+on 36 of the model's 48 layers and which the port's plan never enumerated. This increment lands the FIRST THREE
+kernels of the mixer's chain, in the order `gdn_layer` runs them: `gdn_conv_step` (the four-tap conv),
+`gdn_l2_norm` (the L2 norm, eps on the SQUARED NORM) and `gdn_beta_gate` (`beta = sigmoid(beta)`).
+
+**THE BRANCH POLICY, and the contract on the backend.** The class-A GDN symbols are native/legacy PAIRS
+(`if (native_gdn_enabled()) native_gdn_X else gdn_X`); the port implements the **LEGACY** member of each and
+requires the Vulkan backend to answer **`native_gdn_enabled() == false`**. That one answer makes ONE
+implementation per pair sufficient: the layer takes every `else`, and it also removes the three fused GDN paths
+(`fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm`, gated on `native_gdn_enabled()`) from the path
+entirely. **Re-checked the parent's count:** the 19 symbols are **15 native/legacy pair members (11 GDN + 4
+QSA) + 3 fused + 1 unconditional (`gr_write`)** = 19; collapsed under the policy they need **9 kernel
+implementations** (6 GDN legacy — one of them, `gdn_gate`, already ported —, 2 QSA, `gr_write`), so **8 are
+still to write**. The `layer_verify_compatible()` contract: forcing these flags off makes the P6 verifier refuse
+to init (speculative verification off, class D); a `--spec 0` run is unaffected.
+
+**The three kernels and their proofs** (shaders `gdn_conv_step.comp`, `gdn_l2_norm.comp`, `gdn_beta_gate.comp`;
+cases `case_gdn_conv_step` / `case_gdn_l2_norm` / `case_gdn_beta_gate`; oracles transcribed from the engine's
+own rule — `src/kernels/cuda/gdn.cu` plus `src/kernels/gdn_parity.cpp` — not invented):
+
+| case | rule | measured | falsified by |
+|---|---|---|---|
+| `gdn_conv_step` (3 arms) | `out[c]=Σ conv_state·kW + x·kW`, state slides oldest→newest | **96/96 w 7.09e-08**, 20/20 w 0, 1200/1200 w 3.62e-06 | `gdn-conv-tap-order` → FAIL 72/96 w 2.28 |
+| `gdn_l2_norm` (3 arms) | `x *= 1/sqrt(Σx² + eps)` (eps on the **squared norm**) | **392/392 w 0**, 2312/2312 w 1.66e-07, 648/648 w 1.56e-07 | `gdn-l2-norm-eps-on-mean` → FAIL 265/392 w 0.446 |
+| `gdn_beta_gate` | `beta = 1/(1+exp(-beta))` in place | **48/48 w 1.42e-06** | `gdn-beta-gate-drop-sigmoid` → FAIL 0/48 w 1.8e+12 |
+
+The conv case compares the slid state **bit for bit** (the kernel only moves/appends values) and its fixture
+labels the state rows so the slide direction is observable; the l2 case's oracle is double and the shader sums
+in **f32** (the target has no shaderFloat64), so the printed `worst` IS the measured gap — an honest limit, not a
+bit-exactness claim.
+
+**The map dropped by three:** `PORT-MAP.tsv` `168 — 53 kernel, 63 host, 52 todo` → **`168 — 56 kernel, 63 host,
+49 todo`**; `check_port_map.py` passes and `make_port_map.py` regenerates it byte-identically.
+**Measured: vega Arc 367/0/0, llvmpipe 355/0/3, radeon-iGPU 357/1/2** (+7 verdicts on each; the 1 is the known
+intermittent `budget: independent requery` flake). Full detail in `NEXT.md`'s top section.
+
 ## THE PORT MAP'S BLIND SPOT IS CLOSED — and it was 91 symbols, not 4 (2026-10-05)
 
 `tools/check_port_map.py` keyed on the `kernels::` qualifier, so kernels-namespace symbols that
