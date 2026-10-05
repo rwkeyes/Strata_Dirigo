@@ -1,5 +1,36 @@
 # Status — what is done, what is verified, what is not
 
+## The engine integration has STARTED: increment I1 (device layer + arena + the first entry point) — DONE AND VERIFIED 2026-10-05
+
+`ports/vulkan/plan/BACKEND-INTEGRATION.md` §3's **I1**, the first increment that BUILDS the engine.  It adopts
+`ports/vulkan/harness/vk_compute.*` as `vulkan/src/device/` (namespace renamed `portvk` -> `strata::vulkan` so one
+TU can hold the port's device layer and the engine's without an ODR clash), builds **THE ARENA** (one device-local
+buffer carved by byte offsets; a device pointer is `kArenaBase + offset` in a synthetic address space, which is
+what an unmappable VRAM arena can offer) and the **pointer -> buffer resolution** `arena_resolve` (base subtract,
+live-range check, `view(arena, offset)` — a pointer outside the arena is refused, not bound), and finishes
+`strata::vulkan::fwht256` so increment 0's entry point RUNS (pipeline cache keyed as the engine dispatches: 2
+storage buffers + a 4-byte push constant).  **How the engine's sources join the build:** `vulkan/CMakeLists.txt`
+gained `strata_vulkan_resolve()`, mirroring `../sycl/CMakeLists.txt`'s `strata_resolve` — a source comes from
+`vulkan/` when a migrated copy is there, else from the engine tree.  I1 needs no engine-root source (the wrapper is
+a header) and the top-level `return()` stands; the first engine-root sources are I2's.  The target that proves the
+wiring, `strata_vk_entry_smoke`, builds only under `-DSTRATA_ENABLE_VULKAN=ON` (measured **configure 0.14 s, build
+1.37 s**, 9 objects) and runs PASS on the Arc.  A full engine build was not needed and was not done — the CUDA
+configuration never compiles `vulkan/`.
+
+**The proof, and it is the first WRAPPER this port has gated rather than a shader.**  `case_fwht256_entry` runs the
+same input through the port's shader path and through the ENGINE wrapper (`strata::kernels::fwht256_cuda`) on the
+backend's arena, and compares as 32-bit words: **PASS 1024/1024, worst 0**.  Falsified by
+`gates/inject-verify.sh fwht-entry-wrong-view-offset` (shift the view the DISPATCH binds by one float) ->
+`FAIL ... 128/ 1024 worst 896`.  Recorded honestly: a UNIFORM shift inside `arena_resolve` does NOT bite (transfer
+and dispatch move together and cancel) — the dispatch's offset is the one that decides.
+
+**Gate totals: vega Arc 360/0/0, llvmpipe 348/0/3, radeon-iGPU 351/0/2, exit 0, wall 56.03 s.  Box `z820b`
+post-commit: default XTX 356/0/1 (the 1 is the pre-existing M8 `prefill split` skip), lvp 348/0/3, nvidia
+351/0/2, exit 1 (the skip).  The first box run read 355/1/1: `budget: independent requery agrees` failed on the
+XTX — the KNOWN intermittent flake (that same run's named `radeon_icd` arm read 356/0/1 clean, and the re-run
+cleared it), so 0 failed is the result.  New case 1024/1024 bitwise on every box arm.  Port map unchanged: 77
+decode-path symbols — 28 kernel, 49 host, 0 todo.**
+
 ## Done and verified in this session
 
 Everything below is backed by a command that exits non-zero on failure. Re-run it with:
@@ -497,12 +528,15 @@ the case prints the shape it selected rather than only PASS.
   (b) are now DONE for the two formats that cover the most layers - `native_gu_iq2s.comp` and
   `native_down_iq4nl.comp`, the shape the expert tier actually launches - with the four other instantiations and
   the `_multi` variants left as mechanical copies (see `NEXT.md`).
-* **The engine integration**: no `STRATA_ENABLE_VULKAN`, no arena, no kernel registry, and no recorded decode step
-  IN THE ENGINE. `harness/vk_compute.*` is the seed of the device layer and now carries the single-shot `dispatch()`,
-  the recorded-step API (stage 3), and the engine-shaped memory path — device-local allocation, staging transfers
-  and `plan_fit` fit accounting (stage 4) — each verified by the gate. What it still is NOT: the engine's backend.
-  There is no `setup.py`/`CMakeLists`/`core/device.hpp` change on this branch, so nothing in the engine can call any
-  of it yet.
+* **The engine integration**: **STARTED — I1 landed 2026-10-05** (`vulkan/` carries `STRATA_ENABLE_VULKAN` from
+  increment 0; I1 added `vulkan/src/device/` — the adopted port device layer plus the arena, the pointer->buffer
+  resolution and the pipeline cache — and one entry point, `strata::kernels::fwht256_cuda`, that RUNS and is gated
+  bitwise against the port's shader path; see the section at the top). What is still NOT there: the engine's own
+  sources under `STRATA_ENABLE_VULKAN` (I1's target is a smoke executable, not the engine program), the other 39
+  entry points, and the recorded decode step IN THE ENGINE — so `src/` cannot yet drive the backend and there is
+  still no `setup.py`/engine `CMakeLists` change. `harness/vk_compute.*` remains the seed from which
+  `vulkan/src/device/` was adopted, and it carries the single-shot `dispatch()`, the recorded-step API (stage 3)
+  and the engine-shaped memory path (stage 4), each verified by the gate.
 * **Anything on Intel hardware — NO LONGER UNVERIFIED (2026-10-04).** An Arc Pro B70 is now the discrete card in
   this host (the 7900 XTX is out; the Ryzen iGPU drives the display) and the gate runs on it: **180 / 0 / 0** —
   no skips at all, including the matrix path, which was the port's own criterion misreading the device rather

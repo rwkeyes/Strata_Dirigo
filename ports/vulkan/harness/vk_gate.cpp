@@ -20,6 +20,15 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "iq_grids.hpp"
 
+// THE ENGINE-SIDE BACKEND (vulkan/src/device/), adopted from this harness in increment I1.  It is a SEPARATE
+// copy with its own namespace (strata::vulkan), so a case here can hold BOTH the port's device layer (portvk)
+// and the engine's (strata::vulkan) at once without an ODR clash - which is exactly what case_fwht256_entry
+// needs to compare the two paths.  The engine's wrapper headers are included too; the engine's headers are
+// never edited (see ports/vulkan/plan/BACKEND-INTEGRATION.md).
+#include "strata/vulkan/vk_backend.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "vk_arena.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -10532,6 +10541,89 @@ void case_iq_embed_rows(Ctx& ctx, const std::string& dir) {
     ctx.free(b_g5); ctx.free(b_g6);
 }
 
+// ================== I1: THE FIRST ENGINE ENTRY POINT (the wrapper, not the shader) ==================
+// The plan's I1 proof, and the first case in this port that proves a WRAPPER rather than a shader.  Everything
+// above drives a shader through the port's own device layer; this case drives the ENGINE'S ENTRY POINT -
+// `strata::kernels::fwht256_cuda`, the symbol include/strata/kernels/kv_q4.hpp declares and the decode path
+// calls through `fwht256_inplace_cuda(...)` - through the backend's device layer (vulkan/src/device/): the
+// arena, the raw-device-pointer -> (buffer, offset) resolution, and the pipeline cache keyed as the engine
+// dispatches (2 storage buffers + a 4-byte push constant).
+//
+// THE CLAIM IS BITWISE.  The wrapper runs the SAME shader on the SAME input, so its output must equal the
+// port's already-green shader path word for word.  A wrong arena VIEW OFFSET changes WHERE the shader reads
+// and writes and the value moves - that is the falsification registered in gates/inject-verify.sh
+// (fwht-entry-wrong-view-offset), which must make the BITWISE arm below fail.
+void case_fwht256_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "fwht256.spv")) return;
+    const uint32_t n_rows = 4;
+    std::vector<float> x((size_t) n_rows * 256);
+    for (float& v : x) v = rndf(2.0f);
+    // The shape of fixture the port's rotation case uses: one deliberate outlier row (the case the rotation
+    // exists for) and one all-zero row.
+    for (uint32_t j = 0; j < 256; ++j) x[(size_t) 1 * 256 + j] = (j == 7) ? 40.0f : 0.0f;
+    for (uint32_t j = 0; j < 256; ++j) x[(size_t) 2 * 256 + j] = 0.0f;
+
+    // (A) THE PORT'S PATH: the shader through the gate's own device layer, exactly as case_kv_q4_rot runs it.
+    Buf b_in = ctx.alloc(x.size() * 4), b_ref = ctx.alloc(x.size() * 4);
+    ctx.write(b_in, x.data(), x.size() * 4);
+    VkPipeline pw = ctx.pipeline(dir + "/fwht256.spv", 2, 4);
+    struct { int n_rows; } wpc{(int) n_rows};
+    ctx.dispatch(pw, {&b_in, &b_ref}, &wpc, sizeof(wpc), n_rows);
+    std::vector<float> ref(x.size());
+    ctx.read(b_ref, ref.data(), ref.size() * 4);
+
+    // (B) THE ENGINE'S ENTRY POINT: the backend's device layer, its own arena, the wrapper the engine calls.
+    strata::vulkan::Stream* s = strata::vulkan::stream_open(4ull << 20, dir);
+    if (s == nullptr) {
+        verdict("fwht256 entry point: engine wrapper", false, 1, 1, 0,
+                "the backend could not open a stream");
+        ctx.free(b_in); ctx.free(b_ref);
+        return;
+    }
+    float* dsrc = strata::vulkan::arena_alloc<float>(*s, x.size());
+    float* ddst = strata::vulkan::arena_alloc<float>(*s, x.size());
+    strata::vulkan::stream_write(*s, dsrc, x.data(), x.size() * 4);
+    strata::kernels::fwht256_cuda(dsrc, ddst, (int64_t) n_rows, s);   // THE ENGINE WRAPPER
+    std::vector<float> got(x.size());
+    strata::vulkan::stream_read(*s, ddst, got.data(), got.size() * 4);
+    strata::vulkan::stream_close(s);
+
+    // (C) BITWISE against the port's path.  Compared as 32-bit WORDS: a float `==` calls +0 and -0 equal and
+    // misses a NaN payload, and this port's rule is that what a kernel COPIES - or here, what two identical
+    // dispatches COMPUTE - must match exactly.
+    int bad = 0;
+    uint32_t first = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        uint32_t a, b;
+        std::memcpy(&a, &ref[i], 4); std::memcpy(&b, &got[i], 4);
+        if (a != b) { if (bad == 0) first = (uint32_t) i; ++bad; }
+    }
+    if (bad) {
+        std::printf("      first differing word %u: shader %.9g vs wrapper %.9g\n", first,
+                    (double) ref[first], (double) got[first]);
+    }
+    verdict("fwht256 entry point: engine wrapper == shader path, bitwise", bad == 0, bad, (int) ref.size(),
+            (double) bad,
+            "words differ - the arena view offset, the pipeline or the dispatch the wrapper uses does not "
+            "match the ported shader's own path");
+
+    // (D) and against the EXPLICIT matrix, so the case is not merely a self-consistency check between two
+    // paths that could share a defect.  Same oracle and tolerance as the port's rotation case.
+    std::vector<double> want;
+    fwht_matrix_ref(want, x, n_rows);
+    int badm = 0;
+    double worst = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double rel = std::fabs((double) got[i] - want[i]) / (std::fabs(want[i]) + 1e-30);
+        worst = std::max(worst, rel);
+        if (!(rel <= 2e-5 || std::fabs((double) got[i] - want[i]) <= 1e-6)) ++badm;
+    }
+    verdict("fwht256 entry point: engine wrapper vs explicit Hadamard", badm == 0, badm, (int) got.size(), worst,
+            "values outside tolerance - the wrapper's arena slice is not the row it claims");
+
+    ctx.free(b_in); ctx.free(b_ref);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -10680,6 +10772,7 @@ int main(int argc, char** argv) {
     case_moe_hit_grouped_s2(ctx, dir);     // M-A: the composed per-hit S2 expert entry (gu->swiglu->q8_0->down)
     case_moe_grouped_s2(ctx, dir);         // M-A: the composed GROUPED S2 expert entry (groups + per-entry tokens)
     case_moe_hit_add(ctx, dir);            // M-A: the hit accumulator (parts[dst[h]] += hit_out[dst[h]])
+    case_fwht256_entry(ctx, dir);          // I1: the FIRST ENGINE ENTRY POINT (the wrapper, not the shader)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

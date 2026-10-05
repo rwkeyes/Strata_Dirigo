@@ -34,6 +34,10 @@
 #                                       -> must FAIL  "moe_grouped_s2"
 #   inject-verify.sh moe-hit-add-accumulate      moe_hit_add.comp  `+=` -> `=` (the CPU's prior value dropped)
 #                                       -> must FAIL  "moe_hit_add"
+#   inject-verify.sh fwht-entry-wrong-view-offset  vulkan/src/kernels/fwht_vk.cpp  bind the source view one float
+#                                       early -> must FAIL  "fwht256 entry point: engine wrapper == shader path"
+#                                       (this is the ENGINE-side backend, a non-shader/non-harness source, so the
+#                                       script rebuilds the gate - which links vulkan/src/device/ + the kernel TU)
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -48,11 +52,26 @@ TREE="$(cd "$ROOT/../.." && pwd)"                 # the engine tree (for the rea
 # choice).  Both are real falsifications, so both must rebuild the artifact they change - an injection that does
 # not rebuild runs the stale binary and reports a clean result.
 rebuild_harness() {
-  g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" -o "$GATE" \
+  # THE ENGINE-SIDE BACKEND IS PART OF THE HARNESS NOW: case_fwht256_entry drives the engine's own entry point
+  # (strata::kernels::fwht256_cuda) through vulkan/src/device/, so a change to any of those sources must rebuild
+  # the gate (a device-layer injection that skipped this would run a stale binary and report a clean result).
+  g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
+      -I"$TREE/vulkan/include" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 -o "$GATE" \
       "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" "$ROOT/harness/vk_stack.cpp" \
-      "$ROOT/harness/vk_gate.cpp" -lvulkan
+      "$ROOT/harness/vk_gate.cpp" \
+      "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
+      "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
+      "$TREE/vulkan/src/kernels/fwht_vk.cpp" -lvulkan
 }
-is_harness_src() { case "$1" in "$ROOT"/harness/*.cpp|"$ROOT"/harness/*.hpp) return 0 ;; *) return 1 ;; esac; }
+# A source that must be rebuilt into the GATE (the harness proper, or the engine-side backend the harness links).
+is_harness_src() {
+  case "$1" in
+    "$ROOT"/harness/*.cpp|"$ROOT"/harness/*.hpp) return 0 ;;
+    "$TREE"/vulkan/src/*.cpp|"$TREE"/vulkan/src/*.hpp) return 0 ;;
+    "$TREE"/vulkan/src/*/*.cpp|"$TREE"/vulkan/src/*/*.hpp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 name="${1:-}"; icd="${2:-}"
 case "$name" in
@@ -142,6 +161,16 @@ case "$name" in
     old=$'        parts.v[row + i] += hit_out.v[row + i];'
     new=$'        parts.v[row + i] = hit_out.v[row + i];   // INJECTION: the accumulate dropped'
     want="FAIL  moe_hit_add" ;;
+  fwht-entry-wrong-view-offset)
+    # THE ARENA'S failure mode, and the I1 case's named falsification.  The engine wrapper resolves a raw device
+    # pointer to an arena VIEW and binds it; a wrong offset makes the shader read one thing while the transfer
+    # wrote another.  NOTE: a UNIFORM shift (e.g. inside arena_resolve) does NOT bite - write, dispatch and read
+    # all move together and cancel - which is exactly why the offset that matters is the DISPATCH's, so this
+    # injection shifts the view the dispatch binds.
+    file="$TREE/vulkan/src/kernels/fwht_vk.cpp"
+    old=$'    s.ctx->dispatch(pipe, {&sv, &dv}, &pc, sizeof(pc), (uint32_t) n_rows);'
+    new=$'    Buf s_src = sv; s_src.offset += 4u;   // INJECTION: the source view bound one float early\n    s.ctx->dispatch(pipe, {&s_src, &dv}, &pc, sizeof(pc), (uint32_t) n_rows);'
+    want="FAIL  fwht256 entry point: engine wrapper == shader path" ;;
   sampler-split-merge-drop-parts)
     # The split's whole content is the MERGE: a row's list is the ordered union of its 4096-logit partitions'
     # lists.  Taking the running list first (instead of comparing the two heads) appends each partition after

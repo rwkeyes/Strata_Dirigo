@@ -1,5 +1,77 @@
 # Start here next session
 
+## I1 - THE ENGINE BACKEND'S FIRST INCREMENT: the device layer, the arena, and the first entry point that RUNS - **DONE AND VERIFIED 2026-10-05**
+
+Increment **I1** of `ports/vulkan/plan/BACKEND-INTEGRATION.md` (the first increment that BUILDS the engine).
+Until now every case in this port proved a **shader**; this one proves a **WRAPPER** - `strata::kernels::fwht256_cuda`,
+the engine symbol `include/strata/kernels/kv_q4.hpp` declares and the decode path calls through
+`fwht256_inplace_cuda` - end to end through a real device layer that did not exist in the engine before.
+
+**What was adopted and built.**
+* `ports/vulkan/harness/vk_compute.*` (and the `vk_compat.*` / `vk_stack.*` it includes) is ADOPTED as
+  `vulkan/src/device/`, one copy for the engine.  Its namespace was renamed `portvk` -> `strata::vulkan` so a
+  single translation unit can hold BOTH the port's device layer and the engine's at once (the gate needs both);
+  the port's harness copy is untouched and stays the gate's oracle.
+* **THE ARENA.**  `Stream` owns ONE device-local buffer (`alloc_device`), carved by byte offsets.  `arena_alloc`
+  bump-allocates, 256-byte aligned and raised to the device's `minStorageBufferOffsetAlignment`, so every view it
+  hands out is bindable.  A device pointer is `kArenaBase + byte_offset` in a SYNTHETIC address space - the engine
+  only does arithmetic on it and passes it back, exactly as it did against `cudaMalloc`, so it has to be
+  RESOLVABLE, not readable (the arena is unmappable VRAM on the Arc, so there is no host address to hand out).
+* **POINTER -> BUFFER.**  `arena_resolve` subtracts the base, range-checks the LIVE region (`bump`), and returns
+  `view(arena, offset)` - the `(VkBuffer, byte offset)` a descriptor binds.  A pointer outside the arena is a loud
+  refusal, not a wrong read.
+* **`fwht256` finished.**  The wrapper's two raw pointers resolve to views, and the pipeline comes from the device
+  layer's cache keyed as the engine dispatches (2 storage buffers + a 4-byte push constant).  A LIVE-STREAM
+  REGISTRY makes `stream_of` refuse a handle this backend did not create (membership is a comparison, so the check
+  never dereferences rubbish).
+
+**How the engine's sources join the build (the decision, and it is sycl's pattern).**  `vulkan/CMakeLists.txt`
+gained `strata_vulkan_resolve()`, mirroring `../sycl/CMakeLists.txt`'s `strata_resolve`: a source is taken from
+`vulkan/` when a migrated copy exists there, otherwise from the engine tree `${STRATA_ROOT}`.  I1 needs **no**
+engine-root source (the wrapper is a header), so the top-level `return()` stands; the first engine-root sources are
+the I2 glue and are named through the same function.  The target that proves the wiring is `strata_vk_entry_smoke`
+(built only under `-DSTRATA_ENABLE_VULKAN=ON`): it links the device layer + the kernel TU and calls the engine
+wrapper, round-tripping against an explicit Hadamard matrix on the host.  **Measured: configure 0.14 s, build
+1.37 s** (9 objects); run PASS on the Arc (BMG G31).  A FULL engine build was **not** needed for I1's claim and was
+not done - the CUDA configuration never compiles `vulkan/` (the block is inside `if(STRATA_ENABLE_VULKAN)`), so it
+cannot be affected.
+
+**The proof (the plan's own condition).**  `case_fwht256_entry` in `ports/vulkan/harness/vk_gate.cpp` runs the SAME
+input twice - once through the port's shader path, once through the ENGINE wrapper on the backend's own arena - and
+compares the outputs as 32-bit WORDS (a float `==` calls +0 and -0 equal and misses a NaN payload).  Raw line:
+
+```
+PASS  fwht256 entry point: engine wrapper == shader path, bitwise  1024/ 1024   worst 0          words differ - the arena view offset, the pipeline or the dispatch the wrapper uses does not match the ported shader's own path
+```
+
+Falsified by `gates/inject-verify.sh fwht-entry-wrong-view-offset`, which shifts the view the **dispatch** binds by
+one float:
+
+```
+FALSIFIED (fwht-entry-wrong-view-offset): FAIL  fwht256 entry point: engine wrapper == shader path, bitwise   128/ 1024   worst 896        words differ - the arena view offset, the pipeline or the dispatch the wrapper uses does not match the ported shader's own path
+```
+
+**THE INSTRUCTIVE PART: a UNIFORM shift does not bite.**  The first injection tried `+4` inside `arena_resolve`
+itself and the case stayed GREEN - the transfer (write/read) and the dispatch all resolve the same pointer, so the
+shift CANCELS.  The offset that decides the answer is the one the DISPATCH binds, so the registered injection
+targets that.  The injection lives in `vulkan/src/kernels/fwht_vk.cpp` (an engine-side, non-shader source), so
+`inject-verify.sh`'s `rebuild_harness`/`is_harness_src` were extended to link the whole backend and rebuild it -
+otherwise the script would have run a stale binary.
+
+**Gate totals after I1.**  vega: Arc **360/0/0**, llvmpipe 348/0/3, radeon-iGPU 351/0/2, `run_gate.sh` **exit 0**,
+wall **56.03 s** (a second run read 55.65 s).  Box (`z820b`), the post-commit run: default XTX **356/0/1** (the 1
+is the pre-existing M8 `prefill split` skip), lvp 348/0/3, nvidia (K620) 351/0/2, exit 1 (the skip).  The FIRST box
+run read **355/1/1**: `budget: independent requery agrees` failed on the XTX - the KNOWN intermittent flake (the
+same run's named `radeon_icd` arm read 356/0/1 clean, and the re-run cleared it), so 0 failed is the result and
+the box's non-zero exit is the documented skip.  The new case is **1024/1024 bitwise on every box arm**.  The port
+map still reads **77 decode-path symbols - 28 kernel, 49 host, 0 todo**, and `make_port_map.py` regenerates
+`PORT-MAP.tsv` identically.
+
+**What I1 does NOT do** (kept for the increments that own it): the engine-root sources (the glue, rope, the mapped
+copies, the doorbell redesign) are I2 and nothing in `src/` is compiled under `STRATA_ENABLE_VULKAN` yet; the
+row-slice alignment risk the plan names (`X + t0*K` whose stride is not a multiple of the device's 4-byte limit)
+is not exercised by fwht256, which binds whole 256-float rows.
+
 ## THE 7900 XTX'S TWO FAILURES - A WRONG CASE BOUND AND A LAVAPIPE DRIVER BUG - **DONE AND VERIFIED 2026-10-04**
 
 The gate run on `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8) found two failures and neither was explained.
