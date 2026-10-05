@@ -41,6 +41,49 @@ driver builtin.  The `quantize_q8_0_scaled` sibling was already independent of i
 rule), and this was the only f64 use of `roundEven` in the port.  **Honest limit:** this is a property of that
 Mesa build, measured here and not reproduced upstream; the shader no longer depends on it either way.
 
+## M-A: the standalone dequantiser's LAST TWO FORMATS - IQ2_XXS and IQ2_XS - **DONE AND VERIFIED 2026-10-05**
+
+`iq_dequant_f32` covered 14 formats and REFUSED the remaining two `is_iq` types by name: IQ2_XXS (ggml type 16) and
+IQ2_XS (17), because their grids (`iq2xxs_grid` 256 points, `iq2xs_grid` 512) were not in the port's generated
+table.  Both now decode, and the hole is closed: **`check_port_map.py` still reads 77 symbols - 28 kernel, 49 host,
+0 todo** (the formats live in a shader that was already `kernel`; no map row changed, and `make_port_map.py`
+regenerates `PORT-MAP.tsv` byte-identically).
+
+**What changed.** `tools/gen-iq-tables.py` extracts the two `uint64_t` grids from the engine's own
+`third_party/ggml/ggml-common.h` verbatim, as low/high `uint32` pairs like `iq2s_grid` (no `shaderInt64`);
+`harness/iq_grids.hpp` gains `kIq2xxsGrid[512]` and `kIq2xsGrid[1024]`; `common/iq_dequant.glsl` gains the two
+`tid`-mapped bodies; `iq_dequant_f32.comp` and `iq_embed_rows.comp` declare the two new grid buffers (bindings 5/6,
+the output moving to 7/8); and `harness/vk_gate.cpp` gains ONE ARM PER FORMAT whose oracle is a transcription of
+the engine's `dq_iq2_xxs` / `dq_iq2_xs` (`src/kernels/cuda/iq_kernels.cu`).
+
+**The two layouts, from the engine's decoder (not re-derived).** Both store `d` at byte 0 and `qs` as 32 `uint16`
+at byte 2; the per-lane part is `qs + 4*ib`, i.e. 8 bytes (`ib = tid%8`, `il = tid/8`).
+* **IQ2_XXS (66 bytes):** the four LOW bytes of the part are the four lanes' GRID INDICES (`aux8[il]`, one packed
+  byte each); the four high bytes are `aux32`, whose top nibble is the block scale's high part and whose low 28 bits
+  carry four 7-bit `ksigns_iq2xs` selectors.  `d = f16 * (0.5 + (aux32>>28)) * 0.25`.
+* **IQ2_XS (74 bytes):** the part's four `uint16` words each hold a 9-BIT grid index (`& 511`) with the 7-bit sign
+  selector ABOVE it (`>> 9`); the scale is `scales[ib]`'s nibble `4*(il/2)`.  `d = f16 * (0.5 + nibble) * 0.25`.
+
+**A finding worth keeping: the fixture MARGIN was not serving the arm.** The first version of the IQ2_XS injection
+(drop the grid index's 9th bit, `& 511` -> `& 255`) was **NOT FALSIFIED** - the arm stayed 768/768 green.  Cause: the
+shared fixture's byte pattern `(k*37+13)&0xFF` makes every odd-offset byte EVEN, and the grid-index word's high byte
+is always at an odd offset here, so bit 8 of `q2[il]` was **deterministically 0** at the dequant arm's seed: the
+upper half of the 512-point grid was never indexed and the injection could not move a value.  The fixture now forces
+that bit to split across both halves (`| (ib & 1)`) for IQ2_XS, so the whole grid is exercised - and only then does
+the injection bite.  This is the "a fixture that cannot move under the wrong rule is decorative" rule, found again.
+
+**Falsified (both, on vega).** `gates/inject-verify.sh` gained two registrations:
+* `iq-dequant-iq2xxs-grid-index` (read the neighbour lane's grid byte) -> `FAIL  iq_dequant_f32: IQ2_XXS  300/768  worst 3.79e+05`.
+* `iq-dequant-iq2xs-grid-high` (drop the 512-point grid's 9th bit) -> `FAIL  iq_dequant_f32: IQ2_XS  530/768  worst 3.82e+05`.
+
+**Measured, bit-exact.** Both arms read `bit-exact 768/768` on the dequantiser and `1536/1536` on `iq_embed_rows`
+(the same decode through the row gather).  Totals **+4 verdicts on every implementation**:
+* vega: **Arc Pro B70 333 passed / 0 failed / 0 skipped**; llvmpipe 321/0/3; radeon-iGPU 323/1/2 where the single
+  failure is the documented intermittent `budget: independent requery agrees` (the iGPU figure drift - recorded,
+  not chased; a clean radeon run reads 323/0/2).
+* z820b (7900 XTX): **radeon_icd 329/0/1** (the 1 skip is the pre-existing M8 `prefill split`), lvp 321/0/3,
+  nvidia (K620) 324/0/2.  The box's script exits 1 on that pre-existing skip, as at HEAD.
+
 ## M-A: the decode path's last kernels - the ORDER, and 1/3: `cvec_apply`
 
 **The order, derived from the decode path (`src/core/`), not invented.** The ten `todo` symbols were ordered by

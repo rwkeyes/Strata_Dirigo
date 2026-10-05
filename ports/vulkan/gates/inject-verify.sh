@@ -18,6 +18,10 @@
 #                                       -> must FAIL  "scatter_rows_f32: permutation ..."
 #   inject-verify.sh iq-dequant-iq1m-grid-high  common/iq_dequant.glsl  misplace the IQ1_M grid high bit
 #                                       -> must FAIL  "iq_dequant_f32: IQ1_M"
+#   inject-verify.sh iq-dequant-iq2xxs-grid-index  common/iq_dequant.glsl  read the neighbour lane's IQ2_XXS grid byte
+#                                       -> must FAIL  "iq_dequant_f32: IQ2_XXS"
+#   inject-verify.sh iq-dequant-iq2xs-grid-high    common/iq_dequant.glsl  drop the IQ2_XS 512-point grid's high bit
+#                                       -> must FAIL  "iq_dequant_f32: IQ2_XS"
 #   inject-verify.sh iq-embed-rows-identity     iq_embed_rows.comp  gather the row at the POSITION
 #                                       -> must FAIL  "iq_embed_rows: ..."
 #   inject-verify.sh native-q5k-aux-half        native_q5_k_f32.comp  drop the packed-scale half switch
@@ -72,6 +76,20 @@ case "$name" in
     old=$'        const uint gidx = iq_b(bb + 4u * ib + il) | (((qh >> (4u * (il % 2u))) & 7u) << 8u);'
     new=$'        const uint gidx = iq_b(bb + 4u * ib + il) | (((qh >> (4u * (il % 2u))) & 7u) << 7u);   // INJECTION: IQ1_M grid high bit misplaced'
     want="FAIL  iq_dequant_f32: IQ1_M" ;;
+  iq-dequant-iq2xxs-grid-index)
+    # IQ2_XXS's rule is `aux8[il]`: each lane reads ITS OWN byte of the 4-byte grid-index field.  Reading the
+    # neighbour lane's byte lands on a different 8-byte grid point, which is the plausible wrong layout.
+    file="$SH/common/iq_dequant.glsl"; spv="iq_dequant_f32"; comp="$SH/iq_dequant_f32.comp"
+    old=$'        const uint gidx = iq_b(q2 + il);'
+    new=$'        const uint gidx = iq_b(q2 + il + 1u);   // INJECTION: the IQ2_XXS grid index read off by one lane'
+    want="FAIL  iq_dequant_f32: IQ2_XXS" ;;
+  iq-dequant-iq2xs-grid-high)
+    # IQ2_XS's grid index is 9 bits (`q2[il] & 511`) because the grid has 512 points.  Masking 8 bits indexes the
+    # first half of the grid and silently alias half the points.
+    file="$SH/common/iq_dequant.glsl"; spv="iq_dequant_f32"; comp="$SH/iq_dequant_f32.comp"
+    old=$'        const uint gidx = w & 511u;'
+    new=$'        const uint gidx = w & 255u;   // INJECTION: the IQ2_XS 512-point grid high bit dropped'
+    want="FAIL  iq_dequant_f32: IQ2_XS" ;;
   iq-embed-rows-identity)
     file="$SH/iq_embed_rows.comp"; spv="iq_embed_rows"
     old=$'    const uint row = uint(uint64_t(tok) * uint64_t(pc.row_bytes));'

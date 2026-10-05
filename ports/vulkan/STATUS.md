@@ -24,7 +24,7 @@ never ran on this box after the swap - `NEXT.md`), and the radeon iGPU's `budget
 INTERMITTENT rather than deterministic: the driver's free figure drifts ~2.8 MB against the 1.7 MB tolerance (1
 failure in 3 consecutive runs of one binary on one device; an older commit reproduces it).  Re-run it and record it;
 do not chase it.  **75 kernels, 20 shared includes**, one generated table file (`harness/iq_grids.hpp`,
-holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
+holding the IQ1_S, IQ2_S, IQ2_XXS, IQ2_XS, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
 numbers ever stop reconciling this way, something is wrong with the harness rather than with a kernel.
@@ -122,6 +122,21 @@ inverts); the guard now reads `moved == 0` for count 0 and the arm was not loose
 regenerate it exactly.  **Measured: vega Arc 329/0/0** (`run_gate.sh` exit 0), intel_icd 329/0/0, llvmpipe 317/0/3,
 radeon-iGPU 320/0/2; box `radeon_icd` (7900 XTX) **325/0/1** (the pre-existing M8 `prefill split` skip), lvp
 317/0/3, nvidia 320/0/2.  The two new symbols add 7 verdicts (322 -> 329 on the Arc).
+
+**The standalone dequantiser's LAST TWO FORMATS landed - IQ2_XXS (ggml type 16) and IQ2_XS (17) (2026-10-05).**
+Those two `is_iq` types were the ones `iq_dequant_f32` refused BY NAME because their `uint64` grids were not in the
+generated table; both now decode.  `tools/gen-iq-tables.py` derives `iq2xxs_grid` (256 points) and `iq2xs_grid`
+(512) from the engine's own `ggml-common.h` as low/high `uint32` pairs (so no `shaderInt64`), `harness/iq_grids.hpp`
+carries them, `common/iq_dequant.glsl` gains the two `dq_*` bodies, and the harness gains ONE BIT-EXACT ARM PER
+FORMAT against the engine's own decoder (768/768 bit-exact; the same decode is 1536/1536 through `iq_embed_rows`).
+Falsified twice (`iq-dequant-iq2xxs-grid-index` -> `FAIL IQ2_XXS 300/768 worst 3.79e+05`; `iq-dequant-iq2xs-grid-high`
+-> `FAIL IQ2_XS 530/768 worst 3.82e+05`).  A finding: the shared fixture left IQ2_XS's 9th grid bit
+DETERMINISTICALLY clear, so the upper half of the 512-point grid was never indexed and the first injection was
+INVISIBLE - the fixture now splits that bit across both halves.  **+4 verdicts on every implementation:** vega
+**Arc 333/0/0**, llvmpipe 321/0/3, radeon-iGPU 323/0/2 (a clean run; one run had the documented intermittent
+`budget: independent requery` failure); box `radeon_icd` (7900 XTX) **329/0/1**, lvp 321/0/3, nvidia 324/0/2.  The
+port map still reads **77 symbols - 28 kernel, 49 host, 0 todo**, and `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.
 
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)

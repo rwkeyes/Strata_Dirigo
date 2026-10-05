@@ -9655,9 +9655,9 @@ void case_scatter_rows_f32(Ctx& ctx, const std::string& dir) {
 // port's worst bug class is a re-derived block layout that agrees with itself.
 //
 // The formats are every `is_iq` type whose grid the port's generated table carries (harness/iq_grids.hpp), plus
-// BF16.  IQ2_XXS (ggml type 16) and IQ2_XS (17) are NOT here: their grids (iq2xxs_grid, iq2xs_grid) are not in
-// the generated table, and shaders/iq_dequant_f32.comp does not claim them - an unproven format is recorded,
-// not approximated.
+// BF16.  That is now ALL of them: IQ2_XXS (ggml type 16) and IQ2_XS (17) joined when their 256- and 512-point
+// uint64 grids (iq2xxs_grid, iq2xs_grid) were added to the generated table - before that the port named them as
+// the two it could not decode rather than approximating them.
 
 static const uint8_t kIqSigns[128] = {
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
@@ -9838,6 +9838,26 @@ static void iq_dq_host(int ty, const uint8_t* w, size_t wbase, uint32_t ibs, uin
             y[32 * ib + 8 * il + j]     = d * ((float) ((q0 >> (8 * j)) & 0xFu) + delta);
             y[32 * ib + 8 * il + j + 4] = d * ((float) ((q1 >> (8 * j)) & 0xFu) + delta);
         }
+    } else if (ty == 16) {                                // dq_iq2_xxs
+        const uint8_t* b = b0 + (size_t) ibs * 66;
+        const uint8_t* q2 = b + 2 + 8 * ib;               // x[ibs].qs + 4*ib (uint16 elements)
+        const uint32_t aux32 = iq_u16h(q2 + 4) | (iq_u16h(q2 + 6) << 16);   // q2[2] | (q2[3] << 16)
+        const uint32_t gp = (uint32_t) q2[il];            // aux8[il]: one packed grid index per lane
+        const uint32_t g0 = strata::vkport::kIq2xxsGrid[2 * gp], g1 = strata::vkport::kIq2xxsGrid[2 * gp + 1];
+        const float d = iq_h2fh(b) * (0.5f + (float) (aux32 >> 28)) * 0.25f;
+        const uint8_t signs = kIqSigns[(aux32 >> (7 * il)) & 127u];
+        for (int j = 0; j < 8; ++j)
+            y[32 * ib + 8 * il + j] = d * (float) iq_g64h(g0, g1, j) * ((signs & kIqMask[j]) ? -1.0f : 1.0f);
+    } else if (ty == 17) {                                // dq_iq2_xs
+        const uint8_t* b = b0 + (size_t) ibs * 74;
+        const uint8_t* q2 = b + 2 + 8 * ib;               // x[ibs].qs + 4*ib (uint16 elements)
+        const uint32_t w = iq_u16h(q2 + 2 * il);          // q2[il]
+        const uint32_t gidx = w & 511u;                   // the grid index carries the sign field in the high bits
+        const uint32_t g0 = strata::vkport::kIq2xsGrid[2 * gidx], g1 = strata::vkport::kIq2xsGrid[2 * gidx + 1];
+        const float d = iq_h2fh(b) * (0.5f + (float) ((b[66 + ib] >> (4 * (il / 2))) & 0xF)) * 0.25f;
+        const uint8_t signs = kIqSigns[w >> 9];
+        for (int j = 0; j < 8; ++j)
+            y[32 * ib + 8 * il + j] = d * (float) iq_g64h(g0, g1, j) * ((signs & kIqMask[j]) ? -1.0f : 1.0f);
     }
     // any other type is refused by the host entry point before a dispatch (see the shader's header)
 }
@@ -9847,7 +9867,7 @@ static const IqFmt kIqFmts[] = {
     {30, "BF16",    512}, {20, "IQ4_NL", 144}, {23, "IQ4_XS", 136}, {8, "Q8_0",   272},
     {6,  "Q5_0",    176}, {7,  "Q5_1",   192}, {42, "Q2_0",    72}, {12, "Q4_K",  144},
     {13, "Q5_K",    176}, {11, "Q3_K",   110}, {18, "IQ3_XXS", 98}, {21, "IQ3_S", 110},
-    {22, "IQ2_S",    82}, {29, "IQ1_M",   56},
+    {22, "IQ2_S",    82}, {29, "IQ1_M",   56}, {16, "IQ2_XXS",  66}, {17, "IQ2_XS",  74},
 };
 
 static void iq_wf16(std::vector<uint8_t>& v, size_t off, float f) {
@@ -9878,6 +9898,18 @@ static std::vector<uint8_t> iq_fixture(int ty, uint32_t n_sb, uint32_t sb, uint3
         else if (ty == 12 || ty == 13) { iq_wf16(v, base, sc); iq_wf16(v, base + 2, sc * 0.25f); }
         else if (ty == 11)   { iq_wf16(v, base + 108, sc); }
         else if (ty == 18 || ty == 21 || ty == 22 || ty == 23) { iq_wf16(v, base, sc); }
+        else if (ty == 16) { iq_wf16(v, base, sc); }
+        else if (ty == 17) {                               // IQ2_XS: d, qs[32] (uint16), scales[8]
+            iq_wf16(v, base, sc);
+            // EXERCISE THE WHOLE 512-point GRID.  The grid index is 9 bits (`q2[il] & 511`); the fixture's byte
+            // pattern leaves bit 8 clear at this seed (the high byte of every q2 word is even), so the upper half
+            // of the grid would never be indexed AND a wrong-rule injection that drops that bit would be
+            // invisible.  Split the four index words of each 8-value part across both halves.
+            for (int ib = 0; ib < 8; ++ib)
+                for (int il = 0; il < 4; ++il)
+                    v[base + 2 + 8 * ib + 2 * il + 1] =
+                        (uint8_t) ((v[base + 2 + 8 * ib + 2 * il + 1] & 0xFE) | (ib & 1));
+        }
         else if (ty == 29) {                               // IQ1_M: the fp16 scale is the HIGH NIBBLE of bytes 49/51/53/55
             const uint16_t V = strata::kernels::f16_from_f32(sc);
             uint8_t* p = v.data() + base + 48;
@@ -9893,7 +9925,7 @@ static std::vector<uint8_t> iq_fixture(int ty, uint32_t n_sb, uint32_t sb, uint3
 // One format arm of `iq_dequant_f32`.  Returns the number of elements outside tolerance (also counted into the
 // verdict), and prints the oracle's element 0 against the device's, its mass, and the bit-exact count.
 static void iq_dequant_arm(Ctx& ctx, const std::string& dir, const IqFmt& f, uint32_t n_sb,
-                           Buf& b_w, Buf& b_y, Buf& b_g1, Buf& b_g2, Buf& b_g3, Buf& b_g4) {
+                           Buf& b_w, Buf& b_y, Buf& b_g1, Buf& b_g2, Buf& b_g3, Buf& b_g4, Buf& b_g5, Buf& b_g6) {
     const std::vector<uint8_t> w = iq_fixture(f.ty, n_sb, f.sb, 0);
     ctx.write(b_w, w.data(), w.size());
     const size_t n = (size_t) n_sb * 256;
@@ -9903,8 +9935,8 @@ static void iq_dequant_arm(Ctx& ctx, const std::string& dir, const IqFmt& f, uin
     std::vector<uint8_t> sink(n * 4, 0xC3);
     ctx.write(b_y, sink.data(), sink.size());
     struct { int ty; } pc{f.ty};
-    VkPipeline p = ctx.pipeline(dir + "/iq_dequant_f32.spv", 6, (int) sizeof(pc));
-    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_y}, &pc, sizeof(pc), n_sb);
+    VkPipeline p = ctx.pipeline(dir + "/iq_dequant_f32.spv", 8, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_y}, &pc, sizeof(pc), n_sb);
     std::vector<uint8_t> img(sink.size(), 0);
     ctx.read(b_y, img.data(), img.size());
     const float* got = reinterpret_cast<const float*>(img.data());
@@ -9938,12 +9970,17 @@ void case_iq_dequant_f32(Ctx& ctx, const std::string& dir) {
     Buf b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
     Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
     Buf b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_g5 = ctx.alloc(sizeof(strata::vkport::kIq2xxsGrid));
+    Buf b_g6 = ctx.alloc(sizeof(strata::vkport::kIq2xsGrid));
     ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
     ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
     ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
     ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
-    for (const IqFmt& f : kIqFmts) iq_dequant_arm(ctx, dir, f, 3, b_w, b_y, b_g1, b_g2, b_g3, b_g4);
+    ctx.write(b_g5, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
+    ctx.write(b_g6, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
+    for (const IqFmt& f : kIqFmts) iq_dequant_arm(ctx, dir, f, 3, b_w, b_y, b_g1, b_g2, b_g3, b_g4, b_g5, b_g6);
     ctx.free(b_w); ctx.free(b_y); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4);
+    ctx.free(b_g5); ctx.free(b_g6);
 }
 
 // One arm of `iq_embed_rows`: a table of DISTINCT rows and a token list that is a DERANGEMENT, so a kernel that
@@ -9951,7 +9988,7 @@ void case_iq_dequant_f32(Ctx& ctx, const std::string& dir) {
 // (`row_bytes`) is what the engine passes, and the whole point of the gather: the oracle reads the same stride.
 static void iq_embed_arm(Ctx& ctx, const std::string& dir, const IqFmt& f, uint32_t n_embd, uint32_t n_tok,
                          const std::vector<int32_t>& tokens, Buf& b_t, Buf& b_w, Buf& b_y,
-                         Buf& b_g1, Buf& b_g2, Buf& b_g3, Buf& b_g4) {
+                         Buf& b_g1, Buf& b_g2, Buf& b_g3, Buf& b_g4, Buf& b_g5, Buf& b_g6) {
     const uint32_t n_rows = 6;
     const uint32_t n_sb_row = n_embd / 256;
     const uint32_t row_bytes = n_sb_row * f.sb;
@@ -9972,8 +10009,8 @@ static void iq_embed_arm(Ctx& ctx, const std::string& dir, const IqFmt& f, uint3
     std::vector<uint8_t> sink(n * 4, 0xC3);
     ctx.write(b_y, sink.data(), sink.size());
     struct { int ty; int n_embd; uint32_t row_bytes; } pc{f.ty, (int) n_embd, row_bytes};
-    VkPipeline p = ctx.pipeline(dir + "/iq_embed_rows.spv", 7, (int) sizeof(pc));
-    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_t, &b_y}, &pc, sizeof(pc), n_sb_row, n_tok);
+    VkPipeline p = ctx.pipeline(dir + "/iq_embed_rows.spv", 9, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_t, &b_y}, &pc, sizeof(pc), n_sb_row, n_tok);
     std::vector<uint8_t> img(sink.size(), 0);
     ctx.read(b_y, img.data(), img.size());
     const float* got = reinterpret_cast<const float*>(img.data());
@@ -10008,18 +10045,23 @@ void case_iq_embed_rows(Ctx& ctx, const std::string& dir) {
     Buf b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
     Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
     Buf b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_g5 = ctx.alloc(sizeof(strata::vkport::kIq2xxsGrid));
+    Buf b_g6 = ctx.alloc(sizeof(strata::vkport::kIq2xsGrid));
     ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
     ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
     ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
     ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    ctx.write(b_g5, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
+    ctx.write(b_g6, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
     // one arm per covered format at one superblock per row, PLUS two wide-row arms (n_embd 512 = two superblocks)
     // so the row STRIDE the caller passes is exercised, not assumed equal to the block bytes.
     const int wide[] = {30, 22};
     for (int ty : wide)
         for (const IqFmt& f : kIqFmts)
-            if (f.ty == ty) { iq_embed_arm(ctx, dir, f, 512, 6, toks, b_t, b_w, b_y, b_g1, b_g2, b_g3, b_g4); break; }
-    for (const IqFmt& f : kIqFmts) iq_embed_arm(ctx, dir, f, 256, 6, toks, b_t, b_w, b_y, b_g1, b_g2, b_g3, b_g4);
+            if (f.ty == ty) { iq_embed_arm(ctx, dir, f, 512, 6, toks, b_t, b_w, b_y, b_g1, b_g2, b_g3, b_g4, b_g5, b_g6); break; }
+    for (const IqFmt& f : kIqFmts) iq_embed_arm(ctx, dir, f, 256, 6, toks, b_t, b_w, b_y, b_g1, b_g2, b_g3, b_g4, b_g5, b_g6);
     ctx.free(b_w); ctx.free(b_y); ctx.free(b_t); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4);
+    ctx.free(b_g5); ctx.free(b_g6);
 }
 
 int main(int argc, char** argv) {

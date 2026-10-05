@@ -13,6 +13,8 @@ Re-run after any change to the engine's tables:
 THE SHAPES, and why they are what they are:
 
   * `iq1s_grid` is 2048 uint32 - one 32-bit word per grid point, indexed directly by the kernel.
+  * `iq2xs_grid` is 512 uint64 and `iq2xxs_grid` 256 uint64 - EIGHT packed bytes per grid point, the same
+    low/high pair form as `iq2s_grid`, for the same reason (IQ2_XS / IQ2_XXS).
   * `iq2s_grid` is 1024 uint64 - EIGHT packed bytes per grid point.  `vec_dot_iq2_s_q8_1` reads it as a pair of
     32-bit words (`grid_pos[0]`, `grid_pos[1]`), so the port stores it as 2048 uint32 in low/high order: that
     keeps `shaderInt64` - an OPTIONAL Vulkan feature - out of the shaders entirely, for a value that is only
@@ -69,6 +71,8 @@ def emit(lines: list[str], values: list[int], ctype: str, decl: str, note: str) 
 def render() -> str:
     iq1s = extract_u32("iq1s_grid_gpu", 2048, 8)
     iq2s = extract_u64_as_u32pairs("iq2s_grid", 1024)
+    iq2xxs = extract_u64_as_u32pairs("iq2xxs_grid", 256)
+    iq2xs = extract_u64_as_u32pairs("iq2xs_grid", 512)
     iq3xxs = extract_u32("iq3xxs_grid", 256, 8)
     iq3s = extract_u32("iq3s_grid", 512, 8)
     lines = [
@@ -92,6 +96,14 @@ def render() -> str:
          "// iq2s_grid: 1024 grid points of EIGHT packed bytes, stored as low/high 32-bit halves "
          "(IQ2_S), so no\n// shader needs the optional shaderInt64 feature.")
     lines.append("inline constexpr int kIq2sGridSize = 1024;")
+    emit(lines, iq2xxs, "uint32_t", "kIq2xxsGrid[512]",
+         "// iq2xxs_grid: 256 grid points of EIGHT packed bytes, stored as low/high 32-bit halves "
+         "(IQ2_XXS), so no\n// shader needs the optional shaderInt64 feature.")
+    lines.append("inline constexpr int kIq2xxsGridSize = 256;")
+    emit(lines, iq2xs, "uint32_t", "kIq2xsGrid[1024]",
+         "// iq2xs_grid: 512 grid points of EIGHT packed bytes, stored as low/high 32-bit halves (IQ2_XS), "
+         "so no\n// shader needs the optional shaderInt64 feature.")
+    lines.append("inline constexpr int kIq2xsGridSize = 512;")
     emit(lines, iq3xxs, "uint32_t", "kIq3xxsGrid[256]",
          "// iq3xxs_grid: 256 grid points, one uint32 each (IQ3_XXS). Four signed bytes per word.")
     lines.append("inline constexpr int kIq3xxsGridSize = 256;")
@@ -108,7 +120,7 @@ def main() -> int:
         if not OUT.exists() or OUT.read_text() != text:
             print(f"gen-iq-tables: {OUT} is STALE (or missing) - regenerate it", file=sys.stderr)
             return 1
-        print(f"gen-iq-tables: {OUT} is current (iq1s 2048 + iq2s 1024 + iq3xxs 256 + iq3s 512)")
+        print(f"gen-iq-tables: {OUT} is current (iq1s 2048 + iq2s 1024 + iq2xxs 256 + iq2xs 512 + iq3xxs 256 + iq3s 512)")
         return 0
     OUT.write_text(text)
     print(f"gen-iq-tables: wrote {OUT}")

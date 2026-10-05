@@ -9,15 +9,18 @@
 // A re-derived layout that happens to agree is the port's worst bug class; this file does not have one.
 //
 // WHERE THE PORT ALREADY HAS A FORMAT, this is the same decode the `iq*_mmvq` dots use (shaders/common/iq*_dot.glsl) -
-// but here it stands ALONE, so the row-body write is the whole job rather than a multiply-accumulate.  Formats the
-// port does not decode STANDALONE yet (IQ2_XXS ggml type 16, IQ2_XS 17 - their grids are not in the port's
-// generated table) are deliberately absent: `iq_dequant_f32` REFUSES them by name rather than computing a
+// but here it stands ALONE, so the row-body write is the whole job rather than a multiply-accumulate.  EVERY
+// `is_iq` type the port's generated table carries is decoded here - the 14 older formats plus IQ2_XXS (ggml type
+// 16) and IQ2_XS (17), whose 256- and 512-point uint64 grids are now in the generated table too.  The host entry
+// points dispatch only the types this file covers; an uncovered type is refused by name rather than computed as a
 // plausible wrong row.  See ports/vulkan/PORT-MAP.tsv.
 //
 // THE INCLUDING SHADER MUST DECLARE, with these names:
 //     w_b        the raw block bytes                (uint8 storage buffer, std430)
 //     iq1s_g     the IQ1_S grid, 2048 uint32        (IQ1_M)         - harness/iq_grids.hpp
 //     iq2s_g     the IQ2_S grid, 2048 uint32 (1024 points as lo/hi halves)
+//     iq2xxs_g   the IQ2_XXS grid, 512 uint32 (256 points as lo/hi halves)
+//     iq2xs_g    the IQ2_XS grid, 1024 uint32 (512 points as lo/hi halves)
 //     iq3xxs_g   the IQ3_XXS grid, 256 uint32
 //     iq3s_g     the IQ3_S grid, 512 uint32
 //     OU_        the destination, float             (writeonly storage buffer, member .y)
@@ -228,6 +231,25 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
             OU_.y[obase + 32u * ib + 8u * il + j]     = d * (float((q0 >> (8u * j)) & 0xFu) + delta);
             OU_.y[obase + 32u * ib + 8u * il + j + 4u] = d * (float((q1 >> (8u * j)) & 0xFu) + delta);
         }
+    } else if (ty == 16) {                                       // IQ2_XXS: d, qs[32] (uint16); 4 grid bytes then 4 aux bytes per 8-value part
+        const uint bb = wbase + ibs * 66u;
+        const uint q2 = bb + 2u + 8u * ib;
+        const uint gidx = iq_b(q2 + il);                         // aux8[il]: one packed grid index per lane
+        const uint g0 = iq2xxs_g.v[2u * gidx], g1 = iq2xxs_g.v[2u * gidx + 1u];
+        const uint aux32 = iq_u16(q2 + 4u) | (iq_u16(q2 + 6u) << 16u);
+        const float d = iq_h2f(bb) * (0.5 + float(aux32 >> 28u)) * 0.25;
+        const uint signs = K_SIGNS[(aux32 >> (7u * il)) & 127u];
+        for (uint j = 0u; j < 8u; ++j)
+            OU_.y[obase + 32u * ib + 8u * il + j] = d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
+    } else if (ty == 17) {                                       // IQ2_XS: d, qs[32] (uint16), scales[8]; the 9-bit grid index carries the sign field above it
+        const uint bb = wbase + ibs * 74u;
+        const uint w = iq_u16(bb + 2u + 8u * ib + 2u * il);
+        const uint gidx = w & 511u;
+        const uint g0 = iq2xs_g.v[2u * gidx], g1 = iq2xs_g.v[2u * gidx + 1u];
+        const float d = iq_h2f(bb) * (0.5 + float((iq_b(bb + 66u + ib) >> (4u * (il / 2u))) & 0xFu)) * 0.25;
+        const uint signs = K_SIGNS[w >> 9u];
+        for (uint j = 0u; j < 8u; ++j)
+            OU_.y[obase + 32u * ib + 8u * il + j] = d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
     }
     // any other type is a caller error: the host entry points refuse it before dispatch
 }

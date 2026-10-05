@@ -17,7 +17,9 @@ layout(set = 0, binding = 1, std430) readonly  buffer G1  { uint v[]; } iq1s_g; 
 layout(set = 0, binding = 2, std430) readonly  buffer G2  { uint v[]; } iq2s_g;   // IQ2_S grid
 layout(set = 0, binding = 3, std430) readonly  buffer G3  { uint v[]; } iq3xxs_g; // IQ3_XXS grid
 layout(set = 0, binding = 4, std430) readonly  buffer G4  { uint v[]; } iq3s_g;   // IQ3_S grid
-layout(set = 0, binding = 5, std430) writeonly buffer OUT { float y[]; } OU_;
+layout(set = 0, binding = 5, std430) readonly  buffer G5  { uint v[]; } iq2xxs_g; // IQ2_XXS grid
+layout(set = 0, binding = 6, std430) readonly  buffer G6  { uint v[]; } iq2xs_g;  // IQ2_XS grid
+layout(set = 0, binding = 7, std430) writeonly buffer OUT { float y[]; } OU_;
 
 layout(push_constant) uniform Pc { int ty; } pc;
 
