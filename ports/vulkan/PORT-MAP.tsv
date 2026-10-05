@@ -77,6 +77,6 @@ rope_scaling	host	a table parameter
 rope_table_release	host	table bookkeeping
 rope_table_set	host	table bookkeeping
 s_gemv_split_async	kernel	s_gemv_q8_split
-sample_tokens	kernel	sampler_greedy sampler_kernel sampler_split
+sample_tokens	kernel	sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split
 scatter_rows_f32	kernel	scatter_rows_f32
 shared_expert_scratch_bytes	host	a size

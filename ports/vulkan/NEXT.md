@@ -149,6 +149,38 @@ does not build is a stale binary" rule).
 nvidia 343/0/2.  The port map is unchanged: `sample_tokens` already named `sampler_greedy sampler_kernel
 sampler_split`, and the case adds no `kernels::` symbol.
 
+## THE PORTABLE f32 SIBLING for the sampler - **DONE AND VERIFIED 2026-10-05**
+
+`sampler_kernel_f32.comp`, the sibling the faithful `sampler_kernel.comp` cannot be without.  Every other
+double-arithmetic kernel in this port already had one (`router_top10_f32`, `moe_combine_f32`, `swiglu_f32`,
+`scalar_gate_f32`): the engine's sampler computes its top_p cut and its softmax in DOUBLE, and **Intel Arc has no
+shaderFloat64** (Intel's own support article 000089817 - the target hardware), so without the sibling the sampled
+path cannot run there at all.  The chain and the SELECTION are byte-for-byte the faithful kernel's; only the tail's
+arithmetic is float, and it lives in `common/sampler_tail.glsl` as `sampler_tail_f32`, so the two cannot drift.
+`run_gate.sh`'s fp64 structural rule now also requires this variant to carry NO `Float64` capability (verified:
+`spirv-dis | grep -c OpCapability Float64` = 0), which is the test that it really is the portable one.
+
+**The case MEASURES the gap rather than asserting it.**  Five arms: two EXACT because no rounding can reach the
+answer (a one-survivor shortlist has no exponential - top_k = 1 and a top_p cut of exactly one), one EXACT because
+the softmax cancels out of the walk (64 EQUAL survivors at temperature 0, so the draw is `floor(u*64)` and the RNG
+is pinned bit for bit), and two MEMBERSHIP where a real distribution is involved (the f32 token must be one of the
+f64 chain's survivors).  Measured on the Arc: `f32 vs f64: 0 of 48 seeds differ` - the fixtures' margins are wide
+enough that the two agree here, which is reported rather than claimed as a general result.
+
+**Falsified.**  `gates/inject-verify.sh sampler-kernel-f32-top-p-boundary` changes the f32 tail's `>=` top_p
+boundary to `>`: `FAIL  sampler_kernel_f32: one survivor (top_p cut of one): exact    2/    8  worst 0`.
+
+**Measured.**  vega: **Intel Arc 358 passed / 0 failed / 0 skipped**, llvmpipe 346/0/3, radeon-iGPU 349/0/2,
+`run_gate.sh` exit 0.  **+6 verdicts** (five arms + the group arm).  Box (7900 XTX): radeon_icd 354/0/1, lvp 346/0/3,
+nvidia 349/0/2.  The port map names `sampler_kernel_f32` in the `sample_tokens` row (`make_port_map.py` regenerates
+`PORT-MAP.tsv` identically; still 77 symbols - 28 kernel, 49 host, 0 todo).
+
+**Honest limit.**  0-of-48 agreement is a statement about THESE fixtures, not about f32 in general: a distribution
+whose probabilities pile up within a float ULP of a cumulative boundary can still flip a token, and this port has no
+f64-free device to reproduce the hardware the variant exists for (this box's ANV reports `fp64 1`).  The variant is
+gated as EXACT where the arithmetic is exact and as MEMBERSHIP elsewhere, which is the strongest claim the
+measurement supports.
+
 
 
 ## M-A: the standalone dequantiser's LAST TWO FORMATS - IQ2_XXS and IQ2_XS - **DONE AND VERIFIED 2026-10-05**

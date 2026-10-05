@@ -9212,6 +9212,88 @@ void case_sampler_kernel(Ctx& ctx, const std::string& dir) {
             "a wrong chain order, cut boundary, tie rule or RNG would land here");
 }
 
+// === THE GENERAL SAMPLER'S PORTABLE f32 SIBLING =============================================================
+//
+// `sampler_kernel_f32.comp` is the sibling the faithful `sampler_kernel.comp` cannot be without: the engine's
+// top_p cut and softmax are DOUBLE, and Intel Arc has no shaderFloat64 (Intel's own article - the target hardware),
+// so without it the sampled path cannot run there at all.  This case runs the f32 kernel on the SAME fixtures and
+// measures its disagreement with the f64 chain instead of asserting the gap is nothing.  Two kinds of arm:
+//   * EXACT where no rounding can reach the answer - a one-survivor shortlist (no exponential), and 64 EQUAL
+//     survivors at temperature 0, where the softmax cancels out of the walk and the draw is `floor(u*64)`, so the
+//     RNG is pinned bit for bit.
+//   * MEMBERSHIP where a real distribution is involved: the f32 token must be one of the f64 chain's survivors,
+//     and the number of seeds that differ from the f64 pick is PRINTED.
+enum : int { F32_EXACT = 0, F32_MEMBERSHIP = 1 };
+
+void case_sampler_kernel_f32(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "sampler_kernel_f32.spv")) return;
+    // NO fp64 skip: this variant exists for the devices the faithful one cannot run on.
+    struct Arm {
+        const char* what;
+        int n_vocab, top_k, min_keep, fixture, n_seeds, mode, min_distinct;
+        float temperature, top_p, min_p, pen_rep, pen_freq, pen_pres;
+    };
+    const Arm arms[] = {
+        {"one survivor (top_k = 1): exact, no exp to round",    4096,  1, 1,  0,  4, F32_EXACT,      1, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"one survivor (top_p cut of one): exact",              4096, 64, 1,  6,  8, F32_EXACT,      1, 1.0f, 0.50f, 0.0f, 1.0f, 0, 0},
+        {"64 equal at temp 0: the RNG is pinned exactly",       4096, 64, 1,  1, 16, F32_EXACT,      2, 0.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"a real distribution: the token is a survivor",        4096,  4, 1,  3, 16, F32_MEMBERSHIP, 1, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"the real vocabulary (248320): the token is a survivor",248320,64,1, 8,  4, F32_MEMBERSHIP, 1, 1.0f, 0.95f, 0.0f, 1.0f, 0, 0},
+    };
+    struct Pc {
+        int n_vocab, n_tokens, history_len, penalty_last_n, top_k, min_keep;
+        float temperature, top_p, min_p, penalty_repeat, penalty_freq, penalty_present;
+        uint32_t seed_lo, seed_hi, counter_lo, counter_hi;
+    };
+    VkPipeline ps = ctx.pipeline(dir + "/sampler_kernel_f32.spv", 3, sizeof(Pc));
+    const int history_len = 64;
+    int bad_total = 0, checks_total = 0, disagree_total = 0;
+
+    for (const Arm& a : arms) {
+        std::vector<float> row;
+        std::vector<int32_t> hist;
+        sampler_fixture(a.fixture, a.n_vocab, row, hist, history_len);
+        const SamplerSpec spec{a.n_vocab, a.top_k, a.min_keep, a.temperature, a.top_p, a.min_p,
+                               a.pen_rep, a.pen_freq, a.pen_pres};
+        const SamplerSel sel = sampler_select(row, hist, history_len, spec);
+        Buf b_l = ctx.alloc(row.size() * 4), b_h = ctx.alloc(hist.size() * 4), b_o = ctx.alloc(4);
+        ctx.write(b_l, row.data(), row.size() * 4);
+        ctx.write(b_h, hist.data(), hist.size() * 4);
+        int bad = 0, distinct = 0, disagree = 0;
+        std::vector<int32_t> seen;
+        for (int si = 0; si < a.n_seeds; ++si) {
+            const uint64_t seed = 0x1234567890abcdefULL + uint64_t(si) * 0x9E3779B97F4A7C15ULL;
+            Pc pc{};
+            pc.n_vocab = a.n_vocab; pc.n_tokens = 1; pc.history_len = history_len;
+            pc.penalty_last_n = history_len; pc.top_k = a.top_k; pc.min_keep = a.min_keep;
+            pc.temperature = a.temperature; pc.top_p = a.top_p; pc.min_p = a.min_p;
+            pc.penalty_repeat = a.pen_rep; pc.penalty_freq = a.pen_freq; pc.penalty_present = a.pen_pres;
+            pc.seed_lo = uint32_t(seed); pc.seed_hi = uint32_t(seed >> 32); pc.counter_lo = 0; pc.counter_hi = 0;
+            int32_t got = -1;
+            ctx.write(b_o, &got, 4);
+            ctx.dispatch(ps, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), 1);
+            ctx.read(b_o, &got, 4);
+            ++checks_total;
+            const int want = sampler_pick(sel, a.temperature, seed, 0);
+            const bool in_set = std::find(sel.ids.begin(), sel.ids.end(), got) != sel.ids.end();
+            if (got != want) ++disagree;
+            const bool ok = (a.mode == F32_EXACT) ? (got == want) : in_set;
+            if (!ok) ++bad;
+            if (in_set && std::find(seen.begin(), seen.end(), got) == seen.end()) { seen.push_back(got); ++distinct; }
+        }
+        if (distinct < a.min_distinct) ++bad;
+        std::printf("      %-56s vocab %6d -> %2d distinct, %d bad, %d differ from f64\n",
+                    a.what, a.n_vocab, distinct, bad, disagree);
+        char label[240];
+        std::snprintf(label, sizeof label, "sampler_kernel_f32: %s", a.what);
+        verdict(label, bad == 0, bad, a.n_seeds, 0.0, "the portable f32 chain diverged where it must not");
+        bad_total += bad; disagree_total += disagree;
+    }
+    verdict("sampler_kernel_f32: five arms against the f64 chain", bad_total == 0, bad_total, checks_total, 0.0,
+            "the portable sibling must be exact where no rounding reaches it, and a survivor elsewhere");
+    std::printf("      (f32 vs f64: %d of %d seeds differ, on the distribution arms)\n", disagree_total, checks_total);
+}
+
 // === THE SPLIT SAMPLER (src/kernels/cuda/sampler.cu: sampler_split_part + sampler_split_merge) ================
 //
 // The engine's DEFAULT sampled path, and a different SELECTION from `sampler_kernel`'s: a row is cut into
@@ -10583,6 +10665,7 @@ int main(int argc, char** argv) {
     case_descriptor_offset(ctx, dir);      // binding a row slice (the engine's pointer arithmetic, made bindable)
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
+    case_sampler_kernel_f32(ctx, dir);     // the sampler's PORTABLE f32 sibling (the devices without shaderFloat64)
     case_sampler_split(ctx, dir);          // the split sampler: partition top-k + the ordered merge (the default path)
     case_sample_tokens(ctx, dir);          // the sample_tokens ENTRY POINT: which path a request takes (the choice)
     case_coupled_draft(ctx, dir);          // the coupled draft: the speculative-decoding sampler (counter cell+1)

@@ -30,7 +30,7 @@ TABLE = {
     'quantize_q8_0_scaled':        ('kernel', 'quantize_q8_0_scaled'),
     'quantize_q8_1_rows':          ('kernel', 'quantize_q8_1'),
     's_gemv_split_async':          ('kernel', 's_gemv_q8_split'),
-    'sample_tokens':               ('kernel', 'sampler_greedy sampler_kernel sampler_split'),
+    'sample_tokens':               ('kernel', 'sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split'),
     'ple_block':                   ('kernel', 'ple_bcast ple_conv ple_gate ple_gnorm'),
     'native_mmvq':                 ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq'),
     'native_expert_grouped':       ('kernel', 'native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu'),

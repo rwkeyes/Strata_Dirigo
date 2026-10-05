@@ -177,6 +177,15 @@ case "$name" in
     old=$'    if (greedy || temperature <= 0.0f) return P_GREEDY;'
     new=$'    if (greedy || temperature < 0.0f) return P_GREEDY;   // INJECTION: temp 0 no longer routes to the argmax'
     want="FAIL  sample_tokens: temperature 0" ;;
+  sampler-kernel-f32-top-p-boundary)
+    # The portable f32 tail's top_p cut is `>=` (the SAMPLED chain's boundary, llama.cpp's).  Changing it to `>`
+    # drops the boundary case: a cut of exactly top_p no longer closes the prefix, so a one-survivor shortlist
+    # becomes two and the token depends on the draw.  The case's "one survivor (top_p cut of one)" arm is built to
+    # a 0.50 boundary and must see it.
+    file="$SH/common/sampler_tail.glsl"; spv="sampler_kernel_f32"; comp="$SH/sampler_kernel_f32.comp"
+    old=$'            if (cum >= top_p) { cut = i + 1; break; }'
+    new=$'            if (cum > top_p) { cut = i + 1; break; }   // INJECTION: the >= boundary dropped'
+    want="FAIL  sampler_kernel_f32: one survivor (top_p cut of one)" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

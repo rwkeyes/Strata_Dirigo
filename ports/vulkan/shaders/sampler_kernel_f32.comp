@@ -1,0 +1,111 @@
+// ports/vulkan/shaders/sampler_kernel_f32.comp - the GENERAL sampler, PORTABLE arithmetic (float).
+//
+// THE PORTABLE SIBLING `sampler_kernel.comp` DOES NOT HAVE.  Every other double-arithmetic kernel in this port has
+// one (router_top10_f32 / moe_combine_f32 / swiglu_f32 / scalar_gate_f32): the engine's sampler computes its
+// top_p cut and its softmax in DOUBLE, and **Intel Arc has no shaderFloat64** (Intel's own support article
+// 000089817 - the target hardware), so the faithful kernel cannot run there at all.  The choice is between a
+// MEASURED deviation and not running; the gate runs BOTH on the same logits and measures the disagreement rather
+// than asserting the gap is nothing.
+//
+// The CHAIN and the SELECTION are byte-for-byte the faithful kernel's - penalties on the raw logits once, top_k as
+// the k block-argmax rounds in selection order, then top_p -> min_p -> temperature on the survivors -> one Philox
+// draw.  Only the tail's arithmetic is float, and it lives in `common/sampler_tail.glsl` as `sampler_tail_f32`, so
+// this file and the faithful one cannot drift.  The tail is EXACT against the f64 chain wherever no rounding can
+// reach it: a one-survivor shortlist (top_k = 1, a top_p cut of one, min_p's one survivor) has no exponential to
+// round, and 64 EQUAL survivors at temperature 0 make the softmax cancel out of the walk, so the draw is
+// `floor(u*64)` and the RNG is pinned exactly.  The gate's arms say which is which.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float x[]; } LO_;
+layout(set = 0, binding = 1, std430) readonly buffer HIST { int h[]; } HI_;
+layout(set = 0, binding = 2, std430) buffer OUT { int o[]; } OUT_;
+
+layout(push_constant) uniform Pc {
+    int n_vocab;
+    int n_tokens;
+    int history_len;
+    int penalty_last_n;
+    int top_k;              // 1..63 as given; 0 ("off") and anything wider keep 64
+    int min_keep;           // a floor under the top_p cut
+    float temperature;
+    float top_p;
+    float min_p;
+    float penalty_repeat;
+    float penalty_freq;
+    float penalty_present;
+    uint seed_lo;
+    uint seed_hi;
+    uint counter_lo;
+    uint counter_hi;
+} pc;
+
+#include "common/sampler_tail.glsl"       // owns sc_sel_id / sc_sel_lg and sampler_tail_f32
+#include "common/sampler_select.glsl"     // for sc_k(); its partition selection is unused here
+
+shared float rv[256];
+shared int ri[256];
+
+float apply_penalties(float logit, int count) {
+    if (count <= 0) return logit;
+    if (logit <= 0.0) logit *= pc.penalty_repeat;
+    else              logit /= pc.penalty_repeat;
+    logit -= float(count) * pc.penalty_freq + ((count > 0) ? 1.0 : 0.0) * pc.penalty_present;
+    return logit;
+}
+
+void main() {
+    const int t = int(gl_WorkGroupID.x);
+    if (t >= pc.n_tokens) return;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint row = uint(t) * uint(pc.n_vocab);
+
+    int hlen = 0, hbase = 0;
+    if (pc.history_len > 0) {
+        hlen = min(pc.penalty_last_n, pc.history_len);
+        if (hlen < 0) hlen = 0;
+        hbase = t * pc.history_len + (pc.history_len - hlen);      // the window is the TAIL
+    }
+
+    const int k = sc_k(pc.top_k, pc.n_vocab);
+
+    // ---- top_k: k rounds, each a block argmax over the not-yet-taken (the faithful kernel's selection) ----
+    for (int i = 0; i < k; ++i) {
+        float bv = uintBitsToFloat(0xff800000u);      // -inf
+        int best = pc.n_vocab;
+        for (int v = int(lid); v < pc.n_vocab; v += 256) {
+            bool taken = false;
+            for (int j = 0; j < i; ++j) if (sc_sel_id[j] == v) { taken = true; break; }
+            if (taken) continue;
+            int count = 0;
+            if (hlen > 0) for (int q = 0; q < hlen; ++q) if (HI_.h[hbase + q] == v) ++count;
+            const float s = apply_penalties(LO_.x[row + uint(v)], count);
+            if (s > bv) { bv = s; best = v; }         // strict: the lowest id wins a tie
+        }
+        rv[lid] = bv;
+        ri[lid] = best;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (int(lid) < off) {
+                const float ov = rv[lid + uint(off)];
+                const int oi = ri[lid + uint(off)];
+                if (ov > rv[lid] || (ov == rv[lid] && oi < ri[lid])) { rv[lid] = ov; ri[lid] = oi; }
+            }
+            barrier();
+        }
+        if (lid == 0u) {
+            sc_sel_id[i] = (ri[0] < pc.n_vocab) ? ri[0] : 0;
+            sc_sel_lg[i] = rv[0];
+        }
+        barrier();
+    }
+
+    int pick = 0;
+    float prob = 1.0;
+    sampler_tail_f32(k, pc.temperature, pc.top_p, pc.min_p, pc.min_keep,
+                     pc.seed_lo, pc.seed_hi, pc.counter_lo, pc.counter_hi, t, pick, prob);
+    if (lid == 0u) OUT_.o[t] = pick;
+}

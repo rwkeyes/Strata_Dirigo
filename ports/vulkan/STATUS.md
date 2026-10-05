@@ -175,6 +175,18 @@ non-shader change (and refused an earlier form as `DID NOT COMPILE (harness)`). 
 (`run_gate.sh` exit 0), llvmpipe 340/0/3, radeon-iGPU 343/0/2; box `radeon_icd` (7900 XTX) 348/0/1, lvp 340/0/3,
 nvidia 343/0/2.
 
+**THE SAMPLER'S PORTABLE f32 SIBLING landed (2026-10-05).**  `sampler_kernel_f32.comp` - the double-arithmetic
+sampler's sibling for the devices WITHOUT shaderFloat64 (Intel's own article; the target hardware), which every
+other double kernel in this port already had.  The chain and selection are the faithful kernel's; only the tail is
+float, from `common/sampler_tail.glsl`'s `sampler_tail_f32`.  `run_gate.sh`'s fp64 rule now requires it to carry NO
+`Float64` capability (measured 0).  Five arms: two EXACT where no rounding reaches it (one-survivor shortlists), one
+EXACT because the softmax cancels (64 equal at temp 0, RNG pinned), two MEMBERSHIP on real distributions - and the
+case MEASURES the gap: `f32 vs f64: 0 of 48 seeds differ`.  Falsified by `gates/inject-verify.sh
+sampler-kernel-f32-top-p-boundary` -> `FAIL sampler_kernel_f32: one survivor (top_p cut of one) 2/8`.  **+6
+verdicts: vega Arc 358/0/0** (`run_gate.sh` exit 0), llvmpipe 346/0/3, radeon-iGPU 349/0/2; box `radeon_icd` (7900
+XTX) 354/0/1, lvp 346/0/3, nvidia 349/0/2.  Port map still 77 symbols - 28 kernel, 49 host, 0 todo, regenerating
+identically.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the
