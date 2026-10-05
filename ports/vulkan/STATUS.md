@@ -8,18 +8,18 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
                                                  # checks each shader's declared local size, then runs the gate
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
-was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms and the
-short-step decode attention landed, the box's GPU run was **204 passed / 0 failed / 0 skipped** on the Intel ICD
-(`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 192 / 0 / 3 on llvmpipe and
-195 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone (both skip cooperative
-matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc
-has no skips at all:** the last one (`gemm_coopmat`) was the port misreading the device - BMG's matrix config is
-M8 N16 K16, not the M16 the criterion demanded - and since then the matrix path RUNS on XMX, including the prefill
-GEMM.  On the iGPU, 195/0/2 becomes 194/1/2 when its intermittent budget-requery case fires.  Before the swap the
-same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three times in two days; read the last
-line of your own run.** All three available implementations are exercised again by `run_gate.sh`: it used to stop at
-the Intel skip, which meant the cross-implementation arm never ran on this box after the swap (`NEXT.md`). 59
-kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
+was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
+short-step decode attention and the f16 KV gather landed, the box's GPU run was **209 passed / 0 failed / 0 skipped**
+on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 197 / 0 / 3
+on llvmpipe and 200 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone (both
+skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
+tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port misreading the device - BMG's
+matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the matrix path RUNS on XMX,
+including the prefill GEMM.  On the iGPU, 200/0/2 becomes 199/1/2 when its intermittent budget-requery case fires.
+Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale four times in two
+days; read the last line of your own run.** All three available implementations are exercised again by
+`run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this box
+after the swap (`NEXT.md`). 60 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -78,6 +78,19 @@ a double-precision softmax oracle, 24 heads x 256 dims each, plus a shape contra
 width 257.  `wg_reduce.glsl` gained `wg_max`.  Falsified: the plausible wrong GQA grouping fails all five arms at
 exactly half the values.  What the block still needs - the prompt path (`qsa_prompt_attn.cu`, `qsa_select.cu`), the
 QSA selection/indexer, and a tiled version of this kernel - is listed in `NEXT.md`.
+
+**The f16 KV gather landed with it: the window the attention reads, and the engine's launch rule measured
+(2026-10-04).**  `kv_f16_gather.comp` is the F16 sibling of `kv_q8_gather` (`src/kernels/cuda/qsa.cu`), the producer
+of the `[id][kv_head][head_dim]` window the attention consumes.  Three things came out of it that are worth more than
+the kernel: the POOL's row index CARRIES the head (`[page][kv_head][page_size][dim]`, not `[row][kv_head][dim]` - a
+fixture written the intuitive way has the same total size and fails every value); `ids[id]` is a POSITION and `id` is
+an INDEX, and a softmax over the keys cannot see a permutation of them, which is why the composed gather-then-attend
+arm runs with a position-dependent mask (injected `cell = id` -> worst rel 9.19e+03); and **THE GRID IS THE CAPACITY,
+NOT THE LIVE COUNT** - the engine's own launcher comment, now measured through this port's record/replay path: a
+capacity grid replays at a grown `n_ids` and writes 8 of 8 rows, the live-count grid writes 6 of 8 and loses two
+silently.  That arm is a NEGCTRL: it passes only if the defect reproduces.  The q8 sibling's case had described
+this rule in its verdict text while sizing BOTH its window and its grid from the live count, so the guard region it
+claimed to check did not exist; fixed to a capacity of 8.  Arc 209/0/0.
 
 | Case | Verdict | Method |
 |---|---|---|

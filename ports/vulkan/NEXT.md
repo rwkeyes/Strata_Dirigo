@@ -318,9 +318,60 @@ correctness kernel and the wrong one for throughput.
 
 
 
+## THE ATTENTION BLOCK, KERNEL 2: the f16 KV window - and the engine's launch rule that a recorded buffer makes real
+
+**What was ported.**  `kv_gather_kernel` / `kv_gather_step` (`src/kernels/cuda/qsa.cu`): the F16 sibling of
+`kv_q8_gather`, same addressing, no dequantisation, because the pool itself is f16.  It is the producer of the
+`[id][kv_head][head_dim]` window `attn_decode_short` consumes - the other half of a decode step.
+
+**The pool layout is not what a fixture wants to assume.**  The pool's ROW INDEX CARRIES THE HEAD:
+
+    row = (page * kv_heads + h) * page_size + (cell % page_size)     then  pool[row * head_dim + d]
+
+i.e. `[page][kv_head][page_size][dim]`, NOT `[row][kv_head][dim]`.  A fixture written the second way - which this
+one was, first, and it failed 6144 of 6144 values against a kernel that was right - is the mistake worth recording,
+because the two layouts have the SAME TOTAL SIZE and every index in them is plausible.
+
+**`ids[id]`, not `id`.**  The destination row index is the position in the selection; the cell it holds is the
+selection's value.  Confusing them yields a window that is a PERMUTATION of a correct one, and a softmax over the
+keys cannot see a permutation - it is symmetric in the key index.  That is why the composed gather-then-attend arm
+runs with a POSITION-DEPENDENT MASK: with one, the permutation moves a different mask value onto each cell and the
+output changes.  Measured: the injected `cell = id` fails the composed arm at worst rel error 9.19e+03.
+
+**THE GRID IS THE CAPACITY, and the port now has a measurement for it.**  The engine's launcher says so in as many
+words - "a captured layer would allocate room for token 1 and then index past it at token 500" - because a GROUP
+COUNT IS BAKED INTO A RECORDED COMMAND BUFFER while a buffer is re-read at dispatch time.  The port has had recorded
+command buffers since stage 3, so the rule is not hypothetical here.  The case records the gather, changes `n_ids`
+from 6 to 8 in the step buffer, and replays:
+
+    replay after n_ids 6 -> 8, capacity grid:           8 of 8 rows present
+    replay after n_ids 6 -> 8, NEGCTRL live-count grid: 6 of 8 rows present
+
+The NEGCTRL arm asserts the DEFECT (it passes only if the live-count grid really does lose rows), in the idiom the
+port already uses for `f32_to_f16_trunc`.  Two rows is what a token-1 grid costs at token 8 - and it is silent.
+
+**A case that described the rule without testing it.**  The q8 sibling's case sized BOTH its window and its grid
+from `n_ids`, so the guard region its own verdict text called "incl. the guard region" did not exist: the window WAS
+the live count.  Fixed to size from a capacity of 8 and dispatch over it, which is what makes the guard region real
+(and the case now compares 4224 values per side instead of 3072).
+
+**Evidence.**  Arc: **209 passed / 0 failed / 0 skipped** (five new verdicts).  The f16 gather's window is compared
+element for element against the pool rows the selection names, over 16 pages in REVERSE order, ids that span pages
+and page offsets and include cell 0 and cell 255; the 250 surplus rows of the 256-row window must keep their
+sentinel, which is the guard; the composed arm puts 6 gathered rows through the attention and matches a
+double-precision oracle computed from the POOL at worst rel 1.67e-06.
+
+**What the KV path still needs.**  The append half at f16 (the port has the q8 append), `kv_append_q4`/`kv_gather_q4`
+(the int4 pool with its FWHT-256 rotation - `fwht256_kernel` is a separate piece of arithmetic), the paged ring
+table and the host staging (`kv_stream.cu`: `kv_ring_table`, `kv_stage_from_host`), and the SELECTION that fills
+`ids` in the first place (`qsa_select`, `native_qsa*`) - the gather takes `ids` as an input and the case supplies
+them, which is the boundary the port has drawn so far.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
-**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
+**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 60 kernels, 18 shared includes, one
 generated table file (four IQ grids). The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh`,
 which compiles every shader from source - and this line has gone stale three times in two days, so run it rather
 than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 / 0 on RADV and on radeon, 154 /

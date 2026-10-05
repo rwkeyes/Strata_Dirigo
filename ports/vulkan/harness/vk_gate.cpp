@@ -909,6 +909,262 @@ void case_attn_decode_short(Ctx& ctx, const std::string& dir) {
     attn_arm(ctx, dir, 128, true, "a half window, masked");
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE F16 KV GATHER (src/kernels/cuda/qsa.cu, `kv_gather_kernel` / `kv_gather_step`)
+// ----------------------------------------------------------------------------------------------------------
+
+// A pool whose every (page, head, offset, dim) quad carries an identifiable value, so a window that picked the wrong
+// row cannot look like a window that picked the right one.  THE POOL'S ROW INDEX CARRIES THE HEAD:
+// `row = (page * kv_heads + h) * page_size + (cell % page_size)` and then `pool[row * head_dim + d]` - the head is
+// interleaved at the PAGE level, not stacked inside a row.  Writing the fixture as [row][kv_head][dim] instead is
+// the mistake this case exists to catch, and it cost a debugging pass when the fixture made it first.
+static uint16_t f16_pool_at(uint32_t page, uint32_t h, uint32_t off, uint32_t d) {
+    return f16_from_f32((float) (page * 31 + h * 7 + off * 3 + d % 11) * 0.125f - 4.0f);
+}
+
+static void f16_pool_fill(std::vector<uint16_t>& pool, uint32_t pages, uint32_t kv_heads, uint32_t page_size,
+                          uint32_t head_dim) {
+    for (uint32_t p = 0; p < pages; ++p)
+        for (uint32_t h = 0; h < kv_heads; ++h)
+            for (uint32_t off = 0; off < page_size; ++off)
+                for (uint32_t d = 0; d < head_dim; ++d)
+                    pool[((size_t) (p * kv_heads + h) * page_size + off) * head_dim + d] = f16_pool_at(p, h, off, d);
+}
+
+// The window the gather is supposed to produce: row `id` holds the pool row for `ids[id]`, in [id][kv_head][dim].
+static void f16_window_want(std::vector<uint16_t>& want, const std::vector<uint16_t>& pool,
+                            const std::vector<int32_t>& table, const std::vector<int32_t>& ids, uint32_t kv_heads,
+                            uint32_t head_dim, uint32_t page_size, uint16_t sentinel) {
+    for (uint16_t& x : want) x = sentinel;
+    for (uint32_t id = 0; id < ids.size(); ++id) {
+        for (uint32_t h = 0; h < kv_heads; ++h) {
+            const int32_t cell = ids[id];
+            const int32_t page = table[cell / page_size];
+            // `row` already contains the head - see f16_pool_at.
+            const uint32_t row = (uint32_t) ((page * (int32_t) kv_heads + (int32_t) h) * (int32_t) page_size +
+                                             (cell % (int32_t) page_size));
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                want[((size_t) id * kv_heads + h) * head_dim + d] = pool[(size_t) row * head_dim + d];
+            }
+        }
+    }
+}
+
+void case_kv_f16_gather(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "kv_f16_gather.spv")) return;
+    if (!ctx.info().storage_buffer_16bit) {
+        skip("kv_f16 gather", "device lacks storageBuffer16BitAccess - the pool and window are f16");
+        return;
+    }
+    const uint32_t kv_heads = 2, head_dim = 256, page_size = 16, pages = 16;
+    const uint32_t rows = pages * page_size;                       // 256, the capacity the attention contract wants
+    const uint32_t per = head_dim / 4;
+    const uint16_t SENT = 0xDEADu;
+
+    std::vector<uint16_t> pool((size_t) rows * kv_heads * head_dim);
+    f16_pool_fill(pool, pages, kv_heads, page_size, head_dim);
+    std::vector<int32_t> table(pages);
+    for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) (pages - 1 - i);   // pages in REVERSE order
+    // The selection: not in cell order, spanning pages and page offsets (200 = page 12 + 8, 3 = page 0 + 3), and
+    // deliberately including cell 0 and cell 255 so an off-by-one at either end shows up.
+    const std::vector<int32_t> ids = {3, 200, 17, 250, 0, 255};
+    const uint32_t n_ids = (uint32_t) ids.size();
+
+    std::vector<int32_t> step = {0, 0, 0, (int32_t) n_ids, 0};
+    Buf b_tab = ctx.alloc(table.size() * 4), b_ids = ctx.alloc(ids.size() * 4), b_step = ctx.alloc(step.size() * 4);
+    ctx.write(b_tab, table.data(), table.size() * 4);
+    ctx.write(b_ids, ids.data(), ids.size() * 4);
+    ctx.write(b_step, step.data(), step.size() * 4);
+
+    const uint32_t window_elems = rows * kv_heads * head_dim;
+    struct { int kv_heads, head_dim, page_size; } pc{(int) kv_heads, (int) head_dim, (int) page_size};
+    const uint32_t capacity_groups = (uint32_t) (((size_t) rows * kv_heads * per + kLocalSize - 1) / kLocalSize);
+    const uint32_t live_groups = (uint32_t) (((size_t) n_ids * kv_heads * per + kLocalSize - 1) / kLocalSize);
+    VkPipeline pg = ctx.pipeline(dir + "/kv_f16_gather.spv", 5, 12);
+
+    // ---- (1) the window, both sides, dispatched over the CAPACITY ---------------------------------------
+    // The grid is the capacity and the surplus threads exit on the guard.  The rows past `n_ids` must stay at the
+    // sentinel - if the guard were wrong they would be written with row 0's data, which is the kind of corruption
+    // that turns into a wrong token rather than a crash.
+    {
+        std::vector<uint16_t> want;
+        want.assign(window_elems, SENT);
+        f16_window_want(want, pool, table, ids, kv_heads, head_dim, page_size, SENT);
+        int bad = 0, bad_tail = 0;
+        for (int side = 0; side < 2; ++side) {
+            Buf b_pool = ctx.alloc(pool.size() * 2), b_out = ctx.alloc(window_elems * 2);
+            std::vector<uint16_t> got(window_elems, SENT);
+            ctx.write(b_pool, pool.data(), pool.size() * 2);
+            ctx.write(b_out, got.data(), got.size() * 2);
+            ctx.dispatch(pg, {&b_pool, &b_tab, &b_ids, &b_step, &b_out}, &pc, sizeof(pc), capacity_groups);
+            ctx.read(b_out, got.data(), got.size() * 2);
+            for (uint32_t id = 0; id < n_ids; ++id)
+                for (uint32_t h = 0; h < kv_heads; ++h)
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        const size_t i = ((size_t) id * kv_heads + h) * head_dim + d;
+                        if (got[i] != want[i]) ++bad;
+                    }
+            for (uint32_t id = n_ids; id < rows; ++id)
+                for (uint32_t h = 0; h < kv_heads; ++h)
+                    for (uint32_t d = 0; d < head_dim; ++d)
+                        if (got[((size_t) id * kv_heads + h) * head_dim + d] != SENT) ++bad_tail;
+            ctx.free(b_pool); ctx.free(b_out);
+        }
+        std::printf("      %u live rows gathered into a %u-row window, %d pages in reverse order; "
+                    "rows past the live count untouched (%d violations)\n",
+                    n_ids, rows, (int) pages, bad_tail);
+        verdict("kv_f16 gather: [id][kv_head][head_dim], window over the capacity", bad == 0, bad,
+                (int) (2 * n_ids * kv_heads * head_dim), 0.0, "values not equal to the pool row");
+        verdict("kv_f16 gather: the guard leaves the surplus rows alone", bad_tail == 0, bad_tail,
+                (int) (2 * (rows - n_ids) * kv_heads * head_dim), 0.0, "sentinel rows overwritten");
+    }
+
+    // ---- (2) THE GRID IS THE CAPACITY: the recorded-buffer arm ------------------------------------------
+    // Record the gather, then change `n_ids` and REPLAY.  A buffer is re-read at dispatch time, a group count is not
+    // - it is baked into the recorded command buffer - so a grid sized by the live count would replay at token 500
+    // with token 1's room and never write the rows it does not cover.  This is the engine's launcher comment, run
+    // through this port's own record/replay path.  The second half is the NEGCTRL: the live-count grid, recorded the
+    // same way, must LOSE the rows - if it did not, the rule would not be the reason the first half works.
+    {
+        const uint32_t later = 8;                       // the token's selection grows between record and replay
+        std::vector<int32_t> ids2(ids);
+        for (uint32_t i = n_ids; i < later; ++i) ids2.push_back(7 + (int32_t) i * 13);   // cells 20, 33, 46
+        std::vector<int32_t> step2 = step;
+        step2[3] = (int32_t) later;
+
+        Buf b_ids2 = ctx.alloc(ids2.size() * 4);
+        ctx.write(b_ids2, ids2.data(), ids2.size() * 4);
+        std::vector<uint16_t> want(window_elems, SENT);
+        f16_window_want(want, pool, table, ids2, kv_heads, head_dim, page_size, SENT);
+        auto rows_written = [&](const std::vector<uint16_t>& got) {
+            uint32_t n = 0;
+            for (uint32_t id = 0; id < later; ++id) {
+                bool whole = true;
+                for (uint32_t h = 0; h < kv_heads && whole; ++h)
+                    for (uint32_t d = 0; d < head_dim; ++d)
+                        if (got[((size_t) id * kv_heads + h) * head_dim + d] != want[((size_t) id * kv_heads + h) * head_dim + d]) {
+                            whole = false;
+                            break;
+                        }
+                if (whole) ++n;
+            }
+            return n;
+        };
+
+        for (int variant = 0; variant < 2; ++variant) {
+            // variant 0: the rule (record over the capacity).  variant 1: the NEGCTRL (record over the live count).
+            const uint32_t groups = variant == 0 ? capacity_groups : live_groups;
+            Buf b_pool = ctx.alloc(pool.size() * 2), b_out = ctx.alloc(window_elems * 2);
+            ctx.write(b_pool, pool.data(), pool.size() * 2);
+            std::vector<uint16_t> got(window_elems, SENT);
+            ctx.write(b_out, got.data(), got.size() * 2);
+            // Record with the FIRST token's step, replay with the later one.
+            std::vector<int32_t> s1 = step;
+            Buf b_step2 = ctx.alloc(step2.size() * 4);
+            ctx.write(b_step2, s1.data(), s1.size() * 4);
+            ctx.record_begin();
+            ctx.record_dispatch(pg, {&b_pool, &b_tab, &b_ids2, &b_step2, &b_out}, &pc, sizeof(pc), groups);
+            ctx.record_end_and_submit();
+            ctx.write(b_step2, step2.data(), step2.size() * 4);      // the selection grows
+            ctx.replay_recorded();
+            ctx.read(b_out, got.data(), got.size() * 2);
+            const uint32_t have = rows_written(got);
+            std::printf("      replay after n_ids %u -> %u, %s grid: %u of %u rows present\n", n_ids, later,
+                        variant == 0 ? "capacity" : "NEGCTRL live-count", have, later);
+            if (variant == 0) {
+                verdict("kv_f16 gather: a replayed launch sees the CURRENT n_ids (grid over the capacity)",
+                        have == later, (int) (later - have), (int) later, 0.0, "rows missing after replay");
+            } else {
+                // The NEGCTRL asserts the DEFECT, so it passes only if the live-count grid really does lose rows.
+                verdict("NEGCTRL kv_f16 gather: a live-count grid loses rows on replay", have < later,
+                        (int) (have >= later), (int) later, 0.0,
+                        "the live-count grid was replay-safe, so the capacity rule buys nothing here");
+            }
+            ctx.free(b_pool); ctx.free(b_out); ctx.free(b_step2);
+        }
+        ctx.free(b_ids2);
+    }
+
+    // ---- (3) THE COMPOSED ARM: gather, then attend -----------------------------------------------------
+    // The two kernels' shared contract is the `[id][kv_head][head_dim]` window, and the way to test a contract is to
+    // run both sides of it: gather the pool into a window, attend over that window, and compare against an oracle
+    // computed straight from the POOL rows.  The mask is ON and is not symmetric in the row index, because a softmax
+    // over the keys cannot see a permutation of them - a permuted window gives the same answer without one.
+    {
+        const uint32_t width = 6;
+        std::vector<int32_t> ids_c(ids.begin(), ids.begin() + width);
+        std::vector<int32_t> step_c = {0, 0, 0, (int32_t) width, 0};
+        Buf b_ids_c = ctx.alloc(ids_c.size() * 4), b_step_c = ctx.alloc(step_c.size() * 4);
+        ctx.write(b_ids_c, ids_c.data(), ids_c.size() * 4);
+        ctx.write(b_step_c, step_c.data(), step_c.size() * 4);
+
+        Buf b_pool = ctx.alloc(pool.size() * 2);
+        Buf b_k = ctx.alloc(window_elems * 2), b_v = ctx.alloc(window_elems * 2);
+        ctx.write(b_pool, pool.data(), pool.size() * 2);
+        std::vector<uint16_t> sent_win(window_elems, SENT);
+        ctx.write(b_k, sent_win.data(), sent_win.size() * 2);
+        ctx.write(b_v, sent_win.data(), sent_win.size() * 2);
+        ctx.dispatch(pg, {&b_pool, &b_tab, &b_ids_c, &b_step_c, &b_k}, &pc, sizeof(pc), capacity_groups);
+        ctx.dispatch(pg, {&b_pool, &b_tab, &b_ids_c, &b_step_c, &b_v}, &pc, sizeof(pc), capacity_groups);
+
+        std::vector<float> q((size_t) 24 * 256);
+        for (float& x : q) x = rndf(1.0f);
+        std::vector<uint16_t> mb(256, 0);
+        for (uint32_t c = 0; c < 256; ++c) mb[c] = f16_from_f32(rndf(0.6f));   // position-dependent, and NOT symmetric
+        // The oracle: the same softmax, but its K/V come from the POOL rows the selection names.
+        std::vector<uint16_t> kw((size_t) rows * kv_heads * head_dim, SENT), vw((size_t) rows * kv_heads * head_dim, SENT);
+        f16_window_want(kw, pool, table, ids_c, kv_heads, head_dim, page_size, SENT);
+        f16_window_want(vw, pool, table, ids_c, kv_heads, head_dim, page_size, SENT);
+        std::vector<double> want((size_t) 24 * 256, 0.0), sc(width);
+        for (uint32_t head = 0; head < 24; ++head) {
+            const uint32_t kv = head / 12;
+            double mx = -1e300;
+            for (uint32_t c = 0; c < width; ++c) {
+                double dot = 0.0;
+                for (uint32_t d = 0; d < 256; ++d)
+                    dot += (double) (q[(size_t) head * 256 + d] * 0.0625f) *
+                           (double) strata::kernels::f32_from_f16(kw[((size_t) c * kv_heads + kv) * 256 + d]);
+                sc[c] = dot + (double) strata::kernels::f32_from_f16(mb[c]);
+                mx = std::max(mx, sc[c]);
+            }
+            double den = 0.0;
+            for (uint32_t c = 0; c < width; ++c) den += std::exp(sc[c] - mx);
+            for (uint32_t d = 0; d < 256; ++d) {
+                double acc = 0.0;
+                for (uint32_t c = 0; c < width; ++c)
+                    acc += std::exp(sc[c] - mx) * (double) strata::kernels::f32_from_f16(vw[((size_t) c * kv_heads + kv) * 256 + d]);
+                want[(size_t) head * 256 + d] = acc / den;
+            }
+        }
+        Buf b_q = ctx.alloc(q.size() * 4), b_m = ctx.alloc(512), b_o = ctx.alloc((size_t) 24 * 256 * 4);
+        ctx.write(b_q, q.data(), q.size() * 4);
+        ctx.write(b_m, mb.data(), 512);
+        std::vector<float> nanp((size_t) 24 * 256, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(b_o, nanp.data(), nanp.size() * 4);
+        VkPipeline pa = ctx.pipeline(dir + "/attn_decode_short.spv", 5, 8);
+        struct { uint32_t width, use_mask; } apc{width, 1u};
+        ctx.dispatch(pa, {&b_q, &b_k, &b_v, &b_m, &b_o}, &apc, sizeof(apc), 24);
+        std::vector<float> got((size_t) 24 * 256);
+        ctx.read(b_o, got.data(), got.size() * 4);
+        int bad = 0;
+        double worst = 0, worst_abs = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double g = (double) got[i];
+            const double rel = std::fabs(g - want[i]) / (std::fabs(want[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            worst_abs = std::max(worst_abs, std::fabs(g - want[i]));
+            if (!(rel <= 1e-4 || std::fabs(g - want[i]) <= 1e-5)) ++bad;
+        }
+        std::printf("      gather -> attend: %u rows through the window, out[0] = %.6g want %.6g | worst rel %.3g\n",
+                    width, (double) got[0], want[0], worst);
+        verdict("kv_f16 gather -> attn_decode_short (the window contract, end to end)", bad == 0, bad,
+                (int) got.size(), worst, "values outside tolerance (worst rel err)");
+        ctx.free(b_pool); ctx.free(b_k); ctx.free(b_v); ctx.free(b_q); ctx.free(b_m); ctx.free(b_o);
+        ctx.free(b_ids_c); ctx.free(b_step_c);
+    }
+    ctx.free(b_tab); ctx.free(b_ids); ctx.free(b_step);
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -5760,15 +6016,21 @@ void case_kv_q8_gather(Ctx& ctx, const std::string& dir) {
     const std::vector<int32_t> ids = {0, 20, 21};       // spans both pages and different offsets
     const int n_ids = (int) ids.size();
     const std::vector<int32_t> step = {0, 0, 0, n_ids, 0};
+    // THE CAPACITY, NOT THE LIVE COUNT: the window is sized by `max_ids` and the grid is dispatched over it, because
+    // that is what the engine does and what a RECORDED command buffer needs (a group count is baked in, and would be
+    // replayed at a later token with this token's room).  Sizing both from `n_ids` - which this case used to do -
+    // makes the guard region below disappear, and with it the only place the rule could be exercised.  The guard's
+    // own arm lives in case_kv_f16_gather.
+    const int cap = 8;
 
-    const size_t scratch_elems = (size_t) n_ids * kv_heads * head_dim;
+    const size_t scratch_elems = (size_t) cap * kv_heads * head_dim;
     const uint64_t slack = 128;
     Buf b_tab = ctx.alloc(table.size() * 4), b_ids = ctx.alloc(ids.size() * 4), b_step = ctx.alloc(step.size() * 4);
     ctx.write(b_tab, table.data(), table.size() * 4);
     ctx.write(b_ids, ids.data(), ids.size() * 4);
     ctx.write(b_step, step.data(), step.size() * 4);
 
-    const uint32_t groups_needed = (uint32_t) (((size_t) n_ids * kv_heads * per + kLocalSize - 1) / kLocalSize);
+    const uint32_t groups_needed = (uint32_t) (((size_t) cap * kv_heads * per + kLocalSize - 1) / kLocalSize);
     VkPipeline pg = ctx.pipeline(dir + "/kv_q8_gather.spv", 6, 12);
     struct { int kv_heads, head_dim, page_size; } pc{kv_heads, head_dim, page_size};
 
@@ -6489,6 +6751,7 @@ int main(int argc, char** argv) {
     case_bf16_to_f16(ctx, dir);            // the prefill path's operand conversion (stage 5)
     case_gemm_prefill(ctx, dir);           // THE prefill GEMM: engine layout, both kernels (stage 5)
     case_attn_decode_short(ctx, dir);      // the short-step decode attention (the attention block's first kernel)
+    case_kv_f16_gather(ctx, dir);          // the f16 KV gather: the window the attention reads, and the grid rule
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

@@ -1,0 +1,70 @@
+// ports/vulkan/shaders/kv_f16_gather.comp - gather the selected f16 cells into the attention's window.
+// Ported from src/kernels/cuda/qsa.cu (`kv_gather_kernel`, launched by `kv_gather_step`).
+//
+// The F16 sibling of kv_q8_gather: the same addressing and the same window layout, with no dequantisation, because
+// the pool itself is f16.  The scratch layout is the one the attention kernels read - `[id][kv_head][head_dim]` -
+// so storage format is the only thing that changed.
+//
+//     cell = ids[id]                                              the cell this row holds
+//     page = table[cell / page_size]                              the page table, int32
+//     row  = (page * kv_heads + h) * page_size + (cell % page_size)   the pool row
+//     out[(id * kv_heads + h) * head_dim + d] = pool[row * head_dim + d]
+//
+// **`ids[id]`, NOT `id`.**  The destination ROW INDEX is the position in the selection; the cell it holds is the
+// selection's VALUE.  Those are two different orderings, and confusing them yields a window that is a permutation of
+// a correct one.  A softmax over the keys cannot see a permutation - it is symmetric in the key index - so a
+// permuted window still produces a plausible attention output.  Only a position-dependent MASK distinguishes them,
+// which is why the gate's composed gather-then-attend arm runs with a mask on.
+//
+// **THE GRID IS THE CAPACITY, NOT THIS TOKEN'S LIVE COUNT.**  The source's launcher says so in as many words, and
+// the reason is the recorded command buffer: group counts are baked into it, so a grid sized by `n_ids` would be
+// replayed at token 500 with token 1's room and simply never write the rows it does not cover.  The live count is
+// read from the STEP BUFFER at dispatch time - buffers are re-read on replay, push constants and group counts are
+// not - and the surplus threads exit on the guard below.  The gate has an arm for exactly this, using this port's
+// own record/replay path.
+//
+// The source copies a `uint2` (four halfs) per thread.  This copies the same four halfs elementwise: the same bytes
+// move, and the only thing that matters about the granularity is WHICH four, which is identical.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer POOL { uint16_t p[]; } POOL_;
+layout(set = 0, binding = 1, std430) readonly buffer TAB { int t[]; } TAB_;
+layout(set = 0, binding = 2, std430) readonly buffer IDS { int v[]; } IDS_;
+layout(set = 0, binding = 3, std430) readonly buffer STEP { int s[]; } ST_;
+layout(set = 0, binding = 4, std430) buffer SCRATCH { uint16_t y[]; } OUT_;
+
+layout(push_constant) uniform Pc {
+    int kv_heads;
+    int head_dim;
+    int page_size;
+} pc;
+
+void main() {
+    const int n_ids = ST_.s[3];                    // kStepWidth: read from the buffer, never from a push constant
+    const int per = pc.head_dim / 4;               // four halfs per thread, as the source's `uint2` copy does
+    const int total = n_ids * pc.kv_heads * per;
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= total) return;                        // the grid is the capacity and is rounded up; surplus threads exit
+
+    const int row_span = pc.kv_heads * per;
+    const int id = i / row_span;                   // the destination ROW: the position in the selection
+    const int rem = i - id * row_span;
+    const int h = rem / per;
+    const int q4 = rem - h * per;
+
+    const int cell = IDS_.v[id];
+    const int page = TAB_.t[cell / pc.page_size];
+    const int row = (page * pc.kv_heads + h) * pc.page_size + (cell % pc.page_size);
+
+    const int d = q4 * 4;
+    const int src = row * pc.head_dim + d;
+    const int dst = (id * pc.kv_heads + h) * pc.head_dim + d;
+    for (int t = 0; t < 4; ++t) {
+        OUT_.y[dst + t] = POOL_.p[src + t];        // f16 in, f16 out: no conversion, so nothing can round
+    }
+}
