@@ -76,7 +76,8 @@ injection, three implementations, and the docs kept current.
 ## 4. HOW MUCH FURTHER TO SOMETHING THAT GENERATES TOKENS
 
 `PORT-MAP.tsv` (checked by the gate) classifies **every** `kernels::` symbol the decode path (`src/core/`) calls:
-**77 symbols - 18 kernel, 49 host, 10 todo.**  The inference core is done and gated: attention, the KV cache in all
+**77 symbols - 18 kernel, 49 host, 10 todo.**  (Later, 2026-10-05: the scan also sees BARE-name call sites, and the
+map reads **168 symbols - 53 kernel, 63 host, 52 todo** - see `NEXT.md`'s top section.)  The inference core is done and gated: attention, the KV cache in all
 four modes (f16 / q8 / q4 / hybrid), the QSA block selection, the embedding gather, the router top-10, the quantised
 matvec family, rms_norm / rope / silu / swiglu - and **both samplers, so the port can turn logits into a token**.
 

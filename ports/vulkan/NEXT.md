@@ -1,5 +1,73 @@
 # Start here next session
 
+## THE PORT MAP'S BLIND SPOT IS CLOSED - bare-name decode-path symbols - **DONE 2026-10-05**
+
+`tools/check_port_map.py` keyed on the `kernels::` QUALIFIER, so a kernels-namespace symbol that
+`src/core/` calls BARE (legal wherever a `using namespace strata::kernels;` is in scope, and exactly
+what `src/core/mtp.cpp` does for the coupled-draft entry points) was invisible: the map could read
+`todo 0` while such a symbol was unported, and the two coupled shaders sat in the UNCLAIMED list
+while no row named them.
+
+**THE RULE NOW APPLIED, and why it is not a heuristic that invents symbols.**  A DECODE-PATH SYMBOL
+is an identifier `src/core/` reaches into the kernels namespace, written `kernels::X` or bare `X`.
+The bare names are NOT scraped from `src/core/` -- a source file is full of local identifiers, and
+treating every `foo(` in it as a kernel symbol would invent names the engine does not have.  They
+come from the ENGINE'S OWN DECLARATIONS: namespace-scope functions declared in
+`include/strata/kernels/**`, attributed to `src/core/` only in a source that has actually brought
+the namespace into scope (`using namespace strata::kernels;` / `using strata::kernels::X;`).  The
+discovery lives ONCE in `tools/port_map_lib.py`, imported by BOTH the checker and the generator, so
+the two cannot drift.
+
+**THE MEASURED EFFECT - AND A FINDING, NOT A COSMETIC FIX.**  Closing the blind spot does not add
+the four known symbols; it adds **91**, because the qualifier-only scan was hiding the whole
+bare-name half of the decode path.  The map moves
+
+    77 decode-path symbols - 28 kernel, 49 host,  0 todo; ...
+    168 decode-path symbols - 53 kernel, 63 host, 52 todo; ...
+
+**M-A's `todo = 0` was therefore measured on a 77-symbol map, not on the decode path.**  The two
+coupled symbols ARE ported, and their shaders are now CLAIMED (unclaimed shaders fall 37 -> 19).  But
+the newly-visible set also carries a large body of GPU work this port has NOT done, classified `todo`
+by the map's own definition (GPU work with no shader in this tree): the **GDN family**
+(`gdn_step` / `gdn_conv_step` / `gdn_l2_norm` / `gdn_out_norm` / `gdn_beta_gate` and their `native_*`
+and `fused_*` siblings), **`native_rope_apply`**, **`native_router_top10(_multi)`**,
+**`native_moe_combine(_multi)`**, **`native_qsa_gate_apply`/`_rms_norm_weighted`/`_indexer_append`**,
+**`bf16_gemv`/`bf16_gemv_split`**, **`s_gemv_q8_0_split`/`s_gemv_q8k_split`**, the QSA prompt/indexer
+path (`qsa_decode_attn_batch`, `qsa_index_step`, `qsa_attend_step`, `indexer_key_append`,
+`topk_512_step`, `qsa_gate_apply_f32`), `gr_write`/`fused_gr_read_multi`, `moe_group_resident`, and
+the verify/P6 device helpers (`add_streams_broadcast`, `broadcast_streams`, `fetch_blobs`,
+`copy_indexed`, `gpu_stamp`, `map_ids`, `mtp_select`, `rebase_ptrs`, `resident_plan`, `row_top_prob`,
+`wait_flag_ge(_or)`, `window_ids`).  The 14 new `host` rows are the bare-name host side (the
+`*_enabled` capability checks, the mapped copies, `doorbell_publish_res`/`_value`,
+`coupled_draft_stage`).  **This is the honest hole list M-A claimed to have emptied**, and it
+supersedes the "the map's `todo` column is 0" line in `HANDOFF.md` §6.3 and `STATUS.md`.
+
+**FALSIFIED - and the OLD checker is shown blind on the SAME file.**  Drop the `coupled_draft_sample`
+row (the blind-spot symbol):
+
+    $ grep -v $'^coupled_draft_sample\t' PORT-MAP.tsv > /tmp/pm.tmp && cp /tmp/pm.tmp PORT-MAP.tsv
+    $ python3 tools/check_port_map.py
+      FAIL src/core/ reaches kernels::coupled_draft_sample, which PORT-MAP.tsv does not mention   (exit 1)
+    $ git show HEAD:ports/vulkan/tools/check_port_map.py > /tmp/old.py
+    $ cp /tmp/old.py tools/_old_check.py && python3 tools/_old_check.py
+      port map: 167 decode-path symbols - 52 kernel, 63 host, 52 todo; ...                        (exit 0)
+
+The second injection renames a shader a `kernel` row names (`coupled_sample.spv` ->
+`coupled_sampleX.spv`): `FAIL PORT-MAP.tsv: coupled_draft_sample names shader 'coupled_sample',
+which is not built` (exit 1).  Both restore clean.
+
+**THE ONE-COMMAND REPRODUCTION (checker-only).**  `gates/inject-verify.sh` falsifies a vk_gate CASE
+by injecting into a shader/harness and running the gate binary; this is a build-time Python tool, so
+the injection is recorded here rather than as an `inject-verify.sh` entry:
+
+    cd ports/vulkan && cp PORT-MAP.tsv /tmp/pm.bak \
+      && grep -v $'^coupled_draft_sample\t' PORT-MAP.tsv > /tmp/pm.tmp && cp /tmp/pm.tmp PORT-MAP.tsv \
+      && python3 tools/check_port_map.py; rc=$?; cp /tmp/pm.bak PORT-MAP.tsv; exit $rc
+    # expect:  FAIL src/core/ reaches kernels::coupled_draft_sample ...   (exit 1)
+
+`make_port_map.py` no longer reads a `/tmp/core_syms.txt` hand-off: it derives the symbol set from
+`port_map_lib` too, and regenerates `PORT-MAP.tsv` byte-identically (`diff -q` against a copy).
+
 ## I1 - THE ENGINE BACKEND'S FIRST INCREMENT: the device layer, the arena, and the first entry point that RUNS - **DONE AND VERIFIED 2026-10-05**
 
 Increment **I1** of `ports/vulkan/plan/BACKEND-INTEGRATION.md` (the first increment that BUILDS the engine).
@@ -179,7 +247,8 @@ radeon_icd 341/0/1, lvp 333/0/3, nvidia 336/0/2.
 (`using namespace strata::kernels`), so `check_port_map.py` - which keys on `kernels::` - does not list them, and the
 two coupled shaders are therefore reported as UNCLAIMED by a `kernel` row rather than mapped.  The map's rule is
 unchanged and still passes; the coupled entry points are a pre-existing blind spot of the symbol scan, recorded here
-rather than papered over.  (2) `coupled_penalize` scans a subset index's occurrences in the window instead of the
+rather than papered over.  **CLOSED 2026-10-05 - see the top section: the checker now discovers bare-name call sites,
+the coupled pair is classified, and the same scan surfaced 91 hidden symbols (52 `todo`).**  (2) `coupled_penalize` scans a subset index's occurrences in the window instead of the
 engine's shared bitmap + `atomicOr`; the counts are identical (`id_to_sub` is the inverse of `sub_to_id`) and it
 keeps the shader free of atomics, at O(nv x h) instead of O(h + hits x h) - the port's existing scan-instead-of-bitmap
 trade, acceptable for a correctness arm with the gate's small subset sizes.

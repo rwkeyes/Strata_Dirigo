@@ -1,5 +1,24 @@
 # Status — what is done, what is verified, what is not
 
+## THE PORT MAP'S BLIND SPOT IS CLOSED — and it was 91 symbols, not 4 (2026-10-05)
+
+`tools/check_port_map.py` keyed on the `kernels::` qualifier, so kernels-namespace symbols that
+`src/core/` calls BARE (through `using namespace strata::kernels;`) were invisible — the map could
+read `todo 0` while such a symbol was unported.  The checker now discovers both forms, via one shared
+`tools/port_map_lib.py` (bare names come from the engine's own declarations in
+`include/strata/kernels/**`, attributed only to sources that have the namespace in scope).  **The
+map moves from `77 symbols — 28 kernel, 49 host, 0 todo` to `168 symbols — 53 kernel, 63 host,
+52 todo`.**  The four known symbols (`coupled_draft_sample`, `coupled_draft_stage` and their shaders
+`coupled_penalize`/`coupled_sample`) are classified — their shaders are now claimed, so the unclaimed
+shader count falls 37 → 19 — but the same scan surfaces **52 GPU symbols this port has NOT done**
+(the GDN family and their `native_*`/`fused_*` siblings, `native_rope_apply`, `native_router_top10`,
+`native_moe_combine`, `native_qsa_*`, `bf16_gemv*`, the QSA prompt/indexer path, `gr_write`,
+`fused_gr_read_multi`, `moe_group_resident`, and the verify/P6 device helpers).  **So M-A's `todo = 0`
+was measured on a 77-symbol map, not on the decode path**; the dated "port map ... 0 todo" lines
+lower down are records of the map as it then stood, not the current count.  Full detail, the rule and
+the falsification (the HEAD checker passes the same file the new one fails) are in `NEXT.md`'s top
+section.
+
 ## The engine integration has STARTED: increment I1 (device layer + arena + the first entry point) — DONE AND VERIFIED 2026-10-05
 
 `ports/vulkan/plan/BACKEND-INTEGRATION.md` §3's **I1**, the first increment that BUILDS the engine.  It adopts
@@ -396,9 +415,9 @@ to the shader that INCLUDES the file rather than the include itself.
 `PORT-MAP.tsv` - the classification of every `kernels::` symbol the DECODE path (`src/core/`) calls into kernel /
 host / todo - against the engine's sources and the built shaders, and fails on an invented symbol, on a `kernel` row
 naming a shader that is not built, and on any decode-path symbol the map does not mention.  That last rule is the
-point: a new call site cannot join the decode path unnoticed.  It says 77 symbols - 17 kernel, 50 host, **10 todo** -
-so the decode path's remaining GPU work is ten named kernels rather than the ~250 KB of prefill and fused-MoE code.
-Falsified three ways before landing.
+point: a new call site cannot join the decode path unnoticed.  (It read 77 symbols - 17 kernel, 50 host, **10 todo**
+when it landed; the count is now **168 - 53 kernel, 63 host, 52 todo**, because the scan was later extended to the
+BARE-name call sites a `using namespace` makes legal - see the top section.)  Falsified three ways before landing.
 
 **THE EMBEDDING GATHER LANDED, and `precise` turned out to be LOAD-BEARING.**  `embedding_gather.comp` (packed
 codes + per-group scales -> float rows, from `verify_kernels.cu`'s `_dev` kernel and the parity reference).  The

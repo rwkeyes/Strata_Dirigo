@@ -4,30 +4,43 @@
   * every symbol in the map must exist in the engine's own sources (no invented names)
   * every `kernel` row must name shaders that are BUILT (a .spv in shaders/)
   * every built shader must be named by some row (no orphan shaders)
-  * every kernels:: symbol src/core/ calls must be in the map (the map stays complete over the decode path)
+  * every kernels-namespace symbol src/core/ REACHES must be in the map (the map stays complete
+    over the decode path) -- whether it is written `kernels::X` or BARE `X`
 
-The last rule is the one that matters: it makes "not ported yet" a THING THIS REPO KNOWS, so a new call site cannot
-join the decode path unnoticed.
+The last rule is the one that matters: it makes "not ported yet" a THING THIS REPO KNOWS, so a new
+call site cannot join the decode path unnoticed.
+
+THE BARE-NAME HALF OF THAT RULE, and why it is not a heuristic.  Until this change the scan keyed on
+the `kernels::` qualifier only, so a symbol called through `using namespace strata::kernels;` was
+invisible: `src/core/mtp.cpp` calls `coupled_draft_sample` / `coupled_draft_stage` bare, and the map
+read `todo 0` while the port's two coupled shaders went UNCLAIMED.  The bare names are NOT scraped
+from src/core/ (a source file is full of local identifiers, and treating every `foo(` as a kernel
+symbol would invent names the engine does not have).  They come from the engine's own declarations in
+`include/strata/kernels/**` and are attributed to src/core/ only in a source that has actually
+brought the namespace into scope (`using namespace strata::kernels;` / `using strata::kernels::X;`).
+The discovery lives in tools/port_map_lib.py, shared with the generator so the two cannot drift.
 """
 import pathlib, re, sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import port_map_lib as lib
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]      # .../strata-vulkan-wt
 PORT = ROOT / 'ports/vulkan'
 fail = []
 
 # --- the engine's symbols, from its own sources ---
-engine_src = (ROOT / 'src')
 text = []
-for p in list(engine_src.rglob('*.hpp')) + list(engine_src.rglob('*.cpp')) + list((ROOT / 'include').rglob('*.hpp')):
+for p in list((ROOT / 'src').rglob('*.hpp')) + list((ROOT / 'src').rglob('*.cpp')) \
+        + list((ROOT / 'include').rglob('*.hpp')):
     try:
         text.append(p.read_text(errors='ignore'))
     except OSError:
         continue
 engine_text = '\n'.join(text)
 
-core_syms = sorted({m.group(1) for m in
-                    (m for p in (engine_src / 'core').rglob('*') if p.suffix in ('.cpp', '.hpp')
-                     for m in re.finditer(r'kernels::([a-z_0-9]+)', p.read_text(errors='ignore')))})
+# --- the decode path's symbols: qualified AND bare (see the module docstring / port_map_lib) ---
+core_syms = lib.decode_path_symbols()
 
 # --- the map ---
 rows = []
@@ -58,9 +71,9 @@ for sym, kind, what in rows:
             claimed.add(sh)
 unclaimed = sorted(built - claimed)      # prefill-path kernels and shared primitives: reported, not failures
 
-for sym in core_syms:
+for sym in sorted(core_syms):
     if sym not in mapped:
-        fail.append(f"src/core/ calls kernels::{sym}, which PORT-MAP.tsv does not mention")
+        fail.append(f"src/core/ reaches kernels::{sym}, which PORT-MAP.tsv does not mention")
 
 k = sum(1 for r in rows if r[1] == 'kernel')
 h = sum(1 for r in rows if r[1] == 'host')
