@@ -225,3 +225,32 @@ with the 53 distinct `strata::kernels::` symbols UNCHANGED**: the shim resolves 
 backend library.  Excluded (and why): the three `src/core/*.cu`, the prefill path, the parity/bench TUs, and the
 native-expert/ggml half of the CPU kernels.  The `STRATA_VERSION` define moved ABOVE the backend-option blocks in
 the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.cpp` compile.
+
+## What I4 adds (2026-10-05)
+
+* `vulkan/src/kernels/matvec_vk.cpp` - the NEXT EIGHT matvec/GEMV/KV entry points, in the order the layer body
+  names them (source order in `src/core/layer.cpp`, NOT the plan's list): the BF16 GEMV family
+  (`bf16_gemv_fp32_mmvf` `layer.cpp:97`, `bf16_gemv_split` `:98`, `bf16_gemv` `:99` - the first two branches of
+  `project_bf16`; `bf16_gemv`/`bf16_gemv_split` share `bf16_gemv.spv`), the S2 GEMV (`s2_gemv_q8` `:166`), and
+  the FP16/INT8 KV cache (`kv_append_q8_step` `:934`, `kv_append_step` `:943`, `kv_gather_q8_step` `:983`,
+  `kv_gather_step` `:989`).  Engine headers unchanged.
+* **THE `host` ROW: `kv_block_bytes(s, fmt)`** (the size of one KV page, transcribed from `kv_stream.cu`).  The
+  other three KV-stream rows (`kv_stream_reset`, `kv_ring_table`, `kv_stream_resolve`) are the STREAMING RESIDENT
+  TIER (`--kv-resident`, off by default): the engine calls the first two with a NULL stream (no default stream
+  exists here) and the third needs resolve/copy shaders this tree does not build - so they are NOT answered.
+* **A LATENT I3 DEFECT FIXED:** `kv_append_q4_step` bound the POOL with `host_layout = host ? 1 : 0`, but
+  `host_layout` picks the ROW RULE (page-table row vs identity row), not whether to write - so under KV streaming
+  it wrote only the host row and left the pool stale.  It now always writes the pool AND (when a host pool is
+  present) the host buffers.  `kv_append_q8_step`/`kv_append_step` implement the same two-dispatch shape.
+* **The proof is the established one**: each is re-run through the ENGINE WRAPPER and required to agree BITWISE
+  with the shader path AND with the case's explicit oracle (`case_*_entry` in `ports/vulkan/harness/vk_gate.cpp`,
+  each pinned to the harness device with `EnginePin`).  The q8 append case also proves the host-copy arm with a
+  table whose pool row and identity row DIFFER.
+* **No `*_enabled()` capability was turned on**, so `case_native_capabilities` needed no new arm.
+* **THE LINK PROGRESS (the port's progress bar toward a layer that LINKS):** the one-layer-body link (the standard
+  recipe in `ports/vulkan/NEXT.md`, now including the shim library) moved **118 -> 106** undefined references /
+  **53 -> 44** distinct full-signature `strata::kernels::` symbols / **51 -> 42** under the parent's name-only
+  pattern.  The matvec/GEMV/KV group falls **15 -> 6**.  The engine's five cross-TU symbols
+  (`LayerView::name`, `WeightTable::find`, `native_embed`, `NativeEmbed::gather_one`, `main`) all have a home in
+  the targets the shim batch added; their TUs compile clean under the shim, and only the sibling TUs that need the
+  DEFERRED CUDA graph API (I5's) keep those targets from building.

@@ -70,10 +70,15 @@
 #error "matvec_vk.cpp is the Vulkan backend: compile it only in a -DSTRATA_ENABLE_VULKAN=1 build"
 #endif
 
+#include "strata/kernels/bf16_gemv.hpp"    // bf16_gemv, bf16_gemv_split, bf16_gemv_fp32_mmvf (I4)
 #include "strata/kernels/iq_kernels.hpp"   // quantize_q8_1_rows, iq_row_bytes
 #include "strata/kernels/kv_q4.hpp"        // kv_append_q4_step, kv_gather_q4_step, QsaShapes
+#include "strata/kernels/kv_q8.hpp"        // kv_append_q8_step, kv_gather_q8_step, KV_Q8_GROUP (I4)
+#include "strata/kernels/kv_stream.hpp"    // kv_block_bytes (the KV host row), KvHostPools (I4)
 #include "strata/kernels/native_mmvq.hpp"  // native_quantize_q8_1, native_mmvq, native_q5_k_f32, *_supported/bytes
+#include "strata/kernels/qsa.hpp"          // kv_append_step, kv_gather_step (the fp16 KV cache)
 #include "strata/kernels/quantize_act.hpp" // quantize_q8_0, quantize_q8_0_scaled, quantize_q8_K
+#include "strata/kernels/s2_gemv_q8.hpp"   // s2_gemv_q8 (I4)
 
 #include "iq_grids_vk.hpp"                 // the I-quant grid tables (a verbatim copy of the port's generated
                                            //   harness header - I1 adopted vk_compute.* the same way)
@@ -271,8 +276,11 @@ void native_q5_k_f32(Stream& s, const void* weights, const float* x, void* scrat
 //        and V share the grid.  `step` is a device int32 block whose [0] is the position.  The POOL's extent is
 //        a session property the signature does not carry (the CUDA kernel addresses one row and needs no
 //        total); the resolve below range-checks the pool BASE against one cell's row, which is the largest
-//        region the call itself names.  `host_layout != 0` selects the KV-streaming identity row (the
-//        host mirror); a negative page is the shader's "no write".
+//        region the call itself names.  `host_layout` selects the row rule, NOT whether to write: the POOL write
+//        is ALWAYS dispatched (host_layout 0; the shader itself skips a page the table maps negative), and when
+//        a HOST COPY is present (KV streaming) the IDENTITY row is a SECOND dispatch binding the host buffers -
+//        which is what the CUDA's `if (host.k_q4 != nullptr)` block does.  (This was a single dispatch binding
+//        the pool with host_layout 1, which wrote only the host row and left the pool stale.)
 void kv_append_q4_step(Stream& s, uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const strata::kernels::QsaShapes& sh,
                        const strata::kernels::KvHostPools* host) {
@@ -280,18 +288,26 @@ void kv_append_q4_step(Stream& s, uint8_t* k_q4, uint8_t* v_q4, const int32_t* p
     if (kh <= 0 || hd <= 0 || ps <= 0) return;
     if (hd % 32 != 0) refuse("kv_append_q4_step", "head_dim is not a multiple of 32 (the Q4_0 group)");
     const uint64_t bytes_per_head = strata::kernels::kv_q4_bytes_per_head((int) hd);
+    const uint64_t cell_bytes = bytes_per_head * (uint64_t) kh;
     Buf kv{}, vv{}, tv{}, sv{}, kcv{}, vcv{};
-    if (!arena_resolve(s, k_q4, bytes_per_head * (uint64_t) kh, kv) ||
-        !arena_resolve(s, v_q4, bytes_per_head * (uint64_t) kh, vv) ||
+    if (!arena_resolve(s, k_q4, cell_bytes, kv) ||
+        !arena_resolve(s, v_q4, cell_bytes, vv) ||
         !arena_resolve(s, page_table, 4, tv) || !arena_resolve(s, step, 20, sv) ||
         !arena_resolve(s, kcur, (uint64_t) kh * (uint64_t) hd * 4, kcv) ||
         !arena_resolve(s, vcur, (uint64_t) kh * (uint64_t) hd * 4, vcv))
         refuse("kv_append_q4_step", "a pointer is not inside this stream's arena");
     struct { int32_t kv_heads; int32_t head_dim; int32_t page_size; int32_t host_layout; } pc{
-        (int32_t) kh, (int32_t) hd, (int32_t) ps, host != nullptr ? 1 : 0};
+        (int32_t) kh, (int32_t) hd, (int32_t) ps, 0};
     VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/kv_q4_append.spv", 6, sizeof(pc));
     const uint64_t n_groups = 2 * (uint64_t) kh * (uint64_t) (hd / 32);
     s.ctx->dispatch(pipe, {&kv, &vv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), groups_for(n_groups));
+    if (host != nullptr && host->k_q4 != nullptr) {   // KV streaming: the identity row, the SAME shader
+        Buf hk{}, hv{};
+        if (!arena_resolve(s, host->k_q4, cell_bytes, hk) || !arena_resolve(s, host->v_q4, cell_bytes, hv))
+            refuse("kv_append_q4_step", "the host-copy pointer is not inside this stream's arena");
+        pc.host_layout = 1;
+        s.ctx->dispatch(pipe, {&hk, &hv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), groups_for(n_groups));
+    }
 }
 
 // ---- #6 `kv_gather_q4_step` -> kv_q4_gather.spv (KQ4 ro, VQ4 ro, TAB ro, IDS ro, STEP ro, KS rw, VS rw; push
@@ -317,6 +333,202 @@ void kv_gather_q4_step(Stream& s, const uint8_t* k_q4, const uint8_t* v_q4, cons
     VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/kv_q4_gather.spv", 7, sizeof(pc));
     const uint64_t n_groups = (uint64_t) max_ids * (uint64_t) kh * (uint64_t) (hd / 32);
     s.ctx->dispatch(pipe, {&kv, &vv, &tv, &iv, &sv, &ksv, &vsv}, &pc, sizeof(pc), groups_for(n_groups));
+}
+
+// ============================================================================================================
+// I4 - THE NEXT EIGHT MATVEC / GEMV / KV ENTRY POINTS (the BF16 GEMVs, the S2 GEMV, the fp16/int8 KV cache)
+// ============================================================================================================
+// The order is derived from the layer body's own call sites, in source order as `src/core/layer.cpp` names them
+// (the plan's §3 list is not an order):
+//
+//   1 `bf16_gemv_fp32_mmvf`  layer.cpp:97   project_bf16's native branch (--native)
+//   2 `bf16_gemv_split`      layer.cpp:98   project_bf16's split branch (gdn alpha/beta :291, router :367)
+//   3 `bf16_gemv`            layer.cpp:99   project_bf16's plain branch (qsa indexer k/q :918/:962)
+//   4 `s2_gemv_q8`           layer.cpp:166  gemv_quantized's S2 branch (code_bits == 2)
+//   5 `kv_append_q8_step`    layer.cpp:934  qsa_layer - the INT8/K8V4 KV cache APPEND
+//   6 `kv_append_step`       layer.cpp:943  qsa_layer - the FP16 KV cache APPEND
+//   7 `kv_gather_q8_step`    layer.cpp:983  qsa_layer - the INT8/K8V4 KV cache GATHER
+//   8 `kv_gather_step`       layer.cpp:989  qsa_layer - the FP16 KV cache GATHER
+//
+// Three siblings of these eight are NOT reached and are therefore deferred: `bf16_gemv_fp32_mmvf_cols`
+// (layer.cpp:414, only inside `moe_route_window`, which is called from `verify.cpp:927` - the P6 verifier, not
+// the decode path) and `s_gemv_q8_0_split` / `s_gemv_q8k_split`, which PORT-MAP.tsv carries as `todo` with the
+// reason "no shader in this tree yet" - a wrapper cannot be proved against a case that does not exist.
+
+// ---- 1/3 `bf16_gemv` and 2 `bf16_gemv_split` -> bf16_gemv.spv (X, W, Y; push {int n_in; int n_out}; ONE
+//        WORKGROUP PER OUTPUT ROW).  The activation is BF16 bits read as 32-bit PAIRS; `threads_per_row` is
+//        DROPPED (the port renders the CUDA split's warps as the workgroup barrier tree - subgroup ops are
+//        banned here), so both entry points drive the same shader.
+static void bf16_gemv_impl(Stream& s, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
+                           const char* who) {
+    if (n_in <= 0 || n_out <= 0) return;
+    if ((n_in & 1) != 0) refuse(who, "n_in must be even (the activation is read as 32-bit pairs)");
+    Buf xv{}, wv{}, yv{};
+    if (!arena_resolve(s, x, (uint64_t) n_in * 2, xv) ||
+        !arena_resolve(s, w, (uint64_t) n_out * (uint64_t) n_in * 2, wv) ||
+        !arena_resolve(s, y, (uint64_t) n_out * 4, yv))
+        refuse(who, "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/bf16_gemv.spv", 3, 8);
+    struct { int32_t n_in; int32_t n_out; } pc{(int32_t) n_in, (int32_t) n_out};
+    s.ctx->dispatch(pipe, {&xv, &wv, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
+}
+void bf16_gemv(Stream& s, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out) {
+    bf16_gemv_impl(s, x, w, y, n_in, n_out, "bf16_gemv");
+}
+void bf16_gemv_split(Stream& s, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
+                     int threads_per_row) {
+    (void) threads_per_row;   // the port's split IS one workgroup per row; the CUDA knob is not connected here
+    bf16_gemv_impl(s, x, w, y, n_in, n_out, "bf16_gemv_split");
+}
+
+// ---- 1 `bf16_gemv_fp32_mmvf` -> bf16_mmvf_f32.spv (X f32, W bf16 pairs, Y; push {int n_in; int n_out}; ONE
+//        WORKGROUP PER OUTPUT ROW).  The native single-token MMVF: F32 activation, BF16 weight.
+void bf16_gemv_fp32_mmvf(Stream& s, const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out) {
+    if (n_in <= 0 || n_out <= 0) return;
+    if ((n_in & 1) != 0) refuse("bf16_gemv_fp32_mmvf", "n_in must be even (the weight is read as 32-bit pairs)");
+    Buf xv{}, wv{}, yv{};
+    if (!arena_resolve(s, x, (uint64_t) n_in * 4, xv) ||
+        !arena_resolve(s, w, (uint64_t) n_out * (uint64_t) n_in * 2, wv) ||
+        !arena_resolve(s, y, (uint64_t) n_out * 4, yv))
+        refuse("bf16_gemv_fp32_mmvf", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/bf16_mmvf_f32.spv", 3, 8);
+    struct { int32_t n_in; int32_t n_out; } pc{(int32_t) n_in, (int32_t) n_out};
+    s.ctx->dispatch(pipe, {&xv, &wv, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
+}
+
+// ---- 4 `s2_gemv_q8` -> s2_gemv_q8.spv (ACT q8_0, CODES, SCALES, Y; push {int n_in; int n_out}; ONE WORKGROUP
+//        PER ROW).  The S2 (Q2_0) weight against a Q8_0 activation - the same parallelism decision as
+//        bf16_gemv_split, so `threads_per_row` is dropped too.
+void s2_gemv_q8(Stream& s, const uint8_t* act, const uint8_t* codes, const float* scales, float* y, int64_t n_in,
+                int64_t n_out, int threads_per_row) {
+    (void) threads_per_row;   // dropped, as bf16_gemv_split's is
+    if (n_in <= 0 || n_out <= 0) return;
+    if (n_in % 64 != 0) refuse("s2_gemv_q8", "n_in is not a multiple of 64 (the S2 group)");
+    Buf av{}, cv{}, sv{}, yv{};
+    if (!arena_resolve(s, act, (uint64_t) (n_in / 32) * 34, av) ||
+        !arena_resolve(s, codes, (uint64_t) n_out * (uint64_t) (n_in / 4), cv) ||
+        !arena_resolve(s, scales, (uint64_t) n_out * (uint64_t) (n_in / 64) * 4, sv) ||
+        !arena_resolve(s, y, (uint64_t) n_out * 4, yv))
+        refuse("s2_gemv_q8", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/s2_gemv_q8.spv", 4, 8);
+    struct { int32_t n_in; int32_t n_out; } pc{(int32_t) n_in, (int32_t) n_out};
+    s.ctx->dispatch(pipe, {&av, &cv, &sv, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
+}
+
+// ---- 5 `kv_append_q8_step` -> kv_q8_append.spv (KQ, VQ, KS, VS rw; TAB, STEP, KC, VC ro; push {int kv_heads;
+//        int head_dim; int page_size; int host_layout}; grid = 2 * kv_heads * head_dim/64, one 64-value group
+//        per thread).  THE POOL IS ALWAYS WRITTEN (host_layout 0; the shader itself skips a page the table maps
+//        negative).  With a HOST COPY (KV streaming) the CUDA writes the IDENTITY row TOO - a SECOND dispatch
+//        binding the HOST buffers with host_layout 1, the same shader and the other buffer.
+void kv_append_q8_step(Stream& s, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+                       const int32_t* page_table, const int32_t* step, const float* kcur, const float* vcur,
+                       const strata::kernels::QsaShapes& sh, const strata::kernels::KvHostPools* host) {
+    const int64_t kh = sh.n_head_kv, hd = sh.head_dim, ps = sh.page_size;
+    if (kh <= 0 || hd <= 0 || ps <= 0) return;
+    if (hd % 64 != 0) refuse("kv_append_q8_step", "head_dim is not a multiple of 64 (the KV-Q8 group)");
+    const uint64_t code_bytes = (uint64_t) kh * (uint64_t) hd;              // one cell, all heads
+    const uint64_t scale_bytes = (uint64_t) kh * (uint64_t) (hd / 64) * 2;
+    Buf kqv{}, vqv{}, ksv{}, vsv{}, tv{}, sv{}, kcv{}, vcv{};
+    if (!arena_resolve(s, k_q, code_bytes, kqv) || !arena_resolve(s, v_q, code_bytes, vqv) ||
+        !arena_resolve(s, k_scale, scale_bytes, ksv) || !arena_resolve(s, v_scale, scale_bytes, vsv) ||
+        !arena_resolve(s, page_table, 4, tv) || !arena_resolve(s, step, 20, sv) ||
+        !arena_resolve(s, kcur, (uint64_t) kh * (uint64_t) hd * 4, kcv) ||
+        !arena_resolve(s, vcur, (uint64_t) kh * (uint64_t) hd * 4, vcv))
+        refuse("kv_append_q8_step", "a pointer is not inside this stream's arena");
+    struct { int32_t kv_heads; int32_t head_dim; int32_t page_size; int32_t host_layout; } pc{
+        (int32_t) kh, (int32_t) hd, (int32_t) ps, 0};
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/kv_q8_append.spv", 8, sizeof(pc));
+    const uint32_t ngroups = groups_for(2 * (uint64_t) kh * (uint64_t) (hd / 64));
+    s.ctx->dispatch(pipe, {&kqv, &vqv, &ksv, &vsv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), ngroups);
+    if (host != nullptr && host->k_q != nullptr) {   // KV streaming: the identity row, the SAME shader
+        Buf hk{}, hv{}, hks{}, hvs{};
+        if (!arena_resolve(s, host->k_q, code_bytes, hk) || !arena_resolve(s, host->v_q, code_bytes, hv) ||
+            !arena_resolve(s, host->k_scale, scale_bytes, hks) || !arena_resolve(s, host->v_scale, scale_bytes, hvs))
+            refuse("kv_append_q8_step", "the host-copy pointer is not inside this stream's arena");
+        pc.host_layout = 1;
+        s.ctx->dispatch(pipe, {&hk, &hv, &hks, &hvs, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), ngroups);
+    }
+}
+
+// ---- 6 `kv_append_step` -> kv_f16_append.spv (KPOOL, VPOOL rw; TAB, STEP, KC, VC ro; push {int kv_heads;
+//        int head_dim; int page_size; int host_layout}; grid = 2 * kv_heads * head_dim).  The FP16 sibling of
+//        the q8 append: same row rule, fp16 in and out, one thread per element of K or V.
+void kv_append_step(Stream& s, uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
+                    const float* kcur, const float* vcur, const strata::kernels::QsaShapes& sh,
+                    const strata::kernels::KvHostPools* host) {
+    const int64_t kh = sh.n_head_kv, hd = sh.head_dim, ps = sh.page_size;
+    if (kh <= 0 || hd <= 0 || ps <= 0) return;
+    const uint64_t cell_bytes = (uint64_t) kh * (uint64_t) hd * 2;
+    Buf kv{}, vv{}, tv{}, sv{}, kcv{}, vcv{};
+    if (!arena_resolve(s, k_pool, cell_bytes, kv) || !arena_resolve(s, v_pool, cell_bytes, vv) ||
+        !arena_resolve(s, page_table, 4, tv) || !arena_resolve(s, step, 20, sv) ||
+        !arena_resolve(s, kcur, (uint64_t) kh * (uint64_t) hd * 4, kcv) ||
+        !arena_resolve(s, vcur, (uint64_t) kh * (uint64_t) hd * 4, vcv))
+        refuse("kv_append_step", "a pointer is not inside this stream's arena");
+    struct { int32_t kv_heads; int32_t head_dim; int32_t page_size; int32_t host_layout; } pc{
+        (int32_t) kh, (int32_t) hd, (int32_t) ps, 0};
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/kv_f16_append.spv", 6, sizeof(pc));
+    const uint32_t ngroups = groups_for(2 * (uint64_t) kh * (uint64_t) hd);
+    s.ctx->dispatch(pipe, {&kv, &vv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), ngroups);
+    if (host != nullptr && host->k_pool != nullptr) {   // KV streaming: the identity row, the SAME shader
+        Buf hk{}, hv{};
+        if (!arena_resolve(s, host->k_pool, cell_bytes, hk) || !arena_resolve(s, host->v_pool, cell_bytes, hv))
+            refuse("kv_append_step", "the host-copy pointer is not inside this stream's arena");
+        pc.host_layout = 1;
+        s.ctx->dispatch(pipe, {&hk, &hv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), ngroups);
+    }
+}
+
+// ---- 7 `kv_gather_q8_step` -> kv_q8_gather.spv (CODES, SCALES, TAB, IDS, STEP ro, SCRATCH rw; push {int
+//        kv_heads; int head_dim; int page_size}).  The shader is ONE SIDE (K or V), so this is TWO dispatches -
+//        the K pass and the V pass - into the shared FP16 scratch.  THE GRID IS THE CAPACITY (`max_ids`), not
+//        the live count: the shader reads the real count from `step` and guards the surplus, which is what makes
+//        a RECORDED launch replay-safe at a later token.
+void kv_gather_q8_step(Stream& s, const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale,
+                       const uint16_t* v_scale, const int32_t* page_table, const int32_t* ids, const int32_t* step,
+                       int64_t max_ids, const strata::kernels::QsaShapes& sh, uint16_t* k_scratch,
+                       uint16_t* v_scratch) {
+    const int64_t kh = sh.n_head_kv, hd = sh.head_dim, ps = sh.page_size;
+    if (kh <= 0 || hd <= 0 || ps <= 0 || max_ids <= 0) return;
+    if (hd % 64 != 0) refuse("kv_gather_q8_step", "head_dim is not a multiple of 64 (the KV-Q8 group)");
+    const uint64_t code_bytes = (uint64_t) kh * (uint64_t) hd;
+    const uint64_t scale_bytes = (uint64_t) kh * (uint64_t) (hd / 64) * 2;
+    const uint64_t scratch = (uint64_t) max_ids * (uint64_t) kh * (uint64_t) hd * 2;
+    Buf kqv{}, vqv{}, ksv{}, vsv{}, tv{}, iv{}, sv{}, ksc{}, vsc{};
+    if (!arena_resolve(s, k_q, code_bytes, kqv) || !arena_resolve(s, v_q, code_bytes, vqv) ||
+        !arena_resolve(s, k_scale, scale_bytes, ksv) || !arena_resolve(s, v_scale, scale_bytes, vsv) ||
+        !arena_resolve(s, page_table, 4, tv) || !arena_resolve(s, ids, (uint64_t) max_ids * 4, iv) ||
+        !arena_resolve(s, step, 20, sv) || !arena_resolve(s, k_scratch, scratch, ksc) ||
+        !arena_resolve(s, v_scratch, scratch, vsc))
+        refuse("kv_gather_q8_step", "a pointer is not inside this stream's arena");
+    struct { int32_t kv_heads; int32_t head_dim; int32_t page_size; } pc{(int32_t) kh, (int32_t) hd, (int32_t) ps};
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/kv_q8_gather.spv", 6, sizeof(pc));
+    const uint32_t ngroups = groups_for((uint64_t) max_ids * (uint64_t) kh * (uint64_t) (hd / 4));
+    s.ctx->dispatch(pipe, {&kqv, &ksv, &tv, &iv, &sv, &ksc}, &pc, sizeof(pc), ngroups);
+    s.ctx->dispatch(pipe, {&vqv, &vsv, &tv, &iv, &sv, &vsc}, &pc, sizeof(pc), ngroups);
+}
+
+// ---- 8 `kv_gather_step` -> kv_f16_gather.spv (POOL, TAB, IDS, STEP ro, SCRATCH rw; push {int kv_heads; int
+//        head_dim; int page_size}).  The FP16 sibling of the q8 gather, same two-dispatch K/V shape and the
+//        same capacity grid; f16 in, f16 out, so nothing can round.
+void kv_gather_step(Stream& s, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
+                    const int32_t* ids, const int32_t* step, int64_t max_ids, const strata::kernels::QsaShapes& sh,
+                    uint16_t* k_scratch, uint16_t* v_scratch) {
+    const int64_t kh = sh.n_head_kv, hd = sh.head_dim, ps = sh.page_size;
+    if (kh <= 0 || hd <= 0 || ps <= 0 || max_ids <= 0) return;
+    const uint64_t pool_bytes = (uint64_t) kh * (uint64_t) hd * 2;   // one cell, all heads
+    const uint64_t scratch = (uint64_t) max_ids * (uint64_t) kh * (uint64_t) hd * 2;
+    Buf kpv{}, vpv{}, tv{}, iv{}, sv{}, ksc{}, vsc{};
+    if (!arena_resolve(s, k_pool, pool_bytes, kpv) || !arena_resolve(s, v_pool, pool_bytes, vpv) ||
+        !arena_resolve(s, page_table, 4, tv) || !arena_resolve(s, ids, (uint64_t) max_ids * 4, iv) ||
+        !arena_resolve(s, step, 20, sv) || !arena_resolve(s, k_scratch, scratch, ksc) ||
+        !arena_resolve(s, v_scratch, scratch, vsc))
+        refuse("kv_gather_step", "a pointer is not inside this stream's arena");
+    struct { int32_t kv_heads; int32_t head_dim; int32_t page_size; } pc{(int32_t) kh, (int32_t) hd, (int32_t) ps};
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/kv_f16_gather.spv", 5, sizeof(pc));
+    const uint32_t ngroups = groups_for((uint64_t) max_ids * (uint64_t) kh * (uint64_t) (hd / 4));
+    s.ctx->dispatch(pipe, {&kpv, &tv, &iv, &sv, &ksc}, &pc, sizeof(pc), ngroups);
+    s.ctx->dispatch(pipe, {&vpv, &tv, &iv, &sv, &vsc}, &pc, sizeof(pc), ngroups);
 }
 
 }  // namespace strata::vulkan
@@ -426,6 +638,68 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
                        uint16_t* v_scratch, void* stream) {
     strata::vulkan::kv_gather_q4_step(strata::vulkan::stream_for("kv_gather_q4_step", stream), k_q4, v_q4,
                                       page_table, ids, step, max_ids, s, k_scratch, v_scratch);
+}
+
+// ---- THE KV CACHE'S HOST ROW ------------------------------------------------------------------------------
+// `kv_block_bytes(s, fmt)` - the BYTES OF ONE BLOCK (page) of K and V together, the size the KV-streaming path
+// sizes its pinned host copy with (layer.cpp:659).  A pure function of the shapes and the storage format,
+// transcribed from src/kernels/cuda/kv_stream.cu so the two agree byte for byte.  This IS a host row the layer
+// reaches (it is not a bind); the other three KV-stream rows - `kv_stream_reset`, `kv_ring_table`,
+// `kv_stream_resolve` - are the STREAMING RESIDENT TIER, reached only under `--kv-resident` (mode != 0), and
+// they are NOT answered here: the engine calls the first two with a NULL stream (layer.cpp:707/709) and this
+// backend has no default stream to fall back on, and the third needs the resolve/copy kernels whose shaders this
+// tree does not build.
+uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
+    const uint64_t rows = (uint64_t) (s.n_head_kv * s.page_size);
+    if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+    return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
+                          : rows * (uint64_t) s.head_dim * 2 * 2;
+}
+
+// ---- the I4 entry points: the symbols include/strata/kernels/*.hpp declare --------------------------------
+void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::bf16_gemv(strata::vulkan::stream_for("bf16_gemv", stream), x, w, y, n_in, n_out);
+}
+void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
+                     int threads_per_row, void* stream) {
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::bf16_gemv_split(strata::vulkan::stream_for("bf16_gemv_split", stream), x, w, y, n_in, n_out,
+                                    threads_per_row);
+}
+void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::bf16_gemv_fp32_mmvf(strata::vulkan::stream_for("bf16_gemv_fp32_mmvf", stream), x, w, y, n_in,
+                                        n_out);
+}
+void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, float* y, int64_t n_in, int64_t n_out,
+                int threads_per_row, void* stream) {
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::s2_gemv_q8(strata::vulkan::stream_for("s2_gemv_q8", stream), act, codes, scales, y, n_in, n_out,
+                               threads_per_row);
+}
+void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                       const KvHostPools* host) {
+    strata::vulkan::kv_append_q8_step(strata::vulkan::stream_for("kv_append_q8_step", stream), k_q, v_q, k_scale,
+                                      v_scale, page_table, step, kcur, vcur, s, host);
+}
+void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
+                    const float* kcur, const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
+    strata::vulkan::kv_append_step(strata::vulkan::stream_for("kv_append_step", stream), k_pool, v_pool, page_table,
+                                   step, kcur, vcur, s, host);
+}
+void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                       const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    strata::vulkan::kv_gather_q8_step(strata::vulkan::stream_for("kv_gather_q8_step", stream), k_q, v_q, k_scale,
+                                      v_scale, page_table, ids, step, max_ids, s, k_scratch, v_scratch);
+}
+void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table, const int32_t* ids,
+                    const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
+                    uint16_t* v_scratch, void* stream) {
+    strata::vulkan::kv_gather_step(strata::vulkan::stream_for("kv_gather_step", stream), k_pool, v_pool, page_table,
+                                   ids, step, max_ids, s, k_scratch, v_scratch);
 }
 
 }  // namespace strata::kernels

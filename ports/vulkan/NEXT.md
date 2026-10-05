@@ -100,6 +100,129 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I4 — THE NEXT EIGHT MATVEC / GEMV / KV ENTRY POINTS (THE BF16 GEMVs, THE S2 GEMV, THE FP16/INT8 KV CACHE) AND THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**THE BAR (the running line): `118 → 106` undefined references / `53 → 44` distinct full-signature
+`strata::kernels::` symbols / `51 → 42` under the parent's name-only pattern.**  The matvec/GEMV/KV group falls
+**15 → 6**; every other group is unchanged.  MEASURED with the CURRENT STANDARD recipe (the shim is in the link
+line; `$HOME/vkbuild-vulkan` is a **Makefiles** build dir, so **never pass `-G Ninja`** - CMake refuses and the
+stale library silently reproduces the PREVIOUS batch's numbers):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release     # reconfigure
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 106  (was 118)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 44   (was 53)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 42   (was 51)
+
+**THE EIGHT, IN THE ORDER THE LAYER BODY NAMES THEM** (source order in `src/core/layer.cpp`; the plan's §3
+list is NOT an order).  All eight are reached by `layer.cpp` or a function it defines (`project_bf16`,
+`gemv_quantized`, `qsa_layer`); their first NAMING line is the order:
+
+| # | symbol | call site | stage | shader |
+|---|---|---|---|---|
+| 1 | `bf16_gemv_fp32_mmvf` | layer.cpp:97 | `project_bf16` native branch (`--native`) | bf16_mmvf_f32.spv |
+| 2 | `bf16_gemv_split` | layer.cpp:98 | `project_bf16` split branch (gdn alpha/beta :291, router :367) | bf16_gemv.spv |
+| 3 | `bf16_gemv` | layer.cpp:99 | `project_bf16` plain branch (qsa indexer k/q :918/:962) | bf16_gemv.spv |
+| 4 | `s2_gemv_q8` | layer.cpp:166 | `gemv_quantized` S2 branch (code_bits == 2) | s2_gemv_q8.spv |
+| 5 | `kv_append_q8_step` | layer.cpp:934 | qsa_layer - the INT8/K8V4 KV cache APPEND | kv_q8_append.spv |
+| 6 | `kv_append_step` | layer.cpp:943 | qsa_layer - the FP16 KV cache APPEND | kv_f16_append.spv |
+| 7 | `kv_gather_q8_step` | layer.cpp:983 | qsa_layer - the INT8/K8V4 KV cache GATHER | kv_q8_gather.spv |
+| 8 | `kv_gather_step` | layer.cpp:989 | qsa_layer - the FP16 KV cache GATHER | kv_f16_gather.spv |
+
+All eight live in `vulkan/src/kernels/matvec_vk.cpp` (the KV TU is that file - there is no separate KV file).
+
+**EACH PROVED BY ITS CASE THROUGH THE ENGINE WRAPPER - BITWISE vs THE SHADER PATH AND vs THE EXPLICIT ORACLE.**
+A new `case_*_entry` in the port's gate runs the port's EXISTING case's fixture through (A) the shader path and
+(B) the ENGINE WRAPPER `strata::kernels::<symbol>` on its own engine stream (`EnginePin`-pinned), then asserts
+(C) the wrapper equals the shader path **BITWISE** and (D) equals the case's explicit oracle.  Raw lines (vega,
+`intel_icd`/Arc B70 arm; the same cases pass on llvmpipe and the Ryzen iGPU):
+
+| # | symbol | wrapper == shader path (bitwise), worst | wrapper vs oracle, worst |
+|---|---|---|---|
+| 1 | `bf16_gemv_fp32_mmvf` | **256/256, w 0** | **65/65 w 0.00682** (terms bound + output guard) |
+| 2 | `bf16_gemv_split` | **192/192, w 0** | **49/49 w 0.00612** (terms bound + output guard) |
+| 3 | `bf16_gemv` | **512/512, w 0** | **129/129 w 0.00724** (terms bound + output guard) |
+| 4 | `s2_gemv_q8` | **32/32, w 0** | **8/8 w 0** (the S2-over-Q8_0 rule, terms bound) |
+| 5 | `kv_append_q8_step` | **16896/16896, w 0** | **16896/16896 w 0** (the KV-Q8 group rule, bit-exact; + a host-copy arm **33280/33280**) |
+| 6 | `kv_append_step` | **262144/262144, w 0** | **262144/262144 w 0** (the append row rule, fp16 exact) |
+| 7 | `kv_gather_q8_step` | **8448/8448, w 0** | **8448/8448 w 0** (the int8 reader rule, fp16 exact) |
+| 8 | `kv_gather_step` | **8448/8448, w 0** | **8448/8448 w 0** (the fp16 row copy, exact) |
+
+**THE `host` ROWS THIS BATCH ANSWERS.**  One, and it is not a bare bind: **`kv_block_bytes(s, fmt)`** - the
+BYTES OF ONE BLOCK (page) of K and V together, the size the KV-streaming path sizes its pinned host copy with
+(layer.cpp:659).  A pure function of the shapes and the storage format, transcribed from
+`src/kernels/cuda/kv_stream.cu:192` so the two agree byte for byte.  **The other three KV-stream rows are NOT
+answered, and the reason is measured**: `kv_stream_reset` (layer.cpp:707/738), `kv_ring_table` (:709) and
+`kv_stream_resolve` (:757) are the STREAMING RESIDENT TIER (`--kv-resident`, `p.mode != 0`; the DEFAULT is mode 0,
+fully resident) - the engine calls the first two with a **NULL stream** and this backend has no default stream to
+fall back on, and the third needs the resolve/copy kernels whose shaders this tree does not build.
+
+**CAPABILITIES: NONE TURNED ON, AND THAT IS WHY THE CAPS CASE IS UNTOUCHED.**  None of the eight is gated by a
+`*_enabled()` capability (`bf16_gemv*`'s branch is the `native_bf16_projections` SETTING, not a getter), so
+`case_native_capabilities` needed no new arm and its invariant stands unchanged - and it passed (569/0/0).
+
+**A LATENT DEFECT IN I3'S Q4 KV APPEND, FIXED HERE.**  `kv_append_q4_step` dispatched ONCE binding the POOL with
+`host_layout = host ? 1 : 0`.  But `host_layout` selects the ROW RULE, not whether to write: the CUDA writes the
+VRAM page (page-table row) ALWAYS and the host copy (identity row) additionally when a host pool is present.  So
+under KV streaming I3's wrapper wrote ONLY the host row and left the pool stale.  It is now TWO dispatches: the
+pool always (host_layout 0), and - when `host->k_q4 != nullptr` - the host buffers with host_layout 1.  The same
+shape is what the new `kv_append_q8_step` / `kv_append_step` implement, and the q8 append case PROVES it with a
+table that maps block 0 to page 1 while the identity row is page 0 (so the two images differ): the host-copy arm
+reads 33280/33280.
+
+**THE REMAINING 44 `strata::kernels::` SYMBOLS, GROUPED.**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue (the I2 elementwise set)** | **0** | all answered |
+| **matvec / GEMV / KV** | **6** | `bf16_gemv_fp32_mmvf_cols`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve` |
+| **attention / QSA / MoE / GR / PLE / rope** | **36** | unchanged |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+**WHAT IS LEFT OF THE MATVEC / GEMV / KV GROUP, AND WHY EACH OF THE SIX STAYS.**  `bf16_gemv_fp32_mmvf_cols`
+(layer.cpp:414) is only inside `moe_route_window`, which `verify.cpp:927` calls - the P6 verifier, not the decode
+path.  `s_gemv_q8_0_split` and `s_gemv_q8k_split` are PORT-MAP `todo` rows ("no shader in this tree yet"), and a
+wrapper cannot be proved against a case that does not exist.  The three `kv_stream_*`/`kv_ring_table` rows are the
+streaming tier above.
+
+**THE ENGINE'S CROSS-TU SYMBOLS - ALL FIVE NOW HAVE A HOME; NONE IS MISSING FROM A SOURCE LIST.**  The five the
+shim batch listed (`LayerView::name`, `WeightTable::find`, `native_embed`, `NativeEmbed::gather_one`, `main`) are
+named in the targets the shim batch added, so no further one-liner is owed:
+
+| symbol | file | target that names it |
+|---|---|---|
+| `LayerView::name` | `src/core/layout.cpp:137` | `strata_vulkan_core` |
+| `WeightTable::find` | `src/core/weights.cpp:474` | `strata_vulkan_core` |
+| `native_embed` | `src/core/native_head.cpp:101` | `strata_vulkan_engine` |
+| `NativeEmbed::gather_one` | `src/core/native_head.cpp:194` | `strata_vulkan_engine` |
+| `main` | `src/program/generate.cpp:1228` | `strata_vulkan` (the executable) |
+
+**Each of the three underlying TUs COMPILES clean under the shim** (`layout.cpp`, `weights.cpp`,
+`native_head.cpp`): linking those three objects into the one-layer body drops its raw undefined references
+**106 → 66** and resolves `LayerView::name`, `WeightTable::find`, `native_embed` and `gather_one` (the one
+remaining line is inside `gather_one`'s own body, not the symbol).  The reason the whole targets do not build is
+NOT a source-list gap: each target also carries a sibling TU that needs the DEFERRED CUDA graph API -
+`strata_vulkan_core` carries `src/core/graph.cpp:81` (`cudaGraph_t`/`cudaGraphExec_t`), `strata_vulkan_engine`
+carries `src/core/session.cpp` (same), `strata_vulkan` carries `src/program/generate.cpp` (which also needs
+`cudaLaunchHostFunc`).  That declaration work is **I5's** and was not touched.
+
+**RESULTS (vega).**  Engine CONFIGURE + BUILD under `-DSTRATA_ENABLE_VULKAN=ON` clean.  Gate on `vega`:
+**Arc (intel_icd) 569/0/0 (exit 0), llvmpipe 557/0/3, Ryzen iGPU (radeon_icd) 560/0/2** - **+17 verdicts on every
+arm** (8 new cases: `bf16_gemv_fp32_mmvf` 2, `bf16_gemv_split` 2, `bf16_gemv` 2, `s2_gemv_q8` 2,
+`kv_append_q8_step` 3, `kv_append_step` 2, `kv_gather_q8_step` 2, `kv_gather_step` 2), 0 failed; the radeon arm's
+characterised intermittent defect did NOT fire this run.  `check_port_map.py` passes (`168 - 78 kernel, 61 host,
+29 todo; 111 shaders built, 92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (all
+twelve were already `kernel`/`host` rows, so the map does not move).  **`z820b` is PENDING** (no XTX/K620 number).
+The CUDA graph API was NOT ported; the plan was NOT re-scoped.
+
 ## THE CUDA-RUNTIME SHIM + THE ENGINE'S OWN TARGETS (the approved hybrid route, deliverables A+B) — AND HOW FAR ONE LAYER GETS TOWARD RUNNING (2026-10-05, `vega`)
 
 **THE APPROVED ROUTE, IMPLEMENTED.** The user chose *"Hybrid: shim the ~13 symbols needed to link and run one
