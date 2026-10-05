@@ -5706,6 +5706,262 @@ void case_native_q5_k_f32(Ctx& ctx, const std::string& dir) {
 
 
 // -----------------------------------------------------------------------------------------------------------
+// MoE hit selection: which of a token's routed experts are RESIDENT, and the ROUTING POSITION each hit fills.
+// `hit_select_kernel` (src/kernels/cuda/s2_expert_grouped.cu:623), from `src/core/session.cpp:866`.  The CUDA is
+// a one-warp ballot+popcount compaction; the oracle transcribes its rule and the shader writes the same
+// compaction serially (see the shader header - a ballot is a subgroup op, banned here by design).
+//
+// THE `dst` FIELD IS THE POINT.  `dst[at]` is the ROUTING POSITION (`lane`), not the expert or the slot: writing
+// the slot there lands the downstream add in a cache-order row instead of the router's.  The fixture scrambles
+// the resident slots so slot != position on every hit, which is what makes the two distinguishable.
+static void moe_hit_select_arm(Ctx& ctx, const std::string& dir, int k, int n_expert,
+                               const std::vector<int>& ids_in, const std::vector<int>& res_in, const char* what) {
+    const int cap = 32;   // the CUDA's maximum k, and the engine's capacity grid
+    std::vector<int32_t> ids(ids_in.begin(), ids_in.end());
+    std::vector<int32_t> res(res_in.begin(), res_in.end());
+    std::vector<int32_t> wslot, wdst;
+    for (int lane = 0; lane < k; ++lane) {
+        const int e = ids[(size_t) lane];
+        int s = -1;
+        if (e >= 0 && e < n_expert) s = res[(size_t) e];
+        if (s >= 0) { wslot.push_back(s); wdst.push_back(lane); }
+    }
+    const int wcount = (int) wslot.size();
+
+    Buf b_ids = ctx.alloc((size_t) cap * 4u);
+    Buf b_res = ctx.alloc((size_t) cap * 4u);
+    Buf b_slot = ctx.alloc((size_t) cap * 4u + 64u);
+    Buf b_dst = ctx.alloc((size_t) cap * 4u + 64u);
+    Buf b_cnt = ctx.alloc(4u + 64u);
+    ctx.write(b_ids, ids.data(), ids.size() * 4u);
+    ctx.write(b_res, res.data(), res.size() * 4u);
+    std::vector<uint8_t> sslot((size_t) cap * 4u + 64u, 0xCD), sdst((size_t) cap * 4u + 64u, 0xCD), scnt(4u + 64u, 0xCD);
+    ctx.write(b_slot, sslot.data(), sslot.size());
+    ctx.write(b_dst, sdst.data(), sdst.size());
+    ctx.write(b_cnt, scnt.data(), scnt.size());
+    struct { int k; int n_expert; } pc{k, n_expert};
+    VkPipeline p = ctx.pipeline(dir + "/moe_hit_select.spv", 5, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_ids, &b_res, &b_slot, &b_dst, &b_cnt}, &pc, sizeof(pc), 1);
+
+    std::vector<uint8_t> islot(sslot.size()), idst(sdst.size()), icnt(scnt.size());
+    ctx.read(b_slot, islot.data(), islot.size());
+    ctx.read(b_dst, idst.data(), idst.size());
+    ctx.read(b_cnt, icnt.data(), icnt.size());
+    const int32_t* gslot = reinterpret_cast<const int32_t*>(islot.data());
+    const int32_t* gdst = reinterpret_cast<const int32_t*>(idst.data());
+    const int32_t gcnt = *reinterpret_cast<const int32_t*>(icnt.data());
+    int bad = 0;
+    if (gcnt != wcount) ++bad;
+    for (int i = 0; i < wcount; ++i) {
+        if (gslot[i] != wslot[(size_t) i]) ++bad;
+        if (gdst[i] != wdst[(size_t) i]) ++bad;
+    }
+    // entries the count does not name must keep the sentinel: a kernel that wrote the whole CAPACITY fails here
+    for (int i = wcount; i < cap; ++i) {
+        if (gslot[i] != (int32_t) 0xCDCDCDCD) ++bad;
+        if (gdst[i] != (int32_t) 0xCDCDCDCD) ++bad;
+    }
+    for (size_t i = (size_t) cap * 4u; i < islot.size(); ++i) if (islot[i] != 0xCD) ++bad;
+    for (size_t i = (size_t) cap * 4u; i < idst.size(); ++i) if (idst[i] != 0xCD) ++bad;
+    for (size_t i = 4u; i < icnt.size(); ++i) if (icnt[i] != 0xCD) ++bad;
+    char label[176];
+    std::snprintf(label, sizeof label, "moe_hit_select (k=%d, n_expert=%d, %s): %d hits", k, n_expert, what, wcount);
+    verdict(label, bad == 0, bad, cap, 0.0, "slot/dst/count fields wrong");
+    ctx.free(b_ids); ctx.free(b_res); ctx.free(b_slot); ctx.free(b_dst); ctx.free(b_cnt);
+}
+
+void case_moe_hit_select(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "moe_hit_select.spv")) return;
+    // decode shape: 10 routed, 8 experts, 5 resident (scrambled slots), one id out of range and one negative.
+    // `res` is padded to the CAPACITY with a RESIDENT value past n_expert, so dropping the `e < n_expert` bound
+    // counts an out-of-range id as a hit and the arm fails - an unguarded read the CUDA also refuses to make.
+    {
+        std::vector<int> res(32, 0);
+        const int rv[8] = {5, -1, 2, 7, -1, 0, 3, -1};
+        for (int e = 0; e < 8; ++e) res[(size_t) e] = rv[e];
+        std::vector<int> ids{3, 0, 5, 6, 2, 4, 1, 3, 7, 9};
+        moe_hit_select_arm(ctx, dir, 10, 8, ids, res, "decode shape, scrambled slots, one OOR id");
+    }
+    // k = 32 (the CUDA's maximum), every expert resident with a scrambled slot
+    {
+        std::vector<int> res(32), ids(32);
+        for (int e = 0; e < 32; ++e) res[(size_t) e] = (e * 7 + 1) % 32;
+        for (int i = 0; i < 32; ++i) ids[(size_t) i] = (i * 11 + 5) % 32;
+        moe_hit_select_arm(ctx, dir, 32, 32, ids, res, "every expert resident");
+    }
+    // k = 1: the first decode step
+    {
+        std::vector<int> res{-1, 4, -1};
+        std::vector<int> ids{1};
+        moe_hit_select_arm(ctx, dir, 1, 3, ids, res, "one routed expert, resident");
+    }
+    // NOTHING resident: zero hits, and no entry may be written
+    {
+        std::vector<int> res{-1, -1, -1, -1};
+        std::vector<int> ids{-1, 3, 2, 0};
+        moe_hit_select_arm(ctx, dir, 4, 4, ids, res, "no resident expert: zero hits");
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// `moe_hit_grouped_s2` - the per-hit S2 expert ENTRY, which is a COMPOSITION, not one kernel.  The engine's body
+// (src/kernels/cuda/s2_expert_grouped.cu:579) launches gate+up (`gu_kernel`/`gu_pair_kernel`), the SwiGLU, then
+// `quantize_q8_0` on the intermediate, then the down projection - the four port shaders `s2expert_gu`,
+// `s2expert_swiglu`, `quantize_q8_0` and `s2expert_down`.  Each of those is gated against its OWN oracle
+// elsewhere; THIS case gates the WIRING between them, which no single-kernel case can see: the gate-major layout
+// `s2expert_gu` writes is what the SwiGLU and the quantiser both assume, `quantize_q8_0` reads the first
+// `n_hits*FF` floats the SwiGLU left there, and `s2expert_down` reads them back at `h*(FF/32)*34`.
+//
+// The oracle is INDEPENDENT of the device's quantiser and down projection: it HOST-QUANTISES the device's own
+// post-SwiGLU floats (so a stride error in `quantize_q8_0` or in `s2expert_down` disagrees), checks the up rows
+// against the blob (so a wrong gate-major base disagrees), and requires a live, finite output.  The `dst_index`
+// routing is scrambled so a kernel that wrote `h`'s rows at `h` lands two experts in each other's slots.
+
+void case_moe_hit_grouped_s2(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "s2expert_gu.spv") || !have(dir, "s2expert_swiglu.spv") || !have(dir, "quantize_q8_0.spv") ||
+        !have(dir, "s2expert_down.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("moe_hit_grouped_s2", "device lacks storageBuffer8BitAccess");
+        return;
+    }
+    const int H = 2560, FF = 640;
+    const S2ExpertGeom g = s2expert_geom(H, FF);
+    const std::vector<int32_t> slot_index{2, 0, 1};
+    const std::vector<int32_t> dst_index{1, 2, 0};
+    const int n_hits = (int) slot_index.size();
+    const int n_slots = 3;
+    const int nch_gu = H / 32, nch_d = FF / 32;
+    const std::vector<uint8_t> blob_base = s2expert_blob((size_t) n_slots, g);
+    // The chain's OWN scales.  `s2expert_blob` makes the GATE rows ~1e5 (its *1000 is what makes a gate/up
+    // mis-pairing visible to `case_s2expert_tier`), and `silu(gate)*up` at that magnitude overflows fp16 - the
+    // intermediate's `d16` becomes inf and every down row is NaN.  Here BOTH halves carry a modest scale, so the
+    // intermediate is a real fp16 number; the down region is left as `s2expert_blob` wrote it.
+    std::vector<uint8_t> blob = blob_base;
+    for (size_t e = 0; e < (size_t) n_slots; ++e) {
+        uint8_t* base = blob.data() + e * g.blob_bytes;
+        for (size_t i = 0; i < (size_t) (2 * g.FF); ++i) {
+            const float dw = 0.008f * (float) (1 + ((i + e) % 3));
+            for (size_t j = 0; j < g.sc_gu; ++j)
+                s2_put16(base + g.o_gu_scales + i * g.sc_gu * 2 + j * 2, strata::kernels::f16_from_f32(dw));
+        }
+    }
+    const std::vector<uint8_t> act = s2expert_q8_0_rows(1, nch_gu);
+
+    const size_t gu_floats = (size_t) n_hits * (size_t) (2 * FF);
+    const size_t hq_bytes = (size_t) n_hits * (size_t) nch_d * 34u;
+    const size_t n_out = (size_t) n_slots * (size_t) H;
+    Buf b_blob = ctx.alloc(blob.size());
+    Buf b_act = ctx.alloc(act.size());
+    Buf b_xs = ctx.alloc(4u);
+    Buf b_slot = ctx.alloc(slot_index.size() * 4u);
+    Buf b_dst = ctx.alloc(dst_index.size() * 4u);
+    Buf b_gu = ctx.alloc(gu_floats * 4u + 64u);
+    Buf b_hq = ctx.alloc(hq_bytes + 64u);
+    Buf b_out = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_blob, blob.data(), blob.size());
+    ctx.write(b_act, act.data(), act.size());
+    ctx.write(b_slot, slot_index.data(), slot_index.size() * 4u);
+    ctx.write(b_dst, dst_index.data(), dst_index.size() * 4u);
+    std::vector<uint8_t> sinkg(gu_floats * 4u + 64u, 0xC3), sinkh(hq_bytes + 64u, 0xC3), sinko(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_gu, sinkg.data(), sinkg.size());
+    ctx.write(b_hq, sinkh.data(), sinkh.size());
+    ctx.write(b_out, sinko.data(), sinko.size());
+
+    // 1. gate+up, 2. SwiGLU, 3. the intermediate's own quantiser, 4. down - the engine's four launches in order.
+    {
+        struct { int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales; } pc{n_hits, H, FF,
+                                                                                       (int) g.blob_bytes, 0};
+        VkPipeline p = ctx.pipeline(dir + "/s2expert_gu.spv", 5, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_blob, &b_act, &b_xs, &b_slot, &b_gu}, &pc, sizeof(pc), (uint32_t) (n_hits * 2 * FF));
+    }
+    {
+        struct { int n_pairs; } pc{n_hits * FF};
+        VkPipeline p = ctx.pipeline(dir + "/s2expert_swiglu.spv", 1, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_gu}, &pc, sizeof(pc), groups_for((uint64_t) (n_hits * FF)));
+    }
+    {
+        struct { int n_blocks; } pc{n_hits * nch_d};
+        VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_gu, &b_hq}, &pc, sizeof(pc), groups_for((uint64_t) (n_hits * nch_d)));
+    }
+    {
+        struct { int n_hits; int n_embd; int n_ff; int blob_bytes; int use_xscales; } pc{n_hits, H, FF,
+                                                                                       (int) g.blob_bytes, 0};
+        VkPipeline p = ctx.pipeline(dir + "/s2expert_down.spv", 6, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_blob, &b_hq, &b_xs, &b_slot, &b_dst, &b_out}, &pc, sizeof(pc), (uint32_t) (n_hits * H));
+    }
+
+    std::vector<uint8_t> igu(sinkg.size(), 0), ihq(sinkh.size(), 0), iout(sinko.size(), 0);
+    ctx.read(b_gu, igu.data(), igu.size());
+    ctx.read(b_hq, ihq.data(), ihq.size());
+    ctx.read(b_out, iout.data(), iout.size());
+    const float* gu = reinterpret_cast<const float*>(igu.data());
+    const float* out = reinterpret_cast<const float*>(iout.data());
+
+    int bad = 0;
+    double worst = 0, mass = 0;
+    // (a) the up rows (the half the SwiGLU leaves alone) against the blob: pins the gate-major base
+    for (int h = 0; h < n_hits; ++h) {
+        const uint8_t* slot = blob.data() + (size_t) slot_index[(size_t) h] * g.blob_bytes;
+        for (int rr = 0; rr < FF; rr += 7) {
+            double abs_sum = 0.0;
+            const double want = s2_row_dot_host(slot, (size_t) (2 * rr + 1) * g.row_gu,
+                                                g.o_gu_scales + (size_t) (2 * rr + 1) * g.sc_gu * 2, act.data(),
+                                                nullptr, false, nch_gu, abs_sum);
+            const double got = (double) gu[(size_t) n_hits * FF + (size_t) h * FF + (size_t) rr];
+            const double ratio = std::fabs(got - want) / gemv_bound(want, abs_sum, 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+    }
+    // (b) the DEVICE's intermediate must DECODE to the DEVICE's own post-SwiGLU floats at the same position - this
+    //     is the quantiser's wiring, which the down rows alone would follow (a stride error would have hq block b
+    //     holding a different region's values, and the decode then disagrees with gu)
+    for (int h = 0; h < n_hits; ++h) {
+        for (int c = 0; c < nch_d; ++c) {
+            const uint8_t* blk = ihq.data() + ((size_t) h * nch_d + c) * 34u;
+            const double d16 = (double) strata::kernels::f32_from_f16(s2_le16(blk));
+            // the block's amax, from the DEVICE's own floats, gives the f32 scale the codes were rounded against;
+            // the stored `d16` is that scale in fp16, so a reader's `q*d16` carries the fp16 rounding too.
+            double amax = 0.0;
+            for (int e = 0; e < 32; ++e) amax = std::max(amax, std::fabs((double) gu[(size_t) h * FF + (size_t) c * 32 + (size_t) e]));
+            const double d32 = amax / 127.0;
+            const double bound = 0.5 * d32 + 128.0 * std::fabs(d16 - d32) + 1e-6 * amax + 1e-30;
+            for (int e = 0; e < 32; ++e) {
+                const int raw = (int) blk[2 + e];
+                const double q = (double) (raw > 127 ? raw - 256 : raw) * d16;
+                const double x = (double) gu[(size_t) h * FF + (size_t) c * 32 + (size_t) e];
+                if (std::fabs(q - x) > bound) ++bad;
+            }
+        }
+    }
+    // (c) the down rows from the DEVICE's intermediate, at the scrambled `dst_index` routing
+    for (int h = 0; h < n_hits; ++h) {
+        const uint8_t* slot = blob.data() + (size_t) slot_index[(size_t) h] * g.blob_bytes;
+        const uint8_t* hrow = ihq.data() + (size_t) h * (size_t) nch_d * 34u;
+        for (int r = 0; r < H; r += 13) {
+            double abs_sum = 0.0;
+            const double want = s2_row_dot_host(slot, g.o_d_codes + (size_t) r * g.row_d,
+                                                g.o_d_scales + (size_t) r * g.sc_d * 2, hrow, nullptr, false, nch_d,
+                                                abs_sum);
+            const double got = (double) out[(size_t) dst_index[(size_t) h] * H + (size_t) r];
+            const double ratio = std::fabs(got - want) / gemv_bound(want, abs_sum, 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+            mass += std::fabs(want);
+        }
+    }
+    for (size_t i = n_out * 4u; i < iout.size(); ++i) if (iout[i] != 0xC3) ++bad;
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected down value is ~zero: this chain proves nothing\n");
+    verdict("moe_hit_grouped_s2 (gu -> swiglu -> q8_0 -> down, 3 hits)",
+            bad == 0 && live, bad, (int) ((size_t) n_hits * (size_t) (H / 13 + 1) + n_hits * (FF / 7 + 1)),
+            worst, "chain rows/bytes wrong (worst err/tol)");
+    ctx.free(b_blob); ctx.free(b_act); ctx.free(b_xs); ctx.free(b_slot); ctx.free(b_dst);
+    ctx.free(b_gu); ctx.free(b_hq); ctx.free(b_out);
+}
+
+// -----------------------------------------------------------------------------------------------------------
 // IQ3_XXS: the resident model's SECOND most common expert gate/up format (17 of 48 layers, behind IQ2_S's 20).
 //
 // The oracle transcribes `vec_dot_iq3_xxs_q8_1`.  It carries its OWN copy of the two per-byte helpers (the
@@ -9606,6 +9862,8 @@ int main(int argc, char** argv) {
     case_iq_dequant_f32(ctx, dir);        // M-A: the standalone IQ/BF16 dequantiser (dq_dispatch)
     case_iq_embed_rows(ctx, dir);         // M-A: the token-embedding row gather built on it
     case_native_q5_k_f32(ctx, dir);        // M-A: the native head's Q5_K matvec (the packed aux scale/min dot)
+    case_moe_hit_select(ctx, dir);         // M-A: the MoE hit selection (resident experts + the routing position)
+    case_moe_hit_grouped_s2(ctx, dir);     // M-A: the composed per-hit S2 expert entry (gu->swiglu->q8_0->down)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

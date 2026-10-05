@@ -83,6 +83,26 @@ radeon-iGPU 307/1/2 (the intermittent budget-requery drift); box `radeon_icd` (7
 305/0/3, nvidia 308/0/2.  **M-A is now 6 of the ten**; the four `todo` symbols are `moe_grouped_s2`,
 `moe_hit_add`, `moe_hit_select`, `moe_hit_grouped_s2`.
 
+**M-A 7/10 + 8/10 landed the MoE hit selection and the per-hit S2 expert entry** (one commit, as 4/10 + 5/10
+were).  `moe_hit_select.comp` (`hit_select_kernel`, `s2_expert_grouped.cu:623`, from `src/core/session.cpp:866`)
+is the token graph's first step: only a resident expert is a hit, the hits compact in ascending routing order, and
+`dst[at]` is the ROUTING POSITION (`lane`), not the slot - the same two-roles confusion `gather_rows` carries.  A
+ballot is a subgroup op, so the port writes the same exact compaction SERIALLY from one lane, and the shader
+therefore carries no barrier (it is deliberately NOT on the census whitelist).  Four arms (decode shape with
+scrambled slots, `k=32`, `k=1`, a fully non-resident row), with sentinels past `count` and the `res` buffer padded
+past `n_expert` so an unguarded read fails.  Falsified by `gates/inject-verify.sh moe-hit-select-residency` ->
+`FAIL  moe_hit_select ... 21/32`.  **`moe_hit_grouped_s2` is a COMPOSITION** (`gu -> swiglu -> q8_0 -> down`,
+`s2_expert_grouped.cu:579`), so it needed NO new shader: its increment is the case that gates the WIRING between
+the four already-ported kernels, with an oracle that is independent of the device's quantiser and down projection
+(the device's intermediate must DECODE to its own post-SwiGLU floats at the same position, and the up rows are
+checked against the blob).  Falsified by `gates/inject-verify.sh moe-hit-grouped-s2-hit0-intermediate` ->
+`FAIL  moe_hit_grouped_s2 ... 473/867  worst 1.3e+06`.  Its fixture first made the intermediate's `d16` inf (the
+gu arm's gate scales are `*1000`), which turned EVERY down row into NaN that the oracle also computed - the case
+counts a NaN output as a failure, so it did not pass over garbage; the chain now carries its own modest scales.
+**vega: Arc 322/0/0** (`run_gate.sh` exit 0), llvmpipe 310/0/3, radeon-iGPU 313/0/2; box `radeon_icd` (7900 XTX)
+**318/0/1**, lvp 310/0/3, nvidia 313/0/2.  **M-A is 8 of the ten**; the two `todo` symbols are `moe_grouped_s2`
+and `moe_hit_add`.  The port map reads **77 symbols - 26 kernel, 49 host, 2 todo**.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the

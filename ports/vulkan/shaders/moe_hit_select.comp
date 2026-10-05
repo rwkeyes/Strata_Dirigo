@@ -1,0 +1,52 @@
+// ports/vulkan/shaders/moe_hit_select.comp - the MoE hit selection: which of a token's routed experts are resident,
+// and WHICH ROUTING POSITION each result belongs to.
+//
+// `hit_select_kernel` (src/kernels/cuda/s2_expert_grouped.cu:623), called from `src/core/session.cpp:866`:
+//
+//     lane < k:  e = ids[lane];  s = (0 <= e < n_expert) ? res_row[e] : -1;   else s = -1
+//     hit = ballot(s >= 0)
+//     s >= 0:    at = popc(hit & ((1<<lane)-1));  slot[at] = s;  dst[at] = lane
+//     lane 0:    count = popc(hit)
+//
+// TWO RULES, and the second is the one a paraphrase drops:
+//   * only a RESIDENT expert is a hit (`res_row[e]` is negative when the expert is not in the cache), and the
+//     hits are compacted in ASCENDING LANE ORDER; and
+//   * `dst[at]` is the ROUTING POSITION `lane`, NOT the expert / slot.  Writing `s` there instead is a plausible
+//     wrong answer: the downstream add lands in a cache-order slot rather than the router's, which is the same
+//     two-roles confusion `gather_rows`'s `ids[r]` and the KV gather's `ids[id]` carry.
+//
+// WHY THIS SHAPE.  The CUDA is one warp doing a ballot + popcount compaction.  A ballot is a subgroup op, and this
+// port's reductions are barrier trees BY DESIGN (the target is Intel, where the driver picks the SIMD width per
+// kernel - see common/wg_reduce.glsl).  So the port writes the SAME compaction serially from ONE lane: the rule is
+// exact integer bookkeeping (ascending order, `dst` = the position), so a different shape computes the same
+// output, and there is no shared state to get wrong.  That is also why this shader carries no barrier and no
+// subgroup op, which `run_gate.sh`'s census requires of it.
+//
+// `k` is the router's top-k (1..32, the CUDA's own precondition); `n_expert` bounds the `ids` values.  The output
+// buffers are sized for the CAPACITY (k), which is the grid the engine records - see the KV gather's capacity note.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer IDS { int v[]; } ids;      // routed expert ids
+layout(set = 0, binding = 1, std430) readonly buffer RES { int v[]; } res_row;  // resident slot per expert, <0 if not
+layout(set = 0, binding = 2, std430) buffer SLOT { int v[]; } slot;             // [at] = the resident slot
+layout(set = 0, binding = 3, std430) buffer DST  { int v[]; } dst;              // [at] = the routing position
+layout(set = 0, binding = 4, std430) buffer CNT  { int v[]; } count;            // [0] = the number of hits
+
+layout(push_constant, std430) uniform PC { int k; int n_expert; } pc;
+
+void main() {
+    if (gl_LocalInvocationIndex != 0u) return;   // one lane does the whole selection
+    int c = 0;
+    for (int lane = 0; lane < pc.k; ++lane) {
+        const int e = ids.v[lane];
+        int s = -1;
+        if (e >= 0 && e < pc.n_expert) s = res_row.v[e];
+        if (s >= 0) {
+            slot.v[c] = s;
+            dst.v[c] = lane;
+            ++c;
+        }
+    }
+    count.v[0] = c;
+}

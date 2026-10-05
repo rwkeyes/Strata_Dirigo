@@ -97,8 +97,8 @@ TABLE = {
     'native_q5_k_f32':             ('kernel', 'native_q5_k_f32'),
     'moe_grouped_s2':              ('todo', 'the grouped S2 MoE, not ported'),
     'moe_hit_add':                 ('todo', 'the hit accumulator, not ported'),
-    'moe_hit_select':              ('todo', 'the hit selection, not ported'),
-    'moe_hit_grouped_s2':          ('todo', 'the grouped S2 MoE entry, not ported'),
+    'moe_hit_select':              ('kernel', 'moe_hit_select'),
+    'moe_hit_grouped_s2':          ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
 }
 
 missing = [s for s in syms if s not in TABLE]

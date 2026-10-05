@@ -280,6 +280,70 @@ the double reference's.
 **M-A is now 6 of the ten.** Still `todo`: `moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`,
 `moe_hit_grouped_s2`.  The next in the derived order is **`moe_hit_select`**.
 
+## M-A 7/10: `moe_hit_select` - which routed experts are resident, and the ROUTING POSITION each hit fills
+
+`moe_hit_select.comp`, from `hit_select_kernel` (`src/kernels/cuda/s2_expert_grouped.cu:623`), whose decode-path
+call site is `src/core/session.cpp:866` - the token graph's first step.  One warp; `lane < k`: `e = ids[lane]`,
+`s = (0 <= e < n_expert) ? res_row[e] : -1`; `hit = ballot(s >= 0)`; a hit at `at = popc(hit & ((1<<lane)-1))`
+writes `slot[at] = s` and `dst[at] = lane`; lane 0 writes `count = popc(hit)`.
+
+**TWO RULES, and the second is the one a paraphrase drops.**  Only a RESIDENT expert is a hit (`res_row[e]` is
+negative for one the cache does not hold), and the hits compact in ASCENDING routing order - and `dst[at]` is the
+ROUTING POSITION (`lane`), NOT the expert or the slot.  Writing the slot there hands the downstream add a
+cache-order row instead of the router's; it is the same two-roles confusion `gather_rows`'s `ids[r]` and the KV
+gather's `ids[id]` carry.
+
+**A ballot is a subgroup op, so the port writes the compaction SERIALLY from one lane.**  The rule is exact
+integer bookkeeping, so a different shape computes the same output - and this is why the shader carries no
+barrier, no subgroup op and no atomic, which `run_gate.sh`'s census requires of it (it is deliberately NOT on the
+barrier whitelist).  The output buffers are sized for the CAPACITY (k = 32), the grid the engine records.
+
+**Fixture and arms.**  Four arms: the decode shape (10 routed, 8 experts, 5 resident with SCRAMBLED slots, one id
+out of range, one negative), `k = 32` (the CUDA's maximum), `k = 1`, and a fully non-resident row (zero hits).
+Entries past `count` must keep a sentinel (so a kernel that wrote the whole capacity fails), and the `res` buffer
+is padded past `n_expert` with a RESIDENT value so dropping the `e < n_expert` bound counts an out-of-range id as a
+hit.  Scrambled slots make `slot != position` on every hit, which is what makes `dst` falsifiable.
+
+**Falsified.**  `gates/inject-verify.sh moe-hit-select-residency` drops the residency test (`if (s >= 0)` ->
+always write), so every non-resident entry is written with `slot = -1` and the count includes it:
+`FAIL  moe_hit_select (k=10, n_expert=8, decode shape, ...): 6 hits  21/32`.
+
+## M-A 8/10: `moe_hit_grouped_s2` - the per-hit S2 expert ENTRY, which is a COMPOSITION
+
+`moe_hit_grouped_s2` (`src/kernels/cuda/s2_expert_grouped.cu:579`) is not one kernel: it launches gate+up
+(`gu_kernel`/`gu_pair_kernel`), the SwiGLU, `quantize_q8_0` on the intermediate, then the down projection.  All
+four are already in the port (`s2expert_gu`, `s2expert_swiglu`, `quantize_q8_0`, `s2expert_down`) and each is
+gated against its OWN oracle by `case_s2expert_tier`; **this increment is the case that gates the WIRING between
+them**, which no single-kernel case can see - the gate-major layout `s2expert_gu` writes is what the SwiGLU and the
+quantiser both assume, `quantize_q8_0` reads the first `n_hits*FF` floats the SwiGLU left, and `s2expert_down`
+reads them back at `h*(FF/32)*34`.  So no new shader, and the PORT-MAP row names the four it composes.
+
+**The chain runs on the device end to end** (`gu -> swiglu -> q8_0 -> down`, 3 hits, scrambled `slot_index` and
+`dst_index`), and the oracle is INDEPENDENT of the device's quantiser and down projection: (a) the UP rows (the
+half the SwiGLU leaves alone) are compared against the blob, pinning the gate-major base; (b) the device's
+intermediate must DECODE to the device's own post-SwiGLU floats at the same position - a value check, not a byte
+check, because the stored `d16` is the fp32 scale in fp16; and (c) the down rows are compared against a double
+reference from the DEVICE's intermediate at the scrambled `dst_index`.  A defect in (b) or (c) also has to be seen
+with the other half present, which is exactly what a wiring case is for.
+
+**One silent failure the fixture produced, recorded because it is a class.**  The gu arm's blob makes the GATE rows
+~1e5 (its `*1000` is what makes a gate/up mis-pairing visible to `case_s2expert_tier`); through `silu(gate)*up`
+that overflows fp16, so the intermediate's `d16` became inf and EVERY down row was NaN - and the case's own oracle
+computed NaN too, so the two AGREED.  The case counts a NaN output as a failure (correctly), which is what kept it
+from being a green run over garbage.  The chain now carries its own modest scales.
+
+**Falsified.**  `gates/inject-verify.sh moe-hit-grouped-s2-hit0-intermediate` makes `s2expert_down` read hit 0's
+intermediate for every hit (`x_off = 0`): `FAIL  moe_hit_grouped_s2 (...)  473/867  worst 1.3e+06`.
+
+**Measured (this commit covers 7/10 + 8/10).**  vega: **Intel Arc 322 passed / 0 failed / 0 skipped**, llvmpipe
+**310/0/3**, radeon-iGPU 313/0/2 (`run_gate.sh` **exit 0**).  z820b (7900 XTX): **radeon_icd 318/0/1** (the 1 skip
+is the pre-existing M8 cooperative-matrix case), lvp 310/0/3, nvidia (K620) 313/0/2; the box's script exits 1 on
+that pre-existing skip.  Positive controls: `moe_hit_select` adds **4** verdicts and `moe_hit_grouped_s2` **1**.
+
+**M-A is now 8 of the ten.**  Still `todo`: `moe_grouped_s2` (the grouped S2 MoE, `s2_expert_grouped.cu:1099`) and
+`moe_hit_add` (the hit accumulator, `:1138`) - the batch after this one, and then M-A is closed.  The port map
+reads **77 decode-path symbols - 26 kernel, 49 host, 2 todo** and passes.
+
 
 
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**

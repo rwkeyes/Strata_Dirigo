@@ -22,6 +22,10 @@
 #                                       -> must FAIL  "iq_embed_rows: ..."
 #   inject-verify.sh native-q5k-aux-half        native_q5_k_f32.comp  drop the packed-scale half switch
 #                                       -> must FAIL  "native_q5_k_f32"
+#   inject-verify.sh moe-hit-select-residency   moe_hit_select.comp  write a non-resident hit too
+#                                       -> must FAIL  "moe_hit_select"
+#   inject-verify.sh moe-hit-grouped-s2-hit0-intermediate  s2expert_down.comp  every hit reads hit 0's intermediate
+#                                       -> must FAIL  "moe_hit_grouped_s2"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -76,6 +80,20 @@ case "$name" in
     old=$'    const uint him = (j >= 2) ? 0xFFFFFFFFu : 0u;'
     new=$'    const uint him = 0u;   // INJECTION: the packed-scale half switch dropped'
     want="FAIL  native_q5_k_f32" ;;
+  moe-hit-select-residency)
+    # The selection's rule is "only a RESIDENT expert is a hit".  Dropping the test writes every routed entry,
+    # with slot -1 for the non-resident ones and a count that includes them.
+    file="$SH/moe_hit_select.comp"; spv="moe_hit_select"
+    old=$'        if (s >= 0) {\n            slot.v[c] = s;\n            dst.v[c] = lane;\n            ++c;\n        }'
+    new=$'        {   // INJECTION: a non-resident hit is written too\n            slot.v[c] = s;\n            dst.v[c] = lane;\n            ++c;\n        }'
+    want="FAIL  moe_hit_select" ;;
+  moe-hit-grouped-s2-hit0-intermediate)
+    # The chain's wiring: `s2expert_down` reads hit h's own FF/32 q8_0 blocks at h*(FF/32)*34.  Reading hit 0's
+    # for every hit is a stride error the individual down arm also catches, and the composed case must too.
+    file="$SH/s2expert_down.comp"; spv="s2expert_down"
+    old=$'    const uint x_off = h * (FF / 32u) * 34u;'
+    new=$'    const uint x_off = 0u;   // INJECTION: every hit reads hit 0\'s intermediate'
+    want="FAIL  moe_hit_grouped_s2" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

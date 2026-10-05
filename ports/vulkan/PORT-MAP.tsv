@@ -44,11 +44,11 @@ kv_stream_reset	host	the expert file tier: bookkeeping
 kv_stream_resolve	host	the expert file tier: whether a row is resident
 moe_grouped_s2	todo	the grouped S2 MoE, not ported
 moe_hit_add	todo	the hit accumulator, not ported
-moe_hit_grouped_s2	todo	the grouped S2 MoE entry, not ported
+moe_hit_grouped_s2	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
 moe_hit_grouped_s2_cpu_order	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
 moe_hit_grouped_s2_dev	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
 moe_hit_grouped_scratch_bytes	host	a size
-moe_hit_select	todo	the hit selection, not ported
+moe_hit_select	kernel	moe_hit_select
 native_expert_grouped	kernel	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
 native_expert_layout	host	a layout description
 native_expert_scratch_bytes	host	a size
