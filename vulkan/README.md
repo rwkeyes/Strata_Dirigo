@@ -23,7 +23,7 @@ each one - is `ports/vulkan/plan/BACKEND-INTEGRATION.md`.  Read that first; this
         fwht_vk.cpp                      the fwht256 entry point: strata::kernels::fwht256_cuda + fwht256
         elementwise_vk.cpp               (I2) silu_inplace / scale_inplace / f32_to_bf16_bulk + the I2c glue
         doorbell_vk.cpp                  (I2b) the five doorbell_* symbols (device<->host, from sync.*)
-        gdn_vk.cpp                       (I2d) the first six GDN / DeltaNet mixer entry points (the layer body)
+        gdn_vk.cpp                       (I2d/I2e) the GDN / DeltaNet mixer entry points (all fourteen; the layer body)
         native_caps_vk.cpp               the native_*_enabled() capability answers the backend owns
       tests/
         entry_point_smoke.cpp            strata_vk_entry_smoke: builds + RUNS the entry points via the wrappers
@@ -142,18 +142,25 @@ user's call; `ports/vulkan/NEXT.md`'s I2-continued section reports it and does n
   glue/`doorbell_*` that `layer.cpp` also calls and the "backend answers 4" baseline predates.  The remaining 73
   are grouped in `ports/vulkan/NEXT.md`'s I2-continued-further section, with the reproducing command.
 
-## What I2 continued-further-still adds (2026-10-05)
+## What I2 continued-further-still and I2e add (2026-10-05)
 
-* `vulkan/src/kernels/gdn_vk.cpp` (new) - **the first six GDN / DeltaNet MIXER entry points** the layer body
-  reaches, in the order `gdn_layer` (`src/core/layer.cpp:223`, the mixer for 36 of the 48 layers) reaches them:
-  `fused_gdn_conv_l2` (:250), `native_gdn_conv_silu` (:253), `gdn_conv_step` (:255), `native_gdn_l2_norm`
-  (:266/267), `gdn_l2_norm` (:269/270) and `fused_gdn_ab` (:287).  Engine headers unchanged.  Each is proved by a
-  new `case_*_entry` in the port's gate through the ENGINE WRAPPER, BITWISE against the port's own shader path AND
-  against the case's explicit oracle (a double transcription of the engine's own CUDA body), pinned to the harness
-  device (`EnginePin`); the conv cases compare the slid state bitwise too.  `strata_vk_entry_smoke` runs all six.
-* **No `host` row was needed:** the only row the six reach is `native_gdn_enabled()`, already answered by
-  `native_caps_vk.cpp`.  None of them reads module state (unlike `cvec_apply`); they carry the CUDA wrappers'
-  argument contracts (`d_conv == 4`, `channels % 128 == 0`, `n_embd % 8 == 0`) as loud refusals.
+* `vulkan/src/kernels/gdn_vk.cpp` (new in I2d, completed in I2e) - **the GDN / DeltaNet MIXER entry points**, all
+  fourteen the layer body reaches, in the order `gdn_layer` (`src/core/layer.cpp:223`, the mixer for 36 of the 48
+  layers) reaches them.  I2d: `fused_gdn_conv_l2` (:250), `native_gdn_conv_silu` (:253), `gdn_conv_step` (:255),
+  `native_gdn_l2_norm` (:266/267), `gdn_l2_norm` (:269/270), `fused_gdn_ab` (:287).  I2e: `native_gdn_beta_gate`
+  (:296), `native_gdn_gate` (:297), `gdn_beta_gate` (:299), `native_gdn_step` (:308), `gdn_step` (:309),
+  `fused_gdn_step_norm` (:322), `native_gdn_out_norm` (:324), `gdn_out_norm` (:325) - the beta/gate and step/norm
+  stages, COMPLETING the mixer.  (`gdn_gate` :300 is answered in `elementwise_vk.cpp`.)  Engine headers unchanged.
+  Each is proved by a new `case_*_entry` in the port's gate through the ENGINE WRAPPER, BITWISE against the port's
+  own shader path AND against the case's explicit oracle (a double transcription of the engine's own CUDA body),
+  pinned to the harness device (`EnginePin`); the conv and step cases compare the mutated STATE bitwise too.
+  `strata_vk_entry_smoke` runs them.
+* **No `host` row was needed, and for I2e that is MEASURED:** the only row the mixer reaches is
+  `native_gdn_enabled()`, already answered by `native_caps_vk.cpp` (TRUE).  The GDN headers carry no
+  `*_scratch_bytes` and no shape accessor - `GdnShapes` is a by-value POD, not a symbol - and (I2e) the
+  one-layer-body link drops by exactly the eight symbols this file adds with NO new undefined reference.  None of
+  them reads module state (unlike `cvec_apply`); they carry the CUDA wrappers' argument contracts (`d_conv == 4`,
+  `channels % 128 == 0`, `n_embd % 8 == 0`, `S == 128`, `cols == 128`, `h_v % h_k == 0`) as loud refusals.
 * **The LINK PROGRESS moved `204 -> 196` undefined references / `73 -> 67` distinct `strata::kernels::` symbols**
   (the six this batch answers; all six references `layer.cpp` makes).  The remaining 67, grouped by subsystem
   (glue 0 - matvec/GEMV/KV 21 - attention/QSA/MoE/GR/PLE/rope 36 - GDN mixer 8 - other 2), are at the top of

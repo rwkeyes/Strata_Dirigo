@@ -15188,6 +15188,738 @@ void case_fused_gdn_ab_entry(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ============================================================================================================
+// I2e - THE REMAINING EIGHT GDN / DELTANET MIXER ENTRY POINTS.  Same proof the first six used: (A) run the
+// port's EXISTING shader path on a fixture, (B) run the ENGINE WRAPPER on the same fixture through its own
+// engine stream, (C) assert the wrapper's output equals the shader path's BITWISE, and (D) assert it equals
+// the case's explicit oracle.  APPENDED at the end of main() for the shared-RNG reason stated there.
+// ============================================================================================================
+
+// `native_gdn_beta_gate` (layer.cpp:296) -> native_gdn_beta_gate.spv.  Fixture is case_native_gdn_beta_gate's.
+void case_native_gdn_beta_gate_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_beta_gate.spv")) return;
+    const int h_v = 48;
+    std::vector<float> b((size_t) h_v), want((size_t) h_v);
+    for (int h = 0; h < h_v; ++h) {
+        if (h % 3 == 0) b[(size_t) h] = -25.0f + (float) (h % 7);
+        else if (h % 3 == 1) b[(size_t) h] = 25.0f - (float) (h % 7);
+        else b[(size_t) h] = rndf(4.0f);
+    }
+    for (int h = 0; h < h_v; ++h) want[(size_t) h] = (float) (1.0 / (1.0 + std::exp(-(double) b[(size_t) h])));
+
+    Buf bb = ctx.alloc((size_t) h_v * 4);
+    ctx.write(bb, b.data(), (size_t) h_v * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_beta_gate.spv", 1, 4);
+        struct { int32_t n; } pc{h_v};
+        ctx.dispatch(p, {&bb}, &pc, sizeof(pc), groups_for((uint64_t) h_v));
+    }
+    std::vector<float> ref((size_t) h_v);
+    ctx.read(bb, ref.data(), (size_t) h_v * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("native_gdn_beta_gate entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bb); return;
+    }
+    float* db = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    strata::vulkan::stream_write(*s, db, b.data(), (size_t) h_v * 4);
+    strata::kernels::native_gdn_beta_gate(db, h_v, s);   // THE ENGINE WRAPPER
+    std::vector<float> got((size_t) h_v);
+    strata::vulkan::stream_read(*s, db, got.data(), (size_t) h_v * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (int h = 0; h < h_v; ++h) {
+        uint32_t a, c; std::memcpy(&a, &ref[(size_t) h], 4); std::memcpy(&c, &got[(size_t) h], 4);
+        if (a != c) ++bad_bw;
+    }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "native_gdn_beta_gate entry (h_v=%d): engine wrapper == shader path, bitwise", h_v);
+    verdict(tag, bad_bw == 0, bad_bw, h_v, 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad = 0; double worst = 0;
+    for (int h = 0; h < h_v; ++h) {
+        if (!close_enough(got[(size_t) h], want[(size_t) h], 2e-6, 1e-7)) ++bad;
+        worst = std::max(worst, std::fabs((double) got[(size_t) h] - (double) want[(size_t) h]) /
+                                    (std::fabs((double) want[(size_t) h]) + 1e-30));
+    }
+    std::snprintf(tag, sizeof tag, "native_gdn_beta_gate entry (h_v=%d): engine wrapper vs the sigmoid (double)", h_v);
+    verdict(tag, bad == 0, bad, h_v, worst, "relative vs the engine double sigmoid (tol 2e-6)");
+    ctx.free(bb);
+}
+
+// `gdn_beta_gate` (layer.cpp:299) -> gdn_beta_gate.spv.  The LEGACY sibling; fixture is case_gdn_beta_gate's.
+void case_gdn_beta_gate_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_beta_gate.spv")) return;
+    const int h_v = 48;
+    std::vector<float> b((size_t) h_v), want((size_t) h_v);
+    for (int h = 0; h < h_v; ++h) {
+        if (h % 3 == 0) b[(size_t) h] = -25.0f + (float) (h % 7);
+        else if (h % 3 == 1) b[(size_t) h] = 25.0f - (float) (h % 7);
+        else b[(size_t) h] = rndf(4.0f);
+    }
+    for (int h = 0; h < h_v; ++h) want[(size_t) h] = (float) (1.0 / (1.0 + std::exp(-(double) b[(size_t) h])));
+
+    Buf bb = ctx.alloc((size_t) h_v * 4);
+    ctx.write(bb, b.data(), (size_t) h_v * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_beta_gate.spv", 1, 4);
+        struct { int32_t n; } pc{h_v};
+        ctx.dispatch(p, {&bb}, &pc, sizeof(pc), groups_for((uint64_t) h_v));
+    }
+    std::vector<float> ref((size_t) h_v);
+    ctx.read(bb, ref.data(), (size_t) h_v * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("gdn_beta_gate entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bb); return;
+    }
+    float* db = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    strata::vulkan::stream_write(*s, db, b.data(), (size_t) h_v * 4);
+    strata::kernels::gdn_beta_gate(db, h_v, s);   // THE ENGINE WRAPPER
+    std::vector<float> got((size_t) h_v);
+    strata::vulkan::stream_read(*s, db, got.data(), (size_t) h_v * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (int h = 0; h < h_v; ++h) {
+        uint32_t a, c; std::memcpy(&a, &ref[(size_t) h], 4); std::memcpy(&c, &got[(size_t) h], 4);
+        if (a != c) ++bad_bw;
+    }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "gdn_beta_gate entry (h_v=%d): engine wrapper == shader path, bitwise", h_v);
+    verdict(tag, bad_bw == 0, bad_bw, h_v, 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad = 0; double worst = 0;
+    for (int h = 0; h < h_v; ++h) {
+        if (!close_enough(got[(size_t) h], want[(size_t) h], 2e-6, 1e-7)) ++bad;
+        worst = std::max(worst, std::fabs((double) got[(size_t) h] - (double) want[(size_t) h]) /
+                                    (std::fabs((double) want[(size_t) h]) + 1e-30));
+    }
+    std::snprintf(tag, sizeof tag, "gdn_beta_gate entry (h_v=%d): engine wrapper vs the sigmoid (double)", h_v);
+    verdict(tag, bad == 0, bad, h_v, worst, "relative vs the engine double sigmoid (tol 2e-6)");
+    ctx.free(bb);
+}
+
+// `native_gdn_gate` (layer.cpp:297) -> native_gdn_gate.spv.  Fixture is case_native_gdn_gate's (3 arms).
+void case_native_gdn_gate_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_gate.spv")) return;
+    const int arms[] = {48, 5, 300};
+    for (int heads : arms) {
+        std::vector<float> alpha((size_t) heads), dt((size_t) heads), a((size_t) heads), want((size_t) heads);
+        for (int h = 0; h < heads; ++h) {
+            alpha[(size_t) h] = ((h % 3) == 0) ? (22.0f + 6.0f * (float) (h % 17)) : rndf(3.0f);
+            dt[(size_t) h] = rndf(0.5f);
+            a[(size_t) h] = -(std::fabs(rndf(1.0f)) + 0.1f);
+        }
+        for (int h = 0; h < heads; ++h)
+            want[(size_t) h] = softplus_ref(alpha[(size_t) h] + dt[(size_t) h]) * a[(size_t) h];
+
+        Buf bA = ctx.alloc((size_t) heads * 4), bD = ctx.alloc((size_t) heads * 4),
+            bS = ctx.alloc((size_t) heads * 4), bG = ctx.alloc((size_t) heads * 4);
+        ctx.write(bA, alpha.data(), (size_t) heads * 4);
+        ctx.write(bD, dt.data(), (size_t) heads * 4);
+        ctx.write(bS, a.data(), (size_t) heads * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/native_gdn_gate.spv", 4, 4);
+            struct { int32_t heads; } pc{heads};
+            ctx.dispatch(p, {&bA, &bD, &bS, &bG}, &pc, sizeof(pc), groups_for((uint64_t) heads));
+        }
+        std::vector<float> ref((size_t) heads);
+        ctx.read(bG, ref.data(), (size_t) heads * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("native_gdn_gate entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bA); ctx.free(bD); ctx.free(bS); ctx.free(bG); return;
+        }
+        float* dA = strata::vulkan::arena_alloc<float>(*s, (size_t) heads);
+        float* dD = strata::vulkan::arena_alloc<float>(*s, (size_t) heads);
+        float* dS = strata::vulkan::arena_alloc<float>(*s, (size_t) heads);
+        float* dG = strata::vulkan::arena_alloc<float>(*s, (size_t) heads);
+        strata::vulkan::stream_write(*s, dA, alpha.data(), (size_t) heads * 4);
+        strata::vulkan::stream_write(*s, dD, dt.data(), (size_t) heads * 4);
+        strata::vulkan::stream_write(*s, dS, a.data(), (size_t) heads * 4);
+        strata::kernels::native_gdn_gate(dA, dD, dS, dG, heads, s);   // THE ENGINE WRAPPER
+        std::vector<float> got((size_t) heads);
+        strata::vulkan::stream_read(*s, dG, got.data(), (size_t) heads * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (int h = 0; h < heads; ++h) {
+            uint32_t x, c; std::memcpy(&x, &ref[(size_t) h], 4); std::memcpy(&c, &got[(size_t) h], 4);
+            if (x != c) ++bad_bw;
+        }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "native_gdn_gate entry (h_v=%d): engine wrapper == shader path, bitwise", heads);
+        verdict(tag, bad_bw == 0, bad_bw, heads, 0.0,
+                "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+                "ported shader's own path");
+
+        int bad = 0; double worst = 0;
+        for (int h = 0; h < heads; ++h) {
+            if (!close_enough(got[(size_t) h], want[(size_t) h], 5e-6, 1e-30)) ++bad;
+            worst = std::max(worst, std::fabs((double) got[(size_t) h] - (double) want[(size_t) h]) /
+                                        (std::fabs((double) want[(size_t) h]) + 1e-30));
+        }
+        std::snprintf(tag, sizeof tag, "native_gdn_gate entry (h_v=%d): engine wrapper vs softplus*ssm_a (double)", heads);
+        verdict(tag, bad == 0, bad, heads, worst, "relative vs the native rule's double softplus (tol 5e-6)");
+        ctx.free(bA); ctx.free(bD); ctx.free(bS); ctx.free(bG);
+    }
+}
+
+// `native_gdn_step` (layer.cpp:308) -> native_gdn_step.spv.  Fixture is case_native_gdn_step's; the oracle is
+// the NATIVE rule (decay folded, the 1/sqrt(S) readout scale fused), in double, device layout (S,h_v,S).
+void case_native_gdn_step_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_step.spv")) return;
+    const int S = 128, h_k = 16, h_v = 48;
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st(nstate), q((size_t) h_k * S), k((size_t) h_k * S), v(no), gate((size_t) h_v),
+        beta((size_t) h_v);
+    for (int i = 0; i < S; ++i)
+        for (int j = 0; j < S; ++j)
+            for (int h = 0; h < h_v; ++h)
+                st[(size_t) (i * h_v + h) * S + j] = (float) (0.001 * (i + 2 * j + 3 * h) - 1.0);
+    for (auto& x : q) x = rndf(0.1f);
+    for (auto& x : k) x = rndf(0.1f);
+    for (auto& x : v) x = rndf(1.0f);
+    for (int h = 0; h < h_v; ++h) {
+        gate[(size_t) h] = -(2.0f + 4.0f * (float) (rnd() % 100) / 100.0f);
+        beta[(size_t) h] = (float) (rnd() % 100) / 100.0f;
+    }
+    const float scale = 1.0f / std::sqrt((float) S);
+
+    std::vector<double> sto(nstate);
+    std::vector<float> want_o(no);
+    {
+        sto.assign(st.begin(), st.end());
+        const size_t stride = (size_t) h_v * S;
+        for (int h = 0; h < h_v; ++h) {
+            const int src = h % h_k;
+            const double g = std::exp((double) gate[(size_t) h]);
+            const double bb = (double) beta[(size_t) h];
+            for (int j = 0; j < S; ++j) {
+                double* col = &sto[(size_t) h * S + j];
+                double kv = 0;
+                for (int i = 0; i < S; ++i) kv += col[(size_t) i * stride] * (double) k[(size_t) src * S + i];
+                const double delta = ((double) v[(size_t) h * S + j] - g * kv) * bb;
+                double attn = 0;
+                for (int i = 0; i < S; ++i) {
+                    col[(size_t) i * stride] = g * col[(size_t) i * stride] + (double) k[(size_t) src * S + i] * delta;
+                    attn += col[(size_t) i * stride] * (double) q[(size_t) src * S + i];
+                }
+                want_o[(size_t) h * S + j] = (float) (attn * (double) scale);
+            }
+        }
+    }
+
+    Buf bst = ctx.alloc(nstate * 4), bq = ctx.alloc(q.size() * 4), bk = ctx.alloc(k.size() * 4),
+        bv = ctx.alloc(no * 4), bg = ctx.alloc((size_t) h_v * 4), bb2 = ctx.alloc((size_t) h_v * 4),
+        bo = ctx.alloc(no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+        struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pc{S, h_k, h_v, scale};
+        ctx.dispatch(p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pc, sizeof(pc), groups_for((uint64_t) no));
+    }
+    std::vector<float> ref_o(no), ref_st(nstate);
+    ctx.read(bo, ref_o.data(), no * 4);
+    ctx.read(bst, ref_st.data(), nstate * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("native_gdn_step entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo); return;
+    }
+    float* dst = strata::vulkan::arena_alloc<float>(*s, nstate);
+    float* dq = strata::vulkan::arena_alloc<float>(*s, q.size());
+    float* dk = strata::vulkan::arena_alloc<float>(*s, k.size());
+    float* dv = strata::vulkan::arena_alloc<float>(*s, no);
+    float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    float* db = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    float* dop = strata::vulkan::arena_alloc<float>(*s, no);
+    strata::vulkan::stream_write(*s, dst, st.data(), nstate * 4);
+    strata::vulkan::stream_write(*s, dq, q.data(), q.size() * 4);
+    strata::vulkan::stream_write(*s, dk, k.data(), k.size() * 4);
+    strata::vulkan::stream_write(*s, dv, v.data(), no * 4);
+    strata::vulkan::stream_write(*s, dg, gate.data(), (size_t) h_v * 4);
+    strata::vulkan::stream_write(*s, db, beta.data(), (size_t) h_v * 4);
+    strata::kernels::GdnShapes gsh; gsh.S = S; gsh.h_k = h_k; gsh.h_v = h_v;
+    strata::kernels::native_gdn_step(dst, dq, dk, dv, dg, db, dop, gsh, s);   // THE ENGINE WRAPPER
+    std::vector<float> got_o(no), got_st(nstate);
+    strata::vulkan::stream_read(*s, dop, got_o.data(), no * 4);
+    strata::vulkan::stream_read(*s, dst, got_st.data(), nstate * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < no; ++i) { uint32_t x, c; std::memcpy(&x, &ref_o[i], 4); std::memcpy(&c, &got_o[i], 4); if (x != c) ++bad_bw; }
+    for (size_t i = 0; i < nstate; ++i) { uint32_t x, c; std::memcpy(&x, &ref_st[i], 4); std::memcpy(&c, &got_st[i], 4); if (x != c) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "native_gdn_step entry (S=%d h_k=%d h_v=%d): engine wrapper == shader path, bitwise",
+                  S, h_k, h_v);
+    verdict(tag, bad_bw == 0, bad_bw, (int) (no + nstate), 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad_o = 0, bad_st = 0;
+    double worst_o = 0, worst_st = 0;
+    for (size_t i = 0; i < no; ++i) {
+        const double err = std::fabs((double) got_o[i] - (double) want_o[i]);
+        if (!close_enough(got_o[i], want_o[i], 2e-4, 1e-5)) ++bad_o;
+        worst_o = std::max(worst_o, err / (2e-4 * std::fabs((double) want_o[i]) + 1e-5));
+    }
+    for (size_t i = 0; i < nstate; ++i) {
+        const double err = std::fabs((double) got_st[i] - sto[i]);
+        if (!close_enough(got_st[i], sto[i], 2e-4, 1e-5)) ++bad_st;
+        worst_st = std::max(worst_st, err / (2e-4 * std::fabs(sto[i]) + 1e-5));
+    }
+    std::snprintf(tag, sizeof tag,
+                  "native_gdn_step entry (S=%d h_k=%d h_v=%d): engine wrapper vs the native rule (double)", S, h_k, h_v);
+    verdict(tag, bad_o == 0 && bad_st == 0, bad_o + bad_st, (int) (no + nstate), std::max(worst_o, worst_st),
+            "o + state vs the native rule (double): worst err/tol (tol 2e-4 rel + 1e-5 abs)");
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo);
+}
+
+// `gdn_step` (layer.cpp:309) -> gdn_step.spv.  The LEGACY sibling of the above; the oracle is the legacy rule
+// (decay FIRST, NO readout scale), in double, device layout (S,h_v,S).
+void case_gdn_step_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_step.spv")) return;
+    const int S = 128, h_k = 16, h_v = 48;
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st(nstate), q((size_t) h_k * S), k((size_t) h_k * S), v(no), gate((size_t) h_v),
+        beta((size_t) h_v);
+    for (int i = 0; i < S; ++i)
+        for (int j = 0; j < S; ++j)
+            for (int h = 0; h < h_v; ++h)
+                st[(size_t) (i * h_v + h) * S + j] = (float) (0.001 * (i + 2 * j + 3 * h) - 1.0);
+    for (auto& x : q) x = rndf(0.1f);
+    for (auto& x : k) x = rndf(0.1f);
+    for (auto& x : v) x = rndf(1.0f);
+    for (int h = 0; h < h_v; ++h) {
+        gate[(size_t) h] = -(2.0f + 4.0f * (float) (rnd() % 100) / 100.0f);
+        beta[(size_t) h] = (float) (rnd() % 100) / 100.0f;
+    }
+
+    std::vector<double> sto(nstate);
+    std::vector<float> want_o(no);
+    {
+        sto.assign(st.begin(), st.end());
+        const size_t stride = (size_t) h_v * S;
+        for (int h = 0; h < h_v; ++h) {
+            const int src = h % h_k;
+            const double dec = std::exp((double) gate[(size_t) h]);
+            const double bb = (double) beta[(size_t) h];
+            for (int j = 0; j < S; ++j) {
+                double* col = &sto[(size_t) h * S + j];
+                for (int i = 0; i < S; ++i) col[(size_t) i * stride] *= dec;
+                double sk = 0;
+                for (int i = 0; i < S; ++i) sk += col[(size_t) i * stride] * (double) k[(size_t) src * S + i];
+                const double d = ((double) v[(size_t) h * S + j] - sk) * bb;
+                for (int i = 0; i < S; ++i) col[(size_t) i * stride] += (double) k[(size_t) src * S + i] * d;
+                double dot = 0;
+                for (int i = 0; i < S; ++i) dot += col[(size_t) i * stride] * (double) q[(size_t) src * S + i];
+                want_o[(size_t) h * S + j] = (float) dot;
+            }
+        }
+    }
+
+    Buf bst = ctx.alloc(nstate * 4), bq = ctx.alloc(q.size() * 4), bk = ctx.alloc(k.size() * 4),
+        bv = ctx.alloc(no * 4), bg = ctx.alloc((size_t) h_v * 4), bb2 = ctx.alloc((size_t) h_v * 4),
+        bo = ctx.alloc(no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_step.spv", 7, 12);
+        struct { int32_t S; int32_t h_k; int32_t h_v; } pc{S, h_k, h_v};
+        ctx.dispatch(p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pc, sizeof(pc), groups_for((uint64_t) no));
+    }
+    std::vector<float> ref_o(no), ref_st(nstate);
+    ctx.read(bo, ref_o.data(), no * 4);
+    ctx.read(bst, ref_st.data(), nstate * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("gdn_step entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo); return;
+    }
+    float* dst = strata::vulkan::arena_alloc<float>(*s, nstate);
+    float* dq = strata::vulkan::arena_alloc<float>(*s, q.size());
+    float* dk = strata::vulkan::arena_alloc<float>(*s, k.size());
+    float* dv = strata::vulkan::arena_alloc<float>(*s, no);
+    float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    float* db = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    float* dop = strata::vulkan::arena_alloc<float>(*s, no);
+    strata::vulkan::stream_write(*s, dst, st.data(), nstate * 4);
+    strata::vulkan::stream_write(*s, dq, q.data(), q.size() * 4);
+    strata::vulkan::stream_write(*s, dk, k.data(), k.size() * 4);
+    strata::vulkan::stream_write(*s, dv, v.data(), no * 4);
+    strata::vulkan::stream_write(*s, dg, gate.data(), (size_t) h_v * 4);
+    strata::vulkan::stream_write(*s, db, beta.data(), (size_t) h_v * 4);
+    strata::kernels::GdnShapes gsh; gsh.S = S; gsh.h_k = h_k; gsh.h_v = h_v;
+    strata::kernels::gdn_step(dst, dq, dk, dv, dg, db, dop, gsh, s);   // THE ENGINE WRAPPER
+    std::vector<float> got_o(no), got_st(nstate);
+    strata::vulkan::stream_read(*s, dop, got_o.data(), no * 4);
+    strata::vulkan::stream_read(*s, dst, got_st.data(), nstate * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < no; ++i) { uint32_t x, c; std::memcpy(&x, &ref_o[i], 4); std::memcpy(&c, &got_o[i], 4); if (x != c) ++bad_bw; }
+    for (size_t i = 0; i < nstate; ++i) { uint32_t x, c; std::memcpy(&x, &ref_st[i], 4); std::memcpy(&c, &got_st[i], 4); if (x != c) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "gdn_step entry (S=%d h_k=%d h_v=%d): engine wrapper == shader path, bitwise", S, h_k, h_v);
+    verdict(tag, bad_bw == 0, bad_bw, (int) (no + nstate), 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad_o = 0, bad_st = 0;
+    double worst_o = 0, worst_st = 0;
+    for (size_t i = 0; i < no; ++i) {
+        const double err = std::fabs((double) got_o[i] - (double) want_o[i]);
+        if (!close_enough(got_o[i], want_o[i], 2e-4, 1e-5)) ++bad_o;
+        worst_o = std::max(worst_o, err / (2e-4 * std::fabs((double) want_o[i]) + 1e-5));
+    }
+    for (size_t i = 0; i < nstate; ++i) {
+        const double err = std::fabs((double) got_st[i] - sto[i]);
+        if (!close_enough(got_st[i], sto[i], 2e-4, 1e-5)) ++bad_st;
+        worst_st = std::max(worst_st, err / (2e-4 * std::fabs(sto[i]) + 1e-5));
+    }
+    std::snprintf(tag, sizeof tag, "gdn_step entry (S=%d h_k=%d h_v=%d): engine wrapper vs the legacy rule (double)",
+                  S, h_k, h_v);
+    verdict(tag, bad_o == 0 && bad_st == 0, bad_o + bad_st, (int) (no + nstate), std::max(worst_o, worst_st),
+            "o + state vs the legacy rule (double): worst err/tol (tol 2e-4 rel + 1e-5 abs)");
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo);
+}
+
+// `fused_gdn_step_norm` (layer.cpp:322) -> fused_gdn_step_norm.spv.  Fixture is case_fused_gdn_step_norm's;
+// the oracle is the FUSED rule (decay folded, readout scale fused, the closing RMS norm with sigmoid(z)).
+void case_fused_gdn_step_norm_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "fused_gdn_step_norm.spv")) return;
+    const int S = 128, h_k = 16, h_v = 48;
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st(nstate), q((size_t) h_k * S), k((size_t) h_k * S), v(no), gate((size_t) h_v),
+        beta((size_t) h_v), z(no), gamma((size_t) S);
+    for (int i = 0; i < S; ++i)
+        for (int j = 0; j < S; ++j)
+            for (int h = 0; h < h_v; ++h)
+                st[(size_t) (i * h_v + h) * S + j] = (float) (0.001 * (i + 2 * j + 3 * h) - 1.0);
+    for (auto& x : q) x = rndf(0.1f);
+    for (auto& x : k) x = rndf(0.1f);
+    for (auto& x : v) x = rndf(1.0f);
+    for (int h = 0; h < h_v; ++h) {
+        gate[(size_t) h] = -(2.0f + 4.0f * (float) (rnd() % 100) / 100.0f);
+        beta[(size_t) h] = (float) (rnd() % 100) / 100.0f;
+    }
+    for (int h = 0; h < h_v; ++h)
+        for (int j = 0; j < S; ++j) {
+            const int kk = j % 3;
+            z[(size_t) h * S + j] = (kk == 0) ? -20.0f : (kk == 1) ? 20.0f : rndf(4.0f);
+        }
+    for (int j = 0; j < S; ++j) gamma[(size_t) j] = 1.0f + 0.1f * rndf(1.0f);
+    const float eps = 1e-6f;
+    const double sqrtS = std::sqrt((double) S);
+
+    std::vector<double> sto(nstate);
+    std::vector<float> want_y(no);
+    {
+        sto.assign(st.begin(), st.end());
+        std::vector<double> oc(no, 0.0);
+        const size_t stride = (size_t) h_v * S;
+        for (int h = 0; h < h_v; ++h) {
+            const int src = h % h_k;
+            const double g = std::exp((double) gate[(size_t) h]);
+            const double bb = (double) beta[(size_t) h];
+            for (int j = 0; j < S; ++j) {
+                double* col = &sto[(size_t) h * S + j];
+                double kv = 0;
+                for (int i = 0; i < S; ++i) kv += col[(size_t) i * stride] * (double) k[(size_t) src * S + i];
+                const double delta = ((double) v[(size_t) h * S + j] - g * kv) * bb;
+                double attn = 0;
+                for (int i = 0; i < S; ++i) {
+                    col[(size_t) i * stride] = g * col[(size_t) i * stride] + (double) k[(size_t) src * S + i] * delta;
+                    attn += col[(size_t) i * stride] * (double) q[(size_t) src * S + i];
+                }
+                oc[(size_t) h * S + j] = attn * (1.0 / sqrtS);
+            }
+        }
+        for (int h = 0; h < h_v; ++h) {
+            double ss = 0;
+            for (int j = 0; j < S; ++j) { const double t = oc[(size_t) h * S + j]; ss += t * t; }
+            const double scl = 1.0 / std::sqrt(ss / (double) S + (double) eps);
+            for (int j = 0; j < S; ++j) {
+                const double o = oc[(size_t) h * S + j];
+                const double zz = z[(size_t) h * S + j];
+                want_y[(size_t) h * S + j] =
+                    (float) ((scl * o) * (double) gamma[(size_t) j] * (1.0 / (1.0 + std::exp(-zz))));
+            }
+        }
+    }
+
+    Buf bst = ctx.alloc(nstate * 4), bq = ctx.alloc(q.size() * 4), bk = ctx.alloc(k.size() * 4),
+        bv = ctx.alloc(no * 4), bg = ctx.alloc((size_t) h_v * 4), bb2 = ctx.alloc((size_t) h_v * 4),
+        bz = ctx.alloc(no * 4), bgm = ctx.alloc((size_t) S * 4), by = ctx.alloc(no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    ctx.write(bz, z.data(), no * 4);
+    ctx.write(bgm, gamma.data(), (size_t) S * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_step_norm.spv", 9, 16);
+        struct { int32_t S; int32_t h_k; int32_t h_v; float eps; } pc{S, h_k, h_v, eps};
+        ctx.dispatch(p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bz, &bgm, &by}, &pc, sizeof(pc), groups_for((uint64_t) no));
+    }
+    std::vector<float> ref_y(no), ref_st(nstate);
+    ctx.read(by, ref_y.data(), no * 4);
+    ctx.read(bst, ref_st.data(), nstate * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("fused_gdn_step_norm entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bz);
+        ctx.free(bgm); ctx.free(by); return;
+    }
+    float* dst = strata::vulkan::arena_alloc<float>(*s, nstate);
+    float* dq = strata::vulkan::arena_alloc<float>(*s, q.size());
+    float* dk = strata::vulkan::arena_alloc<float>(*s, k.size());
+    float* dv = strata::vulkan::arena_alloc<float>(*s, no);
+    float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    float* db = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+    float* dz = strata::vulkan::arena_alloc<float>(*s, no);
+    float* dgm = strata::vulkan::arena_alloc<float>(*s, (size_t) S);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, no);
+    strata::vulkan::stream_write(*s, dst, st.data(), nstate * 4);
+    strata::vulkan::stream_write(*s, dq, q.data(), q.size() * 4);
+    strata::vulkan::stream_write(*s, dk, k.data(), k.size() * 4);
+    strata::vulkan::stream_write(*s, dv, v.data(), no * 4);
+    strata::vulkan::stream_write(*s, dg, gate.data(), (size_t) h_v * 4);
+    strata::vulkan::stream_write(*s, db, beta.data(), (size_t) h_v * 4);
+    strata::vulkan::stream_write(*s, dz, z.data(), no * 4);
+    strata::vulkan::stream_write(*s, dgm, gamma.data(), (size_t) S * 4);
+    strata::kernels::fused_gdn_step_norm(dst, dq, dk, dv, dg, db, dz, dgm, eps, dy, h_k, h_v, s);  // THE ENGINE WRAPPER
+    std::vector<float> got_y(no), got_st(nstate);
+    strata::vulkan::stream_read(*s, dy, got_y.data(), no * 4);
+    strata::vulkan::stream_read(*s, dst, got_st.data(), nstate * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < no; ++i) { uint32_t x, c; std::memcpy(&x, &ref_y[i], 4); std::memcpy(&c, &got_y[i], 4); if (x != c) ++bad_bw; }
+    for (size_t i = 0; i < nstate; ++i) { uint32_t x, c; std::memcpy(&x, &ref_st[i], 4); std::memcpy(&c, &got_st[i], 4); if (x != c) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag,
+                  "fused_gdn_step_norm entry (S=%d h_k=%d h_v=%d): engine wrapper == shader path, bitwise", S, h_k, h_v);
+    verdict(tag, bad_bw == 0, bad_bw, (int) (no + nstate), 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad_y = 0, bad_st = 0;
+    double worst_y = 0, worst_st = 0;
+    for (size_t i = 0; i < no; ++i) {
+        const double err = std::fabs((double) got_y[i] - (double) want_y[i]);
+        if (!close_enough(got_y[i], want_y[i], 2e-4, 1e-5)) ++bad_y;
+        worst_y = std::max(worst_y, err / (2e-4 * std::fabs((double) want_y[i]) + 1e-5));
+    }
+    for (size_t i = 0; i < nstate; ++i) {
+        const double err = std::fabs((double) got_st[i] - sto[i]);
+        if (!close_enough(got_st[i], sto[i], 2e-4, 1e-5)) ++bad_st;
+        worst_st = std::max(worst_st, err / (2e-4 * std::fabs(sto[i]) + 1e-5));
+    }
+    std::snprintf(tag, sizeof tag,
+                  "fused_gdn_step_norm entry (S=%d h_k=%d h_v=%d): engine wrapper vs the fused rule (double)", S, h_k, h_v);
+    verdict(tag, bad_y == 0 && bad_st == 0, bad_y + bad_st, (int) (no + nstate), std::max(worst_y, worst_st),
+            "y + state vs the fused rule (double): worst err/tol (tol 2e-4 rel + 1e-5 abs)");
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bz);
+    ctx.free(bgm); ctx.free(by);
+}
+
+// `native_gdn_out_norm` (layer.cpp:324) -> native_gdn_out_norm.spv.  Fixture is case_native_gdn_out_norm's.
+// The wrapper dispatches exactly `heads` groups (no surplus), so the padded tail is checked to stay NaN.
+void case_native_gdn_out_norm_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_out_norm.spv")) return;
+    const int heads = 48, S = 128;
+    const size_t n = (size_t) heads * S;
+    const uint64_t padded = n + 2u * (uint64_t) S;
+    const float NaN = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> o(padded, NaN), z(padded, NaN), g((size_t) S), ref(padded, NaN);
+    for (size_t i = 0; i < n; ++i) o[i] = rndf(1.0f);
+    for (int h = 0; h < heads; ++h)
+        for (int i = 0; i < S; ++i) {
+            const int kk = i % 3;
+            z[(size_t) h * S + i] = (kk == 0) ? -20.0f : (kk == 1) ? 20.0f : rndf(4.0f);
+        }
+    for (int i = 0; i < S; ++i) g[(size_t) i] = 1.0f + 0.1f * rndf(1.0f);
+    const float eps = 1e-6f;
+    auto sigmoid = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+    for (int h = 0; h < heads; ++h) {
+        double acc = 0;
+        for (int i = 0; i < S; ++i) { const double t = o[(size_t) h * S + i]; acc += t * t; }
+        const float scl = (float) (1.0 / std::sqrt(acc / (double) S + (double) eps));
+        for (int i = 0; i < S; ++i) {
+            const size_t idx = (size_t) h * S + i;
+            ref[idx] = (float) (((double) scl * (double) o[idx]) * (double) g[(size_t) i] * sigmoid((double) z[idx]));
+        }
+    }
+
+    Buf bo = ctx.alloc(padded * 4), bz = ctx.alloc(padded * 4), bg = ctx.alloc((size_t) S * 4), by = ctx.alloc(padded * 4);
+    ctx.write(bo, o.data(), padded * 4);
+    ctx.write(bz, z.data(), padded * 4);
+    ctx.write(bg, g.data(), (size_t) S * 4);
+    std::vector<float> init(padded, NaN);
+    ctx.write(by, init.data(), padded * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_out_norm.spv", 4, 12);
+        struct { int32_t heads; int32_t S; float eps; } pc{heads, S, eps};
+        ctx.dispatch(p, {&bo, &bz, &bg, &by}, &pc, sizeof(pc), (uint32_t) heads + 2u);
+    }
+    std::vector<float> ref_y(padded);
+    ctx.read(by, ref_y.data(), padded * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("native_gdn_out_norm entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bo); ctx.free(bz); ctx.free(bg); ctx.free(by); return;
+    }
+    float* do_ = strata::vulkan::arena_alloc<float>(*s, padded);
+    float* dz = strata::vulkan::arena_alloc<float>(*s, padded);
+    float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) S);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, padded);
+    strata::vulkan::stream_write(*s, do_, o.data(), padded * 4);
+    strata::vulkan::stream_write(*s, dz, z.data(), padded * 4);
+    strata::vulkan::stream_write(*s, dg, g.data(), (size_t) S * 4);
+    strata::vulkan::stream_write(*s, dy, init.data(), padded * 4);
+    strata::kernels::native_gdn_out_norm(do_, dz, dg, dy, heads, S, eps, s);   // THE ENGINE WRAPPER
+    std::vector<float> got_y(padded);
+    strata::vulkan::stream_read(*s, dy, got_y.data(), padded * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < n; ++i) { uint32_t x, c; std::memcpy(&x, &ref_y[i], 4); std::memcpy(&c, &got_y[i], 4); if (x != c) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "native_gdn_out_norm entry (h_v=%d S=%d): engine wrapper == shader path, bitwise",
+                  heads, S);
+    verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad = 0, guard_bad = 0;
+    double worst = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!close_enough(got_y[i], ref[i], 1e-5, 1e-6)) ++bad;
+        worst = std::max(worst, std::fabs((double) got_y[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30));
+    }
+    for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got_y[i]) || got_y[i] == 0.0f)) ++guard_bad;
+    std::snprintf(tag, sizeof tag, "native_gdn_out_norm entry (h_v=%d S=%d): engine wrapper vs the native rule (double)",
+                  heads, S);
+    verdict(tag, bad == 0 && guard_bad == 0, bad + guard_bad, (int) (n + (padded - n)), worst,
+            "relative vs the native rule's double transcription (tol 1e-5) + row-guard tail untouched");
+    ctx.free(bo); ctx.free(bz); ctx.free(bg); ctx.free(by);
+}
+
+// `gdn_out_norm` (layer.cpp:325) -> gdn_out_norm.spv.  The LEGACY sibling; fixture is case_gdn_out_norm's.
+void case_gdn_out_norm_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_out_norm.spv")) return;
+    const int h_v = 48, S = 128;
+    const size_t n = (size_t) h_v * S;
+    const uint64_t padded = n + 2u * (uint64_t) S;
+    const float NaN = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> o(padded, NaN), z(padded, NaN), sn((size_t) S), ref(padded, NaN);
+    for (size_t i = 0; i < n; ++i) o[i] = rndf(1.0f);
+    for (int h = 0; h < h_v; ++h)
+        for (int i = 0; i < S; ++i) {
+            const int kk = i % 3;
+            z[(size_t) h * S + i] = (kk == 0) ? -20.0f : (kk == 1) ? 20.0f : rndf(4.0f);
+        }
+    for (int i = 0; i < S; ++i) sn[(size_t) i] = 1.0f + 0.1f * rndf(1.0f);
+    const float eps = 1e-6f;
+    auto sigmoid = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+    for (int h = 0; h < h_v; ++h) {
+        double acc = 0;
+        for (int i = 0; i < S; ++i) { const double t = o[(size_t) h * S + i]; acc += t * t; }
+        const float inv = (float) (1.0 / std::sqrt(acc / (double) S + (double) eps));
+        for (int i = 0; i < S; ++i) {
+            const size_t idx = (size_t) h * S + i;
+            ref[idx] = (float) ((double) o[idx] * (double) inv * (double) sn[(size_t) i] * sigmoid((double) z[idx]));
+        }
+    }
+
+    Buf bo = ctx.alloc(padded * 4), bz = ctx.alloc(padded * 4), bsn = ctx.alloc((size_t) S * 4), by = ctx.alloc(padded * 4);
+    ctx.write(bo, o.data(), padded * 4);
+    ctx.write(bz, z.data(), padded * 4);
+    ctx.write(bsn, sn.data(), (size_t) S * 4);
+    std::vector<float> init(padded, NaN);
+    ctx.write(by, init.data(), padded * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_out_norm.spv", 4, 12);
+        struct { int32_t h_v; int32_t S; float eps; } pc{h_v, S, eps};
+        ctx.dispatch(p, {&bo, &bz, &bsn, &by}, &pc, sizeof(pc), (uint32_t) h_v + 2u);
+    }
+    std::vector<float> ref_y(padded);
+    ctx.read(by, ref_y.data(), padded * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(1ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("gdn_out_norm entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bo); ctx.free(bz); ctx.free(bsn); ctx.free(by); return;
+    }
+    float* do_ = strata::vulkan::arena_alloc<float>(*s, padded);
+    float* dz = strata::vulkan::arena_alloc<float>(*s, padded);
+    float* dsn = strata::vulkan::arena_alloc<float>(*s, (size_t) S);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, padded);
+    strata::vulkan::stream_write(*s, do_, o.data(), padded * 4);
+    strata::vulkan::stream_write(*s, dz, z.data(), padded * 4);
+    strata::vulkan::stream_write(*s, dsn, sn.data(), (size_t) S * 4);
+    strata::vulkan::stream_write(*s, dy, init.data(), padded * 4);
+    strata::kernels::gdn_out_norm(do_, dz, dsn, dy, h_v, S, eps, s);   // THE ENGINE WRAPPER
+    std::vector<float> got_y(padded);
+    strata::vulkan::stream_read(*s, dy, got_y.data(), padded * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < n; ++i) { uint32_t x, c; std::memcpy(&x, &ref_y[i], 4); std::memcpy(&c, &got_y[i], 4); if (x != c) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "gdn_out_norm entry (h_v=%d S=%d): engine wrapper == shader path, bitwise", h_v, S);
+    verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0,
+            "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+            "ported shader's own path");
+
+    int bad = 0, guard_bad = 0;
+    double worst = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!close_enough(got_y[i], ref[i], 1e-5, 1e-6)) ++bad;
+        worst = std::max(worst, std::fabs((double) got_y[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30));
+    }
+    for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got_y[i]) || got_y[i] == 0.0f)) ++guard_bad;
+    std::snprintf(tag, sizeof tag, "gdn_out_norm entry (h_v=%d S=%d): engine wrapper vs the legacy rule (double)", h_v, S);
+    verdict(tag, bad == 0 && guard_bad == 0, bad + guard_bad, (int) (n + (padded - n)), worst,
+            "relative vs the legacy rule's double transcription (tol 1e-5) + row-guard tail untouched");
+    ctx.free(bo); ctx.free(bz); ctx.free(bsn); ctx.free(by);
+}
+
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -15417,6 +16149,17 @@ int main(int argc, char** argv) {
     case_native_gdn_l2_norm_entry(ctx, dir);     // native_gdn_l2_norm  -> native_gdn_l2_norm.spv  (layer.cpp:266)
     case_gdn_l2_norm_entry(ctx, dir);            // gdn_l2_norm         -> gdn_l2_norm.spv         (layer.cpp:269)
     case_fused_gdn_ab_entry(ctx, dir);           // fused_gdn_ab        -> fused_gdn_ab.spv        (layer.cpp:287)
+    // I2e (the GDN / DeltaNet MIXER, completed): the REMAINING EIGHT kernels the mixer `gdn_layer` reaches,
+    // in call-site order (layer.cpp:296/297/299/308/309/322/324/325; gdn_gate :300 is in elementwise_vk.cpp).
+    // APPENDED last for the same shared-RNG reason as every batch above.
+    case_native_gdn_beta_gate_entry(ctx, dir);   // native_gdn_beta_gate -> native_gdn_beta_gate.spv (layer.cpp:296)
+    case_native_gdn_gate_entry(ctx, dir);        // native_gdn_gate      -> native_gdn_gate.spv      (layer.cpp:297)
+    case_gdn_beta_gate_entry(ctx, dir);          // gdn_beta_gate        -> gdn_beta_gate.spv        (layer.cpp:299)
+    case_native_gdn_step_entry(ctx, dir);        // native_gdn_step      -> native_gdn_step.spv      (layer.cpp:308)
+    case_gdn_step_entry(ctx, dir);               // gdn_step             -> gdn_step.spv             (layer.cpp:309)
+    case_fused_gdn_step_norm_entry(ctx, dir);    // fused_gdn_step_norm  -> fused_gdn_step_norm.spv  (layer.cpp:322)
+    case_native_gdn_out_norm_entry(ctx, dir);    // native_gdn_out_norm  -> native_gdn_out_norm.spv  (layer.cpp:324)
+    case_gdn_out_norm_entry(ctx, dir);           // gdn_out_norm         -> gdn_out_norm.spv         (layer.cpp:325)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

@@ -100,6 +100,141 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I2e — THE REMAINING EIGHT GDN / DELTANET MIXER ENTRY POINTS, **COMPLETING THE MIXER**, AND THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**THE MIXER IS COMPLETE: all FOURTEEN entry points `gdn_layer` reaches are wired and proved** (I2d's six + this
+batch's eight), in `vulkan/src/kernels/gdn_vk.cpp`.  The mixer runs on 36 of the model's 48 layers
+(`gdn_layer`, `src/core/layer.cpp:223`), so this closes the GDN / DeltaNet subsystem: the grouped table's
+**GDN mixer group goes 8 → 0**.
+
+**THE EIGHT, IN THE ORDER `gdn_layer`'s OWN BODY REACHES THEM.**  Read from the call sites, NOT from the plan's
+list - and within a stage the branches are alternatives, so "the order the body reaches them" is the order the
+calls appear: **fused, then native, then legacy**.  The beta/gate stage (layer.cpp:285-302) then the recurrence
+(:304-313) then the z-gate/norm stage (:318-327):
+
+| # | symbol | call site | stage | shader |
+|---|---|---|---|---|
+| 7 | `native_gdn_beta_gate` | layer.cpp:296 | beta/gate, native | native_gdn_beta_gate.spv |
+| 8 | `native_gdn_gate` | layer.cpp:297 | beta/gate, native | native_gdn_gate.spv |
+| 9 | `gdn_beta_gate` | layer.cpp:299 | beta/gate, legacy | gdn_beta_gate.spv |
+| 10 | `native_gdn_step` | layer.cpp:308 | recurrence, native | native_gdn_step.spv |
+| 11 | `gdn_step` | layer.cpp:309 | recurrence, legacy | gdn_step.spv |
+| 12 | `fused_gdn_step_norm` | layer.cpp:322 | z-gate/norm, fused | fused_gdn_step_norm.spv |
+| 13 | `native_gdn_out_norm` | layer.cpp:324 | z-gate/norm, native | native_gdn_out_norm.spv |
+| 14 | `gdn_out_norm` | layer.cpp:325 | z-gate/norm, legacy | gdn_out_norm.spv |
+
+(The beta/gate stage's SEVENTH symbol, `gdn_gate` at :300, was already answered in `elementwise_vk.cpp` with the
+other glue kernels, so it is not part of these eight and is not repeated here.)
+
+**EACH PROVED BY ITS CASE THROUGH THE ENGINE WRAPPER - BITWISE vs THE SHADER PATH AND vs THE EXPLICIT ORACLE.**  A
+new `case_*_entry` in the port's gate (`harness/vk_gate.cpp`) runs the port's EXISTING case's fixture through (A)
+the shader path and (B) the ENGINE WRAPPER `strata::kernels::<symbol>` on its own engine stream (`EnginePin`
+pinned to the harness device), then asserts (C) the wrapper's answer equals the shader path's **BITWISE**, and (D)
+equals the case's explicit oracle.  The step/norm cases compare the mutated **STATE** bitwise as well.  Raw lines
+(vega, default/Arc arm; the same eight pass on llvmpipe and the Ryzen iGPU):
+
+| # | symbol | wrapper == shader (bitwise), worst | wrapper vs oracle, worst |
+|---|---|---|---|
+| 7 | `native_gdn_beta_gate` | **48/48, w 0** | **48/48 w 1.42e-06** (double sigmoid, tol 2e-6) |
+| 8 | `native_gdn_gate` | **48/48 + 5/5 + 300/300, w 0** | **48/48 w 2.13e-07; 5/5 w 6.54e-08; 300/300 w 3.83e-07** (double softplus, tol 5e-6) |
+| 9 | `gdn_beta_gate` | **48/48, w 0** | **48/48 w 1.42e-06** (double sigmoid, tol 2e-6) |
+| 10 | `native_gdn_step` | **792576/792576 (+state), w 0** | **792576/792576 w 2.15e-03** (native rule, tol 2e-4 rel + 1e-5 abs) |
+| 11 | `gdn_step` | **792576/792576 (+state), w 0** | **792576/792576 w 4.47e-03** (legacy rule, same tol) |
+| 12 | `fused_gdn_step_norm` | **792576/792576 (+state), w 0** | **792576/792576 w 0.13** (fused rule, same tol) |
+| 13 | `native_gdn_out_norm` | **6144/6144, w 0** | **6400/6400 w 5.89e-07** (+ row-guard tail untouched) |
+| 14 | `gdn_out_norm` | **6144/6144, w 0** | **6400/6400 w 8.08e-07** (+ row-guard tail untouched) |
+
+(The oracle is a double transcription of the engine's OWN body, as every GDN case already uses:
+`native_gdn_preprocess.cu`'s `beta_sigmoid`/`gate_softplus`/`out_norm`, `native_gdn.cu`'s `step`, `gdn.cu`'s
+`gdn_step`/`out_norm`, `fused_gdn.cu`'s `gdn_step_norm_kernel`.  `native_gdn_step`'s oracle is the NATIVE rule -
+the decay folded into the rank-1 update and the `1/sqrt(S)` readout scale FUSED; `gdn_step`'s is the LEGACY rule -
+decay-first, no readout scale; `fused_gdn_step_norm`'s is the fused rule - decay folded, scale fused, the closing
+RMS norm with `sigmoid(z)`.  The wrappers compute the folded scale (`native_gdn_step`) and fix `S = 128`
+(`fused_gdn_step_norm`, the fused operator's own constant); those are the only arithmetic they add.)
+
+**NO `host` ROW WAS NEEDED, AND THAT IS MEASURED RATHER THAN ASSERTED.**  The only `host` row the mixer reaches is
+`native_gdn_enabled()` (layer.cpp:247/253/265/295/306/324), already answered TRUE by
+`vulkan/src/kernels/native_caps_vk.cpp`.  The GDN headers carry **no `*_scratch_bytes` and no shape accessor**: the
+one shared shape, `GdnShapes` (by value, `include/strata/kernels/gdn.hpp`), is a POD the wrapper passes through -
+a TYPE, not an undefined symbol.  Verified by the link measurement below: wiring the eight drops the one-layer-body
+link by **exactly eight** symbols and introduces **no new undefined reference**.
+
+**NONE OF THE EIGHT IS A MODULE-STATE READER LIKE `cvec_apply`.**  Each is a bare bind-and-dispatch over an
+already-gated shader.  What they carry is the CUDA wrapper's argument CONTRACT, kept as the port's loud refusal
+(never a silently wrong binding): `native_gdn_step` refuses `S != 128` and `h_v % h_k != 0`; `gdn_step` and
+`fused_gdn_step_norm` refuse `h_v % h_k != 0`; `native_gdn_out_norm` refuses `cols != 128` (gamma is 128 floats);
+`fused_gdn_step_norm` fixes `S = 128` as the fused body does.
+
+**RESULTS (vega).**  Engine CONFIGURE + BUILD under `-DSTRATA_ENABLE_VULKAN=ON` clean.  Gate on `vega`:
+**Arc (intel_icd) 536/0/0 (exit 0), llvmpipe 524/0/3, Ryzen iGPU (radeon_icd) 527/0/2** - **+20 verdicts on every
+arm** (8 new cases: 6 emit 2 verdicts, `native_gdn_gate` emits 6, the two out_norm cases 2 each), 0 failed.  The
+radeon arm's first three attempts showed the two PRE-EXISTING characterised defects (the `budget: independent
+requery` flake and `bf16_gemv_split`/`fused_gdn_ab` - none of the eight new cases); a re-run read **527/0/2**,
+0 failed, the flake cleared.  `strata_vk_entry_smoke` builds and runs on the Arc.  `check_port_map.py` passes
+(`168 - 78 kernel, 61 host, 29 todo; 111 shaders built, 92 claimed`) and `make_port_map.py` regenerates
+`PORT-MAP.tsv` byte-identically (the eight were already `kernel` rows, so the map does not move).  **`z820b` is
+PENDING** (no XTX/K620 number).  The CUDA-runtime host surface was NOT touched, and the plan was NOT re-scoped.
+
+**THE LINK PROGRESS BAR, STANDARDISED - ONE BUILD DIRECTORY, REBUILT BEFORE MEASURING.**  The bar silently read
+STALE numbers because the recipe named a `<build>` placeholder and the parent picked the wrong `/tmp/vkbuild-*`
+directory: it reproduced I2c's `204/73` from a library built BEFORE I2d, where I2d's real bar was `196/67`.
+Unchanged progress is a PLAUSIBLE reading, so a stale bar is worse than no bar.  THE STANDARD RECIPE names ONE
+stable absolute directory, **`$HOME/vkbuild-vulkan`**, and **it must be reconfigured and rebuilt from the current
+tree before any number is read** (the block below does exactly that; there is no placeholder):
+
+    # THE BUILD.  One stable directory.  RECONFIGURE + REBUILD from the CURRENT tree FIRST - a stale
+    # libstrata_vulkan_kernels.a silently reports the PREVIOUS batch's bar (that is the hazard this fixes).
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels -j"$(nproc)"
+
+    # THE BAR.  Compile the one layer body, link it against the FRESH library, count.
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 \
+        -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # total references -> 188
+    # YOUR pattern (the tree's): the FULL demangled signature, distinct.
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 59
+    # THE PARENT's simpler NAME-ONLY pattern: the name up to the first '('.  It drops the two signatures carrying
+    # a nested `strata::kernels::GdnShapes` (`gdn_step`/`native_gdn_step`), so it reads one or two LOWER - the
+    # same-regex DELTA is the signal, not the absolute value.
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 57
+
+**THE BAR MOVE THIS BATCH OWNS ALL EIGHT OF.**  `layer.cpp` reaches exactly these eight kernels, so each one it
+answers removes its own reference(s) from THIS link:
+
+| measurement | before (e12072d, I2d) | after (this batch, I2e) | delta |
+|---|---:|---:|---:|
+| `grep -c "undefined reference"` (the link's total) | **196** | **188** | **-8** |
+| YOUR pattern: full-signature distinct `strata::kernels::` | **67** | **59** | **-8** |
+| PARENT's name-only pattern: name-up-to-`(` distinct | **65** | **57** | **-8** |
+| (whole-file `grep -oP 'strata::kernels::[A-Za-z_0-9]+'` distinct, for reference) | 81 | 73 | -8 |
+
+(The parent's cited `87/65` pair: **65 reproduces exactly** as the name-only distinct on the I2d library, and **87
+reproduces as the WHOLE-FILE name-only count on the PRE-I2d (I2c) library** - i.e. the two figures come from the two
+name-only variants at different points, which is itself the stale-reading trap; both variants move by the same 6
+per batch, which is the signal.  The I2e build was measured with `$HOME/vkbuild-vulkan` rebuilt from the current
+tree; the I2d baseline was reproduced by rebuilding HEAD's `gdn_vk.cpp` into the same library, giving 196/67/65 -
+the bar I2d recorded.)
+
+**THE REMAINING 59 `strata::kernels::` SYMBOLS, GROUPED (so the next batches plan from a number).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue (the I2 elementwise set)** | **0** | all answered |
+| **matvec / GEMV / KV** | **21** | unchanged |
+| **attention / QSA / MoE / GR / PLE / rope** | **36** | unchanged |
+| **GDN / DeltaNet mixer** | **0** | **COMPLETE** - all fourteen answered in `gdn_vk.cpp` (+ `gdn_gate` in `elementwise_vk.cpp`) |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+(The 188 total also carries the 12 CUDA-runtime symbols and the engine's own cross-TU `strata::core`/`main`
+references - the CUDA-runtime surface is the un-approved RE-SCOPE I2b reported and this batch did not touch.)
+
+**WHAT IS LEFT OF I2.**  The matvec/GEMV/KV group (21) and the attention/QSA/MoE/GR/PLE/rope group (36), plus the
+two `other` rows.  The GDN / DeltaNet mixer contributes **nothing**.
+
 ## INCREMENT I2 (CONTINUED FURTHER-STILL) — THE FIRST SIX GDN / DELTANET MIXER ENTRY POINTS, AND THE LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **LINK PROGRESS (the port's progress bar toward a layer that LINKS): `204 → 196` undefined references, `73 → 67`
@@ -110,7 +245,7 @@ NEXT.md pattern below is the one this tree uses).  Re-run the one-layer-body lin
 
     g++ -std=c++20 -O0 -Iinclude -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 \
         -c src/core/layer.cpp -o /tmp/layer.o
-    g++ /tmp/layer.o <build>/vulkan/libstrata_vulkan_kernels.a <build>/vulkan/libstrata_vulkan_device.a -lvulkan \
+    g++ /tmp/layer.o $HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a $HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a -lvulkan \
         -o /tmp/layer-link 2> /tmp/link.log ; true
     grep -c "undefined reference" /tmp/link.log                                     # -> 196
     grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
@@ -189,7 +324,7 @@ CMake build; measured with `/tmp/vkbuild-i2c`):
 
     g++ -std=c++20 -O0 -Iinclude -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 \
         -c src/core/layer.cpp -o /tmp/layer.o
-    g++ /tmp/layer.o <build>/vulkan/libstrata_vulkan_kernels.a <build>/vulkan/libstrata_vulkan_device.a -lvulkan \
+    g++ /tmp/layer.o $HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a $HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a -lvulkan \
         -o /tmp/layer-link 2> /tmp/link.log ; true
     grep -c "undefined reference" /tmp/link.log                                     # -> 204
     grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \

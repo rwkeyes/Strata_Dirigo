@@ -15,6 +15,7 @@
 #include "strata/kernels/gdn.hpp"                 // gdn_conv_step / gdn_l2_norm
 #include "strata/kernels/fused_gdn.hpp"           // fused_gdn_conv_l2 / fused_gdn_ab
 #include "strata/kernels/native_gdn_preprocess.hpp"  // native_gdn_conv_silu / native_gdn_l2_norm
+#include "strata/kernels/native_gdn.hpp"            // native_gdn_step / native_gdn_enabled
 #include "strata/kernels/bf16_bits.hpp"     // bf16_from_f32: the engine's own converter, included not transcribed
 #include "strata/kernels/f16_bits.hpp"      // f16_from_f32: ditto, for f32_to_f16_bulk
 #include "strata/vulkan/vk_backend.hpp"
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
     std::string spv = (argc > 1) ? argv[1] : "ports/vulkan/shaders";
     if (const char* e = std::getenv("STRATA_VK_SPV_DIR"); e && *e) spv = e;
 
-    strata::vulkan::Stream* s = strata::vulkan::stream_open(/*arena_bytes=*/8ull << 20, spv);
+    strata::vulkan::Stream* s = strata::vulkan::stream_open(/*arena_bytes=*/64ull << 20, spv);
     if (s == nullptr) { std::fprintf(stderr, "smoke: no stream\n"); return 1; }
     std::printf("strata_vk_entry_smoke: device \"%s\"\n", s->ctx->info().name.c_str());
 
@@ -626,6 +627,214 @@ int main(int argc, char** argv) {
             if (!(std::fabs((double) gb[(size_t) r] - want_b) <= 1e-4 * (std::fabs(want_b) + 1.0))) ++bad;
         }
         check("fused_gdn_ab vs the gate/beta rule (double, terms-bound)", bad == 0);
+    }
+
+
+    // ---- I2e (the GDN / DeltaNet MIXER, COMPLETED): the remaining EIGHT wrappers -------------------------
+    // The beta/gate and step/norm stages.  Each is driven through the engine wrapper and checked against a
+    // double transcription of the engine's OWN rule (the gate carries the shader-path bitwise proof).
+    {
+        const int S = 128, h_k = 16, h_v = 48;
+        const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+        {   // native_gdn_beta_gate / gdn_beta_gate: in-place sigmoid
+            std::vector<float> b((size_t) h_v), want((size_t) h_v);
+            for (int h = 0; h < h_v; ++h)
+                b[(size_t) h] = (h % 3 == 0) ? -20.0f : (h % 3 == 1) ? 20.0f : 0.5f * (float) ((h * 7) % 11 - 5);
+            for (int h = 0; h < h_v; ++h)
+                want[(size_t) h] = (float) (1.0 / (1.0 + std::exp(-(double) b[(size_t) h])));
+            for (int which = 0; which < 2; ++which) {
+                float* d = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+                strata::vulkan::stream_write(*s, d, b.data(), (size_t) h_v * 4);
+                if (which == 0) strata::kernels::native_gdn_beta_gate(d, h_v, s);
+                else            strata::kernels::gdn_beta_gate(d, h_v, s);
+                std::vector<float> got((size_t) h_v);
+                strata::vulkan::stream_read(*s, d, got.data(), (size_t) h_v * 4);
+                int bad = 0; double worst = 0;
+                for (int h = 0; h < h_v; ++h) {
+                    const double e = std::fabs((double) got[(size_t) h] - (double) want[(size_t) h]);
+                    worst = std::max(worst, e / (std::fabs((double) want[(size_t) h]) + 1e-30));
+                    if (!(e <= 2e-6 * std::fabs((double) want[(size_t) h]) + 1e-7)) ++bad;
+                }
+                const char* nm = which ? "gdn_beta_gate" : "native_gdn_beta_gate";
+                std::printf("  %s wrapper vs the sigmoid rule (worst rel %.3g)\n", nm, worst);
+                check(nm, bad == 0);
+            }
+        }
+        {   // native_gdn_gate: softplus(alpha + dt) * ssm_a
+            std::vector<float> al((size_t) h_v), dt((size_t) h_v), sa((size_t) h_v), want((size_t) h_v);
+            for (int h = 0; h < h_v; ++h) {
+                al[(size_t) h] = (h % 3 == 0) ? 25.0f : 0.3f * (float) (h % 5);
+                dt[(size_t) h] = 0.1f * (float) (h % 3);
+                sa[(size_t) h] = -0.5f - 0.01f * (float) h;
+            }
+            for (int h = 0; h < h_v; ++h) {
+                const double v = (double) al[(size_t) h] + (double) dt[(size_t) h];
+                want[(size_t) h] = (float) ((v > 20.0 ? v : std::log1p(std::exp(v))) * (double) sa[(size_t) h]);
+            }
+            float* dA = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+            float* dD = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+            float* dS = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+            float* dG = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+            strata::vulkan::stream_write(*s, dA, al.data(), (size_t) h_v * 4);
+            strata::vulkan::stream_write(*s, dD, dt.data(), (size_t) h_v * 4);
+            strata::vulkan::stream_write(*s, dS, sa.data(), (size_t) h_v * 4);
+            strata::kernels::native_gdn_gate(dA, dD, dS, dG, h_v, s);
+            std::vector<float> got((size_t) h_v);
+            strata::vulkan::stream_read(*s, dG, got.data(), (size_t) h_v * 4);
+            int bad = 0; double worst = 0;
+            for (int h = 0; h < h_v; ++h) {
+                const double e = std::fabs((double) got[(size_t) h] - (double) want[(size_t) h]);
+                worst = std::max(worst, e / (std::fabs((double) want[(size_t) h]) + 1e-30));
+                if (!(e <= 5e-6 * std::fabs((double) want[(size_t) h]) + 1e-30)) ++bad;
+            }
+            std::printf("  native_gdn_gate wrapper vs softplus*ssm_a (worst rel %.3g)\n", worst);
+            check("native_gdn_gate", bad == 0);
+        }
+        {   // native_gdn_step / gdn_step / fused_gdn_step_norm
+            std::vector<float> st(nstate), q((size_t) h_k * S), k((size_t) h_k * S), v(no), gate((size_t) h_v),
+                beta((size_t) h_v), z(no), gam((size_t) S);
+            for (int i = 0; i < S; ++i)
+                for (int j = 0; j < S; ++j)
+                    for (int h = 0; h < h_v; ++h)
+                        st[(size_t) (i * h_v + h) * S + j] = 0.001f * (float) (i + 2 * j + 3 * h) - 1.0f;
+            for (size_t i = 0; i < q.size(); ++i) q[i] = 0.05f * (float) ((int) (i % 7) - 3);
+            for (size_t i = 0; i < k.size(); ++i) k[i] = 0.05f * (float) ((int) (i % 5) - 2);
+            for (size_t i = 0; i < v.size(); ++i) v[i] = 0.1f * (float) ((int) (i % 9) - 4);
+            for (int h = 0; h < h_v; ++h) {
+                gate[(size_t) h] = -1.5f - 0.02f * (float) (h % 10);
+                beta[(size_t) h] = 0.3f + 0.01f * (float) (h % 5);
+            }
+            for (int h = 0; h < h_v; ++h)
+                for (int j = 0; j < S; ++j) {
+                    const int kk = j % 3;
+                    z[(size_t) h * S + j] = (kk == 0) ? -10.0f : (kk == 1) ? 10.0f : 0.2f * (float) (j % 4);
+                }
+            for (int j = 0; j < S; ++j) gam[(size_t) j] = 1.0f + 0.01f * (float) (j % 3);
+            const double sqrtS = std::sqrt((double) S);
+            const float eps = 1e-6f;
+
+            float* dst = strata::vulkan::arena_alloc<float>(*s, nstate);
+            float* dq = strata::vulkan::arena_alloc<float>(*s, q.size());
+            float* dk = strata::vulkan::arena_alloc<float>(*s, k.size());
+            float* dv = strata::vulkan::arena_alloc<float>(*s, v.size());
+            float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+            float* dbb = strata::vulkan::arena_alloc<float>(*s, (size_t) h_v);
+            float* dz = strata::vulkan::arena_alloc<float>(*s, z.size());
+            float* dgm = strata::vulkan::arena_alloc<float>(*s, gam.size());
+            float* dy = strata::vulkan::arena_alloc<float>(*s, no);
+            for (int mode = 0; mode < 3; ++mode) {   // 0 native_step, 1 gdn_step, 2 fused
+                const bool legacy = (mode == 1), fused = (mode == 2);
+                strata::vulkan::stream_write(*s, dst, st.data(), nstate * 4);
+                strata::vulkan::stream_write(*s, dq, q.data(), q.size() * 4);
+                strata::vulkan::stream_write(*s, dk, k.data(), k.size() * 4);
+                strata::vulkan::stream_write(*s, dv, v.data(), v.size() * 4);
+                strata::vulkan::stream_write(*s, dg, gate.data(), (size_t) h_v * 4);
+                strata::vulkan::stream_write(*s, dbb, beta.data(), (size_t) h_v * 4);
+                strata::vulkan::stream_write(*s, dz, z.data(), z.size() * 4);
+                strata::vulkan::stream_write(*s, dgm, gam.data(), gam.size() * 4);
+                strata::kernels::GdnShapes sh; sh.S = S; sh.h_k = h_k; sh.h_v = h_v;
+                if (mode == 0) strata::kernels::native_gdn_step(dst, dq, dk, dv, dg, dbb, dy, sh, s);
+                else if (mode == 1) strata::kernels::gdn_step(dst, dq, dk, dv, dg, dbb, dy, sh, s);
+                else strata::kernels::fused_gdn_step_norm(dst, dq, dk, dv, dg, dbb, dz, dgm, eps, dy, h_k, h_v, s);
+                std::vector<float> o(no), stt(nstate);
+                strata::vulkan::stream_read(*s, dy, o.data(), no * 4);
+                strata::vulkan::stream_read(*s, dst, stt.data(), nstate * 4);
+
+                std::vector<double> so(st.begin(), st.end()), oc(no, 0.0);
+                const size_t stride = (size_t) h_v * S;
+                for (int h = 0; h < h_v; ++h) {
+                    const int src = h % h_k;
+                    const double g = std::exp((double) gate[(size_t) h]);
+                    const double b = (double) beta[(size_t) h];
+                    for (int j = 0; j < S; ++j) {
+                        double* col = &so[(size_t) h * S + j];
+                        if (legacy) for (int i = 0; i < S; ++i) col[(size_t) i * stride] *= g;
+                        double kv = 0;
+                        for (int i = 0; i < S; ++i) kv += col[(size_t) i * stride] * (double) k[(size_t) src * S + i];
+                        const double delta = ((double) v[(size_t) h * S + j] - (legacy ? kv : g * kv)) * b;
+                        double attn = 0;
+                        for (int i = 0; i < S; ++i) {
+                            col[(size_t) i * stride] = (legacy ? col[(size_t) i * stride] : g * col[(size_t) i * stride]) +
+                                                       (double) k[(size_t) src * S + i] * delta;
+                            attn += col[(size_t) i * stride] * (double) q[(size_t) src * S + i];
+                        }
+                        oc[(size_t) h * S + j] = attn * (legacy ? 1.0 : 1.0 / sqrtS);
+                    }
+                }
+                std::vector<float> want(no);
+                if (fused) {
+                    for (int h = 0; h < h_v; ++h) {
+                        double ss = 0;
+                        for (int j = 0; j < S; ++j) ss += oc[(size_t) h * S + j] * oc[(size_t) h * S + j];
+                        const double scl = 1.0 / std::sqrt(ss / (double) S + (double) eps);
+                        for (int j = 0; j < S; ++j) {
+                            const size_t id = (size_t) h * S + j;
+                            want[id] = (float) ((scl * oc[id]) * (double) gam[(size_t) j] *
+                                                (1.0 / (1.0 + std::exp(-(double) z[id]))));
+                        }
+                    }
+                } else {
+                    for (size_t i = 0; i < no; ++i) want[i] = (float) oc[i];
+                }
+                int bad = 0; double worst = 0;
+                for (size_t i = 0; i < no; ++i) {
+                    const double e = std::fabs((double) o[i] - (double) want[i]);
+                    worst = std::max(worst, e / (2e-4 * std::fabs((double) want[i]) + 1e-5));
+                    if (!(e <= 2e-4 * std::fabs((double) want[i]) + 1e-5)) ++bad;
+                }
+                for (size_t i = 0; i < nstate; ++i) {
+                    const double e = std::fabs((double) stt[i] - so[i]);
+                    worst = std::max(worst, e / (2e-4 * std::fabs(so[i]) + 1e-5));
+                    if (!(e <= 2e-4 * std::fabs(so[i]) + 1e-5)) ++bad;
+                }
+                const char* nm = mode == 0 ? "native_gdn_step" : mode == 1 ? "gdn_step" : "fused_gdn_step_norm";
+                std::printf("  %s wrapper vs the rule (double, worst err/tol %.3g)\n", nm, worst);
+                check(nm, bad == 0);
+            }
+        }
+        {   // native_gdn_out_norm / gdn_out_norm: rms_norm(o)*gamma*sigmoid(z)
+            const size_t n = (size_t) h_v * S;
+            std::vector<float> o(n), z(n), sn((size_t) S), want(n);
+            for (size_t i = 0; i < n; ++i) o[i] = 0.05f * (float) ((int) (i % 13) - 6);
+            for (int h = 0; h < h_v; ++h)
+                for (int j = 0; j < S; ++j) {
+                    const int kk = j % 3;
+                    z[(size_t) h * S + j] = (kk == 0) ? -15.0f : (kk == 1) ? 15.0f : 0.1f * (float) (j % 5);
+                }
+            for (int j = 0; j < S; ++j) sn[(size_t) j] = 1.0f + 0.02f * (float) (j % 3);
+            for (int h = 0; h < h_v; ++h) {
+                double acc = 0;
+                for (int j = 0; j < S; ++j) { const double t = o[(size_t) h * S + j]; acc += t * t; }
+                const double scl = 1.0 / std::sqrt(acc / (double) S + 1e-6);
+                for (int j = 0; j < S; ++j) {
+                    const size_t id = (size_t) h * S + j;
+                    want[id] = (float) ((scl * (double) o[id]) * (double) sn[(size_t) j] *
+                                        (1.0 / (1.0 + std::exp(-(double) z[id]))));
+                }
+            }
+            float* dO = strata::vulkan::arena_alloc<float>(*s, n);
+            float* dZ = strata::vulkan::arena_alloc<float>(*s, n);
+            float* dSN = strata::vulkan::arena_alloc<float>(*s, (size_t) S);
+            float* dY = strata::vulkan::arena_alloc<float>(*s, n);
+            for (int which = 0; which < 2; ++which) {
+                strata::vulkan::stream_write(*s, dO, o.data(), n * 4);
+                strata::vulkan::stream_write(*s, dZ, z.data(), n * 4);
+                strata::vulkan::stream_write(*s, dSN, sn.data(), (size_t) S * 4);
+                if (which == 0) strata::kernels::native_gdn_out_norm(dO, dZ, dSN, dY, h_v, S, 1e-6f, s);
+                else            strata::kernels::gdn_out_norm(dO, dZ, dSN, dY, h_v, S, 1e-6f, s);
+                std::vector<float> got(n);
+                strata::vulkan::stream_read(*s, dY, got.data(), n * 4);
+                int bad = 0; double worst = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double e = std::fabs((double) got[i] - (double) want[i]);
+                    worst = std::max(worst, e / (std::fabs((double) want[i]) + 1e-30));
+                    if (!(e <= 1e-5 * std::fabs((double) want[i]) + 1e-6)) ++bad;
+                }
+                const char* nm = which ? "gdn_out_norm" : "native_gdn_out_norm";
+                std::printf("  %s wrapper vs the norm rule (double, worst rel %.3g)\n", nm, worst);
+                check(nm, bad == 0);
+            }
+        }
     }
 
     strata::vulkan::stream_close(s);

@@ -15,6 +15,50 @@ stale input read (a single-element mutation of the previous/zero/byte-zeroed for
 a stale word would persist on re-dispatch). **The case is not skipped on radeon and the bound is not
 widened.** Full detail and evidence paths in `NEXT.md`'s top section.
 
+## INCREMENT I2e — the remaining eight GDN / DeltaNet MIXER entry points, COMPLETING the mixer + THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
+
+**THE MIXER IS COMPLETE: all fourteen entry points `gdn_layer` reaches are wired and proved** (I2d's six + I2e's
+eight), in `vulkan/src/kernels/gdn_vk.cpp`.  The GDN / DeltaNet mixer group in the grouped table goes **8 → 0**.
+
+**THE EIGHT, in the order `gdn_layer`'s body reaches them** (fused → native → legacy within each stage):
+`native_gdn_beta_gate` (:296), `native_gdn_gate` (:297), `gdn_beta_gate` (:299), `native_gdn_step` (:308),
+`gdn_step` (:309), `fused_gdn_step_norm` (:322), `native_gdn_out_norm` (:324), `gdn_out_norm` (:325).  Each proved
+by a new `case_*_entry` through the ENGINE WRAPPER, BITWISE against the port's shader path AND against the case's
+explicit oracle, `EnginePin`-pinned; the step/norm cases compare the mutated STATE bitwise too:
+
+| kernel | shader | wrapper == shader (bitwise), worst | wrapper vs oracle, worst |
+|---|---|---|---|
+| `native_gdn_beta_gate` | native_gdn_beta_gate.spv | 48/48, w 0 | 48/48 w 1.42e-06 |
+| `native_gdn_gate` | native_gdn_gate.spv | 48/48+5/5+300/300, w 0 | w 2.13e-07 / 6.54e-08 / 3.83e-07 |
+| `gdn_beta_gate` | gdn_beta_gate.spv | 48/48, w 0 | 48/48 w 1.42e-06 |
+| `native_gdn_step` | native_gdn_step.spv | 792576/792576 (+state), w 0 | 792576/792576 w 2.15e-03 |
+| `gdn_step` | gdn_step.spv | 792576/792576 (+state), w 0 | 792576/792576 w 4.47e-03 |
+| `fused_gdn_step_norm` | fused_gdn_step_norm.spv | 792576/792576 (+state), w 0 | 792576/792576 w 0.13 |
+| `native_gdn_out_norm` | native_gdn_out_norm.spv | 6144/6144, w 0 | 6400/6400 w 5.89e-07 |
+| `gdn_out_norm` | gdn_out_norm.spv | 6144/6144, w 0 | 6400/6400 w 8.08e-07 |
+
+**NO `host` row was needed, MEASURED:** the only row the mixer reaches is `native_gdn_enabled()`, already answered
+TRUE by `native_caps_vk.cpp`.  The GDN headers carry no `*_scratch_bytes` and no shape accessor - `GdnShapes` is a
+by-value POD passed through, a TYPE not a symbol - and the one-layer-body link drops by exactly the eight symbols
+with NO new undefined reference.  NONE of the eight is a module-state reader like `cvec_apply`; each is a bare
+bind-and-dispatch carrying the CUDA wrapper's argument contract (`S == 128`, `h_v % h_k == 0`, `cols == 128`) as a
+loud refusal.
+
+**THE STANDARDISED LINK PROGRESS BAR.**  One stable build directory, **`$HOME/vkbuild-vulkan`**, RECONFIGURED AND
+REBUILT FROM THE CURRENT TREE BEFORE MEASURING - the old recipe named a `<build>` placeholder and a stale library
+once reported I2c's `204/73` after I2d's real `196/67`; a silently stale bar is worse than none, because
+"unchanged" is a plausible reading.  Measured (total references / YOUR full-signature distinct / the PARENT's
+simpler name-only distinct): **196 → 188** / **67 → 59** / **65 → 57** (the whole-file name-only variant: 81 → 73).
+The reproducing recipe, both regexes quoted, and the stale hazard are at the top of `NEXT.md`'s I2e section.  The
+remaining 59 group as: matvec/GEMV/KV 21, attention/QSA/MoE/GR/PLE/rope 36, **GDN mixer 0**, other 2.
+
+**RESULTS (vega).**  Gate: Arc (intel_icd) **536/0/0** (exit 0), llvmpipe 524/0/3, Ryzen iGPU (radeon_icd)
+**527/0/2** — **+20 verdicts on every arm**, 0 failed; the radeon arm's pre-existing `budget`/`bf16_gemv` flakes
+appeared on early attempts (none of the eight new cases) and cleared on a re-run reading 527/0/2.
+`strata_vk_entry_smoke` builds + runs on the Arc.  `check_port_map.py` passes (`168 — 78 kernel, 61 host, 29
+todo; 111 shaders built, 92 claimed`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (the eight
+were already `kernel` rows).  **`z820b` PENDING.**  CUDA-runtime host surface untouched; plan not re-scoped.
+
 ## INCREMENT I2 (CONTINUED FURTHER-STILL) — the first six GDN / DeltaNet MIXER entry points + THE LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **THE LINK PROGRESS — the measured one-layer-body link: `204 → 196` undefined references / `73 → 67` distinct
