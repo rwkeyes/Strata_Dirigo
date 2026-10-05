@@ -57,8 +57,19 @@ void main() {
     B_.b[ob + 1] = uint8_t(d16 >> 8);
 
     for (int i = 0; i < QK8_0; ++i) {
-        // float64, and round-half-to-EVEN - the reference's `rint`, not a nearest-away rule
-        double q = roundEven(double(X_.x[xb + i]) / double(d32));
+        // float64, and round-half-to-EVEN - the reference's `rint`, not a nearest-away rule.
+        //
+        // COMPUTED HERE, NOT WITH GLSL's `roundEven`.  MEASURED on lavapipe / Mesa 26.0.8 (the z820b box):
+        // `roundEven(double)` is NOT ties-to-even there - 3.5 -> 3, -3.5 -> -3, 1.5 -> 1, i.e. round-half-toward-
+        // ZERO - so this shader, which spells the spec exactly, produced 12 wrong code bytes in the exact-tie
+        // block, while the SAME lavapipe on Mesa 25.2.8 and every other implementation agreed with the engine's
+        // `rint`.  The engine's rule (src/kernels/cuda/quantize_act.cu, `rint`) is ties-to-even and admits only
+        // that answer, so the shader is brought off the driver builtin rather than the case loosened.  `floor`
+        // and the parity test below use only exact operations the rest of the shader already depends on.
+        const double u = double(X_.x[xb + i]) / double(d32);
+        const double fl = floor(u);
+        const double odd = (fl != 2.0 * floor(fl * 0.5)) ? 1.0 : 0.0;
+        double q = fl + ((u - fl > 0.5) ? 1.0 : ((u - fl < 0.5) ? 0.0 : odd));
         q = clamp(q, -128.0, 127.0);
         // a signed byte written portably: a value conversion of -1 into uint8_t is not something to rely on
         const int v = int(q);

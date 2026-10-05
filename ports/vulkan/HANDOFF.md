@@ -137,23 +137,29 @@ the target is the 7900 XTX.**  Do not re-open it.
 
 ## 6. OPEN ITEMS
 
-1. **THE 7900 XTX RUN IS DONE, AND IT FOUND TWO THINGS - THE FIRST WORK FOR A FRESH SESSION.**
-   `radeon_icd 267/1/1`, `lvp_icd 259/1/3`, `nvidia_icd (Quadro K620) 263/0/2`, EXIT=1.  The K620 being CLEAN is a
-   good datum in itself (a 2014 Kepler passes everything).  The two failures are both "another implementation
-   disagrees" walks, and neither is explained yet:
+1. **THE 7900 XTX RUN'S TWO FAILURES ARE RESOLVED (2026-10-04).**  The run found `radeon_icd 267/1/1`,
+   `lvp_icd 259/1/3`, `nvidia_icd (Quadro K620) 263/0/2`, EXIT=1.  Both failures are now fixed and the box reads
+   `radeon_icd 268/0/1`, `lvp_icd 260/0/3`, `nvidia_icd 263/0/2` (the XTX's one skip is the pre-existing M8
+   cooperative-matrix case).  One was a wrong CASE BOUND, the other a driver bug the SHADER leaned on:
 
-   * **`radeon_icd` (the target, gfx1100): `kv_q4 round trip: append (rotated) -> gather, inside the Q4_0 group
-     bound` - 3071/3072, worst 0.414.**  It passes on the Arc, on vega's llvmpipe AND on vega's radeon iGPU.  The
-     arithmetic in `kv_q4_gather.comp` is a LONE multiply (`float(kc - 8) * kd`) plus an f16 conversion, so
-     CONTRACTION IS RULED OUT (there is no multiply-add to fuse) - do not start by adding `precise`.  Most likely a
-     near-the-bound value plus the driver's f16 rounding, but the failing INDEX must be printed first; the case
-     reports `worst` but not where.
-   * **`lvp_icd`: `quantize_q8_0 (ggml bytes)` - 256/268, worst 12 differing bytes.**  This is the SAME lavapipe
-     driver that passes on vega, on a NEWER Mesa (26.0.8 here against 25.2.8 there), so the case's expectation is
-     version-sensitive - check whether the engine's rule admits both answers before tightening anything.
-
-   Both are the cross-implementation arm earning its keep; neither is a reason to distrust the port's other 267
-   verdicts on the target.
+   * **`kv_q4 round trip` - the CASE's bound was wrong, not the shader.**  The failing element is printed now:
+     cell 5 head 0 dim 193 (the box's own bytes: `d16=0x3642 code=15 -> (code-8)*d16 = 2.73779`, host rule code
+     `plain=15 fma=15`, `dev-vs-rule mismatch 0` over all 3072).  The rule is `d = mval/-8` from the SIGNED extreme
+     then `code = clamp(trunc(x/d+8.5),0,15)`, so the codes are `d*[-8,+7]` - an ASYMMETRIC range whose +8 end does
+     not exist.  An element that needs the +8 end (`x/d = 7.96` here) is clipped to code 15 and is off by up to
+     `|d|`, TWICE the `|d|/2` the case allowed (that is the bound of a round-to-nearest rule in a symmetric range).
+     Fixed: the case now bounds each element against its OWN group's `|d|` and replays the rule on the host for
+     every element (so it can SHOW the shader faithful).  Contraction was never involved - the gather is still a
+     lone multiply, no `precise` added.  The old verdict compared a GLOBAL worst against a GLOBAL bound, which is
+     fixture-sensitive: the fixture is generated from a shared RNG that device-conditional SKIPS shift (the Arc
+     runs `gemm_coopmat`, llvmpipe/radeon skip it), so the Arc passed at ratio 0.995 where the box failed at 1.22.
+   * **`quantize_q8_0 (ggml bytes)` - a lavapipe/Mesa 26.0.8 driver bug, and the case was RIGHT.**  All 12 differing
+     bytes are in the exact-tie block (`amax = 127 -> d32 = 1.0`, so the quotient IS the value): the device wrote
+     `3.5 -> 3`, `-3.5 -> -3`, `1.5 -> 1`, i.e. `roundEven(double)` rounds half-toward-zero there.  The engine's
+     rule (`src/kernels/cuda/quantize_act.cu`, `rint`) is ties-to-EVEN and admits ONLY that answer, so the case is
+     not over-tight and was not loosened.  Fixed in the SHADER: `roundEven(double)` is replaced by an explicit
+     ties-to-even (`floor` + parity), which the older lavapipe and every other implementation already agreed on.
+     A skipped case would be a different matter; this one is a real divergence, recorded.
 2. **The sampler's remaining variants** (see below) and the ten kernels of section 4.
 3. **The sampler's remaining variants**: split-warp and coupled/draft-staging (speculative decoding), the
    `sample_tokens` entry point that chooses between the paths, and the **portable f32 sibling** every other double

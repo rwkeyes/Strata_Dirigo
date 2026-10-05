@@ -32,6 +32,16 @@ the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcenden
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
 numbers ever stop reconciling this way, something is wrong with the harness rather than with a kernel.
 
+**The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
+the gate now reads **`radeon_icd 268 passed / 0 failed / 1 skipped`**, `lvp_icd 260/0/3`, `nvidia_icd (K620)
+263/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the
+`kv_q4 round trip` failure was the CASE's bound (`|d|/2`, wrong for a `d*[-8,+7]` code range whose +8 end clips -
+the shader was faithful, `dev-vs-rule mismatch 0`); the `quantize_q8_0 (ggml bytes)` failure was a lavapipe/Mesa
+26.0.8 bug (`roundEven(double)` rounds ties toward zero), so the CASE was right and the SHADER was changed to an
+explicit ties-to-even.  Full evidence and the two falsifying injections (`gates/inject-verify.sh`) are in
+`NEXT.md`'s new top block and `HANDOFF.md` section 6.1.  The XTX's single skip is the pre-existing M8
+cooperative-matrix case (the XTX's config is M16), not a failure.
+
 **Stage 3 of the port plan - recorded command buffers, the CUDA-graph replacement - is DONE and VERIFIED
 (2026-10-04).** The engine's decode step re-issues a fixed sequence of dispatches every token, and a CUDA graph is
 how it avoided that; the Vulkan equivalent is ONE command buffer recorded once and RE-SUBMITTED.

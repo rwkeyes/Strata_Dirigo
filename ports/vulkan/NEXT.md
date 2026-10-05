@@ -1,5 +1,46 @@
 # Start here next session
 
+## THE 7900 XTX'S TWO FAILURES - A WRONG CASE BOUND AND A LAVAPIPE DRIVER BUG - **DONE AND VERIFIED 2026-10-04**
+
+The gate run on `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8) found two failures and neither was explained.
+Both are resolved; the box now reads **`radeon_icd 268/0/1`, `lvp_icd 260/0/3`, `nvidia_icd 263/0/2`** (the XTX's one
+skip is the pre-existing M8 cooperative-matrix case, `prefill split`).  The Arc on `vega` is unchanged at
+**272/0/0**; llvmpipe 260/0/3, radeon-iGPU 263/0/2.
+
+**Verb: `cd ~/strata-vulkan-wt && STRATA_VK_DESKTOP_RESERVE_MIB=0 STRATA_VK_RESERVE_FLOOR_MIB=0 bash ports/vulkan/gates/run_gate.sh`**
+
+| failure (before) | where | cause | fix | falsified by |
+|---|---|---|---|---|
+| `kv_q4 round trip ... 3071/3072, worst 0.414` | `radeon_icd` (the target) | the case's bound `|d|/2` is wrong for a `d*[-8,+7]` code range - a clipped element errs up to `|d|` | the CASE: per-element bound `|d|` + a host replay of the rule | inject the gather's `-8` offset away -> `FAIL 0/3072 worst 8.06` |
+| `quantize_q8_0 (ggml bytes) 256/268, 12 bytes` | `lvp_icd` (Mesa 26.0.8) | lavapipe's `roundEven(double)` is half-toward-zero on ties, not half-to-even; the engine's `rint` is definite | the SHADER: explicit ties-to-even (`floor` + parity), not `roundEven` | inject half-toward-+inf -> `FAIL 257/268 worst 11` |
+
+Both falsifications are run by **`gates/inject-verify.sh <name>`** (`q4-gather-offset`, `q8-round-half-up`), which
+prints `ANCHOR MISSED` / `DID NOT COMPILE` rather than running a stale binary and restores the tree on every exit.
+
+**Finding 1 - the case's bound, not the shader.**  `kv_q4_gather.comp` is a lone multiply (`float(kc-8)*kd`) and an
+f16 conversion, so contraction was never in play and no `precise` was added (the handoff already said this; the new
+diagnostic proves it: the failing element - **cell 5 head 0 dim 193**, from the box's own pool bytes `d16=0x3642
+code=15 -> (code-8)*d16 = 2.73779` - has host-rule code `plain=15 fma=15`, and `dev-vs-rule mismatch 0` over all
+3072 elements).  The rule is `d = mval/-8` from the SIGNED extreme, `code = clamp(trunc(x/d+8.5),0,15)`; the codes
+are `d*[-8,+7]`, an ASYMMETRIC 16-level range whose +8 end does not exist, so an element that wants the +8 end
+(`x/d = 7.96` here) is clipped to 15 and errs up to `|d|` - twice `|d|/2`.  The case now bounds **each element
+against its OWN group's `|d|`** instead of comparing a global worst against a global bound, and it PRINTS the
+offender (index, device value, expected, the group's `|d|`, the device's own `d16`/code and the host rule's code)
+so it can never again report `worst` without `where`.  A second-order point worth keeping: the fixture comes from
+a shared RNG that device-conditional SKIPS shift, so the same binary gives the Arc (no skips) a different fixture
+than llvmpipe/radeon (which skip `gemm_coopmat`) - the old global-vs-global test passed on the Arc at ratio 0.995
+and failed on the box at 1.22 for that reason.  The per-group form is immune.
+
+**Finding 2 - a driver bug the shader leaned on; the case was right.**  `quantize_q8_0.comp` spells `roundEven`
+exactly; on lavapipe / Mesa 26.0.8 that builtin is NOT ties-to-even for `double`.  Every one of the 12 wrong bytes
+is in the exact-tie block (`amax = 127 -> d32 = 1.0`, so the double quotient IS the value): the device wrote
+`3.5 -> 3`, `-3.5 -> -3`, `1.5 -> 1`, i.e. round-half-toward-zero, where the engine (`src/kernels/cuda/
+quantize_act.cu`, `rint`) and the case's oracle (`std::nearbyint`) both want `4 / -4 / 2`.  So the engine's rule
+admits only ONE answer, the case was not over-tight, and it was NOT loosened - the shader was brought off the
+driver builtin.  The `quantize_q8_0_scaled` sibling was already independent of it (it uses the CPU's half-away
+rule), and this was the only f64 use of `roundEven` in the port.  **Honest limit:** this is a property of that
+Mesa build, measured here and not reproduced upstream; the shader no longer depends on it either way.
+
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
 
 **Closed the same day the API was written.**  `case_recorded_step` (`harness/vk_gate.cpp`, six verdicts, one

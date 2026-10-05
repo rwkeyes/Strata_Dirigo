@@ -2097,22 +2097,104 @@ void case_kv_q4_rot(Ctx& ctx, const std::string& dir) {
         ctx.read(b_v, win_v.data(), win_v.size() * 2);
 
         // how close is the gathered (rotated, quantised, dequantised) window to the rotated original?
+        //
+        // THE BOUND THIS CASE USED TO ASSERT WAS WRONG, and RADV/gfx1100 (the 7900 XTX) is where it showed: 1 of
+        // 3072 elements failed while the SHADER was faithful to the rule.  The rule is  d = mval/-8  from the
+        // SIGNED extreme, then  code = clamp(trunc(x/d + 8.5), 0, 15)  - so the codes represent  d*[-8, +7], an
+        // ASYMMETRIC 16-level range whose +8 end does not exist.  An element that needs the +8 end (x/d near +8,
+        // i.e. the extreme of the OPPOSITE sign to mval) is clipped to +7 and can be off by up to |d| - TWICE the
+        // |d|/2 this case used to allow, which is the error of a ROUND-to-nearest rule in a symmetric range, not
+        // of a truncating rule in this one.  The offender below proves it: cell 5 dim 193 has x/d = 7.96 -> code 15
+        // (clipped), error 1.92x its group's |d|/2 but only 0.96x |d|.  So the fix is the CASE's bound.  To keep
+        // the case an oracle rather than an assertion it also REPLAYS the rule on the host for EVERY element
+        // (dev-vs-rule mismatches are printed) and counts the elements in the clipping zone.
+        std::vector<uint8_t> pool_k((size_t) pool_bytes);
+        ctx.read(b_kq, pool_k.data(), pool_k.size());
         double worst_abs = 0;
-        int nonfinite = 0;
+        int nonfinite = 0, over_own_bound = 0, dev_vs_rule = 0, clipped = 0;
+        double worst_ratio = 0, worst_group_err = 0;
+        uint32_t wi = 0, wh = 0, wd = 0;
+        double wgath = 0, wexp = 0, wbound = 0, wdev_recon = 0;
+        int wdev_code = -1, whost_plain = -1, whost_fma = -1;
+        uint16_t wd16 = 0;
         for (uint32_t i = 0; i < cells; ++i)
             for (uint32_t h = 0; h < kv_heads; ++h)
-                for (uint32_t d = 0; d < head_dim; ++d) {
-                    const size_t j = ((size_t) i * kv_heads + h) * head_dim + d;
-                    const double g = (double) strata::kernels::f32_from_f16(win_k[j]);
-                    if (!std::isfinite(g)) ++nonfinite;
-                    worst_abs = std::max(worst_abs, std::fabs(g - (double) krot[i][h * head_dim + d]));
+                for (uint32_t b = 0; b < groups_per_head; ++b) {
+                    const float* gp = &krot[i][h * head_dim + b * 32];
+                    float amaxG = 0, mvalG = 0;
+                    for (int jj = 0; jj < 32; ++jj) {
+                        const float a = std::fabs(gp[jj]);
+                        if (a > amaxG || (a == amaxG && gp[jj] > mvalG)) { amaxG = a; mvalG = gp[jj]; }
+                    }
+                    const float dd = mvalG / -8.0f;
+                    const float idr = (dd != 0.0f) ? (1.0f / dd) : 0.0f;
+                    const uint16_t d16 = strata::kernels::f16_from_f32(dd);
+                    const double d16f = (double) strata::kernels::f32_from_f16(d16);
+                    const double bound = std::fabs((double) dd);       // the code range is [-8,+7]: |d|, not |d|/2
+                    worst_group_err = std::max(worst_group_err, bound);
+                    for (uint32_t jj = 0; jj < 32; ++jj) {
+                        const uint32_t d = b * 32 + jj;
+                        const size_t j = ((size_t) i * kv_heads + h) * head_dim + d;
+                        const double g = (double) strata::kernels::f32_from_f16(win_k[j]);
+                        const double xv = (double) gp[jj];
+                        if (!std::isfinite(g)) ++nonfinite;
+                        const double e = std::fabs(g - xv);
+                        worst_abs = std::max(worst_abs, e);
+                        if (e > bound * 1.01 + 1e-6) ++over_own_bound;
+                        const double ratio = e / (bound + 1e-30);
+                        if (ratio > worst_ratio) {
+                            worst_ratio = ratio;
+                            wi = i; wh = h; wd = d; wgath = g; wexp = xv; wbound = bound;
+                        }
+                        // the rule replayed on the host: 0 mismatches means every gathered byte is the rule's own
+                        volatile float tmul = (float) xv * idr;
+                        volatile float eight5 = 8.5f;
+                        const float up = (float) tmul + (float) eight5;
+                        const int code = (int) std::min(std::max(up, 0.0f), 15.0f);
+                        const uint16_t r16 = strata::kernels::f16_from_f32((float) ((double) (code - 8) * d16f));
+                        if (r16 != win_k[j]) ++dev_vs_rule;
+                        const double uu = xv / (double) dd;
+                        if (uu > 7.5 && uu <= 8.0) ++clipped;
+                    }
                 }
-        std::printf("      round trip: worst |gathered - rotated original| %.4g, vs the Q4_0 bound |d|/2 = %.4g "
-                    "(non-finite %d)\n", worst_abs, worst_group_d, nonfinite);
+        {
+            // the offender's own block bytes, plus whether the driver FUSED the append's multiply-add
+            const int pos = first + (int) wi;
+            const int row = ((int) table[pos / (int) page_size] * (int) kv_heads + (int) wh) * (int) page_size +
+                            (pos % (int) page_size);
+            const int off = row * (int) bytes_per_head + (int) (wd / 32) * 18;
+            wd16 = (uint16_t) (pool_k[off] | (pool_k[off + 1] << 8));
+            const int jj = (int) (wd % 32);
+            const uint8_t cb = pool_k[off + 2 + (jj & 15)];
+            wdev_code = (jj < 16) ? (int) (cb & 0x0Fu) : (int) (cb >> 4);
+            wdev_recon = (double) (wdev_code - 8) * (double) strata::kernels::f32_from_f16(wd16);
+            const float* gp = &krot[wi][wh * head_dim + (wd / 32) * 32];
+            float amaxG = 0, mvalG = 0;
+            for (int j2 = 0; j2 < 32; ++j2) {
+                const float a = std::fabs(gp[j2]);
+                if (a > amaxG || (a == amaxG && gp[j2] > mvalG)) { amaxG = a; mvalG = gp[j2]; }
+            }
+            const float dd2 = mvalG / -8.0f;
+            const float idr2 = (dd2 != 0.0f) ? (1.0f / dd2) : 0.0f;
+            const float xv = krot[wi][wh * head_dim + wd];
+            volatile float tmul2 = xv * idr2;
+            volatile float eight52 = 8.5f;
+            whost_plain = (int) std::min(std::max((float) tmul2 + (float) eight52, 0.0f), 15.0f);
+            whost_fma = (int) std::min(std::max(std::fma(xv, idr2, 8.5f), 0.0f), 15.0f);
+        }
+        std::printf("      round trip: worst |gathered - rotated original| %.4g vs the code-range bound |d| = %.4g "
+                    "(old |d|/2 worst was %.4g) | non-finite %d, over-bound %d, clipped-end %d, dev-vs-rule "
+                    "mismatch %d\n", worst_abs, worst_group_err, worst_group_d, nonfinite, over_own_bound, clipped,
+                    dev_vs_rule);
+        std::printf("      WORST ELEMENT cell %u head %u dim %u (group %u): device %.6g expected %.6g, group |d| "
+                    "%.6g, err/|d| %.4f\n", wi, wh, wd, wd / 32, wgath, wexp, wbound, worst_ratio);
+        std::printf("      device block: d16=0x%04x code=%d -> (code-8)*d16 = %.6g | host rule code plain=%d fma=%d "
+                    "| dev-vs-rule total %d\n", (unsigned) wd16, wdev_code, wdev_recon, whost_plain, whost_fma,
+                    dev_vs_rule);
         verdict("kv_q4 round trip: append (rotated) -> gather, inside the Q4_0 group bound",
-                worst_abs <= worst_group_d * 1.001 + 1e-6 && nonfinite == 0,
-                (int) (worst_abs > worst_group_d * 1.001 + 1e-6 || nonfinite != 0), (int) (cells * kv_heads * head_dim),
-                worst_abs, "outside the group's own error bound (|d|/2) or non-finite");
+                over_own_bound == 0 && nonfinite == 0,
+                over_own_bound + nonfinite, (int) (cells * kv_heads * head_dim), worst_abs,
+                "elements outside their own group's code-range bound (|d| - the range is [-8,+7]) or non-finite");
 
         // ---- (4) THE DESIGN CLAIM, through the real attention kernel ---------------------------------------
         // "<Hq, Hk> = <q, k> and the attention output is rotated back" - so attention on rotated inputs, with the
@@ -6982,11 +7064,37 @@ void case_quantize_q8_0(Ctx& ctx, const std::string& dir) {
         ctx.dispatch(p, {&bx, &b_blocks}, &pc, sizeof(pc), (uint32_t) ((nb + kLocalSize - 1) / kLocalSize));
         std::vector<uint8_t> got(blk_bytes + slack);
         ctx.read(b_blocks, got.data(), got.size());
+        std::vector<size_t> diff_idx;
         for (size_t i = 0; i < want_ggml.size(); ++i) {
-            if (got[i] != want_ggml[i]) ++ggml_bad;
+            if (got[i] != want_ggml[i]) { ++ggml_bad; diff_idx.push_back(i); }
         }
         for (size_t i = blk_bytes; i < got.size(); ++i) {
             if (got[i] != SENT) ++ggml_bad;
+        }
+        // DIAGNOSTIC: WHERE the bytes differ.  A different Mesa's fp64 path can move the quotient's last bit
+        // across a .5 boundary, which flips ONE code; printing the block, the element, the quotient and both
+        // answers is what decides whether that is what happened.
+        for (size_t n = 0; n < diff_idx.size() && n < 16; ++n) {
+            const size_t i = diff_idx[n];
+            const int b = (int) (i / 34), within = (int) (i % 34);
+            double detail = 0; int hostcode = -9999; float d32 = 0;
+            if (within >= 2) {
+                const int e = within - 2;
+                float amax = 0.0f;
+                for (int k = 0; k < 32; ++k) amax = std::max(amax, std::fabs(x[(size_t) b * 32 + (size_t) k]));
+                d32 = amax / 127.0f;
+                const double u = (double) x[(size_t) b * 32 + (size_t) e] / (double) d32;
+                detail = u;
+                hostcode = (int) std::nearbyint(u);
+            } else {
+                detail = (double) (got[i] | (got[i + 1] << 8));      // the scale bytes as the device wrote them
+            }
+            std::printf("      byte diff %zu: block %d %s %d: got %d (0x%02x) want %d (0x%02x)\n", i, b,
+                        within < 2 ? "scale byte" : "code elem", within < 2 ? within : within - 2, (int) got[i], (int) got[i],
+                        (int) want_ggml[i], (int) want_ggml[i]);
+            if (within >= 2)
+                std::printf("        element x=%.9g d32=%.9g quotient=%.17g (host rint -> %d)\n",
+                            (double) x[(size_t) b * 32 + (size_t) (within - 2)], (double) d32, detail, hostcode);
         }
         verdict("quantize_q8_0 (ggml bytes)", ggml_bad == 0, ggml_bad, (int) (blk_bytes + slack), (double) ggml_bad,
                 "differing bytes (34-byte blocks + guard)");
