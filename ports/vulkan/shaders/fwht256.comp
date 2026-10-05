@@ -1,0 +1,55 @@
+// ports/vulkan/shaders/fwht256.comp - the orthonormal 256-point Walsh-Hadamard rotation of the Q4_0 KV path.
+// Ported from src/kernels/cuda/kv_q4.cu (`fwht256_kernel`); the design is the engine's own, from kv_q4.hpp:
+//
+//     K and V are rotated by the orthonormal 256-point Hadamard matrix H before quantisation ... The query is
+//     rotated the same way, so <Hq, Hk> = <q, k> and the scores are unchanged, and the attention output (a mix of
+//     rotated values) is rotated back.
+//
+// ORTHONORMALITY IS THE WHOLE DESIGN: H is orthogonal, so inner products are preserved, and H is its own inverse -
+// which is why nothing on the KV path ever has to invert it, and why the SAME kernel serves the rotation going in
+// and the de-rotation of the attention output coming out.  A rotation that merely "spreads outliers" without being
+// orthogonal would change every score, so the gate checks the invariants (<Hx,Hy> = <x,y> and H(Hx) = x), not just
+// the numbers against a matrix.
+//
+// ONE WORKGROUP PER ROW, 256 THREADS, 8 BUTTERFLY STAGES.  The source is one warp per row, with the low 5 index
+// bits across lanes (`__shfl_xor_sync`) and the high 3 across each lane's registers.  This port's reductions are
+// barrier trees (subgroup ops fail its gate), so the row sits in shared memory and each stage is a
+// barrier-separated butterfly.  Same H_256, different rounding order - which the case measures against a double
+// Hadamard matrix rather than claiming.
+//
+// THE SIGN CONVENTION IS NOT COSMETIC: the source's butterfly adds on the bit's zero side and computes
+// `partner - me` on its one side.  The other sign convention also produces an orthogonal matrix, and it also looks
+// smooth and plausible - it is simply a different basis, and the scores it produces are wrong.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SRC { float x[]; } SRC_;
+layout(set = 0, binding = 1, std430) buffer DST { float y[]; } DST_;
+
+layout(push_constant) uniform Pc {
+    int n_rows;
+} pc;
+
+shared float row[256];
+
+void main() {
+    const int r = int(gl_WorkGroupID.x);
+    if (r >= pc.n_rows) return;
+    const uint lid = gl_LocalInvocationIndex;
+
+    row[lid] = SRC_.x[r * 256 + int(lid)] * (1.0 / 16.0);   // 1/sqrt(256): the orthonormal scale, applied at load
+    barrier();
+
+    for (int h = 1; h < 256; h *= 2) {
+        const uint partner = lid ^ uint(h);
+        const float mine = row[lid];
+        const float theirs = row[partner];
+        barrier();                                          // every thread has READ before any thread writes
+        row[lid] = ((lid & uint(h)) == 0u) ? (mine + theirs) : (theirs - mine);
+        barrier();                                          // every write is visible before the next stage reads
+    }
+
+    DST_.y[r * 256 + int(lid)] = row[lid];
+}

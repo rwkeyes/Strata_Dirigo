@@ -9,17 +9,22 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
-short-step decode attention, the f16 KV gather, the QSA selection and the f16 KV append landed, the box's GPU run
-was **226 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
-Vulkan 1.4.318, subgroup size 32) - 214 / 0 / 3 on llvmpipe and 217 / 0 / 2 on the radeon ICD, which now picks the
-AMD iGPU because the discrete card is gone (both skip cooperative matrix, whose driver does not advertise the
-extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
+short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append and the Q4_0 KV path (with its
+Walsh-Hadamard rotation) landed, the box's GPU run was **233 passed / 0 failed / 0 skipped** on the Intel ICD
+(`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 221 / 0 / 3 on llvmpipe and
+224 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone (both skip cooperative
+matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 217/0/2 becomes 216/1/2 when its intermittent
-budget-requery case fires.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
-stale six times in two days; read the last line of your own run.** All three available implementations are exercised
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 224/0/2 becomes 223/1/2
+when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
+compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
+(`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
+binary fails it identically, 2 runs of 2**, and the usage delta is 0 - it is the budget figure drifting on an iGPU
+that shares system memory with everything else.  Verified by building the previous commit in a worktree and running
+the same ICD.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
+stale seven times in two days; read the last line of your own run.** All three available implementations are exercised
 again by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 63 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
+box after the swap (`NEXT.md`). 66 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -115,6 +120,18 @@ over six tokens appended across a page boundary, at worst rel 8.37e-06.  **And t
 hardcoded `maxSets = 64` and one set per pipeline.**  That is a ceiling on the CASE COUNT, not on a kernel, and it
 fails at whichever implementation runs last - fixed by growing the pool on demand and printing when it does
 (`descriptor pool 2 created`).  Arc 226/0/0.
+
+**The Q4_0 KV path landed, and with it the first gate arm that tests a DESIGN CLAIM rather than a kernel
+(2026-10-04).**  `fwht256.comp` (the orthonormal 256-point Walsh-Hadamard rotation), `kv_q4_append.comp` (ggml's Q4_0
+group with the engine's deterministic tie rule) and `kv_q4_gather.comp` (the dequantising reader) - the engine's three
+KV storage formats are now all in the port.  The design (rotate K, V AND the query, quantise in the rotated basis,
+de-rotate the output once) is legal only because H is orthonormal, so the rotation is gated against an EXPLICIT
+Hadamard matrix, against `H(Hx) = x` and `<Hx,Hx> = <x,x>`, and finally THROUGH the real attention kernel: rotate q,
+quantise+rotate K/V to Q4_0, attend, de-rotate, and compare with the unrotated attention - worst absolute deviation
+0.644 against a window that is itself off by up to 0.474.  **The invariants cannot see a flipped butterfly sign
+convention** (the other convention is also orthogonal and self-inverse - it is simply a different basis), and the
+injection proves it: flipping the branches fails only the explicit-matrix arm.  Round trip 0.4719 against the group
+bound |d|/2 = 0.4742.  Arc 233/0/0.
 
 | Case | Verdict | Method |
 |---|---|---|

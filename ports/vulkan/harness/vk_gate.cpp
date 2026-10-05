@@ -1787,6 +1787,425 @@ void case_kv_f16_append(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE Q4_0 KV PATH (src/kernels/cuda/kv_q4.cu): the FWHT rotation, the group quantiser, the dequantising gather
+// ----------------------------------------------------------------------------------------------------------
+
+// The implicit Hadamard matrix, built EXPLICITLY: H[i][j] = (-1)^popcount(i & j) / 16.  An oracle that ran the
+// butterflies in double instead would share the port's STRUCTURE, including its sign convention - and a flipped
+// convention is also an orthogonal, self-inverse matrix, so the invariants (H(Hx) = x, <Hx,Hy> = <x,y>) cannot see
+// it.  This is the independent reference those invariants cannot replace.
+static void fwht_matrix_ref(std::vector<double>& out, const std::vector<float>& x, uint32_t rows) {
+    out.assign((size_t) rows * 256, 0.0);
+    for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t i = 0; i < 256; ++i) {
+            double acc = 0.0;
+            for (uint32_t j = 0; j < 256; ++j) {
+                const uint32_t bits = (uint32_t) __builtin_popcount(i & j);
+                acc += ((bits & 1u) ? -1.0 : 1.0) * (double) x[(size_t) r * 256 + j];
+            }
+            out[(size_t) r * 256 + i] = acc / 16.0;
+        }
+}
+
+// The engine's Q4_0 group rule, transcribed.  NOTE WHAT THE CODES ARE QUANTISED AGAINST: the EXACT f32 scale
+// (ggml's reference does the same - it stores `FP32_TO_FP16(d)` but computes the codes from the f32 `d`), whereas
+// the q8 append in this port quantises against the STORED f16 scale.  Two different conventions in two sibling
+// kernels; both are faithful, and the gate pins each one where it belongs.
+static void q4_group_ref(uint16_t& d_bits, uint8_t codes[16], const float* g) {
+    float amax = 0.0f, mval = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        const float a = std::fabs(g[j]);
+        if (a > amax || (a == amax && g[j] > mval)) {
+            amax = a;
+            mval = g[j];
+        }
+    }
+    const float d = mval / -8.0f;
+    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    d_bits = f16_from_f32(d);
+    for (int j = 0; j < 16; ++j) {
+        const auto code = [&](float x) {
+            const int q = (int) (x * id + 8.5f);          // C++ truncates toward zero, as __float2int_rz does
+            return (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
+        };
+        codes[j] = (uint8_t) (code(g[j]) | (code(g[j + 16]) << 4));
+    }
+}
+
+void case_kv_q4_rot(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "fwht256.spv") || !have(dir, "kv_q4_append.spv") || !have(dir, "kv_q4_gather.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) {
+        skip("kv_q4 rot", "device lacks storageBuffer8BitAccess - the Q4_0 pool is packed bytes");
+        return;
+    }
+    const uint32_t kv_heads = 2, head_dim = 256, page_size = 16, pages = 16, rows = pages * page_size;
+    const uint32_t groups_per_head = head_dim / 32;
+    const uint32_t bytes_per_head = groups_per_head * 18;
+    const uint16_t SENT = 0xDEADu;
+    std::vector<int32_t> table(pages);
+    for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) (pages - 1 - i);
+
+    // ---- (1) THE ROTATION ITSELF ---------------------------------------------------------------------------
+    {
+        const uint32_t n_rows = 4;
+        std::vector<float> x((size_t) n_rows * 256);
+        for (float& v : x) v = rndf(2.0f);
+        // one row with a deliberate outlier, which is the case the rotation exists for, and one all-zero row
+        for (uint32_t j = 0; j < 256; ++j) x[(size_t) 1 * 256 + j] = (j == 7) ? 40.0f : 0.0f;
+        for (uint32_t j = 0; j < 256; ++j) x[(size_t) 2 * 256 + j] = 0.0f;
+        Buf b_in = ctx.alloc(x.size() * 4), b_out = ctx.alloc(x.size() * 4);
+        ctx.write(b_in, x.data(), x.size() * 4);
+        VkPipeline pw = ctx.pipeline(dir + "/fwht256.spv", 2, 4);
+        struct { int n_rows; } wpc{(int) n_rows};
+        ctx.dispatch(pw, {&b_in, &b_out}, &wpc, sizeof(wpc), n_rows);
+        std::vector<float> got(x.size());
+        ctx.read(b_out, got.data(), got.size() * 4);
+
+        std::vector<double> want;
+        fwht_matrix_ref(want, x, n_rows);
+        int bad = 0;
+        double worst = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double rel = std::fabs((double) got[i] - want[i]) / (std::fabs(want[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 2e-5 || std::fabs((double) got[i] - want[i]) <= 1e-6)) ++bad;
+        }
+        std::printf("      fwht256 vs the explicit Hadamard matrix (+-1/16 by popcount parity): worst rel %.3g; "
+                    "outlier row: in 40.0 -> out %.4f (a spread basis puts it in every dimension)\n", worst,
+                    (double) got[7]);
+        verdict("fwht256: the numbers against the explicit matrix", bad == 0, bad, (int) got.size(), worst,
+                "values outside tolerance - including a wrong butterfly SIGN CONVENTION, which the invariants below "
+                "cannot see");
+
+        // The invariants the design rests on.  They do NOT catch a sign flip (an orthogonal self-inverse matrix
+        // still satisfies both), which is exactly why the arm above exists.
+        Buf b_back = ctx.alloc(x.size() * 4);
+        ctx.dispatch(pw, {&b_out, &b_back}, &wpc, sizeof(wpc), n_rows);
+        std::vector<float> back(x.size());
+        ctx.read(b_back, back.data(), back.size() * 4);
+        double worst_back = 0;                             // NORM-relative: an orthonormality claim is about the norm,
+        double num = 0, den = 0, dot_x = 0, dot_h = 0;     // and a per-element relative error explodes on the
+        for (uint32_t r = 0; r < n_rows; ++r) {            // near-cancelling channels a Hadamard product creates
+            num = den = 0;
+            for (uint32_t j = 0; j < 256; ++j) {
+                const double dx = (double) back[(size_t) r * 256 + j] - (double) x[(size_t) r * 256 + j];
+                num += dx * dx;
+                den += (double) x[(size_t) r * 256 + j] * (double) x[(size_t) r * 256 + j];
+            }
+            if (den > 0) worst_back = std::max(worst_back, std::sqrt(num / den));
+        }
+        for (uint32_t j = 0; j < 256; ++j) {
+            dot_x += (double) x[j] * (double) x[j];
+            dot_h += (double) got[j] * (double) got[j];
+        }
+        const double shift = std::fabs(dot_h - dot_x) / (dot_x + 1e-30);
+        std::printf("      self-inverse: ||H(Hx) - x||/||x|| worst %.3g | <Hx,Hx> vs <x,x>: %.3g relative\n",
+                    worst_back, shift);
+        verdict("fwht256: H(Hx) = x and the norm is preserved (the property the design uses)",
+                worst_back <= 1e-6 && shift <= 1e-6, (int) (worst_back > 1e-6 || shift > 1e-6), 2, worst_back,
+                "the transform is not orthonormal - <Hq,Hk> would not equal <q,k>");
+        ctx.free(b_in); ctx.free(b_out); ctx.free(b_back);
+    }
+
+    // ---- (2) THE GROUP QUANTISER, bit for bit --------------------------------------------------------------
+    // Five groups: a plain one, a +-TIE (which decides the scale's sign, so the rule has to pick the larger value),
+    // a tiny maximum (a subnormal scale), an all-zero group, and one whose codes clamp at both ends.
+    {
+        std::vector<float> kcur((size_t) kv_heads * head_dim), vcur((size_t) kv_heads * head_dim);
+        for (float& v : kcur) v = rndf(1.0f);
+        for (float& v : vcur) v = rndf(1.0f);
+        // group 1 of head 0 (elements 32..63): an exact +x / -x tie
+        for (uint32_t j = 0; j < 32; ++j) kcur[32 + j] = ((j % 2) == 0) ? 3.5f : -3.5f;
+        // group 2: a tiny maximum, so the scale lands well below 1
+        for (uint32_t j = 0; j < 32; ++j) kcur[64 + j] = ((j % 2) == 0) ? 1.0e-7f : -1.0e-7f;
+        // group 3: all zero
+        for (uint32_t j = 0; j < 32; ++j) kcur[96 + j] = 0.0f;
+        // group 4: one huge value and the rest tiny - the codes must clamp, not wrap
+        for (uint32_t j = 0; j < 32; ++j) kcur[128 + j] = 1.0e-6f * (float) (j + 1);
+        kcur[128] = 100.0f;
+
+        const uint32_t pool_bytes = (uint32_t) (rows * kv_heads * bytes_per_head);
+        Buf b_kq = ctx.alloc(pool_bytes), b_vq = ctx.alloc(pool_bytes);
+        Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(20);
+        Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+        std::vector<uint8_t> sent(pool_bytes, 0xAB);
+        ctx.write(b_kq, sent.data(), sent.size());
+        ctx.write(b_vq, sent.data(), sent.size());
+        ctx.write(b_tab, table.data(), table.size() * 4);
+        ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+        ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+        const int32_t pos = 40;
+        const std::vector<int32_t> step = {pos, pos + 1, pos / 4, 8, 0};
+        ctx.write(b_step, step.data(), step.size() * 4);
+        struct { int kv_heads, head_dim, page_size, host_layout; } apc{(int) kv_heads, (int) head_dim, (int) page_size, 0};
+        VkPipeline paq = ctx.pipeline(dir + "/kv_q4_append.spv", 6, 16);
+        const uint32_t aq_groups = (uint32_t) ((2 * kv_heads * groups_per_head + kLocalSize - 1) / kLocalSize);
+        ctx.dispatch(paq, {&b_kq, &b_vq, &b_tab, &b_step, &b_kc, &b_vc}, &apc, sizeof(apc), aq_groups);
+
+        std::vector<uint8_t> got(pool_bytes);
+        ctx.read(b_kq, got.data(), got.size());
+        // The row this cell lives on, and the bytes the rule says belong there.
+        int bad = 0, checked = 0;
+        for (uint32_t h = 0; h < kv_heads; ++h) {
+            const uint32_t row = (uint32_t) ((table[pos / (int32_t) page_size] * (int32_t) kv_heads + (int32_t) h) *
+                                                 (int32_t) page_size +
+                                             (pos % (int32_t) page_size));
+            for (uint32_t b = 0; b < groups_per_head; ++b) {
+                uint16_t d_bits = 0;
+                uint8_t codes[16];
+                q4_group_ref(d_bits, codes, &kcur[h * head_dim + b * 32]);
+                const size_t off = (size_t) row * bytes_per_head + b * 18;
+                const uint16_t got_d = (uint16_t) (got[off] | (uint16_t(got[off + 1]) << 8));
+                if (got_d != d_bits) ++bad;
+                for (uint32_t j = 0; j < 16; ++j)
+                    if (got[off + 2 + j] != codes[j]) ++bad;
+                ++checked;
+            }
+        }
+        // THE GUARD REGION, BY POSITION: every byte outside the rows this cell owns must still be the sentinel.
+        // Counting "bytes that changed" instead is a weak proxy - a written byte can EQUAL the sentinel byte, which
+        // is how this check failed the first time (285 of an expected 288, three coincidences short).
+        // The mask is a UNION over the heads: excluding one head's row at a time counts the OTHER head's written
+        // row as "stray", which is how this check first reported 285 stray bytes for a correct kernel.
+        std::vector<uint8_t> owned(pool_bytes, 0);
+        for (uint32_t h = 0; h < kv_heads; ++h) {
+            const uint32_t row = (uint32_t) ((table[pos / (int32_t) page_size] * (int32_t) kv_heads + (int32_t) h) *
+                                                 (int32_t) page_size +
+                                             (pos % (int32_t) page_size));
+            const size_t lo = (size_t) row * bytes_per_head;
+            for (size_t i = lo; i < lo + bytes_per_head; ++i) owned[i] = 1;
+        }
+        uint32_t stray = 0;
+        for (size_t i = 0; i < pool_bytes; ++i)
+            if (!owned[i] && got[i] != 0xAB) ++stray;
+        if (stray != 0) ++bad;
+        std::printf("      Q4_0 groups: scale+16 code bytes compared with the rule, five special groups "
+                    "(tie, subnormal, all-zero, clamping); %u bytes of one cell, %u stray bytes elsewhere\n",
+                    kv_heads * bytes_per_head, stray);
+        verdict("kv_q4_append: the group rule bit-exactly, and one cell's bytes only", bad == 0, bad,
+                (int) (checked * 17), 0.0, "a scale or a code byte differs from the rule");
+
+        // the TIE's determinism: the same values in a reversed order must give the SAME bytes
+        std::vector<float> tie_rev(kcur);
+        for (uint32_t j = 0; j < 32; ++j) tie_rev[32 + j] = ((j % 2) == 0) ? -3.5f : 3.5f;
+        ctx.write(b_kc, tie_rev.data(), tie_rev.size() * 4);
+        std::vector<uint8_t> sent2(pool_bytes, 0xAB);
+        ctx.write(b_kq, sent2.data(), sent2.size());
+        ctx.dispatch(paq, {&b_kq, &b_vq, &b_tab, &b_step, &b_kc, &b_vc}, &apc, sizeof(apc), aq_groups);
+        std::vector<uint8_t> got2(pool_bytes);
+        ctx.read(b_kq, got2.data(), got2.size());
+        // WHAT THE RULE DECIDES IS THE SCALE.  Comparing the whole 18-byte block would fail a CORRECT kernel:
+        // reordering a tie moves values between ELEMENTS, so each element's own code legitimately changes.  The
+        // scale is what the tie picks, and it must not move at all.
+        int tie_bad = 0;
+        for (uint32_t h = 0; h < kv_heads; ++h) {
+            const uint32_t row = (uint32_t) ((table[pos / (int32_t) page_size] * (int32_t) kv_heads + (int32_t) h) *
+                                                 (int32_t) page_size +
+                                             (pos % (int32_t) page_size));
+            for (uint32_t b = 0; b < groups_per_head; ++b) {
+                const size_t off = (size_t) row * bytes_per_head + b * 18;
+                if (got2[off] != got[off] || got2[off + 1] != got[off + 1]) ++tie_bad;
+            }
+        }
+        std::printf("      the +-3.5 tie, presented in the opposite order: %s\n",
+                    tie_bad == 0
+                        ? "the same SCALE bytes (the rule picks the larger VALUE, so it is order-independent)"
+                        : "a DIFFERENT scale - its sign depends on the fold order");
+        verdict("kv_q4_append: the tie rule is order-independent (the engine's determinism fix)", tie_bad == 0,
+                tie_bad, (int) (kv_heads * groups_per_head), 0.0, "a reordered tie changed the stored scale");
+        ctx.free(b_kq); ctx.free(b_vq); ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+    }
+
+    // ---- (3) THE ROUND TRIP: rotated in, quantised, gathered, compared -------------------------------------
+    {
+        const uint32_t cells = 6;
+        const int32_t first = 31;
+        std::vector<int32_t> ids(cells);
+        for (uint32_t i = 0; i < cells; ++i) ids[i] = first + (int32_t) i;
+        const uint32_t pool_bytes = (uint32_t) (rows * kv_heads * bytes_per_head);
+        Buf b_kq = ctx.alloc(pool_bytes), b_vq = ctx.alloc(pool_bytes);
+        Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(20);
+        Buf b_kc = ctx.alloc((size_t) kv_heads * head_dim * 4), b_vc = ctx.alloc((size_t) kv_heads * head_dim * 4);
+        std::vector<uint8_t> sent(pool_bytes, 0xAB);
+        ctx.write(b_kq, sent.data(), sent.size());
+        ctx.write(b_vq, sent.data(), sent.size());
+        ctx.write(b_tab, table.data(), table.size() * 4);
+        VkPipeline paq = ctx.pipeline(dir + "/kv_q4_append.spv", 6, 16);
+        const uint32_t aq_groups = (uint32_t) ((2 * kv_heads * groups_per_head + kLocalSize - 1) / kLocalSize);
+        struct { int kv_heads, head_dim, page_size, host_layout; } apc{(int) kv_heads, (int) head_dim, (int) page_size, 0};
+
+        // per cell: a raw f32 K/V row, its FWHT rotation, then the append of the ROTATED row
+        std::vector<std::vector<float>> kraw(cells), vraw(cells), krot(cells), vrot(cells);
+        std::vector<float> rot_in((size_t) kv_heads * head_dim), rot_out((size_t) kv_heads * head_dim);
+        Buf b_rot_in = ctx.alloc(rot_in.size() * 4), b_rot_out = ctx.alloc(rot_out.size() * 4);
+        VkPipeline pw = ctx.pipeline(dir + "/fwht256.spv", 2, 4);
+        struct { int n_rows; } wpc{(int) kv_heads};
+        double worst_group_d = 0;
+        for (uint32_t i = 0; i < cells; ++i) {
+            kraw[i].resize((size_t) kv_heads * head_dim);
+            vraw[i].resize((size_t) kv_heads * head_dim);
+            krot[i].resize((size_t) kv_heads * head_dim);
+            vrot[i].resize((size_t) kv_heads * head_dim);
+            for (uint32_t h = 0; h < kv_heads; ++h)
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    kraw[i][h * head_dim + d] = rndf(1.5f) + ((d % 97) == 0 ? 6.0f : 0.0f);   // an outlier channel
+                    vraw[i][h * head_dim + d] = rndf(1.5f);
+                }
+            for (int side = 0; side < 2; ++side) {                    // rotate K and V, both heads at once
+                ctx.write(b_rot_in, (side ? vraw[i] : kraw[i]).data(), rot_in.size() * 4);
+                ctx.dispatch(pw, {&b_rot_in, &b_rot_out}, &wpc, sizeof(wpc), kv_heads);
+                ctx.read(b_rot_out, (side ? vrot[i] : krot[i]).data(), rot_out.size() * 4);
+            }
+            const std::vector<int32_t> step = {ids[i], ids[i] + 1, ids[i] / 4, 8, 0};
+            ctx.write(b_step, step.data(), step.size() * 4);
+            ctx.write(b_kc, krot[i].data(), krot[i].size() * 4);
+            ctx.write(b_vc, vrot[i].data(), vrot[i].size() * 4);
+            ctx.dispatch(paq, {&b_kq, &b_vq, &b_tab, &b_step, &b_kc, &b_vc}, &apc, sizeof(apc), aq_groups);
+            // the Q4_0 error bound for this cell: |d|/2 per element, the largest over its groups
+            for (uint32_t h = 0; h < kv_heads; ++h)
+                for (uint32_t b = 0; b < groups_per_head; ++b) {
+                    const float* g = &krot[i][h * head_dim + b * 32];
+                    float amax = 0, mval = 0;
+                    for (int j = 0; j < 32; ++j) {
+                        const float a = std::fabs(g[j]);
+                        if (a > amax || (a == amax && g[j] > mval)) { amax = a; mval = g[j]; }
+                    }
+                    worst_group_d = std::max(worst_group_d, std::fabs((double) (mval / -8.0f)) / 2.0);
+                }
+        }
+
+        // the gather
+        Buf b_ids = ctx.alloc(cells * 4);
+        ctx.write(b_ids, ids.data(), ids.size() * 4);
+        std::vector<int32_t> gsteps(16, 0);
+        gsteps[1] = (int32_t) (first + cells);
+        gsteps[3] = (int32_t) cells;
+        Buf b_gstep = ctx.alloc(gsteps.size() * 4);
+        ctx.write(b_gstep, gsteps.data(), gsteps.size() * 4);
+        const uint32_t window_elems = (uint32_t) (rows * kv_heads * head_dim);
+        Buf b_k = ctx.alloc((size_t) window_elems * 2), b_v = ctx.alloc((size_t) window_elems * 2);
+        std::vector<uint16_t> sent_win(window_elems, SENT);
+        ctx.write(b_k, sent_win.data(), sent_win.size() * 2);
+        ctx.write(b_v, sent_win.data(), sent_win.size() * 2);
+        struct { int kv_heads, head_dim, page_size; } gpc{(int) kv_heads, (int) head_dim, (int) page_size};
+        VkPipeline pgq = ctx.pipeline(dir + "/kv_q4_gather.spv", 7, 12);
+        const uint32_t g_groups = (uint32_t) ((cells * kv_heads * groups_per_head + kLocalSize - 1) / kLocalSize);
+        ctx.dispatch(pgq, {&b_kq, &b_vq, &b_tab, &b_ids, &b_gstep, &b_k, &b_v}, &gpc, sizeof(gpc), g_groups);
+        std::vector<uint16_t> win_k(window_elems), win_v(window_elems);
+        ctx.read(b_k, win_k.data(), win_k.size() * 2);
+        ctx.read(b_v, win_v.data(), win_v.size() * 2);
+
+        // how close is the gathered (rotated, quantised, dequantised) window to the rotated original?
+        double worst_abs = 0;
+        int nonfinite = 0;
+        for (uint32_t i = 0; i < cells; ++i)
+            for (uint32_t h = 0; h < kv_heads; ++h)
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t j = ((size_t) i * kv_heads + h) * head_dim + d;
+                    const double g = (double) strata::kernels::f32_from_f16(win_k[j]);
+                    if (!std::isfinite(g)) ++nonfinite;
+                    worst_abs = std::max(worst_abs, std::fabs(g - (double) krot[i][h * head_dim + d]));
+                }
+        std::printf("      round trip: worst |gathered - rotated original| %.4g, vs the Q4_0 bound |d|/2 = %.4g "
+                    "(non-finite %d)\n", worst_abs, worst_group_d, nonfinite);
+        verdict("kv_q4 round trip: append (rotated) -> gather, inside the Q4_0 group bound",
+                worst_abs <= worst_group_d * 1.001 + 1e-6 && nonfinite == 0,
+                (int) (worst_abs > worst_group_d * 1.001 + 1e-6 || nonfinite != 0), (int) (cells * kv_heads * head_dim),
+                worst_abs, "outside the group's own error bound (|d|/2) or non-finite");
+
+        // ---- (4) THE DESIGN CLAIM, through the real attention kernel ---------------------------------------
+        // "<Hq, Hk> = <q, k> and the attention output is rotated back" - so attention on rotated inputs, with the
+        // output de-rotated, is the SAME as attention on the originals.  Run both and compare.  The mask survives
+        // because it is added to the SCORES, which the rotation does not change.
+        {
+            std::vector<float> q((size_t) 24 * 256);
+            for (float& v : q) v = rndf(1.0f);
+            std::vector<uint16_t> mb(256);
+            for (uint32_t c = 0; c < 256; ++c) mb[c] = f16_from_f32(rndf(0.6f));
+
+            // path A: the ORIGINALS, in the port's own window layout (built straight from the raw rows)
+            std::vector<uint16_t> wok(window_elems, SENT), wov(window_elems, SENT);
+            for (uint32_t i = 0; i < cells; ++i)
+                for (uint32_t h = 0; h < kv_heads; ++h)
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        const size_t j = ((size_t) i * kv_heads + h) * head_dim + d;
+                        wok[j] = f16_from_f32(kraw[i][h * head_dim + d]);
+                        wov[j] = f16_from_f32(vraw[i][h * head_dim + d]);
+                    }
+            std::vector<double> want((size_t) 24 * 256, 0.0);
+            attn_ref_24x256(want, q, wok, wov, mb, cells);
+            Buf b_q = ctx.alloc(q.size() * 4), b_m = ctx.alloc(512), b_o = ctx.alloc((size_t) 24 * 256 * 4);
+            Buf b_wk = ctx.alloc((size_t) window_elems * 2), b_wv = ctx.alloc((size_t) window_elems * 2);
+            ctx.write(b_q, q.data(), q.size() * 4);
+            ctx.write(b_m, mb.data(), 512);
+            ctx.write(b_wk, wok.data(), wok.size() * 2);
+            ctx.write(b_wv, wov.data(), wov.size() * 2);
+            std::vector<float> nanp((size_t) 24 * 256, std::numeric_limits<float>::quiet_NaN());
+            ctx.write(b_o, nanp.data(), nanp.size() * 4);
+            VkPipeline pattn = ctx.pipeline(dir + "/attn_decode_short.spv", 5, 8);
+            struct { uint32_t width, use_mask; } attpc{cells, 1u};
+            ctx.dispatch(pattn, {&b_q, &b_wk, &b_wv, &b_m, &b_o}, &attpc, sizeof(attpc), 24);
+            std::vector<float> got_a((size_t) 24 * 256);
+            ctx.read(b_o, got_a.data(), got_a.size() * 4);
+            int bad = 0;
+            double worst = 0;
+            for (size_t i = 0; i < got_a.size(); ++i) {
+                const double rel = std::fabs((double) got_a[i] - want[i]) / (std::fabs(want[i]) + 1e-30);
+                worst = std::max(worst, rel);
+                if (!(rel <= 1e-4 || std::fabs((double) got_a[i] - want[i]) <= 1e-5)) ++bad;
+            }
+            verdict("kv_q4 rot: the unrotated path is the reference the rotated one must match", bad == 0, bad,
+                    (int) got_a.size(), worst, "values outside tolerance (worst rel err)");
+
+            // path B: rotate q, use the GATHERED (rotated) window, then de-rotate the output
+            std::vector<float> qrot((size_t) 24 * 256);
+            Buf b_q_in = ctx.alloc(q.size() * 4), b_q_out = ctx.alloc(q.size() * 4);
+            ctx.write(b_q_in, q.data(), q.size() * 4);
+            struct { int n_rows; } qpc{24};
+            ctx.dispatch(pw, {&b_q_in, &b_q_out}, &qpc, sizeof(qpc), 24);
+            ctx.read(b_q_out, qrot.data(), qrot.size() * 4);
+            ctx.write(b_q, qrot.data(), qrot.size() * 4);
+            ctx.write(b_o, nanp.data(), nanp.size() * 4);
+            ctx.dispatch(pattn, {&b_q, &b_k, &b_v, &b_m, &b_o}, &attpc, sizeof(attpc), 24);
+            std::vector<float> out_rot((size_t) 24 * 256);
+            ctx.read(b_o, out_rot.data(), out_rot.size() * 4);
+            Buf b_or = ctx.alloc(out_rot.size() * 4), b_ob = ctx.alloc(out_rot.size() * 4);
+            ctx.write(b_or, out_rot.data(), out_rot.size() * 4);
+            struct { int n_rows; } opc{24};
+            ctx.dispatch(pw, {&b_or, &b_ob}, &opc, sizeof(opc), 24);
+            std::vector<float> out_back((size_t) 24 * 256);
+            ctx.read(b_ob, out_back.data(), out_back.size() * 4);
+
+            int bad_b = 0;
+            double worst_b = 0, worst_abs_b = 0;
+            for (size_t i = 0; i < out_back.size(); ++i) {
+                const double g = (double) out_back[i];
+                const double rel = std::fabs(g - want[i]) / (std::fabs(want[i]) + 1e-30);
+                worst_b = std::max(worst_b, rel);
+                const double abs_err = std::fabs(g - want[i]);      // THIS element's, not the running maximum
+                worst_abs_b = std::max(worst_abs_b, abs_err);
+                // The tolerance is the Q4_0 group bound carried through the attention: each window row is off by at
+                // most |d|/2, the output is a convex combination of them, and the SCORES also move slightly (they
+                // come from quantised K), which shifts the weights - hence the allowance, of which the measured
+                // worst error uses about a third.
+                if (!(rel <= 1e-2 || abs_err <= 4.0 * worst_group_d)) ++bad_b;
+            }
+            std::printf("      THE DESIGN CLAIM: rotate q, quantise+rotate K/V to Q4_0, attend, de-rotate -> "
+                        "worst rel %.3g / abs %.3g vs the unrotated attention (Q4_0 bound %.3g)\n",
+                        worst_b, worst_abs_b, worst_group_d);
+            verdict("kv_q4 rot: rotate(q,K,V) + Q4_0 + de-rotate == attention on the originals, within the "
+                    "quantisation error", bad_b == 0, bad_b, (int) out_back.size(), worst_b,
+                    "the rotated path does not reproduce the unrotated attention inside the Q4_0 bound");
+            ctx.free(b_q); ctx.free(b_m); ctx.free(b_o); ctx.free(b_wk); ctx.free(b_wv);
+            ctx.free(b_q_in); ctx.free(b_q_out); ctx.free(b_or); ctx.free(b_ob);
+        }
+        ctx.free(b_kq); ctx.free(b_vq); ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+        ctx.free(b_ids); ctx.free(b_gstep); ctx.free(b_k); ctx.free(b_v);
+        ctx.free(b_rot_in); ctx.free(b_rot_out);
+    }
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -7376,6 +7795,7 @@ int main(int argc, char** argv) {
     case_kv_f16_gather(ctx, dir);          // the f16 KV gather: the window the attention reads, and the grid rule
     case_qsa_select(ctx, dir);             // the selection: block scores + the weighted top-k, and the chain to attention
     case_kv_f16_append(ctx, dir);          // the KV append: the cache's write half, chained into the gather
+    case_kv_q4_rot(ctx, dir);              // the Q4_0 KV path: the FWHT rotation, the group rule, the design claim
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

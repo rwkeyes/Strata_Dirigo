@@ -1,0 +1,82 @@
+// ports/vulkan/shaders/kv_q4_gather.comp - the Q4_0 KV gather: the selected cells dequantised into FP16 scratch.
+// Ported from src/kernels/cuda/kv_q4.cu (`kv_gather_q4_kernel`).  The reader half of the Q4_0 pair whose writer is
+// kv_q4_append; the scratch it produces is the `[id][kv_head][head_dim]` window the attention already reads, so the
+// storage format is the only thing this changes.
+//
+//     block b of a row:  { uint16 d; uint8 qs[16] }
+//     value[j] = fp16(((j < 16 ? qs[j] & 0x0F : qs[j - 16] >> 4) - 8) * f32_from_f16(d))
+//
+// **NO INVERSE ROTATION HERE, and that is the design, not an omission.**  The values in the pool are H-rotated, and
+// they stay rotated: the query is rotated on the way in too, so the scores are unchanged (<Hq, Hk> = <q, k>), and the
+// attention output - a convex mix of rotated values - is rotated back ONCE at the end, by the same fwht256 kernel.
+// An implementation that de-rotated here would be doing the work twice and would also have to re-rotate the queries.
+//
+// K AND V IN ONE DISPATCH, as the source does (the q8 gather in this port takes one side per dispatch): the kernel
+// has both pools and both scratch outputs bound, and a thread owns one group of one side.
+//
+// ONE THREAD PER GROUP, looping its 32 values: the source is one thread per VALUE with 32 threads per group.  A
+// 16-byte block is read once by one thread instead of spread over 32, and the codes are unpacked in a fixed order -
+// slower per group, and the right trade for a correctness kernel (the same call the append makes).
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// The engine's fp16 conversion lives in one place (shaders/common/f16_bits.glsl).
+#include "common/f16_bits.glsl"
+#define f16_from_f32(f) f16_from_f32_port(f)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer KQ4 { uint8_t q[]; } KQ_;
+layout(set = 0, binding = 1, std430) readonly buffer VQ4 { uint8_t q[]; } VQ_;
+layout(set = 0, binding = 2, std430) readonly buffer TAB { int t[]; } TAB_;
+layout(set = 0, binding = 3, std430) readonly buffer IDS { int v[]; } IDS_;
+layout(set = 0, binding = 4, std430) readonly buffer STEP { int s[]; } STEP_;
+layout(set = 0, binding = 5, std430) buffer KSCRATCH { uint16_t y[]; } KS_;
+layout(set = 0, binding = 6, std430) buffer VSCRATCH { uint16_t y[]; } VS_;
+
+layout(push_constant) uniform Pc {
+    int kv_heads;
+    int head_dim;
+    int page_size;
+} pc;
+
+const int QK4_0 = 32;
+const int BLOCK_BYTES = 18;
+
+void main() {
+    const int n_ids = STEP_.s[3];                     // kStepWidth: the live count, from the buffer
+    const int groups_per_head = pc.head_dim / QK4_0;
+    const int per_cell = pc.kv_heads * groups_per_head;
+    const int total = n_ids * per_cell;
+    const int blk = int(gl_GlobalInvocationID.x);
+    if (blk >= total) return;                          // the grid is the capacity; surplus threads exit
+
+    const int id = blk / per_cell;
+    const int rem = blk - id * per_cell;
+    const int h = rem / groups_per_head;
+    const int b = rem - h * groups_per_head;
+
+    const int cell = IDS_.v[id];
+    const int page = TAB_.t[cell / pc.page_size];
+    const int row = (page * pc.kv_heads + h) * pc.page_size + (cell % pc.page_size);   // the row already has the head
+    const int off = row * (groups_per_head * BLOCK_BYTES) + b * BLOCK_BYTES;
+
+    // Widening a half to float is exact, so the builtin cannot round differently from the engine here.
+    const float kd = unpackHalf2x16(uint(KQ_.q[off] | (uint(KQ_.q[off + 1]) << 8))).x;
+    const float vd = unpackHalf2x16(uint(VQ_.q[off] | (uint(VQ_.q[off + 1]) << 8))).x;
+
+    const int dst = (id * pc.kv_heads + h) * pc.head_dim + b * QK4_0;
+    for (int j = 0; j < QK4_0; ++j) {
+        const uint8_t kb = KQ_.q[off + 2 + (j & 15)];
+        const uint8_t vb = VQ_.q[off + 2 + (j & 15)];
+        const int kc = (j < 16) ? int(kb & 0x0Fu) : int(kb >> 4);
+        const int vc = (j < 16) ? int(vb & 0x0Fu) : int(vb >> 4);
+        KS_.y[dst + j] = uint16_t(f16_from_f32(float(kc - 8) * kd));
+        VS_.y[dst + j] = uint16_t(f16_from_f32(float(vc - 8) * vd));
+    }
+}
+

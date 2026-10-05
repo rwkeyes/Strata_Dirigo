@@ -481,9 +481,70 @@ is a limit on the test suite**, and it fails at whichever implementation is exer
 
 
 
+## THE ATTENTION BLOCK, KERNEL 5: the Q4_0 KV path - a rotation the design depends on, and a design claim gated
+
+**What was ported.**  Three pieces of `src/kernels/cuda/kv_q4.cu`: `fwht256_kernel` (the orthonormal 256-point
+Walsh-Hadamard rotation), `kv_append_q4_kernel` with its `q4_group`/`q4_store` pair (ggml's Q4_0 group, with the
+engine's deterministic tie rule), and `kv_gather_q4_kernel` (the dequantising reader).  The KV storage formats now
+match the engine's three - f16, q8 and q4_0.
+
+**THE DESIGN IS THE INTERESTING PART, and the gate tests the design, not just the kernels.**  From `kv_q4.hpp`: K
+and V are rotated by H before quantisation, the QUERY is rotated too, so `<Hq, Hk> = <q, k>` and the scores are
+unchanged, and the attention output - a convex mix of rotated values - is rotated back once at the end.  That is why
+the gather does NOT inverse-rotate: the whole path lives in the rotated basis, and the only reason it is legal is
+that H is ORTHONORMAL.  A rotation that merely "spreads outliers" would change every score.
+
+**The rotation is gated three ways, because one of them cannot see the most likely bug:**
+
+    the numbers against an EXPLICIT Hadamard matrix  H[i][j] = (-1)^popcount(i & j) / 16
+    H(Hx) = x           (||H(Hx) - x||/||x|| <= 1e-6 measured 1.1e-07)
+    <Hx,Hx> = <x,x>     (2.26e-08 relative)
+    + the design claim itself, through the real attention kernel (below)
+
+A double-precision rerun of the butterflies would share the port's own STRUCTURE, and the two invariants cannot see
+a flipped sign convention either - the other convention is ALSO orthogonal and self-inverse, merely a different
+basis with wrong scores.  Only the explicit matrix pins the convention, and the injection proves the point: flipping
+the butterfly branches fails that arm while both invariants still pass.
+
+**The group rule, and the one detail a paraphrase gets wrong:** the scale comes from the SIGNED EXTREME
+(`d = mval / -8`, where `mval` is the value of largest magnitude and, among equals, the LARGER value), not from
+`|max|`.  The sign is what maps the extreme to the bottom of the code range with an offset of 8; taking `|max|`
+gives a positive scale and a wrong code set - "a bit more quantisation noise" to a perplexity run, a wrong basis in
+the cache.  Codes are `trunc(x/d + 8.5)` clamped to 0..15 (TRUNCATED, not rounded), the tie rule is what makes the
+result independent of a fold order (the engine added it on merge), and - unlike this port's q8 append, which
+quantises against the STORED f16 scale - the codes here use the EXACT f32 scale while the stored one is f16.  Two
+sibling kernels, two conventions, both faithful to their sources; the gate pins each where it belongs.
+
+**Evidence.**  Arc: **233 passed / 0 failed / 0 skipped**.  Five special groups compared bit for bit against a host
+transcription of the rule (a plain group, a `+3.5/-3.5` tie, a subnormal scale, an all-zero group, one whose codes
+clamp), with the 288 bytes of the cell verified by POSITION and 0 stray bytes elsewhere.  The tie arm re-presents
+the same values in the opposite order and requires the SCALE to be identical - deliberately not the whole block,
+because reordering a tie moves values between elements and each element's own code legitimately changes (the first
+version of this arm compared all 18 bytes and failed a correct kernel).  Round trip: the gathered window is within
+**0.4719** of the rotated original against the group's own bound `|d|/2 = 0.4742`.  And the design claim, run
+through the actual attention kernel: rotate q, quantise+rotate K/V to Q4_0, attend, de-rotate - worst absolute
+deviation **0.644** from the unrotated attention, against a window that is itself off by up to 0.474.
+
+**Falsified:** the scale from `|max|`; codes rounded instead of truncated; the butterfly's sign convention flipped
+(caught by the matrix arm alone - see above); the nibble halves swapped in the reader.
+
+**A fixture bug worth recording, because its symptom looked like a kernel failure.**  The Q4 pool was sized
+`rows * bytes_per_head`, but the row index CARRIES the head (`(page*kv_heads + h)*page_size + off`), so the pool
+needs `rows * kv_heads * bytes_per_head` - the appends then wrote entirely beyond the buffer, a driver silently
+dropped them, and the gate reported a pool that was never written.  The f16 and q8 pools in this port had the same
+row formula and did NOT have this bug, because their element counts happen to include the head factor; a
+byte-per-head layout is where the factor becomes easy to lose.
+
+**What the Q4 path still needs.**  The prompt-path batch append (`kv_append_q4_batch_kernel`, with its staging pool),
+`kv_hybrid` (q4 for V, q8 for K - `kv_hybrid_parity.cpp` is the engine's own reference for it), the ring/staging
+machinery in `kv_stream.cu`, and the per-token q4 path's rotation call sites in `prefill.cpp` (which is where the
+query and the attention output get their FWHT).
+
+
+
 ## RESUME HERE (state as of the last commit)
 
-**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 63 kernels, 18 shared includes, one
+**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one
 generated table file (four IQ grids). The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh`,
 which compiles every shader from source - and this line has gone stale three times in two days, so run it rather
 than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 / 0 on RADV and on radeon, 154 /

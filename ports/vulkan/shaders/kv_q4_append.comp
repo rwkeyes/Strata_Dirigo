@@ -1,0 +1,117 @@
+// ports/vulkan/shaders/kv_q4_append.comp - the Q4_0 KV append: one 32-value group quantised and stored.
+// Ported from src/kernels/cuda/kv_q4.cu (`kv_append_q4_kernel` and the `q4_group` / `q4_store` pair it calls);
+// the rules are kv_q4.hpp's, and they are ggml's Q4_0 reference with one addition the engine's merge made:
+//
+//     the group's scale comes from the SIGNED EXTREME, not the absolute maximum:
+//         mval = the value with the largest |x|, and among equals the LARGER value      <- the deterministic part
+//         d    = mval / -8
+//         code = trunc(x / d + 8.5) clamped to 0..15        (truncation toward zero, not rounding)
+//     and a group's 32 codes are stored as 16 bytes: element j in the LOW nibble of qs[j], element j+16 in the high
+//     one.  The reader subtracts 8 from each code and multiplies by the scale.
+//
+// WHY THE SIGNED EXTREME: the scale is negative when the extreme is positive, so the extreme always maps to the
+// bottom of the code range and the group's whole span fits in 4 bits with an offset of 8.  Taking |max| instead
+// gives a positive scale and a different (wrong) code set - the kind of error that looks like "a bit more quantisation
+// noise" in a perplexity run and is a wrong basis in the KV cache.
+//
+// WHY THE TIE RULE: two values with equal magnitude but opposite signs decide the scale's SIGN.  "The larger value
+// wins" is order-independent, so the result does not depend on the order a warp happens to reduce in - the engine
+// added it on merge for exactly that reason.  This port folds the 32 values in a fixed order, which is deterministic
+// by construction, and the case pins the rule with a +x / -x tie.
+//
+// ONE THREAD PER GROUP, looping its 32 values - the same decomposition choice the q8 append makes here (the source
+// uses 32 threads and two `__shfl` reductions).  A maximum is exact regardless of reduction order, and the tie rule
+// makes even the choice exact, so nothing is lost; the reduction is the optimisation to make later.
+//
+// THE POOL IS ADDRESSED AS BYTES, because a block is `{ uint16 d; uint8 qs[16]; }` = 18 bytes with the scale
+// INTERLEAVED rather than in a separate array - unlike the q8 pool, which keeps its scales apart.  Two byte writes
+// for the scale assume little-endian, which every platform this port targets is and which the engine's own host
+// paths assume too.
+//
+// TWO DESTINATIONS AND A NEGATIVE PAGE, as in the f16 and q8 appends: `host_layout` selects the identity row formula
+// (always written, the KV-streaming host copy) and a negative page means NO write at all.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+#include "common/f16_bits.glsl"
+#define f16_from_f32(f) f16_from_f32_port(f)
+
+layout(set = 0, binding = 0, std430) buffer KQ4 { uint8_t q[]; } KQ_;
+layout(set = 0, binding = 1, std430) buffer VQ4 { uint8_t q[]; } VQ_;
+layout(set = 0, binding = 2, std430) readonly buffer TAB { int t[]; } TAB_;
+layout(set = 0, binding = 3, std430) readonly buffer STEP { int s[]; } STEP_;
+layout(set = 0, binding = 4, std430) readonly buffer KC { float x[]; } KC_;
+layout(set = 0, binding = 5, std430) readonly buffer VC { float x[]; } VC_;
+
+layout(push_constant) uniform Pc {
+    int kv_heads;
+    int head_dim;
+    int page_size;
+    int host_layout;
+} pc;
+
+const int QK4_0 = 32;                  // values per group
+const int BLOCK_BYTES = 18;            // uint16 scale + 16 code bytes
+
+void main() {
+    const int groups_per_head = pc.head_dim / QK4_0;
+    const int per = pc.kv_heads * groups_per_head;
+    const int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= 2 * per) return;                       // K and V share the grid, one group each
+    const bool is_v = idx >= per;
+    const int rem = is_v ? (idx - per) : idx;
+    const int h = rem / groups_per_head;
+    const int b = rem - h * groups_per_head;
+
+    const int pos = STEP_.s[0];                       // kStepPos == 0
+
+    int row;
+    if (pc.host_layout != 0) {
+        row = ((pos / pc.page_size) * pc.kv_heads + h) * pc.page_size + (pos % pc.page_size);
+    } else {
+        const int page = TAB_.t[pos / pc.page_size];
+        if (page < 0) return;                         // not resident: NO write, to either layout
+        row = (page * pc.kv_heads + h) * pc.page_size + (pos % pc.page_size);
+    }
+
+    const int base = h * pc.head_dim + b * QK4_0;
+    // The group's signed extreme, folded in index order: `a > amax || (a == amax && x > mval)` picks the largest
+    // value among those of maximal magnitude, which is what makes the result independent of the fold order.
+    float amax = 0.0, mval = 0.0;
+    for (int j = 0; j < QK4_0; ++j) {
+        const float x = is_v ? VC_.x[base + j] : KC_.x[base + j];
+        const float a = abs(x);
+        if (a > amax || (a == amax && x > mval)) { amax = a; mval = x; }
+    }
+    const float d = mval / -8.0;
+    const float id = (d != 0.0) ? (1.0 / d) : 0.0;
+
+    const int bytes_per_head = groups_per_head * BLOCK_BYTES;
+    const int off = row * bytes_per_head + b * BLOCK_BYTES;
+    const uint16_t sbits = uint16_t(f16_from_f32(d));
+    if (is_v) {
+        VQ_.q[off] = uint8_t(sbits & 0xFFu);
+        VQ_.q[off + 1] = uint8_t(sbits >> 8);
+    } else {
+        KQ_.q[off] = uint8_t(sbits & 0xFFu);
+        KQ_.q[off + 1] = uint8_t(sbits >> 8);
+    }
+
+    for (int j = 0; j < 16; ++j) {
+        // truncation toward zero, as the source's `__float2int_rz`: `int()` in GLSL truncates, and the +8.5 offset
+        // is what turns a signed range into 0..15 codes.
+        const float xlo = is_v ? VC_.x[base + j] : KC_.x[base + j];
+        const float xhi = is_v ? VC_.x[base + j + 16] : KC_.x[base + j + 16];
+        const int qlo = int(clamp(xlo * id + 8.5, 0.0, 15.0));
+        const int qhi = int(clamp(xhi * id + 8.5, 0.0, 15.0));
+        const uint8_t byte = uint8_t(qlo | (qhi << 4));         // element j low, element j+16 high
+        if (is_v) VQ_.q[off + 2 + j] = byte;
+        else KQ_.q[off + 2 + j] = byte;
+    }
+}
