@@ -48,11 +48,10 @@
 //                                   `native_gdn_step`, `native_gdn_out_norm` at layer.cpp:297/308/324) AND the
 //                                   THREE fused paths `fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm`
 //                                   (layer.cpp:250/287/322, additionally gated on `g_fused_gdn` and
-//                                   `native_bf16_projections`).  This backend has ported the first three
-//                                   (`gdn_conv_silu`, `gdn_l2_norm`, `beta_gate` shaders); the other THREE GDN
-//                                   kernels and ALL THREE fused paths have no shader.  Answering true would
+//                                   `native_bf16_projections`).  This backend has ported ALL SIX native GDN
+//                                   kernels; the THREE fused paths have no shader.  Answering true would
 //                                   dispatch them.  ANSWER: false - and the answer is not "nothing is
-//                                   implemented": the three ported shaders exist and are gated.  The flag stays
+//                                   implemented": all six ported shaders exist and are gated.  The flag stays
 //                                   false until EVERY symbol it selects has a shader, which is what
 //                                   `case_native_capabilities`'s gdn arm enforces (it requires the flag to equal
 //                                   "every gated symbol has a built shader").
@@ -96,12 +95,13 @@ bool native_moe_combine_enabled() { return true; } // native_moe_combine.comp, g
 void native_qsa_set_enabled(bool) { /* see the header note */ }
 bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported
 
-// ---- native GDN: the flag also gates the UNPORTED three GDN kernels + three fused paths -----------------------
-// `native_gdn_conv_silu` / `native_gdn_l2_norm` / `native_gdn_beta_gate` ARE ported and gated, but the SAME flag
-// also selects `native_gdn_gate` / `native_gdn_step` / `native_gdn_out_norm` and the three `fused_gdn_*` paths,
-// none of which has a shader - so the answer is false and must stay false while any of them is missing.  This is
-// the "symbol-at-a-time truth" rule; `case_native_capabilities`'s gdn arm asserts the invariant directly.
+// ---- native GDN: the flag also gates the UNPORTED three fused paths ----------------------------------------
+// ALL SIX native GDN kernels (`native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate`,
+// `native_gdn_gate`, `native_gdn_step`, `native_gdn_out_norm`) ARE ported and gated, but the SAME flag also
+// selects the three `fused_gdn_*` paths, none of which has a shader - so the answer is false and must stay
+// false while any of them is missing.  This is the "symbol-at-a-time truth" rule; `case_native_capabilities`'s
+// gdn arm asserts the invariant directly.
 void native_gdn_set_enabled(bool) { /* see the header note */ }
-bool native_gdn_enabled() { return false; }        // see the header note: six gated symbols unported
+bool native_gdn_enabled() { return false; }        // see the header note: the three fused_gdn_* paths are unported
 
 }  // namespace strata::kernels

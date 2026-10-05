@@ -1,0 +1,62 @@
+#version 450
+// ports/vulkan/shaders/native_gdn_out_norm.comp - the PERFORMANCE tier's native GDN closing norm, ported
+// from src/kernels/cuda/native_gdn_preprocess.cu's `out_norm` kernel (host wrapper `native_gdn_out_norm`,
+// native_gdn_preprocess.hpp:31-35), replacing the legacy `gdn_out_norm` (shaders/gdn_out_norm.comp,
+// src/kernels/cuda/gdn.cu:132-149).
+//
+// THE RULE (native_gdn_preprocess.cu:99-114), one block per row (one ROW per HEAD), over a 128-wide row:
+//
+//     partial  = sum_{col<128} x[col]^2
+//     scale    = rsqrtf(partial / S + epsilon)                     // eps on the MEAN; gamma has S floats
+//     weighted = __fmul_rn(__fmul_rn(scale, value), gamma[col])    // RMSNorm+gamma is ONE pinned fused operator
+//     out[col] = weighted * sigmoid(z[col])                        // sigmoid, NOT SiLU
+//
+// WHAT THE NATIVE BODY IS, vs the legacy kernel, stated rather than assumed:
+//
+//   * the RULE is the SAME expression as the legacy kernel's (`y = (x*inv)*gamma*sigmoid(z)`, eps on the
+//     MEAN), in the same multiply order - so this pair is a wash and is reported as one.  What differs is
+//     the ARITHMETIC PATH: the native body reduces with a 32-lane `__shfl_xor_sync` warp tree (warp
+//     partials in shared memory, the first warp combines them), where this port uses the workgroup barrier
+//     tree in common/wg_reduce.glsl (no subgroup op - the port's vendor-compatibility rule, since Intel's
+//     driver picks the SIMD width per kernel).  That is a THIRD association, and the case MEASURES the gap
+//     against the native rule's double transcription instead of claiming bit-exactness.
+//   * the host wrapper requires `cols == 128` and the eps it forwards is the caller's `epsilon` DIRECTLY
+//     (unlike `native_gdn_l2_norm`, whose wrapper passes `epsilon/S`) - so the division by S is in the
+//     kernel, which is where this shader performs it.
+//
+// THE ORACLE is the native body's rule transcribed in double by the gate case (`case_native_gdn_out_norm`);
+// the fixture carries z spanning +-20 (so the sigmoid is exercised at both ends) and the case checks
+// host-side that the SiLU reading moves the output (the gdn_parity.cpp section 4 trap) before judging.
+//
+// ONE WORKGROUP PER ROW (the port's rule, so the driver's per-kernel subgroup width cannot size a grid
+// wrongly); `heads` groups are dispatched and the row guard makes an over-dispatch harmless.  destination
+// is a separate buffer from input, exactly as the wrapper requires (disjoint spans).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer O { float v[]; } ob;   // (heads, S)
+layout(set = 0, binding = 1, std430) readonly buffer Z { float v[]; } zb;   // (heads, S)
+layout(set = 0, binding = 2, std430) readonly buffer G { float v[]; } gb;   // (S,)  gamma / ssm_norm.weight
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } yb;            // (heads, S)
+layout(push_constant, std430) uniform PC { int heads; int S; float eps; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    if (h >= uint(pc.heads)) return;   // workgroup-uniform, so every barrier below is reached by everyone
+    const uint S = uint(pc.S);
+    const uint base = h * S;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float partial = 0.0f;
+    for (uint c = lid; c < S; c += gl_WorkGroupSize.x) {
+        const float t = ob.v[base + c];
+        partial += t * t;
+    }
+    // the native body's `rsqrtf(partial / S + epsilon)`: the eps is the caller's epsilon, on the MEAN.
+    const float scale = inversesqrt(wg_sum(partial) / float(S) + pc.eps);
+    for (uint c = lid; c < S; c += gl_WorkGroupSize.x) {
+        const float value = ob.v[base + c];
+        const float weighted = (scale * value) * gb.v[c];     // the pinned RMSNorm+gamma fused operator
+        yb.v[base + c] = weighted * (1.0f / (1.0f + exp(-zb.v[base + c])));   // sigmoid(z), NOT SiLU
+    }
+}

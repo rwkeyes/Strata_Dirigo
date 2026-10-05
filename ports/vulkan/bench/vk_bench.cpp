@@ -648,6 +648,129 @@ void bench_gdn_beta_gate_pair(Ctx& ctx, const std::string& dir, int reps, int wa
     ctx.free(bb);
 }
 
+// batch 3: the remaining three native GDN / DeltaNet mixer kernels.  `native_gdn_gate` and
+// `native_gdn_out_norm` are drop-in replacements (one dispatch each side, the same work per element), so
+// their pairs are expected to be washes; `native_gdn_step` is ALSO measured against the two-dispatch legacy
+// chain it replaces (`scale_inplace` + `gdn_step`), which is the layer-level comparison.
+
+void bench_gdn_gate_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int h_v = 48;                                 // ssm_v_heads; the native wrapper is per-head, one token
+    std::vector<float> alpha = floats((size_t) h_v), dt = floats((size_t) h_v), a = floats((size_t) h_v);
+    for (auto& v : a) v = -std::fabs(v) - 0.1f;         // ssm_a = -exp(A_log)
+    Buf bA = alloc(ctx, (size_t) h_v * 4), bD = alloc(ctx, (size_t) h_v * 4), bS = alloc(ctx, (size_t) h_v * 4),
+        bG = alloc(ctx, (size_t) h_v * 4);
+    ctx.write(bA, alpha.data(), (size_t) h_v * 4);
+    ctx.write(bD, dt.data(), (size_t) h_v * 4);
+    ctx.write(bS, a.data(), (size_t) h_v * 4);
+    const uint32_t groups = (uint32_t) ((h_v + 255) / 256);
+    Timing tl;
+    {
+        // legacy gdn_gate at the shape the layer uses it: n_tokens = 1, h_v = 48 (layer.cpp:300).
+        VkPipeline p = ctx.pipeline(dir + "/gdn_gate.spv", 4, 8);
+        struct { int32_t h_vv; int32_t n_tokens; } pc{h_v, 1};
+        tl = time_kernel(ctx, p, {&bA, &bD, &bS, &bG}, &pc, sizeof(pc), groups, 1, 128, reps, warmups);
+        report("gdn_gate (legacy)", "h_v=48 n_tokens=1", tl, (double) h_v, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_gate.spv", 4, 4);
+        struct { int32_t heads; } pc{h_v};
+        tn = time_kernel(ctx, p, {&bA, &bD, &bS, &bG}, &pc, sizeof(pc), groups, 1, 128, reps, warmups);
+        report("native_gdn_gate", "heads=48", tn, (double) h_v, 0.0);
+    }
+    std::printf("XPAIR gdn_gate h_v=48 | legacy gdn_gate | native native_gdn_gate | native/legacy %.3f\n",
+                tn.med / tl.med);
+    ctx.free(bA); ctx.free(bD); ctx.free(bS); ctx.free(bG);
+}
+
+void bench_gdn_out_norm_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int h_v = 48, S = 128;                        // the native wrapper requires cols == 128
+    const size_t n = (size_t) h_v * S;
+    std::vector<float> o = floats(n), z = floats(n), sn = floats((size_t) S);
+    Buf bo = alloc(ctx, n * 4), bz = alloc(ctx, n * 4), bsn = alloc(ctx, (size_t) S * 4), by = alloc(ctx, n * 4);
+    ctx.write(bo, o.data(), n * 4);
+    ctx.write(bz, z.data(), n * 4);
+    ctx.write(bsn, sn.data(), (size_t) S * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "h_v=%d S=%d", h_v, S);
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_out_norm.spv", 4, 12);
+        struct { int32_t h_vv; int32_t S; float eps; } pc{h_v, S, 1e-6f};
+        tl = time_kernel(ctx, p, {&bo, &bz, &bsn, &by}, &pc, sizeof(pc), (uint32_t) h_v, 1, 64, reps, warmups);
+        report("gdn_out_norm (legacy)", shape, tl, (double) n, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_out_norm.spv", 4, 12);
+        struct { int32_t heads; int32_t S; float eps; } pc{h_v, S, 1e-6f};
+        tn = time_kernel(ctx, p, {&bo, &bz, &bsn, &by}, &pc, sizeof(pc), (uint32_t) h_v, 1, 64, reps, warmups);
+        report("native_gdn_out_norm", shape, tn, (double) n, 0.0);
+    }
+    std::printf("XPAIR gdn_out_norm %s | legacy gdn_out_norm | native native_gdn_out_norm | native/legacy %.3f\n",
+                shape, tn.med / tl.med);
+    ctx.free(bo); ctx.free(bz); ctx.free(bsn); ctx.free(by);
+}
+
+void bench_gdn_step_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int S = 128, h_k = 16, h_v = 48;              // the native wrapper requires S == 128
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st = floats(nstate), q = floats((size_t) h_k * S), k = floats((size_t) h_k * S),
+                        v = floats(no), gate = floats((size_t) h_v), beta = floats((size_t) h_v);
+    for (auto& g : gate) g = -std::fabs(g) - 0.5f;
+    Buf bst = alloc(ctx, nstate * 4), bq = alloc(ctx, (size_t) h_k * S * 4), bk = alloc(ctx, (size_t) h_k * S * 4),
+        bv = alloc(ctx, no * 4), bg = alloc(ctx, (size_t) h_v * 4), bb2 = alloc(ctx, (size_t) h_v * 4),
+        bo = alloc(ctx, no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    const float scale = 1.0f / std::sqrt((float) S);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "S=128 h_k=16 h_v=48 (3 MiB state)");
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_step.spv", 7, 12);
+        struct { int32_t S; int32_t h_k; int32_t h_v; } pc{S, h_k, h_v};
+        tl = time_kernel(ctx, p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pc, sizeof(pc),
+                         (uint32_t) ((no + 255) / 256), 1, 8, reps, warmups);
+        report("gdn_step (legacy)", shape, tl, (double) no, (double) no * 3.0 * (double) S);
+    }
+    Timing tn;
+    {
+        // one THREAD per column (the coalesced legacy decomposition, carrying the native arithmetic and its
+        // fused readout scale); the dispatch is groups_for(h_v * S).
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+        struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pc{S, h_k, h_v, scale};
+        tn = time_kernel(ctx, p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pc, sizeof(pc),
+                         (uint32_t) ((no + 255) / 256), 1, 8, reps, warmups);
+        report("native_gdn_step", shape, tn, (double) no, (double) no * 3.0 * (double) S);
+    }
+    std::printf("XPAIR gdn_step %s | legacy gdn_step | native native_gdn_step | native/legacy %.3f\n", shape,
+                tn.med / tl.med);
+    // THE FUSION, MEASURED.  The native body folds the `1/sqrt(S)` readout scale into the kernel; the legacy
+    // branch applies it to q in a SEPARATE `scale_inplace` dispatch (layer.cpp:276).  This row times
+    // scale_inplace + gdn_step in one recorded batch and reports native over that two-dispatch chain.  NOTE:
+    // scale is applied to q in place once per batch iteration, so q decays toward zero across the timed
+    // replays; neither kernel's cost depends on the values (no data-dependent branch), so the timing is
+    // unaffected - stated rather than hidden.
+    {
+        VkPipeline psc = ctx.pipeline(dir + "/scale.spv", 1, 8);
+        VkPipeline pst = ctx.pipeline(dir + "/gdn_step.spv", 7, 12);
+        struct { int32_t n; float s; } pcs{(int32_t) (h_k * S), scale};
+        struct { int32_t S; int32_t h_k; int32_t h_v; } pct{S, h_k, h_v};
+        Timing tc = time_two(ctx, psc, {&bq}, &pcs, sizeof(pcs), (uint32_t) ((h_k * S + 255) / 256), 1,
+                             pst, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pct, sizeof(pct),
+                             (uint32_t) ((no + 255) / 256), 1, 8, reps, warmups);
+        report("scale+gdn_step (legacy chain)", shape, tc, (double) no, (double) no * 3.0 * (double) S);
+        std::printf("XPAIR gdn_step_fused %s | legacy scale+gdn_step (2 dispatches) | native native_gdn_step (1) | "
+                    "native/chain %.3f\n", shape, tn.med / tc.med);
+    }
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -734,6 +857,10 @@ int main(int argc, char** argv) {
     bench_gdn_conv_silu_pair(ctx, dir, reps, warmups);
     bench_gdn_l2_norm_pair(ctx, dir, reps, warmups);
     bench_gdn_beta_gate_pair(ctx, dir, reps, warmups);
+    // batch 3: the remaining three native GDN / DeltaNet mixer kernels (gate, out_norm, step).
+    bench_gdn_gate_pair(ctx, dir, reps, warmups);
+    bench_gdn_out_norm_pair(ctx, dir, reps, warmups);
+    bench_gdn_step_pair(ctx, dir, reps, warmups);
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a

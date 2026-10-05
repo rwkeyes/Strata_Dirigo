@@ -1,0 +1,56 @@
+#version 450
+// ports/vulkan/shaders/native_gdn_gate.comp - the PERFORMANCE tier's native GDN gate, ported from
+// src/kernels/cuda/native_gdn_preprocess.cu's `gate_softplus` kernel (host wrapper `native_gdn_gate`,
+// native_gdn_preprocess.hpp:26-29), replacing the legacy `gdn_gate` (shaders/gdn_gate.comp,
+// src/kernels/cuda/gdn.cu:217-233).
+//
+// THE RULE (native_gdn_preprocess.cu:90-97), one thread per head:
+//
+//     value    = alpha[i] + dt[i]                                   // the native body's __fadd_rn
+//     softplus = value > 20.0f ? value : log1pf(expf(value))        // the threshold-20 branch
+//     gate[i]  = softplus * ssm_a[i]
+//
+// WHAT THE NATIVE BODY IS, vs the legacy kernel, stated rather than assumed:
+//
+//   * it is PER-HEAD ONLY and one token.  The host wrapper takes `heads` and launches ceil(heads/256)
+//     blocks; the layer calls it `native_gdn_gate(alpha, dt, ssm_a, gate, ssm_v_heads, stream)`
+//     (layer.cpp:297).  The legacy `gdn_gate` is per-(token, head) over `n_tokens * h_v` elements and the
+//     legacy branch calls it with `n_tokens = 1` (layer.cpp:300), so at THAT shape the two RULES agree
+//     element for element - this pair is expected to be a wash and the bench reports it as one.
+//   * the softplus expression is the legacy `softplus_dev`'s: `x > 20 ? x : log1p(exp(x))`.  CUDA has
+//     `log1pf`; GLSL does not, and the port proved (see gdn_gate.comp's measured history and the
+//     `vulkan-compute-shader-porting` skill) that both obvious translations fail because the DRIVER's
+//     `log` carries an ~2^-22 ABSOLUTE error near u = 1, where softplus(x) for negative x IS exp(x).
+//     The port therefore uses the same 18-term Horner `log1p_series` below z = 0.5 and the driver's
+//     `log` above - a faithful implementation of the native body's `log1pf`, not a different function.
+//
+// THE ORACLE is the native body's rule transcribed in double by the gate case (`case_native_gdn_gate`).
+// The case spans the branch (every third head is > 20) and ssm_a is NEGATIVE (as `ssm_a = -exp(A_log)`),
+// and it checks host-side that the RAW (identity) reading differs, so the falsification (dropping the
+// ssm_a factor) must bite.
+//
+// One thread per head, as the CUDA; the grid is sized to `heads`.  No barrier, no subgroup op, no atomic.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer ALPHA { float v[]; } alpha;
+layout(set = 0, binding = 1, std430) readonly buffer DT { float v[]; } dt;
+layout(set = 0, binding = 2, std430) readonly buffer SSMA { float v[]; } ssm_a;
+layout(set = 0, binding = 3, std430) buffer GATE { float v[]; } gate;
+layout(push_constant, std430) uniform PC { int heads; } pc;
+
+// softplus, with a log1p that does not rely on the driver's `log` being accurate NEAR 1 (gdn_gate.comp's
+// measured history: `log(1+exp)` and the Kahan form both failed at worst relative 4.26e-05, the series
+// below is exact to ~2e-07; sized offline against double-precision log1p before being written here).
+float log1p_series(float z) {
+    float r = 1.0f / 18.0f;
+    for (int k = 17; k >= 1; --k) r = (1.0f / float(k)) - z * r;
+    return z * r;
+}
+float log1p_s(float z) { return (z < 0.5f) ? log1p_series(z) : log(1.0f + z); }
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.heads)) return;
+    const float value = alpha.v[i] + dt.v[i];                    // the native body's __fadd_rn(alpha[i], dt[i])
+    const float softplus = (value > 20.0f) ? value : log1p_s(exp(value));
+    gate.v[i] = softplus * ssm_a.v[i];
+}

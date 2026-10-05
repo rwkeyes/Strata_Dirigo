@@ -1,0 +1,78 @@
+#version 450
+// ports/vulkan/shaders/native_gdn_step.comp - the PERFORMANCE tier's native GDN / DeltaNet recurrence,
+// ported from src/kernels/cuda/native_gdn.cu's `step` kernel (host wrapper `native_gdn_step`,
+// native_gdn.hpp:18-20), replacing the legacy `gdn_step` (shaders/gdn_step.comp,
+// src/kernels/cuda/gdn.cu:43-95).
+//
+// THE RULE (native_gdn.cu:46-81), one thread per (head, column) of the (S, h_v, S) state, in place:
+//
+//     g_val    = expf(gate[head])                                     // decay, formed ONCE
+//     kv_col   = sum_i state[(i,h,head)] * k[src*S + i]               // the UNDECAYED state dotted with k
+//     delta    = (v[head*S + col] - g_val * kv_col) * beta[head]
+//     s_i      = g_val * s_i + k[src*S + i] * delta                   // decay and rank-1 update in ONE step
+//     attn     = sum_i s_i * q[src*S + i]                             // readout against the UPDATED state
+//     output[h*S + col] = attn * scale                                // the folded 1/sqrt(S) readout scale
+//
+// WHAT THE NATIVE BODY IS, vs the legacy kernel, stated rather than assumed.  The two RULES are
+// MATHEMATICALLY THE SAME (`g * sum(state*k)` == `sum((g*state)*k)`), so no element has a different
+// intended value; what differs is the ARITHMETIC and the DISPATCH:
+//
+//   * the DECAY is folded into the rank-1 update (`g*s + k*delta`) and the `sk` contract is taken against
+//     the UNDECAYED state, then multiplied by g - where the legacy shader writes `s = state*dec` first and
+//     then contracts.  Same value, a different rounding order.
+//   * the `1/sqrt(S)` READOUT scale is FUSED into this kernel (`attn * scale`).  The legacy shader does
+//     NOT scale its readout; the legacy branch applies that factor to q in a SEPARATE `scale_inplace`
+//     launch (src/core/layer.cpp:276), so the native kernel replaces a two-dispatch sequence - that is the
+//     bench's layer-level comparison (`native_gdn_step` vs `scale_inplace` + `gdn_step`).
+//
+// THE DECOMPOSITION, AND A MEASUREMENT THAT DECIDED IT.  The native body uses ONE 32-LANE WARP per column
+// (four state rows per lane in registers, reduced with `__shfl_xor_sync`).  This port BANS subgroup ops
+// (Intel picks the SIMD width per kernel; see common/wg_reduce.glsl), so the two non-subgroup renderings
+// of that warp are (a) one WORKGROUP per column with the barrier tree, or (b) one THREAD per column with a
+// serial walk over the row axis - which is the decomposition the legacy `gdn_step` port already uses, and
+// which is COALESCED (adjacent threads read adjacent `j`), whereas (a) is not (adjacent invocations own
+// rows `i` and `i+1`, which are `h_v*S` floats apart).  (a) was built and MEASURED against the legacy
+// kernel at this shape, `bench/README.md`: **1.564x the Arc, 8.33x the Ryzen iGPU and 43.5x llvmpipe** -
+// 6144 workgroups each doing two 8-round barrier trees, at 32 cache lines per warp, is a large
+// REGRESSION, not a wash.  So the shipped port keeps the coalesced one-thread-per-column decomposition
+// (the legacy port's own note: the CUDA's warp/staging shape is a parallelism strategy, not the rule) and
+// carries the native body's ARITHMETIC and its fused readout scale.  The case's oracle is still the
+// native RULE transcribed in double.
+//
+// The head pairing is `src = h % h_k` (MODULO), the state layout is the port's (S, h_v, S) with j fastest
+// (`state[(i*h_v + h)*S + j]`).  The dispatch is one thread per column, `groups_for(h_v * S)`; the column
+// guard makes an over-dispatch harmless.  No barrier, no subgroup op, no atomic.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;     // (S, h_v, S), j fastest, in place
+layout(set = 0, binding = 1, std430) readonly buffer Q { float v[]; } qb;   // (h_k, S)
+layout(set = 0, binding = 2, std430) readonly buffer K { float v[]; } kb;   // (h_k, S)
+layout(set = 0, binding = 3, std430) readonly buffer V { float v[]; } vb;   // (h_v, S)
+layout(set = 0, binding = 4, std430) readonly buffer G { float v[]; } gb;   // (h_v,) pre-exp gate
+layout(set = 0, binding = 5, std430) readonly buffer B { float v[]; } bb;   // (h_v,)
+layout(set = 0, binding = 6, std430) buffer O { float v[]; } ob;            // (h_v, S)
+layout(push_constant, std430) uniform PC { int S; int h_k; int h_v; float scale; } pc;
+
+void main() {
+    const uint S = uint(pc.S), hv = uint(pc.h_v);
+    const uint col = gl_GlobalInvocationID.x;           // j fastest, then h: col = h*S + j
+    if (col >= S * hv) return;
+    const uint h = col / S;
+    const uint j = col % S;
+    const uint src = h % uint(pc.h_k);                  // MODULO head pairing (not h / (h_v/h_k))
+    const float g = exp(gb.v[h]);                       // the native body's `g_val = expf(gate[head])`
+    const float b = bb.v[h];
+
+    // pass 1: the contract against the UNDECAYED state (the native body's `kv_col`).
+    float kv = 0.0f;
+    for (uint i = 0u; i < S; ++i) kv += state.v[(i * hv + h) * S + j] * kb.v[src * S + i];
+    const float delta = (vb.v[h * S + j] - g * kv) * b;
+    // pass 2: the native body's single folded decay+rank-1 update, then the readout against the UPDATED state.
+    float attn = 0.0f;
+    for (uint i = 0u; i < S; ++i) {
+        const uint idx = (i * hv + h) * S + j;
+        const float s = g * state.v[idx] + kb.v[src * S + i] * delta;   // g*s + k*delta, one step
+        state.v[idx] = s;
+        attn += s * qb.v[src * S + i];
+    }
+    ob.v[h * S + j] = attn * pc.scale;                  // the native body's folded 1/sqrt(S) readout scale
+}

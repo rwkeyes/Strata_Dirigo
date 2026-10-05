@@ -24,12 +24,13 @@ BUILD="$ROOT/bench/build"
 SPV="$BUILD/spv"
 mkdir -p "$SPV"
 
-KERNELS=(gdn_conv_step gdn_l2_norm gdn_beta_gate gdn_gate gdn_step gdn_out_norm
+KERNELS=(gdn_conv_step gdn_l2_norm gdn_beta_gate gdn_gate gdn_step gdn_out_norm scale
          iq_dequant_f32 iq2s_mmvq sampler_kernel_f32
          quantize_q8_0 quantize_q8_1 quantize_q8_K
          rope_neox native_rope_apply router_top10_f32 native_router_top10
          moe_combine_f32 native_moe_combine rms_norm native_qsa_rms_norm_weighted
-         silu_f32 native_gdn_conv_silu native_gdn_l2_norm native_gdn_beta_gate)
+         silu_f32 native_gdn_conv_silu native_gdn_l2_norm native_gdn_beta_gate
+         native_gdn_gate native_gdn_out_norm native_gdn_step)
 
 rc=0
 echo "== compiling the measured kernels from source -> $SPV"

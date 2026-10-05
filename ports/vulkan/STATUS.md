@@ -1,5 +1,54 @@
 # Status — what is done, what is verified, what is not
 
+## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, the remaining three native kernels — class B batch 3 (2026-10-05)
+
+The LAST three native **GDN / DeltaNet mixer** kernels — **COMPLETING the six** — `native_gdn_gate`,
+`native_gdn_step`, `native_gdn_out_norm`, each replacing a legacy kernel already ported and gated, each oracled
+against the engine's OWN native body (`src/kernels/cuda/native_gdn_preprocess.cu` / `native_gdn.cu`), each
+MEASURED against that legacy kernel at the same shape on the same device (and, for `native_gdn_step`, against
+the two-dispatch legacy chain it replaces), with **`native_gdn_enabled()` left answering FALSE** (the flag also
+gates the three unported `fused_gdn_*` paths) and `case_native_capabilities` enforcing it.
+
+| case | rule (the engine's OWN native body = the oracle) | measured (vega Arc / box XTX) | falsified by |
+|---|---|---|---|
+| `native_gdn_gate` (3 arms h_v=48/5/300) | `native_gdn_preprocess.cu` `gate_softplus`: `softplus(alpha+dt) * ssm_a`, per-head one token; the threshold-20 branch | **48/48 w 2.79e-07**, 5/5 w 1.04e-07, 300/300 w 3.06e-07 (Arc); raw identity checked host-side to move | `native-gdn-gate-drop-ssm-a` → FAIL 0/48 w 8.89 |
+| `native_gdn_step` (2 arms 128/16/48, 128/4/8) | `native_gdn.cu` `step`: decay FOLDED into the rank-1 update, contract against the UNDECAYED state, `1/sqrt(S)` readout scale FUSED; one thread per column (see the decomposition finding) | **792576/792576 err/tol 0.00155**, 132096/132096 w 0.00107 (Arc); INTERLEAVE + dropped-scale margins | `native-gdn-step-drop-readout-scale` → FAIL 786434/792576 w 2.03e+04 |
+| `native_gdn_out_norm` (3 arms h_v=48/4/3, cols=128) | `native_gdn_preprocess.cu` `out_norm`: `(rms_norm(o) * gamma) * sigmoid(z)`, eps on the MEAN, cols==128 | **6400/6400 w 7.04e-07**, 768/768 w 6.13e-07, 640/640 w 4.92e-07 (Arc); NaN row-guard | `native-gdn-out-norm-silu-instead-of-sigmoid` → FAIL 2321/6400 w 21 |
+| `native capabilities: gdn flag` | `native_gdn_enabled()` == "every gated symbol has a built shader"; the 6 native shaders exist | **4/4** — flag **FALSE** (the 3 unported fused shaders absent) | `native-caps-gdn-true` → FAIL 3/4 |
+
+**THE MEASUREMENT (native/legacy, same shape, same device — < 1.0 is faster; full table in `bench/README.md`).**
+`native_gdn_step` is a **WIN — 0.917 Arc / 0.776 iGPU / 0.866 lvp (pair)** and **0.867 / 0.771 / 0.829 against
+the legacy `scale_inplace`+`gdn_step` chain**; it does LESS memory traffic than the legacy kernel (the legacy's
+first pass STORES the decayed state).  `native_gdn_gate` (0.901–1.044) and `native_gdn_out_norm` (0.974–1.144)
+are **WASHES** — the same work per element and, at the layer's one-token / one-row shape, no algorithmic
+difference to win.  A native kernel is not required to be faster, and a wash is reported as a finding.  **On the
+box's XTX the three cases read `native_gdn_gate` 48/48 w 3.38e-07, `native_gdn_out_norm` 6400/6400 w 6.06e-07 and
+`native_gdn_step` 792576/792576 err/tol 0.00154 — all PASS, 0 failed on every arm.**
+
+**A FINDING THE MEASUREMENT PRODUCED, and it CHANGED THE SHIPPED KERNEL.**  The native `step` body uses ONE
+32-LANE WARP per column; subgroup ops are banned here (Intel picks the SIMD width per kernel), so the warp has
+two non-subgroup renderings.  The workgroup-per-column **barrier-tree** version was built and MEASURED against
+the legacy kernel at this shape — **1.564x Arc, 8.328x Ryzen iGPU, 43.501x llvmpipe** (chain 1.471 / 8.078 /
+41.597): 6144 workgroups each doing two 8-round barrier trees with adjacent invocations `h_v*S` floats apart is
+a large REGRESSION.  So the SHIPPED port keeps the **coalesced one-thread-per-column serial** decomposition the
+legacy port already uses (the CUDA's warp shape is a parallelism strategy, not the rule) and carries the native
+arithmetic and its fused readout scale.  The variant is recorded in `NEXT.md` and `bench/README.md`, not shipped.
+
+**CAPABILITY CONTRACT.**  `native_gdn_enabled()` gates NINE symbols: the six native kernels (now ALL ported) +
+the three `fused_gdn_*` paths (also gated on `g_fused_gdn` + `native_bf16_projections`), which have no shader.
+The backend answers **false**, and the gdn arm asserts the flag equals "every gated symbol has a built shader"
+AND that the six ported shaders exist — a strict invariant (a "reachable" formulation was considered and
+rejected: it would let the engine route to an unported symbol when a setting changed).
+
+**THE MAP MOVES BY THREE ROWS:** `168 — 69 kernel, 61 host, 38 todo` → **`168 — 72 kernel, 61 host, 35 todo`**;
+`check_port_map.py` passes (`106 shaders built, 87 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.  **Gate, after the commit: vega Arc 423/0/0, lvp 411/0/3, radeon-iGPU 414/0/2 (exit 0); box
+`z820b` XTX 419/0/1 (the 1 is the pre-existing M8 skip), lvp 411/0/3, K620 414/0/2 — 0 failed on every arm**
+(+8 verdicts on each); a re-run of the box's XTX cross-arm, after the documented intermittent `budget` flake,
+read 419/0/1.  Full detail in `NEXT.md`'s top section.
+
+---
+
 ## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, first three native kernels — class B batch 2 (2026-10-05)
 
 The first three native **GDN / DeltaNet mixer** kernels — the mixer is **36 of the model's 48 layers** — each

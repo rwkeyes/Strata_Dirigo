@@ -1,10 +1,10 @@
 # Decode-path triage — the 52 `todo` rows, from the engine's own sources
 #
-# CURRENT 2026-10-05 (after the class-B batch 2): the map reads **168 = 69 kernel + 61 host + 38 todo** (the
-# class-A set is CLOSED and the performance tier is in progress: 7 of the scoreboard's class-B native fast paths
-# are ported - the four of batch 1 plus the three native GDN mixer kernels of batch 2).  M-A is RE-DEFINED over
-# the class-A set at the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted immediately below
-# are the state at `7c317c4`, kept as the record the triage was written against.
+# CURRENT 2026-10-05 (after the class-B batch 3): the map reads **168 = 72 kernel + 61 host + 35 todo** (the
+# class-A set is CLOSED and the performance tier is in progress: ALL TEN of the scoreboard's class-B native fast
+# paths are ported - the four of batch 1 plus ALL SIX native GDN / DeltaNet mixer kernels (batches 2 and 3)).  M-A
+# is RE-DEFINED over the class-A set at the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted
+# immediately below are the state at `7c317c4`, kept as the record the triage was written against.
 
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads
@@ -203,6 +203,30 @@ gains a **gdn arm** asserting the flag EQUALS "every gated symbol has a built sh
 that the three ported shaders exist.  Measured (`bench/README.md`): `native_gdn_conv_silu` is a win (0.694-0.938
 per dispatch; 0.481-0.764 against the 2-dispatch legacy chain), while `native_gdn_l2_norm` (0.938-1.039) and
 `native_gdn_beta_gate` (0.865-1.068) are WASHES - the same work per element, no algorithmic difference to win.
+
+### Class B, batch 3: the GDN / DeltaNet MIXER's REMAINING three native fast paths (2026-10-05)
+
+The third batch COMPLETES the six native GDN kernels.  `native_gdn_gate` (replaces `gdn_gate`),
+`native_gdn_out_norm` (replaces `gdn_out_norm`) and `native_gdn_step` (replaces `gdn_step`) are each oracled
+against the engine's OWN native body (`native_gdn_preprocess.cu` / `native_gdn.cu`), not the legacy rule.
+`native_gdn_step` also fuses a SECOND dispatch the legacy branch runs (`scale_inplace`, layer.cpp:276), so it is
+measured against that two-dispatch chain too.  **`native_gdn_enabled()` STILL answers FALSE**, because that ONE
+flag also gates the THREE `fused_gdn_*` paths this tree has no shader for (`fused_gdn_conv_l2` / `fused_gdn_ab` /
+`fused_gdn_step_norm` at layer.cpp:250/287/322, the latter also gated on `g_fused_gdn` +
+`native_bf16_projections`).  The gdn arm of `case_native_capabilities` asserts the flag equals "every gated
+symbol has a built shader" and that all SIX ported shaders exist - the strict form, deliberately: a "reachable
+symbols" reading would let the flag answer true here (the fused paths need settings this backend never sets) and
+could route the engine at an unported symbol when a setting changed.
+
+Measured (`bench/README.md`): `native_gdn_step` is a WIN - **0.917 / 0.776 / 0.866** against `gdn_step` and
+**0.867 / 0.771 / 0.829** against the legacy chain (Arc / Ryzen iGPU / llvmpipe) - because it moves ~a third less
+state traffic (the legacy kernel's first pass stores the decayed state; the native contracts the UNDECAYED state
+and folds the decay into the second pass).  `native_gdn_gate` (0.901-0.998) and `native_gdn_out_norm`
+(0.974-1.000) are WASHES.  **A finding that changed the shipped kernel:** the native `step` body is one 32-lane
+warp per column; with subgroup ops banned, its workgroup-per-column BARRIER-TREE rendering was built and timed at
+**1.564x Arc / 8.328x iGPU / 43.501x llvmpipe** the legacy kernel, so the port ships the coalesced
+one-thread-per-column serial decomposition instead, carrying the native arithmetic and the fused readout scale.
+The remaining GDN holes in the map are the three `fused_gdn_*` paths and the `_multi` variants.
 
 ## Class C — the non-selected configuration (7)
 

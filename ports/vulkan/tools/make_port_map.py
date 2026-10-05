@@ -83,12 +83,19 @@ TABLE = {
     'native_qsa_rms_norm_weighted':   ('kernel', 'native_qsa_rms_norm_weighted'),   # replaces rms_norm_weighted
     # THE PERFORMANCE TIER, class B, batch 2: the first three native GDN / DeltaNet MIXER kernels (the mixer is
     # 36 of the model's 48 layers).  Each replaces a legacy kernel already ported (`gdn_conv_step` / `gdn_l2_norm`
-    # / `gdn_beta_gate`), and all three are gated by the SAME `native_gdn_enabled()` flag - which stays FALSE
-    # because the flag ALSO gates six unported symbols (`native_gdn_gate`/`_step`/`_out_norm` and the three
-    # `fused_gdn_*` paths).  See vulkan/src/kernels/native_caps_vk.cpp and case_native_capabilities.
+    # / `gdn_beta_gate`), and all are gated by the SAME `native_gdn_enabled()` flag - which stays FALSE because
+    # the flag ALSO gates the three unported `fused_gdn_*` paths.  See vulkan/src/kernels/native_caps_vk.cpp
+    # and case_native_capabilities.
     'native_gdn_conv_silu':           ('kernel', 'native_gdn_conv_silu'),      # replaces gdn_conv_step (fused + SiLU)
     'native_gdn_l2_norm':             ('kernel', 'native_gdn_l2_norm'),        # replaces gdn_l2_norm
     'native_gdn_beta_gate':           ('kernel', 'native_gdn_beta_gate'),      # replaces gdn_beta_gate
+    # THE PERFORMANCE TIER, class B, batch 3: the REMAINING three native GDN / DeltaNet MIXER kernels,
+    # COMPLETING the six.  Each replaces a legacy kernel already ported (`gdn_gate` / `gdn_out_norm` / `gdn_step`)
+    # and is gated by the same flag, which still answers FALSE because the three `fused_gdn_*` paths remain
+    # unported (the flag stays false until EVERY symbol it gates has a shader).
+    'native_gdn_gate':                ('kernel', 'native_gdn_gate'),           # replaces gdn_gate
+    'native_gdn_out_norm':            ('kernel', 'native_gdn_out_norm'),       # replaces gdn_out_norm
+    'native_gdn_step':                ('kernel', 'native_gdn_step'),           # replaces gdn_step (folds scale_inplace)
     'native_quantize_q8_1':           ('kernel', 'quantize_q8_1'),
     'ple_block':                      ('kernel', 'ple_bcast ple_conv ple_gate ple_gnorm'),
     'ple_history_advance':            ('kernel', 'ple_history_advance'),
@@ -194,9 +201,6 @@ TABLE = {
     'map_ids':                        ('todo', 'no shader in this tree yet'),
     'moe_group_resident':             ('todo', 'no shader in this tree yet'),
     'mtp_select':                     ('todo', 'no shader in this tree yet'),
-    'native_gdn_gate':                ('todo', 'no shader in this tree yet'),
-    'native_gdn_out_norm':            ('todo', 'no shader in this tree yet'),
-    'native_gdn_step':                ('todo', 'no shader in this tree yet'),
     'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),
     'native_qsa_gate_apply':          ('todo', 'no shader in this tree yet'),
     'native_qsa_indexer_append':      ('todo', 'no shader in this tree yet'),

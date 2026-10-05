@@ -1,5 +1,88 @@
 # Start here next session
 
+## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, the remaining three native kernels — class B batch 3 — **DONE 2026-10-05**
+
+This increment ports the **last three native fast paths** of the model's GDN / DeltaNet mixer — the mixer runs
+on **36 of the model's 48 layers** (`gdn_layer`, `src/core/layer.cpp:223`), so it is where the decode step
+spends most of its layers — **COMPLETING the six**.  `native_gdn_gate`, `native_gdn_step` and
+`native_gdn_out_norm` each replace a legacy kernel already ported and gated, each is **oracled against the
+engine's OWN native body** (`src/kernels/cuda/native_gdn_preprocess.cu` / `native_gdn.cu`, not the legacy
+rule), each is **MEASURED against that legacy kernel at the same shape on the same device** and, for the one
+that fuses a second dispatch, against the **legacy dispatch chain** (`ports/vulkan/bench/`), and
+**`native_gdn_enabled()` is deliberately left answering FALSE** with `case_native_capabilities` extended to
+enforce that the answer keeps describing what is actually implemented.
+
+**THE THREE SYMBOLS, and the oracle each was transcribed from:**
+
+| symbol (shader) | replaces | the native body's rule (oracle) | case |
+|---|---|---|---|
+| `native_gdn_gate` | `gdn_gate` | `native_gdn_preprocess.cu`'s `gate_softplus` (`:90-97`): `gate[h] = softplus(alpha[h] + dt[h]) * ssm_a[h]`, the threshold-20 branch `x > 20 ? x : log1p(exp(x))`. **PER-HEAD, one token** (the layer calls it with `heads = ssm_v_heads`, layer.cpp:297); the legacy kernel is per-(token,head) and the legacy branch calls it with `n_tokens = 1` (layer.cpp:300), so at THAT shape the two RULES agree | 3 arms (h_v = 48 / 5 / 300); vs the native rule's double softplus; ssm_a NEGATIVE as `-exp(A_log)`, every third head past the branch; raw-identity margin checked host-side |
+| `native_gdn_step` | `gdn_step` | `native_gdn.cu`'s `step` (`:46-81`): the SAME recurrence with the decay FOLDED into the rank-1 update (`s = g*s + k*delta`), the `sk` contract taken against the **UNDECAYED** state, and the `1/sqrt(S)` **readout scale FUSED** into the kernel — which the legacy branch applies in a SEPARATE `scale_inplace` launch (layer.cpp:276) | 2 arms (S=128 h_k=16 h_v=48 / h_k=4 h_v=8; the native wrapper requires S==128); o + state vs the native rule in double; INTERLEAVE-pairing and dropped-scale margins checked host-side |
+| `native_gdn_out_norm` | `gdn_out_norm` | `native_gdn_preprocess.cu`'s `out_norm` (`:99-114`): `y = rms_norm(o, eps) * gamma * sigmoid(z)`, ONE RMS per head, eps on the **MEAN** (`partial/S + eps`), `(scale*value)*gamma` then `* sigmoid` — the SAME expression as the legacy kernel; the wrapper requires **cols == 128** and forwards eps DIRECTLY (unlike `l2_norm`'s eps/S) | 3 arms (h_v = 48 / 4 / 3, all cols=128); vs the native rule's double transcription; SiLU-vs-sigmoid margin (the `gdn_parity.cpp` §4 trap) checked host-side; NaN row-guard |
+
+**THE MEASUREMENT — native vs legacy, same shape, same device (`XPAIR` lines; ratio is native/legacy, so < 1.0
+means the native kernel is faster).**  The step's pair is a WIN (it does LESS memory traffic than the legacy
+kernel: the legacy's first pass STORES the decayed state, the native keeps the undecayed state and folds `g`
+into the second pass); the other two are washes, as expected for drop-in replacements:
+
+| pair (native ← legacy) | Arc B70 | Ryzen iGPU | XTX (box) | K620 (box) | llvmpipe (vega/box) |
+|---|---:|---:|---:|---:|---:|
+| `native_gdn_gate` ← `gdn_gate` | 0.998 | 0.901 | 1.044 | 1.037 | 0.980 / 1.042 |
+| `native_gdn_out_norm` ← `gdn_out_norm` | 0.995 | 1.000 | 1.144 | 1.020 | 0.974 / 0.979 |
+| `native_gdn_step` ← `gdn_step` | **0.917** | **0.776** | **0.946** | **0.724** | 0.866 / 0.943 |
+| `native_gdn_step` ← `scale_inplace`+`gdn_step` (the 2-dispatch chain it replaces) | **0.867** | **0.771** | 1.022 | **0.724** | 0.829 / 0.869 |
+
+`native_gdn_step` wins against the legacy kernel on EVERY GPU (0.724-0.946) and against the two-dispatch chain on
+five of the six (0.724-0.869); the exception is the XTX, where the chain reads **1.022** — the XTX's step is fast
+and memory-bound (0.098 ms) and the extra `scale_inplace` dispatch (2048 q elements) fits inside the same
+fence-clock window, so the fused kernel's advantage is inside run noise there.  Both rows are printed.
+
+**THE STEP'S DECOMPOSITION, AND A MEASUREMENT THAT DECIDED IT.**  The native body uses ONE 32-LANE WARP per
+column (four state rows per lane in registers, reduced with `__shfl_xor_sync`).  Subgroup ops are BANNED in this
+port (Intel picks the SIMD width per kernel — see `common/wg_reduce.glsl`), so the warp has two non-subgroup
+renderings: a **workgroup-per-column barrier tree**, or the **coalesced one-thread-per-column serial walk** the
+legacy `gdn_step` port already uses.  The barrier-tree version was BUILT AND MEASURED against the legacy kernel
+at this shape — **1.564x the Arc, 8.328x the Ryzen iGPU and 43.501x llvmpipe** (chain 1.471 / 8.078 / 41.597) —
+because 6144 workgroups each doing two 8-round barrier trees, with adjacent invocations owning rows `h_v*S`
+floats apart (32 cache lines per warp), is a large REGRESSION, not a wash.  So the SHIPPED port keeps the
+coalesced serial decomposition (the legacy port's own note: the CUDA's warp/staging shape is a parallelism
+strategy, not the rule) and carries the native ARITHMETIC and its fused readout scale; the case's oracle is
+still the native RULE.  **The measurement is the finding; the barrier-tree variant is recorded here and in
+`bench/README.md`, not shipped.**
+
+**THE CAPABILITY DISCIPLINE — `native_gdn_enabled()` STILL answers FALSE, and the case enforces WHY.**  This ONE
+flag gates NINE symbols: ALL SIX native GDN kernels — the three of batch 2 and the three here (layer.cpp
+:253/266-267/296 and :297/308/324) — AND the three UNPORTED fused paths `fused_gdn_conv_l2` / `fused_gdn_ab` /
+`fused_gdn_step_norm` (:250/287/322, the latter additionally gated on `g_fused_gdn` + `native_bf16_projections`).
+Answering true would make the engine dispatch a symbol with no shader, so the backend
+(`vulkan/src/kernels/native_caps_vk.cpp`) answers **false**.  `case_native_capabilities`'s **gdn arm** asserts the
+flag EQUALS *"every gated symbol has a built shader"* — currently false, because the three fused shaders are
+absent — AND that all six ported shaders exist (so a `false` cannot hide a deleted shader).  It is an invariant,
+not a hard-coded boolean.  **The stricter "every gated symbol" form is kept deliberately** (the comment in the
+case states the alternative): a more permissive *"every symbol REACHABLE under the current settings"* reading
+WOULD let the flag answer true here, because the fused paths need `g_fused_gdn` + `native_bf16_projections`,
+which this backend never sets — but that is a weaker invariant: it would let the engine route to an unported
+symbol the moment a setting changed.  Falsified by `native-caps-gdn-true` → `FAIL native capabilities: gdn flag
+3/4`.
+
+**THE MAP DROPS BY THREE.**  `PORT-MAP.tsv` moved `168 — 69 kernel, 61 host, 38 todo` -> **`168 — 72 kernel,
+61 host, 35 todo`** (the three symbols are now `kernel` rows naming their shaders); `check_port_map.py` passes
+(`106 shaders built, 87 claimed`) and `make_port_map.py` regenerates the file **byte-identically** (`diff -q`).
+
+**GATE, after the change.  vega:** intel_icd (Arc B70) **423 / 0 / 0** (`run_gate.sh` exit **0**), llvmpipe
+**411 / 0 / 3**, radeon_icd (Ryzen iGPU) **414 / 0 / 2** — **+8 verdicts** on every arm (3 gate + 3 out_norm + 2
+step), 0 failed.  Box (`z820b`): radeon_icd (RX 7900 XTX) **419 / 0 / 1**, llvmpipe **411 / 0 / 3**, nvidia_icd
+(Quadro K620) **414 / 0 / 2** — **0 failed on every arm**; the one skip is the pre-existing M8 `prefill split`,
+so `run_gate.sh` exits **1** there (a skipped case is not a passing one).  The box's cross-arm caught the
+documented intermittent `budget: independent requery agrees` on one run of the XTX arm; a re-run read
+**419 / 0 / 1**, the flake cleared.  The XTX's new-case verdicts: `native_gdn_gate` 48/48 w 3.38e-07, 5/5,
+300/300 w 3.71e-07; `native_gdn_out_norm` 6400/6400 w 6.06e-07, 768/768, 640/640; `native_gdn_step`
+792576/792576 err/tol 0.00154, 132096/132096 w 0.000883; gdn flag 4/4.  Every one of the four new falsification
+injections was run and BIT: `native-gdn-gate-drop-ssm-a` -> `FAIL native_gdn_gate h_v=48 0/48 worst 8.89`;
+`native-gdn-out-norm-silu-instead-of-sigmoid` -> `FAIL native_gdn_out_norm h_v=48 S=128 2321/6400 worst 21`;
+`native-gdn-step-drop-readout-scale` -> `FAIL native_gdn_step S=128 h_k=16 h_v=48 786434/792576 worst 2.03e+04`;
+`native-caps-gdn-true` -> `FAIL native capabilities: gdn flag 3/4`.
+
 ## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, first three native kernels — class B batch 2 — **DONE 2026-10-05**
 
 The mixer runs on **36 of the model's 48 layers** (`gdn_layer`, `src/core/layer.cpp:223`), so it is where the

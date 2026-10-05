@@ -72,7 +72,7 @@
 #
 #   (performance tier, class B, batch 2 - the native GDN / DeltaNet mixer)
 #   inject-verify.sh native-caps-gdn-true  vulkan/src/kernels/native_caps_vk.cpp  answer the GDN flag true while
-#                                       six of its gated symbols are unported
+#                                       a gated symbol (the three fused_gdn_* paths) is unported
 #                                       -> must FAIL  "native capabilities: gdn flag"
 #   inject-verify.sh native-gdn-conv-silu-drop-silu  native_gdn_conv_silu.comp  drop the fused SiLU
 #                                       -> must FAIL  "native_gdn_conv_silu"
@@ -80,6 +80,14 @@
 #                                       -> must FAIL  "native_gdn_l2_norm"
 #   inject-verify.sh native-gdn-beta-gate-sign-flip  native_gdn_beta_gate.comp  flip the sigmoid's exponent sign
 #                                       -> must FAIL  "native_gdn_beta_gate"
+#
+#   (performance tier, class B, batch 3 - the remaining three native GDN / DeltaNet mixer kernels)
+#   inject-verify.sh native-gdn-gate-drop-ssm-a  native_gdn_gate.comp  drop the ssm_a factor of
+#                                       `softplus(alpha+dt) * ssm_a` -> must FAIL  "native_gdn_gate"
+#   inject-verify.sh native-gdn-out-norm-silu-instead-of-sigmoid  native_gdn_out_norm.comp  SiLU instead of
+#                                       sigmoid (the gdn_parity.cpp s4 trap) -> must FAIL  "native_gdn_out_norm"
+#   inject-verify.sh native-gdn-step-drop-readout-scale  native_gdn_step.comp  drop the folded 1/sqrt(S)
+#                                       readout scale the native kernel fuses -> must FAIL  "native_gdn_step"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -371,12 +379,12 @@ case "$name" in
     want="FAIL  native capabilities" ;;
   native-caps-gdn-true)
     # THE GDN FLAG'S own falsification, and it is the batch's capability point: `native_gdn_enabled()` gates the
-    # three kernels this batch ports AND six it does not, so it must stay FALSE.  The case's gdn arm asserts
-    # `flag == (every gated symbol has a built shader)`; answering true while the six unported gated shaders are
-    # absent is exactly the lie the arm exists to catch.
+    # six native kernels this tree ports AND the three `fused_gdn_*` paths it does not, so it must stay FALSE.
+    # The case's gdn arm asserts `flag == (every gated symbol has a built shader)`; answering true while the
+    # three unported fused shaders are absent is exactly the lie the arm exists to catch.
     file="$TREE/vulkan/src/kernels/native_caps_vk.cpp"
-    old=$'bool native_gdn_enabled() { return false; }        // see the header note: six gated symbols unported'
-    new=$'bool native_gdn_enabled() { return true; }        // INJECTION: the GDN flag answered true while six gated symbols are unported'
+    old=$'bool native_gdn_enabled() { return false; }        // see the header note: the three fused_gdn_* paths are unported'
+    new=$'bool native_gdn_enabled() { return true; }        // INJECTION: the GDN flag answered true while the three fused_gdn_* paths are unported'
     want="FAIL  native capabilities: gdn flag" ;;
   native-gdn-conv-silu-drop-silu)
     # The native body's new content vs `gdn_conv_step` is the FUSED SiLU and the second output.  Writing the raw
@@ -401,6 +409,30 @@ case "$name" in
     old=$'    b.v[i] = 1.0f / (1.0f + exp(-b.v[i]));'
     new=$'    b.v[i] = 1.0f / (1.0f + exp(b.v[i]));   // INJECTION: the sigmoid exponent\'s sign flipped'
     want="FAIL  native_gdn_beta_gate" ;;
+  native-gdn-gate-drop-ssm-a)
+    # `native_gdn_gate`'s rule is `gate[i] = softplus(alpha[i] + dt[i]) * ssm_a[i]` - the second factor is the
+    # SIGNED `ssm_a = -exp(A_log)`.  Writing just the softplus drops it; the fixture's ssm_a is negative and
+    # of order 1, so the case checks host-side that the drop moves the output and it bites on every head.
+    file="$SH/native_gdn_gate.comp"; spv="native_gdn_gate"
+    old=$'    gate.v[i] = softplus * ssm_a.v[i];'
+    new=$'    gate.v[i] = softplus;   // INJECTION: the ssm_a factor of softplus(alpha+dt)*ssm_a dropped'
+    want="FAIL  native_gdn_gate" ;;
+  native-gdn-out-norm-silu-instead-of-sigmoid)
+    # The closing norm's gate is a SIGMOID, not SiLU (gdn_parity.cpp section 4 pins that the two are
+    # distinguishable, and this artifact is the one that does NOT use qwen3.5's SiLU).  The fixture's z spans
+    # +-20, so the SiLU reading moves the large-z third of every row by ~z at z = 20.
+    file="$SH/native_gdn_out_norm.comp"; spv="native_gdn_out_norm"
+    old=$'        yb.v[base + c] = weighted * (1.0f / (1.0f + exp(-zb.v[base + c])));   // sigmoid(z), NOT SiLU'
+    new=$'        yb.v[base + c] = weighted * (zb.v[base + c] / (1.0f + exp(-zb.v[base + c])));   // INJECTION: SiLU instead of sigmoid'
+    want="FAIL  native_gdn_out_norm" ;;
+  native-gdn-step-drop-readout-scale)
+    # The native body FUSES the `1/sqrt(S)` readout scale (`output = attn * scale`), which the legacy branch
+    # applies in a separate `scale_inplace` launch.  Dropping it here makes this kernel match the legacy one
+    # and scales every output by sqrt(128) = 11.3 - the native body's distinguishing fused step.
+    file="$SH/native_gdn_step.comp"; spv="native_gdn_step"
+    old=$'    ob.v[h * S + j] = attn * pc.scale;                  // the native body\'s folded 1/sqrt(S) readout scale'
+    new=$'    ob.v[h * S + j] = attn;   // INJECTION: the folded 1/sqrt(S) readout scale dropped'
+    want="FAIL  native_gdn_step" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

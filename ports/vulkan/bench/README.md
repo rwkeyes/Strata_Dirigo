@@ -101,6 +101,10 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `gdn_conv_step`+`silu_f32` vs `native_gdn_conv_silu` | C=2560 d_conv=4 (the 2-dispatch legacy chain) | elements/s |
 | `gdn_l2_norm` vs `native_gdn_l2_norm` | rows=48 cols=128 | elements/s |
 | `gdn_beta_gate` vs `native_gdn_beta_gate` | h_v=48 | elements/s |
+| `gdn_gate` vs `native_gdn_gate` | h_v=48 n_tokens=1 | elements/s |
+| `gdn_out_norm` vs `native_gdn_out_norm` | h_v=48 S=128 | elements/s |
+| `gdn_step` vs `native_gdn_step` | S=128 h_k=16 h_v=48 (3 MiB state) | GMAC/s (3·S MACs per output) |
+| `scale`+`gdn_step` vs `native_gdn_step` | S=128 h_k=16 h_v=48 (the 2-dispatch legacy chain) | GMAC/s |
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
@@ -241,6 +245,45 @@ means the native kernel is faster**; `reps=9`.
 * **A native kernel is not required to be faster.**  The batch's value for these two is that the ONE
   `native_gdn_enabled()` flag now has all three of its simple mixer stages on the native arithmetic path; the
   flag stays false until the six remaining gated symbols land (see `NEXT.md`).
+
+### The class-B NATIVE vs LEGACY pairs, batch 3 — the REST of the GDN / DeltaNet MIXER — measured 2026-10-05
+
+The remaining three native mixer kernels, completing the six.  Same `XPAIR` convention (`native/legacy`, **< 1.0
+means the native kernel is faster**); `reps=9`.  For `native_gdn_step` the legacy branch runs a SECOND dispatch
+the native kernel fuses (the `1/sqrt(S)` readout scale, applied by `scale_inplace` at `layer.cpp:276`), so that
+pair is ALSO measured against the two-dispatch chain.
+
+| pair (native ← legacy) | Arc B70 (ms) native/legacy | ratio | Ryzen iGPU | ratio | XTX (box) | ratio | K620 (box) | ratio | llvmpipe (vega/box) | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `native_gdn_gate` ← `gdn_gate` | 0.0041 / 0.0042 | 0.998 | 0.0014 / 0.0015 | 0.901 | 0.0021 / 0.0020 | 1.044 | 0.0032 / 0.0031 | 1.037 | 0.0123 / 0.0126 · 0.0544 / 0.0523 | 0.980 / 1.042 |
+| `native_gdn_out_norm` ← `gdn_out_norm` | 0.0061 / 0.0061 | 0.995 | 0.0065 / 0.0065 | 1.000 | 0.0035 / 0.0031 | 1.144 | 0.0119 / 0.0117 | 1.020 | 0.0680 / 0.0698 · 0.1399 / 0.1429 | 0.974 / 0.979 |
+| `native_gdn_step` ← `gdn_step` | 0.0437 / 0.0476 | **0.917** | 0.4133 / 0.5327 | **0.776** | 0.0924 / 0.0977 | **0.946** | 0.3556 / 0.4909 | **0.724** | 0.3864 / 0.4464 · 0.9369 / 0.9937 | **0.866 / 0.943** |
+| `native_gdn_step` ← `scale`+`gdn_step` (2 dispatches) | 0.0437 / 0.0504 | **0.867** | 0.4133 / 0.5358 | **0.771** | 0.0924 / 0.0904 | 1.022 | 0.3556 / 0.4909 | **0.724** | 0.3864 / 0.4661 · 0.9369 / 1.0778 | **0.829 / 0.869** |
+
+**The honest reading.**
+
+* **`native_gdn_step` is a WIN against the legacy kernel on EVERY device measured (0.724–0.946 pair), and it is
+  a MEMORY-TRAFFIC win, not a compute one.**  Both kernels do the same two S-long passes; the legacy kernel's
+  first pass STORES the decayed state back to the (S, h_v, S) buffer, while the native body contracts the
+  UNDECAYED state and folds the decay into the second pass — so the native moves ~one third less state traffic.
+  **Against the two-dispatch legacy chain it is a win on five of the six GPUs (0.724–0.869) but NOT on the
+  XTX**, where the chain reads 1.022: the XTX's step is fast and memory-bound (0.098 ms) and the extra
+  `scale_inplace` dispatch (2048 q elements) fits in the same fence window, so the fused kernel's advantage is
+  inside run noise there.  Both rows are printed.
+* **`native_gdn_gate` (0.901–1.044) and `native_gdn_out_norm` (0.974–1.144) are WASHES-with-noise.**  At the
+  layer's shapes (gate: 48 heads, one token; out_norm: one row per head) both do the same work per element as the
+  legacy kernel; the largest deviation is the XTX's `out_norm` at 1.144 (native ~14% slower, i.e. ~0.4 µs on a
+  0.003 ms row — near the fence-clock floor).  Recorded as measured, not tuned.
+* **A MEASUREMENT THAT CHANGED THE SHIPPED KERNEL, and it is the batch's real finding.**  The native `step` body
+  is ONE 32-LANE WARP per column (four rows/lane in registers, `__shfl_xor_sync`).  Subgroup ops are banned in
+  this port, so the warp was ALSO rendered as a workgroup-per-column BARRIER TREE and timed: **1.564x the Arc,
+  8.328x the Ryzen iGPU and 43.501x llvmpipe** the legacy kernel (chain 1.471 / 8.078 / 41.597).  The causes are
+  both structural: 6144 workgroups × two 8-round barrier trees is a lot of synchronisation, and the
+  warp-shaped row ownership makes adjacent invocations read rows `h_v*S` floats apart — 32 cache lines per warp
+  instead of one.  The port therefore SHIPS the coalesced one-thread-per-column serial decomposition (which the
+  legacy `gdn_step` port already uses; the CUDA's warp shape is a parallelism strategy, not the rule) carrying
+  the native arithmetic and the fused readout scale.  The barrier-tree variant is NOT in the tree; its numbers
+  are recorded here and in `NEXT.md`/`STATUS.md` as the price of the port's no-subgroup rule at this shape.
 
 ## The one number that is a problem, not a baseline
 

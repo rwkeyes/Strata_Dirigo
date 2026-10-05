@@ -99,10 +99,10 @@ native_flash_attn_short_step	kernel	attn_decode_short
 native_gdn_beta_gate	kernel	native_gdn_beta_gate
 native_gdn_conv_silu	kernel	native_gdn_conv_silu
 native_gdn_enabled	host	a capability check
-native_gdn_gate	todo	no shader in this tree yet
+native_gdn_gate	kernel	native_gdn_gate
 native_gdn_l2_norm	kernel	native_gdn_l2_norm
-native_gdn_out_norm	todo	no shader in this tree yet
-native_gdn_step	todo	no shader in this tree yet
+native_gdn_out_norm	kernel	native_gdn_out_norm
+native_gdn_step	kernel	native_gdn_step
 native_mmvq	kernel	iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq
 native_mmvq_supported	host	a capability check
 native_mmvq_weight_bytes	host	a size
