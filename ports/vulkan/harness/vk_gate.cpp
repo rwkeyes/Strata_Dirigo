@@ -2870,6 +2870,11 @@ void case_iq1m_mmvq(Ctx& ctx, const std::string& dir) {
     iq1m_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
     iq1m_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
     iq1m_arm(ctx, dir, 256, 1, 1, "one block");
+    // MULTI-TOKEN: 8 columns is the widest count the engine's own `mmvq_multi_kernel` specialises for, so this is
+    // the multi-token expert path and not a synthetic width.  The single-column arms above cannot see a column
+    // index, an activation-row stride or a per-column accumulator that is reset too late - at 8 columns they all
+    // become a wrong number in a specific column rather than a wrong number everywhere.
+    iq1m_arm(ctx, dir, 2560, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -3407,6 +3412,114 @@ void case_iq2s_mmvq(Ctx& ctx, const std::string& dir) {
     iq2s_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
     iq2s_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
     iq2s_arm(ctx, dir, 256, 1, 1, "one block");
+    // MULTI-TOKEN, the half of the quantised path the single-column arms cannot see: 8 is the widest count the
+    // engine's `mmvq_multi_kernel` specialises for, and 32 goes past it, where an activation-row stride that is
+    // right for 8 columns and wrong for a wider row would show up.
+    iq2s_arm(ctx, dir, 2560, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
+    iq2s_arm(ctx, dir, 2560, 8, 32, "32 token columns: past the engine's specialisations");
+}
+
+// THE QUANTISED PREFILL CHAIN, END TO END: the device quantises the activations (quantize_q8_1), the device
+// multiplies them against IQ weight rows (iq2s_mmvq), and the ORACLE READS THE DEVICE'S OWN QUANTISED BYTES.
+//
+// WHY THIS IS A CASE OF ITS OWN, even though both halves are gated bit-exactly elsewhere: each half agreeing with
+// its own oracle does not make the INTERFACE right.  The activation block is 36 bytes (half2 ds + int8 qs[32]), the
+// row kernel strides (n_in/32)*36 per column, and the meaning of that contract lives in neither kernel alone.  It
+// is the wiring - the same class of defect the port's own notes call out from the grouped-expert wave, where one
+// pointer stood in for two buffers.  iq2s is the format to hang it on because 20 of the resident model's 48 layers
+// store their gate/up experts in it.
+void case_quant_prefill_chain(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "quantize_q8_1.spv") || !have(dir, "iq2s_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit || !ctx.info().storage_buffer_16bit) {
+        skip("quant_prefill chain", "device lacks 8-bit or 16-bit storage - the q8_1 block needs both");
+        return;
+    }
+    const int n_in = 2560, n_out = 6, ncols = 8;
+    const int nb = n_in / 256;
+    const int row_bytes = nb * 82;
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> w = iq2s_fill_blob((size_t) n_out, nb, n_in);
+
+    std::vector<float> act_f((size_t) ncols * n_in);
+    for (float& v : act_f) v = rndf(1.0f);
+    Buf b_af = ctx.alloc(act_f.size() * 4);
+    Buf b_a = ctx.alloc((uint64_t) ncols * blocks_per_col * 36);
+    ctx.write(b_af, act_f.data(), act_f.size() * 4);
+    {
+        VkPipeline pq = ctx.pipeline(dir + "/quantize_q8_1.spv", 2, 8);
+        struct { int n_in; int ncols; } pqc{n_in, ncols};
+        const uint32_t per_col = (uint32_t) ((n_in + 255) / 256);     // one workgroup per 256 values
+        ctx.dispatch(pq, {&b_af, &b_a}, &pqc, sizeof(pqc), per_col * (uint32_t) ncols);
+    }
+    std::vector<uint8_t> act((size_t) ncols * blocks_per_col * 36, 0);
+    ctx.read(b_a, act.data(), act.size());
+
+    // The oracle consumes THAT buffer - the device's own bytes - through the format's own host dot.  A quantiser
+    // that wrote the right values at the wrong stride would pass its own case and fail here.
+    std::vector<double> want((size_t) ncols * n_out, 0.0), want_abs(want.size(), 0.0);
+    for (int c = 0; c < ncols; ++c) {
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, abs_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * 8; ++k) {
+                const double v = iq2s_dot_host(w, wrow + (size_t) (k / 8) * 82, act, arow + (size_t) k * 36,
+                                               2 * (k % 8));
+                acc += v;
+                abs_sum += std::fabs(v);
+            }
+            want[(size_t) c * n_out + r] = acc;
+            want_abs[(size_t) c * n_out + r] = abs_sum;
+        }
+    }
+
+    Buf b_w = ctx.alloc(w.size());
+    Buf b_g = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    const size_t n_y = (size_t) ncols * n_out;
+    Buf b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_g, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    VkPipeline p = ctx.pipeline(dir + "/iq2s_mmvq.spv", 4, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out);
+
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0, dead_cols = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        worst = std::max(worst, std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6));
+        if (!(std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6) <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) {
+        if (img[i] != 0xC3) ++bad;
+    }
+    // PER-COLUMN LIVENESS, and it is not decoration.  This oracle reads the DEVICE's own quantised bytes, so a
+    // quantiser that wrote every column's blocks into ONE column's region would be invisible to the comparison
+    // above: both sides would then read the same misplaced bytes.  Measured with exactly that injection (the
+    // quantiser's per-column block stride deleted): this arm PASSED, because the oracle followed the bug.  What
+    // catches it is asking whether each column actually carried data - with random activations a column that
+    // reads nothing returns zeros, and seven all-zero columns out of eight is not a coincidence.
+    for (int c = 0; c < ncols; ++c) {
+        double col_mass = 0.0;
+        for (int r = 0; r < n_out; ++r) col_mass += std::fabs((double) got[(size_t) c * n_out + r]);
+        if (col_mass <= 1e-3) ++dead_cols;
+    }
+    if (dead_cols) std::printf("      %d of %d columns came back all-zero: the activation path is not per-column\n",
+                               dead_cols, ncols);
+    const bool live = mass > 1e-3 && dead_cols == 0;
+    if (!live && mass <= 1e-3) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    std::printf("      chain: quantiser wrote %d block(s) of 36 B per column; y[0] = %.6g want %.6g\n",
+                blocks_per_col, (double) got[0], want[0]);
+    verdict("quant_prefill chain (q8_1 -> iq2s, 8 cols)", bad == 0 && live, bad + dead_cols, (int) n_y, worst,
+            "rows outside tolerance (worst err/tol) + dead columns");
+    ctx.free(b_af); ctx.free(b_a); ctx.free(b_w); ctx.free(b_g); ctx.free(b_y);
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -3560,6 +3673,7 @@ void case_iq3xxs_mmvq(Ctx& ctx, const std::string& dir) {
     iq3xxs_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
     iq3xxs_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
     iq3xxs_arm(ctx, dir, 256, 1, 1, "one block");
+    iq3xxs_arm(ctx, dir, 2560, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -3730,6 +3844,7 @@ void case_iq4nl_mmvq(Ctx& ctx, const std::string& dir) {
     iq4nl_arm(ctx, dir, 2560, 8, 1, "80 blocks: 160 parts < 256 lanes");
     iq4nl_arm(ctx, dir, 10240, 4, 2, "320 blocks: 640 parts > 256 lanes, two columns");
     iq4nl_arm(ctx, dir, 32, 1, 1, "one block: the smallest legal shape");
+    iq4nl_arm(ctx, dir, 2560, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -3883,6 +3998,7 @@ void case_q2_0_mmvq(Ctx& ctx, const std::string& dir) {
     q2_0_arm(ctx, dir, 2304, 8, 1, "36 blocks: 72 parts < 256 lanes");
     q2_0_arm(ctx, dir, 4096, 4, 2, "64 blocks: 128 parts, two columns");
     q2_0_arm(ctx, dir, 64, 1, 1, "one block: the smallest legal shape");
+    q2_0_arm(ctx, dir, 2304, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -4048,6 +4164,7 @@ void case_iq3s_mmvq(Ctx& ctx, const std::string& dir) {
     iq3s_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
     iq3s_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
     iq3s_arm(ctx, dir, 256, 1, 1, "one block");
+    iq3s_arm(ctx, dir, 2560, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -4200,6 +4317,7 @@ void case_iq4xs_mmvq(Ctx& ctx, const std::string& dir) {
     iq4xs_arm(ctx, dir, 2560, 8, 1, "10 blocks: 80 parts < 256 lanes");
     iq4xs_arm(ctx, dir, 10240, 4, 2, "40 blocks: 320 parts > 256 lanes, two columns");
     iq4xs_arm(ctx, dir, 256, 1, 1, "one block");
+    iq4xs_arm(ctx, dir, 2560, 8, 8, "8 token columns: the engine's widest multi-token specialisation");
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -6193,6 +6311,7 @@ int main(int argc, char** argv) {
     case_s2expert_tier(ctx, dir);
     case_iq1m_mmvq(ctx, dir);
     case_iq2s_mmvq(ctx, dir);
+    case_quant_prefill_chain(ctx, dir);    // the composed quantised path: q8_1 quantiser -> iq2s row kernel
     case_iq3xxs_mmvq(ctx, dir);
     case_iq4nl_mmvq(ctx, dir);
     case_q2_0_mmvq(ctx, dir);

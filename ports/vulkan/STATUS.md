@@ -8,18 +8,18 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
                                                  # checks each shader's declared local size, then runs the gate
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
-was swapped for an Arc Pro B70 and after stages 3, 4 and the prefill GEMM landed, the box's GPU run was
-**189 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan
-1.4.318, subgroup size 32) - 177 / 0 / 3 on llvmpipe and 180 / 0 / 2 on the radeon ICD, which now picks the AMD
-iGPU because the discrete card is gone (both skip cooperative matrix, whose driver does not advertise the
-extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one
-(`gemm_coopmat`) was the port misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion
-demanded - and since then the matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 180/0/2 becomes
-179/1/2 when its intermittent budget-requery case fires.  Before the swap the same gate read 160 / 0 / 0 on RADV
-and on radeon. That count has gone stale three times in two days; read the last line of your own run.** All three
-available implementations are exercised again by `run_gate.sh`: it used to stop at the Intel skip, which meant the
-cross-implementation arm never ran on this box after the swap (`NEXT.md`). 58 kernels, 17 shared includes, one
-generated table file (`harness/iq_grids.hpp`,
+was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM and the quantised multi-token arms landed,
+the box's GPU run was **198 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa
+25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 186 / 0 / 3 on llvmpipe and 189 / 0 / 2 on the radeon ICD, which
+now picks the AMD iGPU because the discrete card is gone (both skip cooperative matrix, whose driver does not
+advertise the extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the
+last one (`gemm_coopmat`) was the port misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the
+criterion demanded - and since then the matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 189/0/2
+becomes 188/1/2 when its intermittent budget-requery case fires - which it did in the run behind these numbers.
+Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone stale three times in two
+days; read the last line of your own run.** All three available implementations are exercised again by
+`run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this box
+after the swap (`NEXT.md`). 58 kernels, 17 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -56,6 +56,17 @@ all three implementations), with the transposed-operand bug falsified to fail fo
 that leaves the stride columns NaN and requires them to survive.  `NEXT.md`'s stage-5 block carries the layout
 proof, the two-kernel split (aligned rows on the matrix units, the remainder on FMA) and the device-layer gap it
 found: the harness binds descriptors at offset 0, and the engine reaches row slices by pointer arithmetic.
+
+**The quantised multi-token path needed no new kernel, and is now armed and composed (2026-10-04).**  Reading the
+engine showed the prompt path reaches quantised weights two ways: `Gemm::native` **dequantises** the ggml blocks to
+f16 and calls the GEMM above (so the quantised prefill needs a DEQUANTISER, not a GEMM), and `iq_mmvq` is the
+multi-token row-kernel path (the engine specialises 1/2/4/8 columns).  The port's seven per-format row kernels
+already take `ncols` - they were gated only at 1 and 2 - so the multi-token path is now armed at 8 for all seven and
+at 32 for IQ2_S, and a new COMPOSED case runs the device's `quantize_q8_1` into the device's `iq2s_mmvq` with the
+oracle reading the device's own quantised bytes.  That composed case is also the session's sharpest lesson: its
+first version PASSED under an injected per-column-stride bug in the quantiser (an oracle built from the thing under
+test follows that thing's mistakes), and it only became an oracle once it asked the question the bytes cannot
+answer - per-column liveness.  `NEXT.md`'s stage-5b block has the injection and the fix.
 
 | Case | Verdict | Method |
 |---|---|---|

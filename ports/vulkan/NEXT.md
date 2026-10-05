@@ -224,6 +224,51 @@ slice.
 
 
 
+## STAGE 5b: the QUANTISED prefill path - **and a finding that needed no new kernel**
+
+**Reading the engine first paid off again.**  The prompt path has TWO routes to quantised weights, and only one of
+them is a GEMM-shaped kernel:
+
+* **`Gemm::native`** (what the prefill calls): it does NOT use an MMQ kernel at all.  It **dequantises** the ggml
+  blocks to f16 (`strata::kernels::dequant_f16`) and then calls the ordinary f16 GEMM - the same one this port
+  gated an hour earlier.  So the quantised prefill needs an IQ *dequantiser*, not a new GEMM.
+* **`iq_mmvq`** (the expert tier's multi-token path): the row kernels, which the engine calls with a `ncols`
+  argument and specialises at 1 / 2 / 4 / 8 columns (`mmvq_multi_kernel`).
+
+**The port's row kernels already take `ncols`** - `iq1m_mmvq.comp` and its siblings loop
+`for (c = 0; c < pc.ncols; ++c)` - so the quantised multi-token path needed **no new kernel**: it needed arming.
+The existing arms sat at ncols 1 and 2, i.e. the single-token and barely-multi-token cases.  Added, for all seven
+of the resident model's formats: an arm at **ncols = 8** (the widest count the engine specialises for, so this is
+the real multi-token expert path) and, for IQ2_S, one at **ncols = 32**, past the engine's specialisations, where
+an activation-row stride that is right for a narrow row and wrong for a wide one shows up.
+
+**A composed case for the interface, because the halves agreeing with their own oracles does not make the wiring
+right:** `case_quant_prefill_chain` runs the DEVICE's `quantize_q8_1` and feeds its output to the DEVICE's
+`iq2s_mmvq`, with the oracle reading those same bytes.  IQ2_S is the format to hang it on: 20 of the model's 48
+layers store their gate/up experts in it.
+
+**AND THE CASE'S FIRST ORACLE COULD NOT FAIL - which is the finding worth keeping.**  The injection was the
+obvious one: delete the quantiser's per-column block stride so every column's blocks land in column 0's region.
+The quantiser's own case caught it (`ncols=2` arm: 2105 of 5760 bytes) - and **the chain case PASSED**, because an
+oracle that reads the device's own bytes follows the device's own mistake: both sides then read the same misplaced
+data, and the columns that read nothing compare equal to an expectation of nothing.  Fixed by asking a question the
+bytes cannot answer by themselves - **per-column liveness**: with random activations, a column that read nothing
+returns zeros, so the case now requires that no column comes back all-zero.  With that, the same injection fails
+the case (7 of 8 columns dead) and the real tree passes.  The general form: **an oracle built from the thing under
+test is blind exactly where that thing is systematically wrong**, and a liveness/coverage assertion is what closes
+it - the same class as the existing `mass > 1e-3` guard, one level down.
+
+**What is still missing for quantised prefill:** the IQ **dequantiser** (`dequant_f16` / `iq_dequant_f16`, which
+covers ggml types 16/17/18/21/22/29 plus the Q2_0, IQ4_NL/IQ4_XS and k-quant families through a second path).  The
+port's per-format dot includes already encode each block layout FOR A DOT, so a hand-written dequantiser would be a
+second copy of that layout - the shape of bug this port keeps finding.  The non-duplicating route, recorded here
+for whoever takes it: **derive the dequantiser from the dot by a one-hot activation** (a q8_1 block with a single
+code set to 127 and d = 1/127 gives exactly 1.0 at one position and 0 elsewhere), so the dequantised value IS the
+dot and there is nothing to drift; slow, but this is a verification path, and the same trick gives one dequantiser
+per format for free.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one
