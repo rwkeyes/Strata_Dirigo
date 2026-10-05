@@ -82,7 +82,7 @@ TABLE = {
     'moe_hit_select':                 ('kernel', 'moe_hit_select'),
     'native_expert_grouped':          ('kernel', 'native_gu_any native_down_any ptr_to_off'),
     'native_flash_attn_short_step':   ('kernel', 'attn_decode_short'),
-    'native_mmvq':                    ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq'),
+    'native_mmvq':                    ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq q8_0_mmvq native_k_mmvq'),
     'native_q5_k_f32':                ('kernel', 'native_q5_k_f32'),
     # THE PERFORMANCE TIER, class B: the native fast paths, each replacing the legacy kernel already ported.
     # The Vulkan backend answers the checks they belong to itself (vulkan/src/kernels/native_caps_vk.cpp).

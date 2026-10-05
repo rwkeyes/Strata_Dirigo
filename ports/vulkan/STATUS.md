@@ -1,5 +1,61 @@
 # Status — what is done, what is verified, what is not
 
+## THE NATIVE-DENSE K-QUANTS ARE PORTED (one generic shader), the LAUNCHER'S `view()` DEFECT IS FOUND AND FIXED, and the real pack stops at the PROMPT PREFILL (2026-10-05, `vega`)
+
+**No token from the real pack, and the stopping point is now a NAMED, MEASURED subsystem, not a flag.**  The
+run loads every dense projection and comes up (`1406 MiB ... 302 canonical tensors skipped: served natively`,
+`300 native projection matrices, 2018.88 MiB of weights`, `session is up`), then prints `output :` EMPTY with
+`decode 0 tokens in 0.0 ms`, exit 0.
+
+**WHY EMPTY, ESTABLISHED FROM THE CODE.**  A native pack's decode loop BREAKS on its first iteration
+(`generate.cpp:7578-7579`: `if (native_pack) { spec_pos = pos; break; }`) — its only decode path is the verify
+window — and the window's guard is `spec_pos > 0` (`:7806`), while `spec_pos = pos_start` is 0 (`:7472`) unless
+the PREFILL block set it (`:7564`).  A 1-token prompt skips that block, so nothing runs.  Any prompt with >1
+token needs `--prefill CHUNK` (`:2165`) — and the prompt path is NOT PORTED: `--tokens "1,2" --prefill 1` exits
+2 at `strata::prefill::Gemm::init_external: NOT PORTED on the Vulkan backend - REFUSING.`  **PREFILL IS THE
+NEXT INCREMENT: 40 unported GPU entry points (~150 KB of CUDA: kernels.cu 53 KB, gemm.cu 25 KB, moe_fused.cu
+23 KB, moe_fused_iq.cu 35 KB, moe_mmq.cu 12 KB).**  Behind it stand `Verifier::init`'s two preconditions: the
+`--expert-profile`/`--expert-cache` residency table (`verify.cpp:324`, built only when a profile is supplied,
+`generate.cpp:4267`) and `layer_verify_compatible()` — FALSE here because `native_qsa_indexer_enabled()` is
+FALSE (the unported `native_qsa_indexer_append`).
+
+**DELIVERABLE A — ONE generic K-quant MMVQ.**  `shaders/native_k_mmvq.comp` covers ggml 12 Q4_K / 13 Q5_K /
+14 Q6_K (210 of the pack's 300 eligible dense tensors) behind a `ty` push constant; the three dots are ONE
+definition in `shaders/common/k_dots.glsl`, which the port's EXISTING per-type `native_q5_k_f32.comp` now also
+includes (its Q5_K dot was lifted out verbatim).  Q4_K/Q6_K are transcribed from the engine's own
+`q4_q8_dot`/`q6_q8_dot` (`native_mmvq.cu:544`/`:638`).  `native_mmvq` gained case 12/13/14; `native_mmvq_supported`
+answers TRUE for them.  **Proven** (`case_native_k_mmvq`): generic == engine wrapper BITWISE per type; generic
+(ty=13) == `native_q5_k_f32.spv` BITWISE; generic vs the engine's dot (double) terms-bounded.  A first version
+failed the per-type arm last-bit because a runtime parts/stride defeated the compiler's folding — each type now
+has its own uniform arm.  **No K-quant dot needed inventing.**
+
+**DELIVERABLE C — the flagged gaps, and the DEFECT they found.**
+* `q8_0_mmvq` is gated (`case_q8_0_mmvq`, bitwise vs the wrapper + the engine's rule).
+* The 4 GiB window boundary is exercised: `ptr_to_off.spv` for 0/wb-1/wb/wb+5/2wb+7, AND the launcher reads the
+  SAME expert through window 0 (offset 0) and window 1 (offset 4 313 715 712) with BITWISE-equal output.
+* The launcher's wrapper case is registered with SIX FALSIFYING injections, including two for the launcher.
+* Independent arms for the generic shaders at the formats the real pack uses (`native_gu_any` 18/21/23,
+  `native_down_any` 42).
+
+**THE DEFECT: `view(b, off)` SET the offset instead of ADDING the base's.**  So `native_expert_grouped`'s four
+`view(b_scr, k*fa)` scratch regions bound at the ARENA BASE: the gate/up/h/hq staging landed on the first
+expert's blob, the raw-pointer q8_1 quantiser wrote to the caller's scratch, and the down stage read a region
+that was neither.  **Measured:** zeroing an expert's ENTIRE gate/up half left `out` bitwise UNCHANGED (0/2560).
+That is a silently wrong expert for every native expert.  Fixed to `v.offset = b.offset + off` (both copies);
+new arms D (gate/up-only perturbation moves the output, 2560/2560) and E (zeroing it gives exactly 0) PIN it,
+and `view-absolute-offset` restores the defect to FAIL arm D.
+
+**RESULTS (vega).**  Gate: **Arc intel_icd 781/0/0 (exit 0), llvmpipe 769/0/3, Ryzen iGPU 768/4/2.**  The lvp
+arm had ABORTED (a bare line, no counts) because the launcher case first asked for a 5 GiB arena and llvmpipe's
+`vkCreateBuffer` returned `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which the device layer exits on; the arena is now the
+minimum that crosses one window (kWinBytes + 24 MiB, < 4 GiB) and lvp reports 769/0/3.  The 4 radeon failures
+are ALL on the documented intermittent list; `native_quantize_q8_1 entry` (1151/1152) appeared once, touches
+no shader this batch changed, passed on Arc and llvmpipe in the same run and did not recur — recorded as a new
+instance of the platform non-determinism, not chased.  Map: `168 = 79 kernel + 0 shader + 45 host + 0 todo +
+44 refused`; `check_port_map.py` passes, `make_port_map.py` regenerates byte-identically.  **ENGINE BAR: the
+program LINKS, 0 undefined — 0 BY CONSTRUCTION (the refusals define the unported symbols), NOT a porting
+gain.**  **`z820b` untouched.**
+
 ## THE REAL PACK, AND THE NATIVE-EXPERT GATE — the IQ-pack load defect is FIXED at the cause, the port owns the native expert GEOMETRY, and the stopping point is a NAMED missing kernel (2026-10-05, `vega`)
 
 **No token from the real pack, and it is not a token's worth of guessing: the engine's own load path refuses

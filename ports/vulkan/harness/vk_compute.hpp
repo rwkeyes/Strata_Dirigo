@@ -63,7 +63,7 @@ struct Buf {
 // A view of `b` starting `off` bytes in: the engine's row-slice pattern, made explicit.
 inline Buf view(const Buf& b, uint64_t off) {
     Buf v = b;
-    v.offset = off;
+    v.offset = b.offset + off;   // RELATIVE to `b`; see vulkan/src/device/vk_compute.hpp for the measured defect
     return v;
 }
 

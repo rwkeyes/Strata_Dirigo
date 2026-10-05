@@ -229,7 +229,13 @@ void native_mmvq(Stream& s, int ggml_type, const void* weights, const void* x_q8
     case 20: spv = "iq4nl_mmvq.spv"; break;
     case 23: spv = "iq4xs_mmvq.spv"; break;
     case 8:  spv = "q8_0_mmvq.spv"; break;   // Q8_0: the native-DENSE path (dense projections from the GGUF shard)
-    default: refuse("native_mmvq", "this backend has no shader for this ggml type (IQ1_M/IQ2_S/IQ3_S/IQ3_XXS/IQ4_NL/IQ4_XS/Q8_0 only)");
+    // THE THREE K-QUANTS, ONE GENERIC SHADER.  Q6_K/Q4_K/Q5_K (ggml 14/12/13) are 210 of `coder-iq1_m`'s 300
+    // eligible dense tensors; they share the 256-block MMVQ shape and differ only in the dot, which
+    // `native_k_mmvq.comp` selects by a `ty` push constant (the dots are `common/k_dots.glsl`, the same source
+    // the native head's per-type `native_q5_k_f32.comp` includes).  The type therefore rides in the push
+    // constant here rather than picking a different .spv per format.
+    case 12: case 13: case 14: spv = "native_k_mmvq.spv"; break;
+    default: refuse("native_mmvq", "this backend has no shader for this ggml type (IQ1_M/IQ2_S/IQ3_S/IQ3_XXS/IQ4_NL/IQ4_XS/Q8_0/Q4_K/Q5_K/Q6_K only)");
     }
     const uint64_t row_bytes = strata::kernels::iq_row_bytes(ggml_type, n_in);
     const uint64_t wbytes = strata::kernels::native_mmvq_weight_bytes(ggml_type, (int) n_in, (int) n_out);
@@ -238,6 +244,14 @@ void native_mmvq(Stream& s, int ggml_type, const void* weights, const void* x_q8
     if (!arena_resolve(s, weights, wbytes, wv) || !arena_resolve(s, x_q8_1, abytes, av) ||
         !arena_resolve(s, y, (uint64_t) n_out * (uint64_t) ncols * 4, yv))
         refuse("native_mmvq", "a pointer is not inside this stream's arena");
+    if (ggml_type == 12 || ggml_type == 13 || ggml_type == 14) {
+        // the generic K-quant shader: a FIFTH push-constant field carries the ggml type
+        struct { int32_t n_in; int32_t n_out; int32_t row_bytes; int32_t ncols; int32_t ty; } kpc{
+            (int32_t) n_in, (int32_t) n_out, (int32_t) row_bytes, (int32_t) ncols, (int32_t) ggml_type};
+        VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/" + spv, 3, sizeof(kpc));
+        s.ctx->dispatch(pipe, {&wv, &av, &yv}, &kpc, sizeof(kpc), (uint32_t) n_out);
+        return;
+    }
     struct { int32_t n_in; int32_t n_out; int32_t row_bytes; int32_t ncols; } pc{
         (int32_t) n_in, (int32_t) n_out, (int32_t) row_bytes, (int32_t) ncols};
     const uint32_t* grid = grid_for(s, ggml_type, gv);
@@ -729,6 +743,7 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     switch (ggml_type) {
     case 29: case 22: case 21: case 18: case 20: case 23: return true;
     case 8: return true;   // Q8_0 - q8_0_mmvq.spv: the native-DENSE projections served from the GGUF shard
+    case 12: case 13: case 14: return true;   // Q4_K/Q5_K/Q6_K - native_k_mmvq.spv (one generic shader, `ty` selects)
     default: return false;
     }
 }

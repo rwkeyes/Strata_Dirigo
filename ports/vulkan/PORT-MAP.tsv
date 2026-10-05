@@ -115,7 +115,7 @@ native_gdn_gate	kernel	native_gdn_gate
 native_gdn_l2_norm	kernel	native_gdn_l2_norm
 native_gdn_out_norm	kernel	native_gdn_out_norm
 native_gdn_step	kernel	native_gdn_step
-native_mmvq	kernel	iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq
+native_mmvq	kernel	iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq q8_0_mmvq native_k_mmvq
 native_mmvq_supported	host	a capability check
 native_mmvq_weight_bytes	host	a size
 native_moe_combine	kernel	native_moe_combine

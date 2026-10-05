@@ -243,11 +243,14 @@ case "$name" in
     new=$'    const uint row = uint(uint64_t(gl_WorkGroupID.y) * uint64_t(pc.row_bytes));   // INJECTION: row index = position, not the token'
     want="FAIL  iq_embed_rows: " ;;
   native-q5k-aux-half)
-    # The kernel's distinguishing rule: the 12-byte `scales` packs SIX 6-bit scales and SIX 6-bit mins and `hi`
-    # switches between groups 0..2 and 3..5.  Dropping it reads groups 0..2's fields for every group.
-    file="$SH/native_q5_k_f32.comp"; spv="native_q5_k_f32"
-    old=$'    const uint him = (j >= 2) ? 0xFFFFFFFFu : 0u;'
-    new=$'    const uint him = 0u;   // INJECTION: the packed-scale half switch dropped'
+    # The kernel's distinguishing rule: the 12-byte `scales` packs SIX 6-bit scales and SIX 6-bit mins and the
+    # `qh` shift `>> bq8_offset` selects the low/high group.  Dropping the shift reads one half's fields for
+    # every group.  The dot now lives in the SHARED include (common/k_dots.glsl) that BOTH native_q5_k_f32.comp
+    # and the generic native_k_mmvq.comp include, so the injection targets the include (its including shader is
+    # the compile target) and both paths move together.  `vh0` is Q5_K-only, so the anchor is unique.
+    file="$SH/common/k_dots.glsl"; spv="native_q5_k_f32"; comp="$SH/native_q5_k_f32.comp"
+    old=$'    const int vh0 = q5_i32(qh) >> int(bq8_offset);'
+    new=$'    const int vh0 = q5_i32(qh);   // INJECTION: the packed-scale half shift dropped'
     want="FAIL  native_q5_k_f32" ;;
   moe-hit-select-residency)
     # The selection's rule is "only a RESIDENT expert is a hit".  Dropping the test writes every routed entry,
@@ -680,6 +683,45 @@ case "$name" in
     old=$'    if (stream == nullptr) return default_stream();'
     new=$'    if (stream == nullptr) return nullptr;   // INJECTION: a null handle refused instead of resolving to the default stream'
     want="FAIL  null stream: cuda's nullptr IS the default stream" ;;
+  native-k-q6-byte-sub)
+    # Q6_K centres its 6-bit codes by `__vsubss4(v, 0x20202020)` - a PER-BYTE subtract.  A plain 32-bit
+    # subtract is the plausible wrong reading (it borrows across a byte boundary).  Must FAIL the Q6_K arm.
+    file="$SH/common/k_dots.glsl"; spv="native_k_mmvq"; comp="$SH/native_k_mmvq.comp"
+    old=$'        uint viu = 0u;\n        for (uint b = 0u; b < 4u; ++b) {\n            const int bytev = int((vi0 >> (8u * b)) & 0xFFu) - 32;\n            viu |= (uint(bytev) & 0xFFu) << (8u * b);\n        }'
+    new=$'        const uint viu = vi0 - 0x20202020u;   // INJECTION: a 32-bit subtract instead of the per-byte one'
+    want="FAIL  native_k_mmvq (ty=14 Q6_K" ;;
+  native-k-q4-ql-offset)
+    # Q4_K's two `qs` words sit at `16*bq8_offset + 4*nib`.  Reading them at `2*nib` is the plausible
+    # "step-4 like the IQ formats" mistake.  Must FAIL the Q4_K arm.
+    file="$SH/common/k_dots.glsl"; spv="native_k_mmvq"; comp="$SH/native_k_mmvq.comp"
+    old=$'    const uint ql = blk + 16u + 16u * bq8_offset + 4u * nib;   // bq4->qs (offset 16) + the source\'s expression'
+    new=$'    const uint ql = blk + 16u + 16u * bq8_offset + 2u * nib;   // INJECTION: the Q4_K code nibble stride halved'
+    want="FAIL  native_k_mmvq (ty=12 Q4_K" ;;
+  native-mmvq-k-ty)
+    # The generic K-quant shader takes the ggml type in a FIFTH push-constant field.  Sending a constant 12
+    # (Q4_K) for every K-quant is the "one field, one value" mistake; the Q5_K/Q6_K arms must move.
+    file="$TREE/vulkan/src/kernels/matvec_vk.cpp"
+    old=$'            (int32_t) n_in, (int32_t) n_out, (int32_t) row_bytes, (int32_t) ncols, (int32_t) ggml_type};'
+    new=$'            (int32_t) n_in, (int32_t) n_out, (int32_t) row_bytes, (int32_t) ncols, (int32_t) 12};   // INJECTION: the K-quant `ty` pinned to Q4_K'
+    want="FAIL  native_mmvq entry (ty=13 Q5_K)" ;;
+  native-expert-grouped-window)
+    # THE LAUNCHER'S WINDOW LOOP.  The real pack's experts sit at 1.4 .. 24.8 GiB, so every expert past the
+    # first 4 GiB is read through `win_id * WIN_BYTES`.  Running only window 0 leaves those groups unwritten -
+    # a silently wrong expert.  Arm B (same expert through window 0 and window 1) must FAIL.
+    file="$TREE/vulkan/src/kernels/native_expert_grouped_vk.cpp"
+    old=$'    for (uint32_t w = 0; w < nwin; ++w) {'
+    new=$'    for (uint32_t w = 0; w < nwin && w < 1; ++w) {   // INJECTION: only window 0 is dispatched'
+    want="FAIL  native_expert_grouped: the SAME expert read through WINDOW 0 and WINDOW 1" ;;
+  view-absolute-offset)
+    # THE MEASURED `view()` DEFECT (2026-10-05).  `view(b, off)` used to SET `v.offset = off` instead of adding
+    # the base buffer's offset, so every view of a bump-allocated buffer (non-zero arena offset) bound at the
+    # ARENA BASE.  In `native_expert_grouped` that put the gate/up/h/hq scratch regions at the arena's first
+    # ~8 KiB while the raw-pointer quantiser wrote to the caller's scratch - the expert's gate/up half never
+    # reached the output.  This restores the defect; the launcher arm must FAIL.
+    file="$TREE/vulkan/src/device/vk_compute.hpp"
+    old=$'    v.offset = b.offset + off;'
+    new=$'    v.offset = off;   // INJECTION: the view offset taken as arena-absolute (the measured defect)'
+    want="FAIL  native_expert_grouped: the expert's GATE/UP half reaches the output" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

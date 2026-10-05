@@ -1,5 +1,138 @@
 # Start here next session
 
+## THE NATIVE-DENSE K-QUANTS LAND (ONE generic shader), the LAUNCHER'S `view()` DEFECT IS FOUND AND FIXED, and the real pack stops at PREFILL — which a native pack REQUIRES (2026-10-05, `vega`)
+
+**THE REAL `coder-iq1_m` PACK NOW LOADS EVERY DENSE PROJECTION AND THE SESSION COMES UP** (the stopping point
+moved off the K-quant gap entirely).  Raw output, `/tmp/run_final.log`, `RC=0`:
+
+```
+strata generate: 1406 MiB of weights loaded from .../coder-iq1_m (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights
+strata generate: session is up (engine 0.1.39)
+strata generate: sampling greedy
+prompt  : 1
+output  :
+decode                   0 tokens in 0.0 ms  ->  0.00 tok/s
+```
+
+**THE `output :` LINE IS EMPTY AND EXIT IS 0 BECAUSE THE DECODE LOOP NEVER ENTERED — a native pack cannot start
+where this prompt starts it.**  `src/program/generate.cpp:7577` opens the token loop and `:7578-7579` BREAKS on
+its first iteration for ANY native pack (`if (native_pack) { spec_pos = pos; break; }`), because a native
+pack's ONLY decode path is the P6 verify window (`Verifier::run`; the token graph is not even captured for one,
+`:4334`).  The verify block's guard is `spec_pos > 0` (`:7806`), and `spec_pos = pos_start`, which `:7472`
+initialises to **0** and only `:7564` (INSIDE the prefill block) ever sets.  A 1-token prompt skips the prefill
+block, so `pos_start` stays 0, `spec_pos` is 0, the guard is false, and NOTHING runs.  This is a measured
+dead-end of the engine as written, not a port defect.
+
+### DELIVERABLE A — THE K-QUANT NATIVE MMVQ, ONE generic shader, proven three ways
+
+`shaders/native_k_mmvq.comp` is the composite's arm for ggml 12 Q4_K / 13 Q5_K / 14 Q6_K — 210 of
+`coder-iq1_m`'s 300 eligible dense tensors (Q6_K 128, Q4_K 47, Q5_K 35).  ONE shader, one mechanism: all three
+share the 256-value block and the port's per-row MMVQ shape, and they differ ONLY in the dot.  The three dots
+are ONE definition in the new `shaders/common/k_dots.glsl`; **Q5_K's is the dot that already lived in
+`native_q5_k_f32.comp` (the native head's matvec), lifted out verbatim, and that file now INCLUDES the shared
+definition** — so the generic path and the per-type path cannot drift.  Q4_K's and Q6_K's are transcribed
+from the engine's own `q4_q8_dot`/`q6_q8_dot` (`src/kernels/cuda/native_mmvq.cu:544`/`:638`), including Q6_K's
+PER-BYTE `__vsubss4(v, 0x20202020)` centring (a 32-bit subtract borrows across a byte boundary — the injection
+`native-k-q6-byte-sub` proves the difference bites).  `native_mmvq` (composite) gained `case 12/13/14` and
+`native_mmvq_supported` now answers TRUE for them; the port's own `iq_row_bytes` ALREADY held 144/176/210, so
+no row layout was invented.
+
+**PROOF, per format, three checks** (`case_native_k_mmvq`): (1) the generic shader's bytes vs the ENGINE
+WRAPPER `native_mmvq(ty,...)` — **BITWISE**; (2) for Q5_K, the generic shader vs the port's EXISTING per-type
+`native_q5_k_f32.spv` — **BITWISE** (16/16); (3) the generic shader vs a DOUBLE transcription of the engine's
+dot — terms-bounded.  **The first form of the shader FAILED arm (2) last-bit** (`-628.262085` vs
+`-628.261719`): a runtime `parts`/`blk_bytes` read from `ty` stopped the compiler folding the per-part block
+index.  Each type now has its OWN uniform arm with a compile-time parts/stride, and the Q5_K arm is then
+byte-for-byte the per-type shader's loop.  **All three types are covered; no K-quant dot needed inventing.**
+
+### DELIVERABLE B — THE VERIFIER PRECONDITION, FROM THE CODE
+
+A native pack's first token genuinely goes through `Verifier::init`/`Verifier::run` (see the loop-break above),
+and there is NO flag to skip it.  What the verifier needs, in `Verifier::init`'s own order:
+1. **A VRAM expert-tier residency table** (`:324`; `hits.d_res`/`cache_base`/`blob`).  `thits.d_res` is built
+   only when `graph_hits = hit_fn && !profile.empty() && !no_pool` (`:4267`), so it requires `--expert-profile`
+   (a `profile.bin`) — which the fixed launch command does not carry — and a non-empty `--expert-cache`.
+2. **`layer_verify_compatible()`** (`layer.cpp:476-491`), which demands `native_bf16_projections` and
+   `g_fused_gr` (both set TRUE by `--native`, `generate.cpp:1804-1805`), `g_fused_gdn` + `native_gdn_enabled()`
+   (TRUE), the split-K decode attention (TRUE), `g_fast_select` (TRUE) — and **`native_qsa_indexer_enabled()`**,
+   which THIS PORT ANSWERS FALSE (`native_caps_vk.cpp:129`) because `native_qsa_indexer_append` is unported.
+   So the verifier refuses with "the native QSA indexer is off" even if a profile were supplied.
+
+**AND BEFORE EITHER, THE PROMPT PATH.**  `generate.cpp:2165` REFUSES a native pack with more than one prompt
+token unless `--prefill CHUNK` is given (`o.prefill_chunk <= 0 && o.tokens.size() > 1`).  `--tokens "1,2"`
+without it exits 2 with "it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK" (`/tmp/run_real2.log`);
+with `--prefill 1` it reaches the PROMPT PATH and stops at its first kernel — a LOUD REFUSAL
+(`/tmp/run_real3.log`, RC=2):
+
+```
+strata::prefill::Gemm::init_external: NOT PORTED on the Vulkan backend - REFUSING.
+```
+
+**PREFILL IS ON THE CRITICAL PATH AFTER ALL, and it is a SUBSYSTEM, not a flag.**  What a native pack needs it
+FOR, from the code: it is the ONLY producer of the prompt's conditioning positions [0, n_prompt-1) — because
+the native decode's token loop is disabled (`:7579`), nothing else evaluates them — AND the only setter of
+`pos_start`/`spec_pos` (`:7564`), without which no verify window can start.  It applies to any prompt that must
+be chunked (the `:2165` guard is `tokens.size() > 1`); a 1-token prompt is exempt from the flag but then cannot
+start the decode at all.  **Size, measured from the refusal list and the engine's own tree: 40 unported GPU
+entry points** (`refusals_prefill_vk.cpp`, each a LOUD refusal) over `src/prefill/kernels.cu` (53 KB),
+`gemm.cu` (25 KB), `moe_fused.cu` (23 KB), `moe_fused_iq.cu` (35 KB), `moe_mmq.cu` (12 KB) — ~150 KB of CUDA.
+**That is the next increment, and it comes BEFORE the verifier's two preconditions.**
+
+### DELIVERABLE C — THE CORRECTNESS GAPS, and THE DEFECT THEY FOUND
+
+1. **`q8_0_mmvq` is gated** (`case_q8_0_mmvq`): a Q8_0 fixture, the shader vs the engine wrapper BITWISE, both
+   vs the engine's `d_w*d_a*sum(qs_w*qs_a)` rule.
+2. **The 4 GiB window boundary is exercised** (`case_native_expert_grouped` arm A: `ptr_to_off.spv` for
+   0 / wb-1 / wb / wb+5 / 2wb+7), **and the launcher reads an expert THROUGH window 1 end-to-end** (arm B: the
+   SAME expert at offset 0 and at offset 4 313 715 712 — win 0 and win 1 — is BITWISE the same output).
+3. **The launcher's wrapper case + its injection are registered** — `native-expert-grouped-window` (window 0
+   only) and `view-absolute-offset` (below), plus `native-k-q6-byte-sub`, `native-k-q4-ql-offset`,
+   `native-mmvq-k-ty`, `native-q5k-aux-half` (retargeted to the shared include) — **all six FALSIFY**.
+4. **Independent arms for the generic shaders at the formats the REAL PACK uses** (`case_native_any_formats`):
+   `native_gu_any` at ty 18/21/23 and `native_down_any` at ty 42, each against that format's own engine dot.
+   These are the formats layers 0/1 and the IQ3_S/IQ4_XS layers read, and they had NO arm before.
+
+**THE DEFECT THIS FOUND — `view()` TOOK THE VIEW OFFSET AS ARENA-ABSOLUTE.**  `view(b, off)` was
+`v.offset = off` (REPLACING the base handle's offset), so every `view(b_scr, k*fa)` in
+`native_expert_grouped` bound at the ARENA BASE instead of inside the scratch: the gate/up/h/hq staging landed
+on the arena's first ~8 KiB (the first expert's blob), the q8_1 quantiser — the one stage that uses raw
+pointer arithmetic — wrote to the CALLER's scratch, and the down stage read a region that was neither.
+**Measured, not inferred:** zeroing an expert's ENTIRE gate/up weight half left `out` bitwise UNCHANGED
+(0/2560), the scratch read back all-zero after a call, and the scratch readback round-trip sentinel passed —
+so the reads were real and the expert's gate/up half simply never reached the output.  That is a SILENTLY
+WRONG EXPERT for every native expert, the worst class here.  Fixed to `v.offset = b.offset + off` (both copies,
+`vulkan/src/device/vk_compute.hpp` + the harness's) — the only two call sites are the launcher, and a
+zero-offset base (the arena itself) is unchanged.  **New arms that now PIN it:** arm D (perturbing ONLY the
+gate/up half moves the output, 2560/2560) and arm E (zeroing it drives `out` to exactly 0) — arm D FAILS under
+the restored defect (`view-absolute-offset`).
+
+### DELIVERABLE D/E — THE RUN, THE BAR, THE MAP, THE GATE
+
+Command (the brief's, `/tmp/run_final.log`): `STRATA_VK_SPV_DIR=.../shaders VK_ICD_FILENAMES=.../intel_icd.json
+STRATA_VK_ARENA_GIB=26 ~/bin/memguard 40G ~/vkbuild-vulkan/vulkan/strata_vulkan --pack .../coder-iq1_m
+--native ~/strata-models/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf --spec 4 --tokens 1
+--max-new 1 --max-context 8`.  **No token; the exact stopping point is the prompt prefill** (see B), and the
+1-token form is a no-op of the engine.  Bounds, in the same breath: this is REAL weights, but PLE is ON
+(`--native` forces it), `--spec 4` is on, the PCIe probe reads 0.1 GB/s, and **meaning requires the weights to
+be right AND every expert read — which is the GATE's job, not this run's**, and the experts were never read
+(the run stops before the decode).
+
+Map: **`168 = 79 kernel + 0 shader + 45 host + 0 todo + 44 refused`** (`refused` is NOT a capability);
+`check_port_map.py` passes and `make_port_map.py` regenerates byte-identically (the `native_mmvq` row now names
+`q8_0_mmvq` and `native_k_mmvq`).  Engine bar: the program LINKS, 0 undefined — **0 BY CONSTRUCTION** (the
+refusals define the unported symbols), not a porting gain.  Gate (vega): **Arc intel_icd 781/0/0 (exit 0),
+llvmpipe 769/0/3, Ryzen iGPU 768/4/2.**  **THE lvp ARM WAS ABORTING AND IS FIXED:** the launcher case first
+asked for a 5 GiB arena and llvmpipe's `vkCreateBuffer` returned `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which the
+device layer exits on — killing that implementation's whole arm (a BARE line, no counts, because the harness
+aborted mid-run).  The arena is now the MINIMUM that crosses one window (kWinBytes + 24 MiB, < 4 GiB), and lvp
+runs the arm and reports 769/0/3.  **The 4 radeon failures are all on the DOCUMENTED intermittent list**
+(`fused_gdn_ab entry`, `bf16_gemv_fp32_mmvf_cols entry` ×2 verdicts, `bf16_gemv_fp32_mmvf_multi entry`); an
+EARLIER run of this same batch additionally failed `native_quantize_q8_1 entry` (1151/1152) — that case is NOT
+on the documented list, it touches no shader this batch changed, it passed on Arc and llvmpipe in the same run,
+and it did NOT recur in the re-run, so it is recorded as a NEW INSTANCE of the same platform-level
+non-determinism, not attributing it to this batch — **recorded, not chased.**  **`z820b` untouched.**
+
 ## THE NATIVE-EXPERT LAUNCHER LANDS: the grouped IQ experts run over a DEVICE-POINTER->BYTE-OFFSET rebase and TWO GENERIC shaders covering all seven (gu,d) pairs, and the real pack's stopping point moves OFF the expert gate to the NATIVE-DENSE Q4_K/Q5_K/Q6_K (2026-10-05, `vega`)
 
 **THE RUN NOW PASSES THE CAPABILITY GATE ON ALL 48 LAYERS AND STOPS AT THE NATIVE DENSE PROJECTIONS - NOT AT

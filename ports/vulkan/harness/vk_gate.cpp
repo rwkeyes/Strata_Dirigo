@@ -7001,6 +7001,352 @@ void case_native_q5_k_f32(Ctx& ctx, const std::string& dir) {
     native_q5_k_arm(ctx, dir, 10240, 4, 2, "40 blocks x 2 columns: the widest Q5_K pitch");
 }
 
+// PIN THE ENTRY CASES TO THE HARNESS'S OWN PHYSICAL DEVICE.  Moved up from the I2 section so the K-quant and
+// Q8_0 cases (which drive the engine's `strata::kernels::native_mmvq` wrapper and compare it BITWISE to the
+// shader path) pin the engine device to the harness device.  See the fuller note at its original site.
+class EnginePin {
+public:
+    explicit EnginePin(const Ctx& harness) {
+        const std::vector<strata::vulkan::DeviceInfo> devs = strata::vulkan::Ctx::list_devices();
+        for (size_t i = 0; i < devs.size(); ++i) {
+            if (devs[i].name == harness.info().name) { idx_ = (int) i; break; }
+        }
+        if (idx_ < 0) return;                      // not found: leave the environment alone and let it fail loudly
+        const char* old = std::getenv("STRATA_VK_DEVICE");
+        if (old != nullptr) saved_ = old;
+        had_ = (old != nullptr);
+        setenv("STRATA_VK_DEVICE", std::to_string(idx_).c_str(), 1);
+    }
+    ~EnginePin() {
+        if (idx_ < 0) return;
+        if (had_) setenv("STRATA_VK_DEVICE", saved_.c_str(), 1);
+        else unsetenv("STRATA_VK_DEVICE");
+    }
+    bool pinned() const { return idx_ >= 0; }
+    int index() const { return idx_; }
+
+private:
+    int idx_ = -1;
+    bool had_ = false;
+    std::string saved_;
+};
+
+// ============================================================================================================
+// THE NATIVE-DENSE K-QUANTS: Q4_K (12), Q5_K (13), Q6_K (14) - ONE generic shader, `native_k_mmvq.spv`.
+//
+// `native_mmvq`'s composite (`src/core/layer.cpp:151`) now dispatches these three ggml types to ONE shader
+// that selects the dot by a `ty` push constant.  In `coder-iq1_m` they are 210 of the 300 eligible dense
+// tensors (Q6_K 128, Q4_K 47, Q5_K 35) - the whole remaining dense gap - so this case is the arm that keeps
+// the run's dense coverage honest.  Three checks, per format:
+//   (1) the generic shader's bytes vs the ENGINE WRAPPER `strata::kernels::native_mmvq(ty, ...)` - BITWISE,
+//       so the composite's type switch, push constant and dispatch cannot mismatch;
+//   (2) for Q5_K, the generic shader vs the port's EXISTING per-type shader `native_q5_k_f32.spv` - BITWISE,
+//       so "one generic mechanism reusing the existing dot" is a measurement rather than a claim;
+//   (3) the generic shader vs a DOUBLE transcription of the engine's own `q4_q8_dot`/`q5_q8_dot`/`q6_q8_dot`
+//       (`src/kernels/cuda/native_mmvq.cu:544/:196/:638`), terms-bounded - the engine's rule, not the shader.
+static double q4_dot_host(const std::vector<uint8_t>& w, size_t blk, const std::vector<uint8_t>& act, size_t abase, int p) {
+    const auto u8  = [&](size_t o) { return (uint32_t) w[o]; };
+    const auto u16 = [&](size_t o) { return u8(o) | (u8(o + 1) << 8); };
+    const auto i32 = [&](size_t o) { return (int32_t) (u8(o) | (u8(o + 1) << 8) | (u8(o + 2) << 16) | (u8(o + 3) << 24)); };
+    const int bq8_offset = 2 * (p / 4);
+    const size_t nib = (size_t) (p % 4);
+    const size_t ql = blk + 16 + 16 * (size_t) bq8_offset + 4 * nib;
+    const int32_t v0 = i32(ql), v1 = i32(ql + 16);
+    const int j = bq8_offset / 2, jm = j & 1;
+    const size_t sbase = blk + 4 + 2 * (size_t) jm;
+    const uint32_t s0 = u16(sbase), s2 = u16(sbase + 4), s4 = u16(sbase + 8);
+    const uint32_t him = (j >= 2) ? 0xFFFFFFFFu : 0u;
+    const uint32_t aux0 = (uint16_t) (((s0 & 0x3f3f) & ~him) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & him));
+    const uint32_t aux1 = (uint16_t) (((s2 & 0x3f3f) & ~him) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & him));
+    const int scv[2] = {(int) (aux0 & 0xFF), (int) ((aux0 >> 8) & 0xFF)};
+    const int mv[2]  = {(int) (aux1 & 0xFF), (int) ((aux1 >> 8) & 0xFF)};
+    double sumf_d = 0.0, sumf_m = 0.0;
+    for (int i = 0; i < 2; ++i) {
+        const size_t b8 = abase + (size_t) (bq8_offset + i) * 36;
+        const double d8 = (double) strata::kernels::f32_from_f16((uint16_t) (act[b8] | ((uint16_t) act[b8 + 1] << 8)));
+        const int32_t u0 = (int32_t) ((uint32_t) act[b8 + 4 + 4 * nib] | ((uint32_t) act[b8 + 5 + 4 * nib] << 8) |
+                                      ((uint32_t) act[b8 + 6 + 4 * nib] << 16) | ((uint32_t) act[b8 + 7 + 4 * nib] << 24));
+        const int32_t u1 = (int32_t) ((uint32_t) act[b8 + 20 + 4 * nib] | ((uint32_t) act[b8 + 21 + 4 * nib] << 8) |
+                                      ((uint32_t) act[b8 + 22 + 4 * nib] << 16) | ((uint32_t) act[b8 + 23 + 4 * nib] << 24));
+        const int32_t v0i = (int32_t) (((uint32_t) v0 >> (4 * i)) & 0x0f0f0f0fu);
+        const int32_t v1i = (int32_t) (((uint32_t) v1 >> (4 * i)) & 0x0f0f0f0fu);
+        const int dot1 = q5_dp4a_host(v1i, u1, q5_dp4a_host(v0i, u0, 0));
+        const int dot2 = q5_dp4a_host(0x01010101, u1, q5_dp4a_host(0x01010101, u0, 0));
+        sumf_d += d8 * (double) (dot1 * scv[i]);
+        sumf_m += d8 * (double) (dot2 * mv[i]);
+    }
+    const double d  = (double) strata::kernels::f32_from_f16((uint16_t) (w[blk] | ((uint16_t) w[blk + 1] << 8)));
+    const double mn = (double) strata::kernels::f32_from_f16((uint16_t) (w[blk + 2] | ((uint16_t) w[blk + 3] << 8)));
+    return d * sumf_d - mn * sumf_m;
+}
+
+static double q6_dot_host(const std::vector<uint8_t>& w, size_t blk, const std::vector<uint8_t>& act, size_t abase, int p) {
+    const auto u8 = [&](size_t o) { return (uint32_t) w[o]; };
+    const int bq8_offset = 4 * (p / 16) + (p % 16) / 8;
+    const size_t scale_offset = (size_t) (8 * (p / 16) + (p % 16) / 4);
+    const int vh_shift = 2 * ((p % 16) / 8);
+    const uint32_t vl = u8(blk + 4 * p) | (u8(blk + 4 * p + 1) << 8) | (u8(blk + 4 * p + 2) << 16) | (u8(blk + 4 * p + 3) << 24);
+    const size_t qh = blk + 128 + 4 * ((size_t) 8 * (p / 16) + (size_t) (p % 8));
+    const int32_t vh = (int32_t) (u8(qh) | (u8(qh + 1) << 8) | (u8(qh + 2) << 16) | (u8(qh + 3) << 24)) >> vh_shift;
+    double sumf = 0.0;
+    for (int i = 0; i < 2; ++i) {
+        const int sc = (int) (int8_t) w[blk + 192 + scale_offset + 4 * (size_t) i];
+        const int32_t vil = (int32_t) (((uint32_t) vl >> (4 * i)) & 0x0f0f0f0fu);
+        const int32_t vih = (int32_t) ((((uint32_t) vh >> (4 * i)) << 4) & 0x30303030u);
+        const uint32_t vi0 = (uint32_t) (vil | vih);
+        uint32_t viu = 0;
+        for (uint32_t b = 0; b < 4; ++b) {                 // __vsubss4 per-byte, no saturation (0..63 - 32)
+            const int bytev = (int) ((vi0 >> (8 * b)) & 0xFFu) - 32;
+            viu |= (uint32_t) (bytev & 0xFF) << (8 * b);
+        }
+        const size_t aoff = abase + (size_t) (bq8_offset + 2 * i) * 36;
+        const double d8 = (double) strata::kernels::f32_from_f16((uint16_t) (act[aoff] | ((uint16_t) act[aoff + 1] << 8)));
+        const int32_t u = (int32_t) ((uint32_t) act[aoff + 4 + 4 * (size_t) (p % 8)] |
+                                     ((uint32_t) act[aoff + 5 + 4 * (size_t) (p % 8)] << 8) |
+                                     ((uint32_t) act[aoff + 6 + 4 * (size_t) (p % 8)] << 16) |
+                                     ((uint32_t) act[aoff + 7 + 4 * (size_t) (p % 8)] << 24));
+        sumf += d8 * (double) (q5_dp4a_host((int) viu, u, 0) * sc);
+    }
+    const double d = (double) strata::kernels::f32_from_f16((uint16_t) (w[blk + 208] | ((uint16_t) w[blk + 209] << 8)));
+    return d * sumf;
+}
+
+// Random Q4_K/Q5_K/Q6_K blocks, dm/d FINITE and small.  For Q4_K/Q5_K `dm` is a (d, min) half2; for Q6_K the
+// 16 `scales` are SIGNED int8 and there is a single `d` half.  Every other byte varies so all of `qs`/`qh`/`ql`
+// and the packed `aux` are exercised across the row set.
+static std::vector<uint8_t> k_fill_blob(int ty, size_t n_out, int nb) {
+    const int blk_bytes = (ty == 12) ? 144 : (ty == 13) ? 176 : 210;
+    const size_t row_bytes = (size_t) nb * (size_t) blk_bytes;
+    std::vector<uint8_t> w(n_out * row_bytes, 0);
+    for (size_t r = 0; r < n_out; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * row_bytes + (size_t) b * blk_bytes;
+            const float dmag = 0.02f * (float) (1 + ((b + (int) r) % 4));
+            if (ty == 12 || ty == 13) {
+                const float mmag = ((b + (int) r) % 3 == 0) ? -0.01f : 0.005f * (float) (1 + (b % 3));
+                s2_put16(blk + 0, strata::kernels::f16_from_f32(((b + (int) r) % 5 == 0) ? -dmag : dmag));
+                s2_put16(blk + 2, strata::kernels::f16_from_f32(mmag));
+                for (int i = 0; i < 12; ++i) blk[4 + i] = (uint8_t) ((i * 29 + b * 17 + (int) r * 43 + 7) & 0xFF);
+                if (ty == 13) {
+                    for (int i = 0; i < 32; ++i) blk[16 + i] = (uint8_t) ((i * 37 + b * 11 + (int) r * 53 + 5) & 0xFF);
+                    for (int i = 0; i < 128; ++i) blk[48 + i] = (uint8_t) ((i * 61 + b * 7 + (int) r * 19 + 1) & 0xFF);
+                } else {
+                    for (int i = 0; i < 128; ++i) blk[16 + i] = (uint8_t) ((i * 61 + b * 7 + (int) r * 19 + 1) & 0xFF);
+                }
+            } else {
+                for (int i = 0; i < 128; ++i) blk[i] = (uint8_t) ((i * 61 + b * 7 + (int) r * 19 + 1) & 0xFF);
+                for (int i = 0; i < 64; ++i) blk[128 + i] = (uint8_t) ((i * 37 + b * 11 + (int) r * 53 + 5) & 0xFF);
+                for (int i = 0; i < 16; ++i) blk[192 + i] = (uint8_t) (int8_t) (((i * 29 + b * 13 + (int) r * 7 + 3) & 0x7F) - 64);
+                s2_put16(blk + 208, strata::kernels::f16_from_f32(((b + (int) r) % 7 == 0) ? -dmag : dmag));
+            }
+        }
+    }
+    return w;
+}
+
+static double k_dot_host(int ty, const std::vector<uint8_t>& w, size_t blk, const std::vector<uint8_t>& act, size_t ab, int p) {
+    if (ty == 12) return q4_dot_host(w, blk, act, ab, p);
+    if (ty == 13) return q5_dot_host(w, blk, act, ab, p);
+    return q6_dot_host(w, blk, act, ab, p);
+}
+
+static void native_k_arm(Ctx& ctx, const std::string& dir, int ty, const char* name, int n_in, int n_out, int ncols, const char* what) {
+    const int blk_bytes = (ty == 12) ? 144 : (ty == 13) ? 176 : 210;
+    const int parts = (ty == 14) ? 32 : 16;
+    const int nb = n_in / 256;
+    const int row_bytes = nb * blk_bytes;
+    const int blocks_per_col = n_in / 32;
+    const std::vector<uint8_t> w = k_fill_blob(ty, (size_t) n_out, nb);
+    const std::vector<uint8_t> act = q5_k_fill_act(ncols, blocks_per_col);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c)
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, a_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) blocks_per_col * 36;
+            for (int k = 0; k < nb * parts; ++k) {
+                const int blk = k / parts;
+                const double v = k_dot_host(ty, w, wrow + (size_t) blk * (size_t) blk_bytes, act,
+                                            arow + (size_t) blk * 8 * 36, k % parts);
+                acc += v; a_sum += std::fabs(v);
+            }
+            want[(size_t) c * n_out + r] = acc; want_abs[(size_t) c * n_out + r] = a_sum;
+        }
+
+    // (shader path) the generic shader with the type in the push constant
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size()), b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size()); ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3); ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; int ty; } pc{n_in, n_out, row_bytes, ncols, ty};
+    { VkPipeline p = ctx.pipeline(dir + "/native_k_mmvq.spv", 3, (int) sizeof(pc));
+      ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out); }
+    std::vector<uint8_t> img(sink.size(), 0); ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0; double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) if (img[i] != 0xC3) ++bad;
+    char label[192];
+    std::snprintf(label, sizeof label, "native_k_mmvq (ty=%d %s n_in=%d n_out=%d ncols=%d, %s): vs the engine's %s dot (double, terms bound)",
+                  ty, name, n_in, n_out, ncols, what, name);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && nonfinite == 0 && live, bad + nonfinite, (int) n_y, worst,
+            "rows outside tolerance (worst err/tol)");
+
+    // (2) Q5_K: the generic shader vs the port's EXISTING per-type path, BITWISE
+    if (ty == 13 && have(dir, "native_q5_k_f32.spv")) {
+        Buf b_y2 = ctx.alloc(n_y * 4u + 64u);
+        std::vector<uint8_t> s2(n_y * 4u + 64u, 0xC3); ctx.write(b_y2, s2.data(), s2.size());
+        struct { int n_in; int n_out; int row_bytes; int ncols; } pc5{n_in, n_out, row_bytes, ncols};
+        VkPipeline p5 = ctx.pipeline(dir + "/native_q5_k_f32.spv", 3, (int) sizeof(pc5));
+        ctx.dispatch(p5, {&b_w, &b_a, &b_y2}, &pc5, sizeof(pc5), (uint32_t) n_out);
+        std::vector<uint8_t> i2(s2.size(), 0); ctx.read(b_y2, i2.data(), i2.size());
+        int bw = 0;
+        for (size_t i = 0; i < n_y * 4u; ++i) if (i2[i] != img[i]) ++bw;
+        verdict("native_k_mmvq (ty=13 Q5_K) == native_q5_k_f32 (the port's per-type path) BITWISE", bw == 0, bw,
+                (int) (n_y * 4u), (double) bw, "the generic K-quant shader's bytes differ from the per-type one's");
+        ctx.free(b_y2);
+    }
+
+    // (1) the ENGINE WRAPPER `strata::kernels::native_mmvq(ty, ...)` vs the shader path, BITWISE
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+    if (s != nullptr) {
+        uint8_t* dw = (uint8_t*) strata::vulkan::arena_alloc(*s, w.size());
+        uint8_t* da = (uint8_t*) strata::vulkan::arena_alloc(*s, act.size());
+        float*   dy = strata::vulkan::arena_alloc<float>(*s, n_y);
+        strata::vulkan::stream_write(*s, dw, w.data(), w.size());
+        strata::vulkan::stream_write(*s, da, act.data(), act.size());
+        strata::kernels::native_mmvq(ty, dw, da, dy, n_in, n_out, ncols, s);          // THE ENGINE WRAPPER
+        std::vector<float> wgot(n_y); strata::vulkan::stream_read(*s, dy, wgot.data(), n_y * 4);
+        strata::vulkan::stream_close(s);
+        int bw = 0;
+        for (size_t i = 0; i < n_y; ++i) {
+            uint32_t a, b; std::memcpy(&a, &got[i], 4); std::memcpy(&b, &wgot[i], 4);
+            if (a != b) ++bw;
+        }
+        std::snprintf(label, sizeof label, "native_mmvq entry (ty=%d %s): engine wrapper == native_k_mmvq shader path, bitwise",
+                      ty, name);
+        verdict(label, bw == 0, bw, (int) n_y, (double) bw, "words differ - the composite's K-quant switch or push constant mismatch");
+    } else {
+        verdict("native_mmvq entry: engine wrapper", false, 1, 1, 0, "no stream");
+    }
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_y);
+}
+
+void case_native_k_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_k_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("native_k_mmvq", "device lacks storageBuffer8BitAccess"); return; }
+    native_k_arm(ctx, dir, 12, "Q4_K", 2560, 4, 1, "80 blocks, 16 parts");
+    native_k_arm(ctx, dir, 13, "Q5_K", 2560, 4, 1, "80 blocks, 16 parts");
+    native_k_arm(ctx, dir, 14, "Q6_K", 2560, 4, 1, "80 blocks, 32 parts");
+    native_k_arm(ctx, dir, 14, "Q6_K", 256, 1, 2, "one block, 32 parts < 256 lanes, two columns");
+    native_k_arm(ctx, dir, 12, "Q4_K", 10240, 2, 2, "40 blocks x 2 columns");
+}
+
+// ============================================================================================================
+// THE ONE UNGATED DENSE SHADER: `q8_0_mmvq.spv` (ggml type 8).  It shipped with the native-dense work but had
+// NO case, so nothing pinned its rule.  `native_mmvq`'s case 8 arm and `native_mmvq_supported(8)` feed it, so
+// an ungated shader here is exactly the class the port refuses to leave open: it is reached by the real pack's
+// one Q8_0 dense tensor.  Checked (a) BITWISE against the ENGINE WRAPPER `native_mmvq(8, ...)` and (b) against
+// the engine's own rule - `vec_dot_q8_0_q8_1`'s `d_w * d_a * sum(qs_w * qs_a)` - transcribes in double.
+static double q8_0_dot_host(const std::vector<uint8_t>& w, size_t wb, const std::vector<uint8_t>& act, size_t ab) {
+    const auto i8 = [&](const std::vector<uint8_t>& v, size_t o) { return (int) (int8_t) v[o]; };
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wb] | ((uint16_t) w[wb + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ab] | ((uint16_t) act[ab + 1] << 8)));
+    long long sumi = 0;
+    for (int j = 0; j < 32; ++j) sumi += (long long) i8(w, wb + 2 + (size_t) j) * i8(act, ab + 4 + (size_t) j);
+    return dw * da * (double) sumi;
+}
+
+static void native_q8_0_arm(Ctx& ctx, const std::string& dir, int n_in, int n_out, int ncols, const char* what) {
+    const int nb = n_in / 32, row_bytes = nb * 34, abpc = nb;
+    std::vector<uint8_t> w((size_t) n_out * (size_t) row_bytes, 0);
+    for (size_t r = 0; r < (size_t) n_out; ++r)
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = w.data() + r * (size_t) row_bytes + (size_t) b * 34;
+            const float d = 0.02f * (float) (1 + ((b + (int) r) % 4));
+            s2_put16(blk, strata::kernels::f16_from_f32(((b + (int) r) % 5 == 0) ? -d : d));
+            for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) (int8_t) (((i * 31 + b * 17 + (int) r * 13) % 251) - 125);
+        }
+    std::vector<uint8_t> act = q5_k_fill_act(ncols, abpc);
+    const size_t n_y = (size_t) ncols * (size_t) n_out;
+    std::vector<double> want(n_y, 0.0), want_abs(n_y, 0.0);
+    for (int c = 0; c < ncols; ++c)
+        for (int r = 0; r < n_out; ++r) {
+            double acc = 0.0, a_sum = 0.0;
+            const size_t wrow = (size_t) r * (size_t) row_bytes;
+            const size_t arow = (size_t) c * (size_t) abpc * 36;
+            for (int k = 0; k < nb; ++k) {
+                const double v = q8_0_dot_host(w, wrow + (size_t) k * 34, act, arow + (size_t) k * 36);
+                acc += v; a_sum += std::fabs(v);
+            }
+            want[(size_t) c * n_out + r] = acc; want_abs[(size_t) c * n_out + r] = a_sum;
+        }
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size()), b_y = ctx.alloc(n_y * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size()); ctx.write(b_a, act.data(), act.size());
+    std::vector<uint8_t> sink(n_y * 4u + 64u, 0xC3); ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    { VkPipeline p = ctx.pipeline(dir + "/q8_0_mmvq.spv", 3, (int) sizeof(pc));
+      ctx.dispatch(p, {&b_w, &b_a, &b_y}, &pc, sizeof(pc), (uint32_t) n_out); }
+    std::vector<uint8_t> img(sink.size(), 0); ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0; double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_y; ++i) {
+        const double gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        const double ratio = std::fabs(gv - want[i]) / gemv_bound(want[i], want_abs[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_y * 4u; i < img.size(); ++i) if (img[i] != 0xC3) ++bad;
+    char label[192];
+    std::snprintf(label, sizeof label, "q8_0_mmvq (n_in=%d n_out=%d ncols=%d, %s): vs the engine's q8_0 rule (double, terms bound)", n_in, n_out, ncols, what);
+    std::printf("      y[0] = %.6g, want[0] = %.6g | non-finite %d of %d | worst err/tol %.3g | oracle mass %.6g\n",
+                (double) got[0], want[0], nonfinite, (int) n_y, worst, mass);
+    verdict(label, bad == 0 && nonfinite == 0 && mass > 1e-3, bad + nonfinite, (int) n_y, worst,
+            "rows outside tolerance (worst err/tol)");
+    // the ENGINE WRAPPER `native_mmvq(8, ...)` vs the shader path, BITWISE
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s != nullptr) {
+        uint8_t* dw = (uint8_t*) strata::vulkan::arena_alloc(*s, w.size());
+        uint8_t* da = (uint8_t*) strata::vulkan::arena_alloc(*s, act.size());
+        float*   dy = strata::vulkan::arena_alloc<float>(*s, n_y);
+        strata::vulkan::stream_write(*s, dw, w.data(), w.size());
+        strata::vulkan::stream_write(*s, da, act.data(), act.size());
+        strata::kernels::native_mmvq(8, dw, da, dy, n_in, n_out, ncols, s);            // THE ENGINE WRAPPER
+        std::vector<float> wgot(n_y); strata::vulkan::stream_read(*s, dy, wgot.data(), n_y * 4);
+        strata::vulkan::stream_close(s);
+        int bw = 0;
+        for (size_t i = 0; i < n_y; ++i) {
+            uint32_t a, b; std::memcpy(&a, &got[i], 4); std::memcpy(&b, &wgot[i], 4);
+            if (a != b) ++bw;
+        }
+        verdict("native_mmvq entry (ty=8 Q8_0): engine wrapper == q8_0_mmvq shader path, bitwise", bw == 0, bw,
+                (int) n_y, (double) bw, "words differ - the composite's Q8_0 switch or dispatch mismatch");
+    }
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_y);
+}
+
+void case_q8_0_mmvq(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "q8_0_mmvq.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("q8_0_mmvq", "device lacks storageBuffer8BitAccess"); return; }
+    native_q8_0_arm(ctx, dir, 2560, 4, 1, "80 blocks one column");
+    native_q8_0_arm(ctx, dir, 256, 1, 3, "one block three columns");
+}
+
 
 // -----------------------------------------------------------------------------------------------------------
 // MoE hit selection: which of a token's routed experts are RESIDENT, and the ROUTING POSITION each hit fills.
@@ -8641,6 +8987,395 @@ void case_native_grouped(Ctx& ctx, const std::string& dir) {
     } else {
         skip("native_down_iq4nl", "shader absent from this build");
     }
+}
+
+// ============================================================================================================
+// THE GENERIC GROUPED SHADERS AT THE FORMATS THE REAL PACK ACTUALLY USES.
+//
+// `case_native_grouped` exercises `native_gu_any.spv` only at ty=22 (IQ2_S) and `native_down_any.spv` only at
+// ty=20 (IQ4_NL), each bitwise against a specialised sibling.  But `coder-iq1_m`'s 48 layers use gate/up in
+// {18 IQ3_XXS, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS} and down in {20 IQ4_NL, 42 Q2_0} - so layers 0 (18/20), 1 (22/42)
+// and the IQ3_S/IQ4_XS layers read formats the generic shader's `ty` switch has NO arm for.  The dots are the
+// already-gated `common/iq*_dot.glsl` includes, so what these arms pin is the GENERIC side: the `ty` dispatch,
+// the per-format row stride and part decomposition.  Each format's oracle is the engine's own dot (the same
+// host rule the per-format `case_iq*_mmvq` arms are gated by), transcribed here.
+static double generic_gu_dot_host(int ty, const std::vector<uint8_t>& w, size_t wblk, const std::vector<uint8_t>& act,
+                                  size_t ablk, int iqs) {
+    if (ty == 18) return iq3xxs_dot_host(w, wblk, act, ablk, iqs);
+    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (act[ablk] | ((uint16_t) act[ablk + 1] << 8)));
+    const double f = (double) (float) (dw * da);
+    if (ty == 21) return f * (double) iq3s_sumi_host(w, wblk, act, ablk, iqs);
+    return f * (double) iq4xs_sumi_host(w, wblk, act, ablk, iqs);
+}
+
+static void native_gu_any_arm(Ctx& ctx, const std::string& dir, const NativeGroupedCase& c, int n_tok, int grid_y,
+                              int ty, const char* what) {
+    const int row_b = (ty == 18) ? 98 : (ty == 21) ? 110 : (ty == 23) ? 136 : 82;
+    const int nb = c.n_embd / 256;
+    const int gu_row = nb * row_b;
+    const int up_off = c.n_ff * gu_row;
+    const int blob = 2 * c.n_ff * gu_row;
+    const int n_groups = (int) c.grp_start.size() - 1;
+    std::vector<uint8_t> w((size_t) n_groups * (size_t) blob, 0);
+    for (int g = 0; g < n_groups; ++g) {
+        std::vector<uint8_t> one = (ty == 18) ? iq3xxs_fill_blob((size_t) (2 * c.n_ff), nb, c.n_embd)
+                                 : (ty == 21) ? iq3s_fill_blob((size_t) (2 * c.n_ff), nb, c.n_embd)
+                                 : (ty == 23) ? iq4xs_fill_blob((size_t) (2 * c.n_ff), nb, c.n_embd)
+                                              : iq2s_fill_blob((size_t) (2 * c.n_ff), nb, c.n_embd);
+        std::memcpy(w.data() + (size_t) g * (size_t) blob, one.data(), one.size());
+    }
+    const int blocks_per_tok = c.n_embd / 32;
+    const std::vector<uint8_t> act = iq1m_fill_act(n_tok * blocks_per_tok);
+    std::vector<uint32_t> grp_off((size_t) n_groups);
+    for (int g = 0; g < n_groups; ++g) grp_off[(size_t) g] = (uint32_t) g * (uint32_t) blob;
+
+    const size_t n_out = (size_t) c.grp_start.back() * (size_t) c.n_ff;
+    std::vector<double> want_gate(n_out, 0.0), want_up(n_out, 0.0), abs_gate(n_out, 0.0), abs_up(n_out, 0.0);
+    for (int g = 0; g < n_groups; ++g)
+        for (int e = c.grp_start[(size_t) g]; e < c.grp_start[(size_t) g + 1]; ++e) {
+            const size_t arow = (size_t) c.ent[(size_t) e] * (size_t) blocks_per_tok * 36u;
+            for (int r = 0; r < c.n_ff; ++r) {
+                double gacc = 0, uacc = 0, gabs = 0, uabs = 0;
+                for (int k = 0; k < nb * 8; ++k) {
+                    const size_t ablk = arow + (size_t) k * 36u;
+                    const int iqs = (ty == 23) ? 4 * (k % 8) : 2 * (k % 8);
+                    const size_t wb = (size_t) g * (size_t) blob + (size_t) r * (size_t) gu_row + (size_t) (k / 8) * (size_t) row_b;
+                    const double gv = generic_gu_dot_host(ty, w, wb, act, ablk, iqs);
+                    const double uv = generic_gu_dot_host(ty, w, wb + (size_t) up_off, act, ablk, iqs);
+                    gacc += gv; uacc += uv; gabs += std::fabs(gv); uabs += std::fabs(uv);
+                }
+                const size_t idx = (size_t) e * (size_t) c.n_ff + (size_t) r;
+                want_gate[idx] = gacc; want_up[idx] = uacc; abs_gate[idx] = gabs; abs_up[idx] = uabs;
+            }
+        }
+
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(act.size());
+    Buf b_o = ctx.alloc(grp_off.size() * 4u), b_win = ctx.alloc((size_t) n_groups * 4u);
+    Buf b_s = ctx.alloc(c.grp_start.size() * 4u), b_ng = ctx.alloc(4u), b_e = ctx.alloc(c.ent.size() * 4u);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g2 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_og = ctx.alloc(n_out * 4u + 64u), b_ou = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size()); ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_o, grp_off.data(), grp_off.size() * 4u);
+    std::vector<uint32_t> win((size_t) n_groups, 0u);
+    ctx.write(b_win, win.data(), win.size() * 4u);
+    ctx.write(b_s, c.grp_start.data(), c.grp_start.size() * 4u);
+    const int ngv = n_groups; ctx.write(b_ng, &ngv, 4u);
+    ctx.write(b_e, c.ent.data(), c.ent.size() * 4u);
+    ctx.write(b_g1, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g2, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g3, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    std::vector<uint8_t> sink(n_out * 4u + 64u, 0xC3);
+    ctx.write(b_og, sink.data(), sink.size()); ctx.write(b_ou, sink.data(), sink.size());
+    struct { int n_embd; int n_ff; int ty; int win_id; } pc{c.n_embd, c.n_ff, ty, 0};
+    VkPipeline p = ctx.pipeline(dir + "/native_gu_any.spv", 12, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_g1, &b_g2, &b_g3, &b_o, &b_win, &b_s, &b_ng, &b_e, &b_og, &b_ou},
+                 &pc, sizeof(pc), (uint32_t) (2 * c.n_ff), (uint32_t) grid_y);
+    std::vector<uint8_t> img_g(sink.size(), 0), img_u(sink.size(), 0);
+    ctx.read(b_og, img_g.data(), img_g.size()); ctx.read(b_ou, img_u.data(), img_u.size());
+    const float* gg = reinterpret_cast<const float*>(img_g.data());
+    const float* uu = reinterpret_cast<const float*>(img_u.data());
+    int bad = 0; double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        const double rg = std::fabs((double) gg[i] - want_gate[i]) / gemv_bound(want_gate[i], abs_gate[i], 1e-6);
+        const double ru = std::fabs((double) uu[i] - want_up[i]) / gemv_bound(want_up[i], abs_up[i], 1e-6);
+        worst = std::max(worst, std::max(rg, ru));
+        if (!(rg <= 1.0) || !(ru <= 1.0)) ++bad;
+        mass += std::fabs(want_gate[i]) + std::fabs(want_up[i]);
+    }
+    for (size_t i = n_out * 4u; i < img_g.size(); ++i) if (img_g[i] != 0xC3 || img_u[i] != 0xC3) ++bad;
+    char label[192];
+    std::snprintf(label, sizeof label, "native_gu_any (generic, ty=%d) vs the engine's %s dot (groups=%d, entries=%d, grid.y=%d, %s)",
+                  ty, (ty == 18) ? "IQ3_XXS" : (ty == 21) ? "IQ3_S" : (ty == 23) ? "IQ4_XS" : "IQ2_S", n_groups,
+                  c.grp_start.back(), grid_y, what);
+    std::printf("      ty=%d gate[0]=%.6g (want %.6g) up[0]=%.6g (want %.6g) | worst err/tol %.3g | mass %.6g\n", ty,
+                (double) gg[0], want_gate[0], (double) uu[0], want_up[0], worst, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live, bad, (int) (n_out * 2), worst, "values outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_o); ctx.free(b_win); ctx.free(b_s); ctx.free(b_ng); ctx.free(b_e);
+    ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_og); ctx.free(b_ou);
+}
+
+// Q2_0 (ty=42) is the OTHER down format the pack uses (layer 1).  The generic `native_down_any.spv` selects it
+// by `pc.ty`; the geometry is 64-value / 18-byte blocks, `nparts = n_ff/32`, `iqs = k%2`, block `k/2`.
+static void native_down_any_arm(Ctx& ctx, const std::string& dir, const NativeGroupedCase& c, int grid_y,
+                                int ty, const char* what) {
+    const int nb = (ty == 42) ? c.n_ff / 64 : c.n_ff / 32;
+    const int d_row = nb * 18;
+    const int blob = d_row * c.n_embd;
+    const int n_groups = (int) c.grp_start.size() - 1;
+    const int n_entries = c.grp_start.back();
+    const int n_dst = 1 + *std::max_element(c.ent.begin(), c.ent.begin() + n_entries);
+    std::vector<uint8_t> w((size_t) n_groups * (size_t) blob, 0);
+    for (int g = 0; g < n_groups; ++g) {
+        std::vector<uint8_t> one = (ty == 42) ? q2_0_fill_blob((size_t) c.n_embd, nb, c.n_ff)
+                                              : iq4nl_fill_blob((size_t) c.n_embd, nb, c.n_ff);
+        std::memcpy(w.data() + (size_t) g * (size_t) blob, one.data(), one.size());
+    }
+    const int hb = c.n_ff / 32;                       // q8_1 blocks per entry of hq
+    std::vector<uint8_t> hq = iq1m_fill_act((size_t) n_entries * (size_t) hb);
+    std::vector<uint32_t> grp_off((size_t) n_groups);
+    for (int g = 0; g < n_groups; ++g) grp_off[(size_t) g] = (uint32_t) g * (uint32_t) blob;
+
+    const size_t n_out = (size_t) n_dst * (size_t) c.n_embd;
+    std::vector<double> want(n_out, 0.0), abs_w(n_out, 0.0);
+    for (int g = 0; g < n_groups; ++g)
+        for (int e = c.grp_start[(size_t) g]; e < c.grp_start[(size_t) g + 1]; ++e) {
+            const size_t arow = (size_t) e * (size_t) hb * 36u;
+            for (int r = 0; r < c.n_embd; ++r) {
+                double acc = 0.0, a = 0.0;
+                for (int k = 0; k < hb; ++k) {
+                    const size_t wblk = (size_t) g * (size_t) blob + (size_t) r * (size_t) d_row + (size_t) (k / 2) * 18;
+                    const size_t ablk = arow + (size_t) k * 36u;
+                    const double dw = (double) strata::kernels::f32_from_f16((uint16_t) (w[wblk] | ((uint16_t) w[wblk + 1] << 8)));
+                    const double da = (double) strata::kernels::f32_from_f16((uint16_t) (hq[ablk] | ((uint16_t) hq[ablk + 1] << 8)));
+                    const double v = (double) (float) (dw * da) * (double) q2_0_sumi_host(w, wblk, hq, ablk, k % 2);
+                    acc += v; a += std::fabs(v);
+                }
+                const size_t idx = (size_t) c.ent[(size_t) e] * (size_t) c.n_embd + (size_t) r;
+                want[idx] = acc; abs_w[idx] = a;
+            }
+        }
+    Buf b_w = ctx.alloc(w.size()), b_a = ctx.alloc(hq.size());
+    Buf b_o = ctx.alloc(grp_off.size() * 4u), b_win = ctx.alloc((size_t) n_groups * 4u);
+    Buf b_s = ctx.alloc(c.grp_start.size() * 4u), b_ng = ctx.alloc(4u), b_e = ctx.alloc(c.ent.size() * 4u);
+    Buf b_y = ctx.alloc(n_out * 4u + 64u);
+    ctx.write(b_w, w.data(), w.size()); ctx.write(b_a, hq.data(), hq.size());
+    ctx.write(b_o, grp_off.data(), grp_off.size() * 4u);
+    std::vector<uint32_t> win((size_t) n_groups, 0u); ctx.write(b_win, win.data(), win.size() * 4u);
+    ctx.write(b_s, c.grp_start.data(), c.grp_start.size() * 4u);
+    const int ngv = n_groups; ctx.write(b_ng, &ngv, 4u);
+    ctx.write(b_e, c.ent.data(), c.ent.size() * 4u);
+    std::vector<uint8_t> sink(n_out * 4u + 64u, 0xC3); ctx.write(b_y, sink.data(), sink.size());
+    struct { int n_embd; int n_ff; int ty; int win_id; int d_row; int down_off; } pc{c.n_embd, c.n_ff, ty, 0, d_row, 0};
+    VkPipeline p = ctx.pipeline(dir + "/native_down_any.spv", 8, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_a, &b_o, &b_win, &b_s, &b_ng, &b_e, &b_y}, &pc, sizeof(pc), (uint32_t) c.n_embd,
+                 (uint32_t) grid_y);
+    std::vector<uint8_t> img(sink.size(), 0); ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0; double worst = 0, mass = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        const double ratio = std::fabs((double) got[i] - want[i]) / gemv_bound(want[i], abs_w[i], 1e-6);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(want[i]);
+    }
+    for (size_t i = n_out * 4u; i < img.size(); ++i) if (img[i] != 0xC3) ++bad;
+    char label[192];
+    std::snprintf(label, sizeof label, "native_down_any (generic, ty=42 Q2_0) vs the engine's Q2_0 dot (groups=%d, entries=%d, grid.y=%d, %s)",
+                  n_groups, n_entries, grid_y, what);
+    std::printf("      out[0]=%.6g (want %.6g) | worst err/tol %.3g | mass %.6g\n", (double) got[0], want[0], worst, mass);
+    verdict(label, bad == 0 && mass > 1e-3, bad, (int) n_out, worst, "values outside tolerance (worst err/tol)");
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_o); ctx.free(b_win); ctx.free(b_s); ctx.free(b_ng); ctx.free(b_e); ctx.free(b_y);
+}
+
+void case_native_any_formats(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gu_any.spv") || !have(dir, "native_down_any.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("native_any_formats", "device lacks storageBuffer8BitAccess"); return; }
+    // the pack's seven (gu,d) pairs: gu 18/21/22/23 x down 20/42.  gu>2560, n_ff=8 and down:n_embd=8,
+    // n_ff=2560 - the same shapes `case_native_grouped` uses, so the grouped machinery is identical.
+    NativeGroupedCase gu{2560, 8, {0, 2, 5, 5}, {0, 1, 3, 3, 2}};
+    native_gu_any_arm(ctx, dir, gu, 4, 3, 18, "IQ3_XXS: layer 0's gate/up");
+    native_gu_any_arm(ctx, dir, gu, 4, 3, 21, "IQ3_S");
+    native_gu_any_arm(ctx, dir, gu, 4, 3, 23, "IQ4_XS: the pack's largest blob format");
+    NativeGroupedCase dn{8, 2560, {0, 2, 5, 5}, {0, 1, 3, 3, 2}};
+    native_down_any_arm(ctx, dir, dn, 3, 42, "Q2_0: layer 1's down");
+}
+
+// ============================================================================================================
+// THE GROUPED NATIVE-EXPERT LAUNCHER: `native_expert_grouped` (vulkan/src/kernels/native_expert_grouped_vk.cpp).
+//
+// This is the symbol the engine actually calls for a native (IQ) pack's experts, and the one piece of the port
+// that must be RIGHT past 4 GiB: the reference hands it an array of DEVICE POINTERS, and glslang 15.1 has no
+// 64-bit buffer index, so the launcher rebases each pointer to a (within-window offset, window) pair and binds
+// the weights VIEWED AT `win_id * WIN_BYTES`.  The pack's experts sit at 1.4 .. 24.8 GiB, so EVERY expert
+// beyond the first window is read through that machinery - and a wrong window index reads the right offset in
+// the WRONG 4 GiB, which is a silently wrong expert rather than a crash.
+//
+// THE ARMS, and why each is not decoration:
+//   * A - `ptr_to_off.spv` at the boundary, synthetic pointers: the (off, win) split for 0, wb-1, wb, wb+5,
+//         2wb+7.  Cheap, no arena, and it pins the exact arithmetic the launcher's every dispatch depends on.
+//   * B - the launcher end-to-end with the SAME expert placed in WINDOW 0 and in WINDOW 1 (a > 4 GiB arena):
+//         the two runs must be BITWISE EQUAL.  This is the arm the pack needs - it is the only one that reads
+//         an expert through a NON-ZERO window - and it needs no chain oracle, because the two outputs are the
+//         same function of the same bytes.
+//   * C - the same shape with a DIFFERENT expert in window 1: the output must DIFFER, so arm B cannot pass by
+//         both runs reading window 0's bytes.
+void case_native_expert_grouped(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "ptr_to_off.spv") || !have(dir, "native_gu_any.spv") || !have(dir, "native_down_any.spv") ||
+        !have(dir, "swiglu_f32.spv")) {
+        skip("native_expert_grouped", "launcher shader(s) absent from this build");
+        return;
+    }
+    if (!ctx.info().storage_buffer_8bit) { skip("native_expert_grouped", "device lacks storageBuffer8BitAccess"); return; }
+
+    // ---- ARM A: the rebase's window split, at the boundary, on synthetic pointers ----
+    {
+        // THE WINDOW CONSTANT, by the launcher's own formula (native_expert_grouped_vk.cpp's kWinBytes =
+        // 4 GiB - 64 MiB).  It is a push constant to this shader and the launcher owns the value; this arm
+        // restates the arithmetic rather than reading it, so a change to one and not the other fails here.
+        const uint64_t wb = (1ull << 32) - (64ull << 20);
+        const uint64_t base = 0x700000000000ull;      // Stream::kArenaBase
+        const uint64_t f[] = {0ull, wb - 1, wb, wb + 5, 2 * wb + 7};
+        const int n = (int) (sizeof f / sizeof f[0]);
+        std::vector<uint32_t> ptr((size_t) n * 2), off((size_t) n, 0xDEADBEEFu), win((size_t) n, 0xDEADBEEFu);
+        for (int i = 0; i < n; ++i) {
+            const uint64_t p = base + f[i];
+            ptr[(size_t) 2 * i] = (uint32_t) (p & 0xFFFFFFFFu);
+            ptr[(size_t) 2 * i + 1] = (uint32_t) (p >> 32);
+        }
+        Buf b_p = ctx.alloc(ptr.size() * 4u), b_n = ctx.alloc(4u), b_o = ctx.alloc((size_t) n * 4u), b_w = ctx.alloc((size_t) n * 4u);
+        ctx.write(b_p, ptr.data(), ptr.size() * 4u);
+        const int ng = n; ctx.write(b_n, &ng, 4u);
+        ctx.write(b_o, off.data(), off.size() * 4u); ctx.write(b_w, win.data(), win.size() * 4u);
+        struct { uint32_t base_lo; uint32_t base_hi; uint32_t win_bytes; } pc{(uint32_t) base, (uint32_t) (base >> 32), (uint32_t) wb};
+        VkPipeline p = ctx.pipeline(dir + "/ptr_to_off.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_p, &b_n, &b_o, &b_w}, &pc, sizeof(pc), groups_for((uint64_t) n));
+        std::vector<uint32_t> go((size_t) n), gw((size_t) n);
+        ctx.read(b_o, go.data(), go.size() * 4u); ctx.read(b_w, gw.data(), gw.size() * 4u);
+        int bad = 0;
+        for (int i = 0; i < n; ++i)
+            if (go[(size_t) i] != (uint32_t) (f[i] % wb) || gw[(size_t) i] != (uint32_t) (f[i] / wb)) ++bad;
+        std::printf("      ptr_to_off: 0 -> (%u,%u); wb-1 -> (%u,%u); wb -> (%u,%u); 2wb+7 -> (%u,%u)\n",
+                    go[0], gw[0], go[1], gw[1], go[2], gw[2], go[4], gw[4]);
+        verdict("ptr_to_off at the 4 GiB window boundary: (within-offset, window) for 0 / wb-1 / wb / wb+5 / 2wb+7",
+                bad == 0, bad, n, (double) bad,
+                "the rebase's window split - a wrong window is a silently wrong expert");
+        ctx.free(b_p); ctx.free(b_n); ctx.free(b_o); ctx.free(b_w);
+    }
+
+    // ---- ARMS B/C: the launcher reads the SAME expert through window 0 and window 1 (and a DIFFERENT one) ----
+    const int n_embd = 2560, n_ff = 640;
+    const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(22, 20, n_embd, n_ff);
+    std::vector<uint8_t> gu = iq2s_fill_blob((size_t) (2 * n_ff), n_embd / 256, n_embd);
+    std::vector<uint8_t> dn = iq4nl_fill_blob((size_t) n_embd, n_ff / 32, n_ff);
+    if (gu.size() + dn.size() != (size_t) L.bytes || (size_t) L.down_off < gu.size()) {
+        skip("native_expert_grouped", "fixture does not match native_expert_layout's blob");
+        return;
+    }
+    std::vector<uint8_t> blob((size_t) L.bytes, 0);
+    std::memcpy(blob.data(), gu.data(), gu.size());
+    std::memcpy(blob.data() + (size_t) L.down_off, dn.data(), dn.size());
+    // ARMS B/C/D.  One scratch/activation buffer, reused; the expert copies differ only in their bytes.
+    std::vector<uint8_t> blob2 = blob;                 // a DIFFERENT expert: perturb BOTH halves' code bytes
+    for (size_t i = 0; i < blob2.size(); ++i) {
+        // keep every block's `d`/`dm` half intact (a random half can assemble an inf)
+        if (i < (size_t) L.down_off) { if (i % 82 >= 2) blob2[i] ^= 0x33; }
+        else                        { if ((i - (size_t) L.down_off) % 18 >= 2) blob2[i] ^= 0x33; }
+    }
+    // ARM D's fixture: perturb ONLY the gate/up half.  This is the arm that CATCHES the `view()` defect the
+    // scratch sentinel above was probing - with the view offset taken as arena-absolute, the gate/up weights
+    // never reached the output and this fixture left `out` bitwise unchanged.
+    std::vector<uint8_t> blob3 = blob;
+    for (size_t i = 0; i < (size_t) L.down_off; ++i) if (i % 82 >= 2) blob3[i] ^= 0x77;
+    // ARM E's fixture: the gate/up half ZEROED.  `swiglu(0, 0) = 0`, so a launcher that actually reads this
+    // half must produce an ALL-ZERO `out` - a sharp observable, not a tolerance.
+    std::vector<uint8_t> blob4 = blob;
+    for (size_t i = 0; i < (size_t) L.down_off; ++i) blob4[i] = 0;
+
+    // THE ARENA IS THE MINIMUM THAT CROSSES ONE WINDOW BOUNDARY, not a round 5 GiB.  `nwin` is computed from
+    // the arena's own size, so the arena only has to exceed kWinBytes (= 4 GiB - 64 MiB) for a second window to
+    // exist; keeping it under 4 GiB lets llvmpipe's `maxBufferSize` serve it too.  An earlier 5 GiB here made
+    // `vkCreateBuffer` fail on llvmpipe with VK_ERROR_OUT_OF_DEVICE_MEMORY and ABORTED that implementation's
+    // whole arm (the device layer exits on a Vulkan failure) - measured 2026-10-05.
+    const uint64_t wb = (1ull << 32) - (64ull << 20);
+    const uint64_t SZ = wb + (24ull << 20);
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(SZ, dir); }
+    if (s == nullptr) { skip("native_expert_grouped", "no engine stream (could not open a >4 GiB-window arena)"); return; }
+
+    // the expert copies, and the offsets that decide their windows
+    uint8_t* e0 = (uint8_t*) strata::vulkan::arena_alloc(*s, blob.size());
+    strata::vulkan::stream_write(*s, e0, blob.data(), blob.size());
+    {   // bump to just past the window boundary, so e1 lands in window 1
+        const uint64_t cur = (uint64_t) (uintptr_t) e0 - strata::vulkan::Stream::kArenaBase + blob.size();
+        (void) strata::vulkan::arena_alloc(*s, wb + (2ull << 20) - cur);
+    }
+    uint8_t* e1 = (uint8_t*) strata::vulkan::arena_alloc(*s, blob.size());
+    strata::vulkan::stream_write(*s, e1, blob.data(), blob.size());
+    uint8_t* e1b = (uint8_t*) strata::vulkan::arena_alloc(*s, blob2.size());
+    strata::vulkan::stream_write(*s, e1b, blob2.data(), blob2.size());
+    uint8_t* e3 = (uint8_t*) strata::vulkan::arena_alloc(*s, blob3.size());
+    strata::vulkan::stream_write(*s, e3, blob3.data(), blob3.size());
+    uint8_t* e4 = (uint8_t*) strata::vulkan::arena_alloc(*s, blob4.size());
+    strata::vulkan::stream_write(*s, e4, blob4.data(), blob4.size());
+    std::printf("      launcher arena: e0 off %llu (win %llu), e1 off %llu (win %llu)\n",
+                (unsigned long long) ((uint64_t) (uintptr_t) e0 - strata::vulkan::Stream::kArenaBase),
+                (unsigned long long) (((uint64_t) (uintptr_t) e0 - strata::vulkan::Stream::kArenaBase) /
+                                      ((1ull << 32) - (64ull << 20))),
+                (unsigned long long) ((uint64_t) (uintptr_t) e1 - strata::vulkan::Stream::kArenaBase),
+                (unsigned long long) (((uint64_t) (uintptr_t) e1 - strata::vulkan::Stream::kArenaBase) /
+                                      ((1ull << 32) - (64ull << 20))));
+
+    const int blocks_per_col = n_embd / 32;
+    const size_t xq_bytes = (size_t) (n_embd / 32) * 36u;
+    const size_t scr_bytes = strata::kernels::native_expert_scratch_bytes(1, n_ff);
+    // one scratch and activation buffer, reused by every run (the launcher's stages all address this scratch)
+    uint8_t* xq = (uint8_t*) strata::vulkan::arena_alloc(*s, xq_bytes);
+    uint8_t* scr = (uint8_t*) strata::vulkan::arena_alloc(*s, scr_bytes);
+    {
+        std::vector<uint8_t> act = iq1m_fill_act(blocks_per_col);
+        strata::vulkan::stream_write(*s, xq, act.data(), act.size());
+    }
+    auto run = [&](unsigned long long exp_ptr, float* out) {
+        unsigned long long* gp = strata::vulkan::arena_alloc<unsigned long long>(*s, 1);
+        int32_t* gs = strata::vulkan::arena_alloc<int32_t>(*s, 2);
+        int32_t* ng = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        int32_t* ed = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        int32_t* et = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        const unsigned long long hp = exp_ptr;
+        const int32_t gsv[2] = {0, 1}, ngv = 1, edv = 0, etv = 0;
+        strata::vulkan::stream_write(*s, (uint8_t*) gp, &hp, sizeof hp);
+        strata::vulkan::stream_write(*s, (uint8_t*) gs, gsv, sizeof gsv);
+        strata::vulkan::stream_write(*s, (uint8_t*) ng, &ngv, sizeof ngv);
+        strata::vulkan::stream_write(*s, (uint8_t*) ed, &edv, sizeof edv);
+        strata::vulkan::stream_write(*s, (uint8_t*) et, &etv, sizeof etv);
+        strata::kernels::native_expert_grouped(L, gp, gs, ng, ed, et, 1, 1, xq, scr, out, s, 1);   // THE ENGINE WRAPPER
+    };
+    float* y0 = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    float* y1 = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    float* y2 = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    float* y3 = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    float* y4 = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    run((unsigned long long) (uintptr_t) e0, y0);
+    run((unsigned long long) (uintptr_t) e1, y1);
+    run((unsigned long long) (uintptr_t) e1b, y2);
+    run((unsigned long long) (uintptr_t) e3, y3);
+    run((unsigned long long) (uintptr_t) e4, y4);
+    std::vector<float> h0(n_embd), h1(n_embd), h2(n_embd), h3(n_embd), h4(n_embd);
+    strata::vulkan::stream_read(*s, y0, h0.data(), n_embd * 4);
+    strata::vulkan::stream_read(*s, y1, h1.data(), n_embd * 4);
+    strata::vulkan::stream_read(*s, y2, h2.data(), n_embd * 4);
+    strata::vulkan::stream_read(*s, y3, h3.data(), n_embd * 4);
+    strata::vulkan::stream_read(*s, y4, h4.data(), n_embd * 4);
+    strata::vulkan::stream_close(s);
+    int bw01 = 0, same02 = 0, nonfinite = 0, gu_moved = 0, zero_nonzero = 0; double mass = 0;
+    for (int i = 0; i < n_embd; ++i) {
+        uint32_t a, b, c; std::memcpy(&a, &h0[i], 4); std::memcpy(&b, &h1[i], 4); std::memcpy(&c, &h2[i], 4);
+        if (a != b) ++bw01;
+        if (a == c) ++same02;
+        if (h3[i] != h0[i]) ++gu_moved;
+        if (h4[i] != 0.0f) ++zero_nonzero;
+        if (!std::isfinite((double) h0[i])) ++nonfinite;
+        mass += std::fabs((double) h0[i]);
+    }
+    std::printf("      launcher: window0 y[0]=%.6g, window1 y[0]=%.6g | |y0| sum %.6g | gu-only moves %d/%d | zero-gu nonzero %d\n",
+                (double) h0[0], (double) h1[0], mass, gu_moved, n_embd, zero_nonzero);
+    verdict("native_expert_grouped: the SAME expert read through WINDOW 0 and WINDOW 1 is BITWISE the same output",
+            bw01 == 0 && mass > 1e-3 && nonfinite == 0, bw01 + nonfinite, n_embd, (double) bw01,
+            "words differ across the 4 GiB window boundary - a wrong window reads the wrong expert");
+    verdict("native_expert_grouped: a DIFFERENT expert in window 1 moves the output (so arm B cannot pass on window 0's bytes)",
+            same02 < n_embd / 2, same02, n_embd, (double) same02,
+            "the different expert produced the same output - the launcher read the wrong window's bytes");
+    verdict("native_expert_grouped: the expert's GATE/UP half reaches the output (perturbing only it moves the result)",
+            gu_moved >= n_embd / 2, n_embd - gu_moved, n_embd, (double) (n_embd - gu_moved),
+            "the gate/up weights did not move the output - the expert's gate/up half is not being read");
+    verdict("native_expert_grouped: zeroing the GATE/UP half drives the output to exactly 0 (swiglu(0,0)=0)",
+            zero_nonzero == 0 && mass > 1e-3, zero_nonzero, n_embd, (double) zero_nonzero,
+            "a gate/up-independent term reached the output");
 }
 
 // bf16_mmvf_f32: a BF16 weight against an FP32 activation.
@@ -13609,34 +14344,8 @@ void case_fused_gdn_step_norm(Ctx& ctx, const std::string& dir) {
 // (x=-3.44161081: arcs bits bddaa466, llvmpipe bddaa465), so a bitwise arm comparing them is comparing two
 // DIFFERENT hardware implementations, not the wrapper against the shader.  The engine's `stream_open` honours
 // `STRATA_VK_DEVICE` as an index into the list it itself enumerates, so this scopes that index to the harness
-// device's NAME and restores the environment on the way out.
-class EnginePin {
-public:
-    explicit EnginePin(const Ctx& harness) {
-        const std::vector<strata::vulkan::DeviceInfo> devs = strata::vulkan::Ctx::list_devices();
-        for (size_t i = 0; i < devs.size(); ++i) {
-            if (devs[i].name == harness.info().name) { idx_ = (int) i; break; }
-        }
-        if (idx_ < 0) return;                      // not found: leave the environment alone and let it fail loudly
-        const char* old = std::getenv("STRATA_VK_DEVICE");
-        if (old != nullptr) saved_ = old;
-        had_ = (old != nullptr);
-        setenv("STRATA_VK_DEVICE", std::to_string(idx_).c_str(), 1);
-    }
-    ~EnginePin() {
-        if (idx_ < 0) return;
-        if (had_) setenv("STRATA_VK_DEVICE", saved_.c_str(), 1);
-        else unsetenv("STRATA_VK_DEVICE");
-    }
-    bool pinned() const { return idx_ >= 0; }
-    int index() const { return idx_; }
-
-private:
-    int idx_ = -1;
-    bool had_ = false;
-    std::string saved_;
-};
-
+// device's NAME and restores the environment on the way out.  THE CLASS LIVES EARLIER (just before the
+// native-dense K-quant cases) so those cases can pin the engine device too.
 // I2 — THE DOORBELL REPLACEMENT.  The CUDA handshake is a kernel that SPINS on host memory ordered by
 // `__threadfence_system()` (elementwise.cu:209-218, called from layer.cpp:380 and session.cpp:873); Vulkan
 // has no equivalent and a spinning kernel is forbidden here.  The replacement is a FENCE for the device->host
@@ -21564,6 +22273,13 @@ int main(int argc, char** argv) {
     // launcher, and the blob layout checked against `coder-iq1_m`'s OWN `native_experts.txt` column.  APPENDED
     // last for the shared-RNG reason every batch above names.
     case_native_expert_capability_entry(ctx, dir);
+    // THIS BATCH: THE NATIVE-DENSE K-QUANTS (Q4_K/Q5_K/Q6_K, 210 of the pack's 300 eligible dense tensors) run
+    // through ONE generic shader, and the one previously-ungated dense shader (`q8_0_mmvq`) gets its case.
+    // APPENDED last for the shared-RNG reason every batch above names.
+    case_native_k_mmvq(ctx, dir);
+    case_q8_0_mmvq(ctx, dir);
+    case_native_any_formats(ctx, dir);
+    case_native_expert_grouped(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

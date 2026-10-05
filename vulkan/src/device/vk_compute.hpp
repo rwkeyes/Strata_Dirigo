@@ -61,9 +61,19 @@ struct Buf {
 };
 
 // A view of `b` starting `off` bytes in: the engine's row-slice pattern, made explicit.
+//
+// RELATIVE TO `b`, NOT TO THE ARENA.  This was `v.offset = off` (replacing the base handle's offset), which is
+// correct only for a handle whose own offset is 0 - e.g. the single arena buffer.  `native_expert_grouped`
+// views its SCRATCH (a bump-allocation with a non-zero arena offset) as `view(b_scr, k*fa)`, so the four
+// scratch regions were bound at the ARENA BASE instead of inside the scratch: the gate/up/h/hq stages wrote
+// over the arena's first ~8 KiB (the first expert's blob), the q8_1 quantiser - the one stage that uses raw
+// pointer arithmetic - wrote to the CALLER's scratch, and the down stage read back a region that was neither.
+// Measured 2026-10-05 by the gate's launcher arm: zeroing an expert's whole gate/up half left `out` bitwise
+// unchanged, and the scratch read back all-zero after a call.  Adding the base offset is the one-line fix;
+// every call site with a zero-offset base is unchanged.
 inline Buf view(const Buf& b, uint64_t off) {
     Buf v = b;
-    v.offset = off;
+    v.offset = b.offset + off;
     return v;
 }
 

@@ -1,0 +1,71 @@
+// ports/vulkan/shaders/native_k_mmvq.comp - the GENERIC native-dense MMVQ for the three K-quants, ONE shader.
+//
+// WHY THIS EXISTS (the last dense gap).  Under `--native` a pack's dense projections that are stored ONLY in
+// the GGUF shard (the pack index gives them `dst_bytes 0`) are uploaded by `NativeDense::load` and computed
+// through `native_mmvq` (`src/core/native_dense.cpp`, `src/core/layer.cpp:151`).  The port shipped
+// `native_mmvq` for the IQ formats and Q8_0; in `coder-iq1_m` the eligible dense tensors are Q6_K x128,
+// Q4_K x47, IQ4_NL x47, IQ4_XS x42, Q5_K x35, Q8_0 x1 - so the K-quants (210 of 300) had NO shader and
+// `native_mmvq_supported` answered FALSE for them, leaving the tensor on `WeightTable::load`'s refusal
+// (`src/core/weights.cpp:269`, "holds the tensor only in its GGUF form").  This shader closes that: it is the
+// composite's arm for ggml types 12 (Q4_K), 13 (Q5_K) and 14 (Q6_K), selected by a `ty` push constant.
+//
+// THE MECHANISM IS THE ONE THE PORT USES EVERYWHERE ELSE.  All three formats share the 256-value block and the
+// same per-row MMVQ shape - one workgroup (256) per output row, a strided walk over (block, part), the
+// `common/wg_reduce.glsl` barrier-tree sum, `y[c*n_out + row]`.  Only the dot differs, and those three dots
+// are ONE definition in `common/k_dots.glsl`, which the native head's per-type shader
+// (`native_q5_k_f32.comp`) also includes - so the Q5_K path here IS the port's existing one, and the gate
+// compares them bitwise.  The Q4_K/Q6_K parts are `native_mmvq.cu`'s `q4_q8_dot`/`q6_q8_dot`.
+//
+// WHY THREE UNIFORM ARMS AND NOT A RUNTIME PART/BLOCK STRIDE.  The first form walked `k < nb*parts` with
+// `parts`/`blk_bytes` read from `ty`.  That is arithmetically identical, but the compiler then cannot fold the
+// per-part block index and the Q5_K branch came back LAST-BIT different from `native_q5_k_f32.spv` (measured
+// 2026-10-05: `-628.262085` vs `-628.261719`; the gate's bitwise arm caught it 13/16).  Each arm below uses a
+// COMPILE-TIME `parts` and block size, which is what makes the Q5_K arm byte-for-byte the per-type shader's
+// (`native_q5_k_f32.comp` walks the identical loop).  It is still one shader and one mechanism: `ty` picks the
+// arm, and the grouping/row/activation addressing is the same in all three.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;   // the K-quant weight rows
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } a_b;   // q8_1 activation blocks (36 B)
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+#include "common/k_dots.glsl"
+
+// ty: 12 = Q4_K, 13 = Q5_K, 14 = Q6_K (ggml type ids; the engine's own numbering).
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; int ty; } pc;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;                 // workgroup-uniform: the reduction's barriers stay legal
+    const uint ty = uint(pc.ty);
+    const uint nb = uint(pc.n_in) / 256u;
+    const uint blocks_per_col = uint(pc.n_in) / 32u;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint abase = c * blocks_per_col * KD_Q8_1_BLOCK;
+        float acc = 0.0;
+        if (ty == 12u) {                                // Q4_K: 16 parts, 144 B/block
+            for (uint k = lid; k < nb * 16u; k += gl_WorkGroupSize.x) {
+                const uint blk = k / 16u;
+                acc += q4_q8_dot(wrow + blk * KD_Q4K_BLOCK, abase + blk * 8u * KD_Q8_1_BLOCK, k % 16u);
+            }
+        } else if (ty == 13u) {                         // Q5_K: 16 parts, 176 B/block
+            for (uint k = lid; k < nb * 16u; k += gl_WorkGroupSize.x) {
+                const uint blk = k / 16u;
+                acc += q5_q8_dot(wrow + blk * KD_Q5K_BLOCK, abase + blk * 8u * KD_Q8_1_BLOCK, k % 16u);
+            }
+        } else {                                        // Q6_K: 32 parts, 210 B/block
+            for (uint k = lid; k < nb * 32u; k += gl_WorkGroupSize.x) {
+                const uint blk = k / 32u;
+                acc += q6_q8_dot(wrow + blk * KD_Q6K_BLOCK, abase + blk * 8u * KD_Q8_1_BLOCK, k % 32u);
+            }
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}
