@@ -10578,15 +10578,21 @@ void case_sampler_split(Ctx& ctx, const std::string& dir) {
     }
     struct Arm {
         const char* what;
-        int n_vocab, top_k, min_keep, n_seeds, expect_first;
+        int n_vocab, top_k, min_keep, n_seeds, expect_first, hist_hit;
         float temperature, top_p, min_p, pen_rep, pen_freq, pen_pres;
     };
     const Arm arms[] = {
-        {"one partition equals the host chain",                 4096,  1, 1,  4,      0, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
-        {"three partitions: the merge interleaves the lists",  12288,  4, 1, 16,    100, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
-        {"61 partitions (248320): the merge runs to the end", 248320,  4, 1,  8,    500, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
-        {"the top_p cut reads the merged list",                12288, 64, 1, 16,    100, 1.0f, 0.50f, 0.0f, 1.0f, 0, 0},
-        {"temperature 0 is UNIFORM over the merged shortlist",  4096,  8, 1, 16,     -1, 0.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"one partition equals the host chain",                 4096,  1, 1,  4,      0, -1, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"three partitions: the merge interleaves the lists",  12288,  4, 1, 16,    100, -1, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"61 partitions (248320): the merge runs to the end", 248320,  4, 1,  8,    500, -1, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"the top_p cut reads the merged list",                12288, 64, 1, 16,    100, -1, 1.0f, 0.50f, 0.0f, 1.0f, 0, 0},
+        {"temperature 0 is UNIFORM over the merged shortlist",  4096,  8, 1, 16,     -1, -1, 0.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        // The PENALTY arm: a real hit on the row's head logit (id 100, 8 times in the window) with
+        // `penalty_repeat = 4`, which DIVIDES a positive logit - so the head falls from 9 to 2.25 and the
+        // selection moves to id 4200.  This is the arm the penalty HOIST answers to: the hoist caches each
+        // element's penalised value once per partition (the engine's `s[kSplitPerLane]` shape) instead of
+        // re-scanning the window on every k round, and an arm with no hit cannot tell the two apart.
+        {"the repeat penalty is applied ONCE per partition (the hoist)", 12288, 4, 1, 16, 4200, 100, 1.0f, 1.00f, 0.0f, 4.0f, 0.0f, 0.0f},
     };
     struct Pc {
         int n_vocab, n_tokens, history_len, penalty_last_n, top_k, min_keep;
@@ -10601,7 +10607,9 @@ void case_sampler_split(Ctx& ctx, const std::string& dir) {
     for (const Arm& a : arms) {
         const uint32_t nv = (uint32_t) a.n_vocab;
         std::vector<float> row((size_t) nv, -50.0f);
-        std::vector<int32_t> hist((size_t) history_len, 9999);   // no penalty hits (9999 is no candidate here)
+        std::vector<int32_t> hist((size_t) history_len, 9999);   // 9999 is no candidate here (no penalty hit)
+        if (a.hist_hit >= 0)                                     // ... unless THIS arm wants a real hit
+            for (int i = 0; i < 8; ++i) hist[(size_t) i] = a.hist_hit;
         if (a.n_vocab == 4096) {
             for (int v = 0; v < 64 && v < a.n_vocab; ++v) row[(size_t) v] = 1.0f;   // equal survivors
         } else if (a.n_vocab == 12288) {
@@ -10659,7 +10667,7 @@ void case_sampler_split(Ctx& ctx, const std::string& dir) {
     }
     verdict("sampler_split: the merged selection equals the block kernel's", parity_bad == 0, parity_bad,
             parity_total, 0.0, "the engine claims its sampled paths pick the same token bit for bit");
-    verdict("sampler_split: five arms against the transcribed chain", bad_total == 0, bad_total, checks_total, 0.0,
+    verdict("sampler_split: six arms against the transcribed chain", bad_total == 0, bad_total, checks_total, 0.0,
             "a wrong partition, merge order or tail would land here");
 }
 

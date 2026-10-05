@@ -89,7 +89,8 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `gdn_out_norm` | h_v=48 S=128 | elements/s |
 | `iq_dequant_f32` BF16 / IQ4_NL / IQ2_S | 256 superblocks (65536 floats); IQ2_S also at 1024 (262144) | elements/s |
 | `iq2s_mmvq` | n_in=2560 n_out=512 and 2048, ncols=1 | GMAC/s (n_in MACs per output) |
-| `sampler_kernel_f32` | vocab=248320, n_tokens=1 | elements/s (logits scanned) |
+| `sampler_kernel_f32` (the ONE-BLOCK fallback) | vocab=248320, n_tokens=1 | elements/s (logits scanned) |
+| `sampler_split` (the engine's DEFAULT) | vocab=248320, n_tokens=1 and 64 | elements/s (logits scanned) |
 | `quantize_q8_0` | n=65536 (2048 blocks) — **skipped where the device has no `shaderFloat64`** | elements/s |
 | `quantize_q8_1` | n_in=2560 ncols=8 | elements/s |
 | `quantize_q8_K` | n=65536 (256 blocks) | elements/s |
@@ -112,7 +113,9 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
-to trip a driver timeout.  Running it last means a reset there costs only that row.
+to trip a driver timeout.  Running it last means a reset there costs only that row.  The split row (the
+engine's default - see the sampler section below) is measured in the same pass, at the single-token shape and
+at the engine's 64-row bound.
 
 ## Baseline — measured 2026-10-05
 
@@ -400,15 +403,52 @@ and benchmarked first: at these shapes it is **14–18x slower** than the workgr
 CUDA's own comment: 32 transactions per load at a fixed `i`).  CUDA takes the naive path only below n_out=64,
 which this engine never does for `bf16_gemv`, so the port ships the workgroup-per-row rendering.
 
-## The one number that is a problem, not a baseline
+## THE SAMPLER, MEASURED PROPERLY: the engine's DEFAULT (the split) vs the one-block fallback — 2026-10-05
 
-`sampler_kernel_f32` **202–1165 ms per token** on every device (202 ms on the XTX, 547 ms on the Arc).
-The kernel's top-k is `k` rounds, each a block-argmax over the *whole* vocabulary with an inner loop over
-the already-taken ids and the history window — cost ~ `k · vocab · (k + history)`.  At `k=64`,
-`vocab=248320`, `history=64` that is the port's slowest single dispatch by three orders of magnitude.  This
-is the **one-block** sampler; the engine's default is the split sampler (4096-logit partitions), which the
-port also has (`sampler_split.comp`) but which this harness does not yet measure.  For the performance tier
-this is the first target: no decode step survives a 200 ms sampler.
+The baseline above carried the sampler as **one number with a caveat**: `sampler_kernel_f32` 546.9 ms (Arc) /
+202.0 ms (XTX), labelled the *one-block fallback* rather than the engine's default.  That caveat is now measured
+and the default path is fixed.
+
+**WHICH PATH THE ENGINE TAKES.**  `sample_tokens` (`src/kernels/cuda/sampler.cu:1005-1026`) takes the **SPLIT**
+whenever `sampled_path() == Split` (the default — neither `STRATA_OLD_SAMPLER` nor `STRATA_SAMPLER_ONE_BLOCK` set),
+`n_blocks = ceil(n_vocab / 4096) <= 64` (`kSplitMaxBlocks`) and `n_tokens <= 64` (`kSplitMaxRows`) and the stream
+is not capturing and the scratch allocates.  **At the model's vocab 248,320 that is 61 blocks — inside the bound —
+so the SPLIT is what the engine runs on the shipped model**, and the one-block kernel is the FALLBACK (a wider
+vocabulary, more than 64 rows, a captured stream, or no scratch).  `run_bench.sh` now measures BOTH, at the same
+shape on the same device (`reps=5`, one dispatch per batch; the split accumulates its tail in double, so it is
+SKIPPED BY NAME where the device has no `shaderFloat64`).  `split/block < 1.0` means the DEFAULT is faster:
+
+| device | `sampler_kernel_f32` (the ONE-BLOCK fallback) | `sampler_split` (the **DEFAULT**) | split/block | DEFAULT at n_tokens=64 |
+|---|---:|---:|---:|---:|
+| vega Arc B70 (intel_icd) | 546.81 ms | **13.50 ms** | **0.025** | 13.97 ms |
+| vega Ryzen iGPU (radeon_icd) | 301.55 ms | **9.06 ms** | **0.030** | 74.91 ms |
+| vega llvmpipe (lvp_icd) | 1171.46 ms | **67.64 ms** | **0.058** | 391.29 ms |
+
+**WHAT THE SPLIT COST BEFORE THE FIX, AND WHY.**  The split was ported correct but slow: **348.95 ms on the Arc /
+161.62 ms on the iGPU / 665.46 ms on llvmpipe** at `n_tokens=1` (a focused probe of the same device layer and
+shader: one dispatch per replay, median of 5).  Measured, not assumed: **not bandwidth** (the 248,320-float row is
+993 KB, microseconds to load once); **not the one-workgroup-per-row decomposition** (64 rows cost about what 1 row
+cost — Arc 348.95 -> 384.54 ms pre-fix, 13.50 -> 13.97 ms post-fix — so the workgroups run concurrently and the
+cost is per row); **it was a serial scan in the wrong place.**  With the penalty window removed entirely the split
+fell to **12.66 ms on the Arc — a 27.6× drop** (the one-block f32 kernel 546.76 -> 210.37 ms).  `sampler_row_topk`
+(`common/sampler_select.glsl`) re-read each logit and re-scanned the whole history window on **every one of the `k`
+rounds** — `O(k · span · hlen)` — where the engine builds a 4,096-bit bitmap of the block and penalises each element
+**once** into registers (`src/kernels/cuda/sampler.cu:690-706`).
+
+**THE FIX.**  `sampler_row_topk` now computes each partition element's penalised logit **once** into the lane's
+registers (the lane's `SC_PER_LANE = 4096/256 = 16` slice — the engine's own `s[kSplitPerLane]` shape) and runs the
+k rounds over the cached values.  Candidate set, order, tie rule and penalty count are unchanged, so the selection
+is byte-for-byte the old one; the include is shared with `coupled_sample.comp`.  **Before -> after: 348.95 -> 13.50
+ms (Arc, 25.8×), 161.62 -> 9.06 (iGPU, 17.8×), 665.46 -> 67.64 (llvmpipe, 9.8×).**  Nothing slower was shipped
+(nothing was rejected — the single candidate was a win on all three devices).  The stream headroom left on the
+table is the engine's stage-1 grid over (61 blocks × rows), which the port's one-workgroup-per-row form does not
+take — visible in the `n_tokens=64` column on llvmpipe (391 ms, 5.8× the 1-row figure) and the iGPU (74.9 ms, 8.3×),
+while the Arc's 64 workgroups run concurrently (13.97 ms, ~1.03×).
+
+**THE RELEASE NOTE'S CAVEAT, RESTATED.**  546.9 / 202.0 ms was the FALLBACK's cost, never the default's: on the Arc
+the default measured 348.95 ms pre-fix, so the headline was 1.6× the default's real cost — and it is now **40×**
+above it (546.81 vs 13.50).  The XTX's default cost is **NOT MEASURED** (the box is suspended): **202.0 ms stands
+as the XTX ONE-BLOCK FALLBACK figure, and the XTX SPLIT row is PENDING.**
 
 ## Evidence the harness measures something real
 

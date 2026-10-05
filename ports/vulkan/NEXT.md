@@ -1,5 +1,87 @@
 # Start here next session
 
+## THE SAMPLER, MEASURED PROPERLY — the DEFAULT is the SPLIT, its real cost, and the PENALTY-HOIST fix — **DONE 2026-10-05**
+
+The performance tier's named first target, and the only number in the port above 100 ms.  The baseline carried
+`sampler_kernel_f32` **546.9 ms (Arc) / 202.0 ms (XTX)** with a CAVEAT: it is the ONE-BLOCK **fallback**, not the
+engine's default.  This increment names the default, measures it over the real vocabulary, finds WHY it was slow,
+and fixes the hot step.
+
+**WHICH PATH THE ENGINE ACTUALLY TAKES (the call site and the condition).**  `sample_tokens`
+(`src/kernels/cuda/sampler.cu:977`) branches, in order: `p.greedy || p.temperature <= 0.0f` -> the GREEDY argmax
+(`:988`); `sampled_path() == SampledPath::Old` -> the one-block `sampler_kernel` (`:1000`, `STRATA_OLD_SAMPLER=1`);
+else the default (`:1005`), where `:1013`
+`if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows && !stream_capturing(stream))`
+selects the **SPLIT** (`sampler_split_part_kernel` + `sampler_split_merge_kernel`); anything else — a wider
+vocabulary, more rows, a captured stream, or a scratch that failed to allocate — falls to
+`sampler_one_block_kernel`.  `sampled_path()` (`:854-859`) is **`Split`** unless `STRATA_OLD_SAMPLER` or
+`STRATA_SAMPLER_ONE_BLOCK` is set; `kSplitMaxBlocks = kSplitMaxRows = 64` (`:606-608`).  **At the model's vocab
+248,320, `n_blocks = ceil(248320/4096) = 61 <= 64` and a decode has `n_tokens = 1`, so a sampled request takes the
+SPLIT.  The fallback is NOT the default, and 546.9/202.0 ms was never the selection's real cost.**  (The port
+already pinned this choice as a predicate in `case_sample_tokens`; what was missing was the COST of the chosen
+path.)
+
+**MEASURED (vega; the shipped `bench/vk_bench.cpp` rows, `reps=5`, one dispatch per batch; `< 1.0` means the
+default is faster than the fallback).**  The default takes ONE workgroup per row, so the split row is the whole
+selection for that token:
+
+| device | `sampler_kernel_f32` ONE-BLOCK fallback (tokens=1) | `sampler_split` **DEFAULT** (tokens=1) | split/block | `sampler_split` tokens=64 |
+|---|---:|---:|---:|---:|
+| vega Arc B70 (intel_icd) | 546.81 ms | **13.50 ms** | **0.025** | 13.97 ms |
+| vega Ryzen iGPU (radeon_icd) | 301.55 ms | **9.06 ms** | **0.030** | 74.91 ms |
+| vega llvmpipe (lvp_icd) | 1171.46 ms | **67.64 ms** | **0.058** | 391.29 ms |
+
+**THE DIAGNOSIS, MEASURED NOT ASSUMED.**  The split was ported CORRECT but slow: **348.95 ms on the Arc /
+161.62 ms on the iGPU / 665.46 ms on llvmpipe** at `n_tokens=1` (a focused probe of the same device layer and the
+same shipped shader, one dispatch per replay, median of 5).  Three candidate causes, distinguished by measurement:
+* **Not bandwidth.**  The logits row is 248,320 × 4 = **993 KB**; loading it once at any plausible bandwidth is
+  microseconds, three orders below the 349 ms observed.
+* **Not the one-workgroup-per-row decomposition.**  64 rows cost about what 1 row cost pre-fix (Arc **348.95 ->
+  384.54 ms**, `tokens=64`) and post-fix (13.50 -> 13.97 ms): the workgroups run concurrently and the cost is
+  PER ROW, not per launch.  (The engine's stage-1 grid over (61 blocks × rows) is parallel form the port did NOT
+  take — that is headroom left on the table, not the bottleneck.)
+* **It WAS the serial scan, in the wrong place.**  Removing the penalty window entirely took the split to **12.66 ms
+  on the Arc — a 27.6× drop** (and the one-block f32 kernel 546.76 -> 210.37 ms, 2.6×).  `sampler_row_topk`
+  (`common/sampler_select.glsl`) re-read each logit and re-scanned the whole history window on **every one of the
+  `k` rounds** — `O(k · span · hlen)`, the port's scan-instead-of-bitmap trade applied where the engine applies a
+  bitmap.  The engine's `sampler_split_part_kernel` (`src/kernels/cuda/sampler.cu:690-706`) builds a 4,096-bit
+  bitmap of the block and penalises each element **once**, into the warp's registers (`s[kSplitPerLane]`), then runs
+  its rounds over the cached values.
+
+**THE FIX (the hot one, and only it).**  `sampler_row_topk` now computes each partition element's penalised logit
+**once** into the lane's registers (`sc_pv[]`/`sc_pi[]`, the lane's `SC_PER_LANE = 4096/256 = 16` slice — the
+engine's own `s[kSplitPerLane]` shape) and runs the k rounds over the cached values.  The value and index are the
+same, the penalty count is round-invariant, and the candidate set and order are unchanged, so the selection is
+byte-for-byte the old one.  The include is shared by `sampler_split.comp` and `coupled_sample.comp`, so the
+coupled merge gets it too.  **Before -> after: 348.95 -> 13.50 ms on the Arc (25.8×), 161.62 -> 9.06 on the iGPU
+(17.8×), 665.46 -> 67.64 on llvmpipe (9.8×).**  Nothing slower was shipped (nothing was rejected this batch — the
+single candidate was a win on all three devices).
+
+**FALSIFIED, and the case it falsifies is NEW.**  `gates/inject-verify.sh sampler-select-penalty-drop` zeroes the
+hoisted penalty's count -> **`FAIL  sampler_split: the repeat penalty is applied ONCE per partition (the hoist)
+    2/   16  worst 0`**.  `case_sampler_split` gained a SIXTH arm for it (a real hit on the row's head logit, id
+100 × 8 with `penalty_repeat = 4`, which divides the 9.0 head to 2.25 and moves the selection to id 4200) — the
+five existing arms all carry an empty window (`hist = 9999`), so NOTHING in the split case exercised the penalty
+before this arm, and a hoist arm with no hit could not tell the two forms apart.  The existing
+`sampler-split-merge-drop-parts` still bites (`FAIL ... 9/16`, the merge is unchanged).
+
+**GATE TOTALS AFTER THE CHANGE (vega, whole gate, `run_gate.sh` exit 0):** **Arc (intel_icd) 445 passed / 0 failed
+/ 0 skipped**, llvmpipe 433/0/3, radeon-iGPU 436/0/2 — **+1 verdict on every implementation** (the new split arm).
+The pre-existing skips and the intermittent radeon `budget: independent requery` flake are unchanged (this batch
+did not touch it).
+
+**MAP:** `check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo; 111 shaders built, 92 claimed`);
+`make_port_map.py` regenerates `PORT-MAP.tsv` **byte-identically**.  No `kernels::` symbol changed (no new shader).
+
+**THE RELEASE NOTE'S CAVEAT, RESTATED.**  The one-block figure was the FALLBACK's cost.  On the Arc the DEFAULT
+measured 348.95 ms pre-fix, so the headline was 1.6× the default's real cost — and after this fix it is **40×**
+above it (546.81 vs 13.50).  The XTX's default cost is **NOT MEASURED** (the box is suspended): **202.0 ms stands
+as the XTX ONE-BLOCK FALLBACK figure, and the XTX SPLIT row is PENDING.**
+
+**BOX `z820b`: PENDING, and deliberately un-invented.**  A probe of `192.168.1.116` times out (`100% packet loss`,
+`No route to host`) with no WoL path; the whole-tree sync and `run_gate.sh`/`run_bench.sh` there are PENDING the
+box being up.  No cross-host number is claimed.
+
 ## THE BF16-PROJECTION PAIR — `bf16_gemv` + `bf16_gemv_split` PORTED (one shared shader) — and the
 ## 8 SPECULATIVE-DRAFTER SYMBOLS LABELLED CLASS C — **DONE 2026-10-05**
 

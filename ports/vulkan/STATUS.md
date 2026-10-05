@@ -1,5 +1,51 @@
 # Status — what is done, what is verified, what is not
 
+## THE SAMPLER, MEASURED PROPERLY — the engine's DEFAULT is the SPLIT, and the PENALTY HOIST — the performance tier's first target (2026-10-05)
+
+The one number in the port above 100 ms, with a caveat the release notes carried: `sampler_kernel_f32` **546.9 ms
+(Arc) / 202.0 ms (XTX)** is the ONE-BLOCK **fallback**, not the engine's default.  Both halves are now settled.
+
+**THE DEFAULT, BY CALL SITE.**  `sample_tokens` (`src/kernels/cuda/sampler.cu:977`): greedy or `temp <= 0` ->
+the argmax (`:988`); `sampled_path() == Old` (`STRATA_OLD_SAMPLER=1`) -> the one-block `sampler_kernel` (`:1000`);
+else the default `:1013`
+`sampled_path() == Split && n_blocks <= 64 && n_tokens <= 64 && !stream_capturing(stream)` -> the **SPLIT**
+(`sampler_split_part_kernel` + `sampler_split_merge_kernel`), with `sampler_one_block_kernel` as the FALLBACK.
+`sampled_path()` is `Split` unless `STRATA_OLD_SAMPLER`/`STRATA_SAMPLER_ONE_BLOCK` is set (`:854-859`).  At the
+model's vocab 248,320, `n_blocks = ceil(248320/4096) = 61 <= 64`, so **the split is what the engine runs, and the
+546.9/202.0 figure was never the default's cost.**
+
+| device (vega) | `sampler_kernel_f32` **fallback** (tokens=1) | `sampler_split` **DEFAULT** (tokens=1) | split/block | DEFAULT, tokens=64 |
+|---|---:|---:|---:|---:|
+| Arc B70 (intel_icd) | 546.81 ms | **13.50 ms** | **0.025** | 13.97 ms |
+| Ryzen iGPU (radeon_icd) | 301.55 ms | **9.06 ms** | **0.030** | 74.91 ms |
+| llvmpipe (lvp_icd) | 1171.46 ms | **67.64 ms** | **0.058** | 391.29 ms |
+
+Shipped `bench/vk_bench.cpp` rows, `reps=5`, one dispatch per batch; full tables in `bench/README.md`.
+
+**WHY IT WAS SLOW, MEASURED BEFORE FIXING.**  The split cost **348.95 ms (Arc) / 161.62 ms (iGPU) / 665.46 ms
+(llvmpipe)** pre-fix.  Not bandwidth (the 993 KB row loads in microseconds); not the one-workgroup-per-row
+decomposition (64 rows cost ≈ what 1 row cost: Arc 348.95 -> 384.54 ms); it WAS a serial scan in the wrong place —
+removing the penalty window took it to **12.66 ms (27.6×)**.  `sampler_row_topk` re-read each logit and re-scanned
+the whole history window on EVERY k round (`O(k · span · hlen)`), where the engine builds a 4,096-bit block bitmap
+and penalises each element ONCE into registers (`src/kernels/cuda/sampler.cu:690-706`).
+
+**THE FIX.**  `common/sampler_select.glsl` caches each partition element's penalised logit once in the lane's
+registers (the engine's `s[kSplitPerLane]` shape, `SC_PER_LANE = 16`) and runs the k rounds over the cache; the
+selection is byte-for-byte unchanged.  **348.95 -> 13.50 ms Arc (25.8×), 161.62 -> 9.06 iGPU (17.8×), 665.46 ->
+67.64 llvmpipe (9.8×).**  The include is shared, so `coupled_sample.comp` gets the hoist too.
+
+| case | rule | measured (vega Arc) | falsified by |
+|---|---|---|---|
+| `sampler_split` (SIX arms now; the new 6th exercises a real penalty hit) | partition top-k + ordered merge, tail in double; the 6th arm: id 100 × 8 in the window, `penalty_repeat = 4` -> head 9.0/4 = 2.25, selection moves to id 4200 | 6 arms bit-exact vs the transcribed chain; parity with `sampler_kernel` unchanged | `sampler-select-penalty-drop` -> **FAIL `sampler_split: the repeat penalty is applied ONCE per partition (the hoist)` 2/16**; `sampler-split-merge-drop-parts` still 9/16 |
+
+**Gate, after the change: vega Arc 445/0/0, lvp 433/0/3, radeon-iGPU 436/0/2 (`run_gate.sh` exit 0)** — +1 verdict
+per implementation (the new arm).  Map unchanged: `check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo`),
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **Box `z820b`: PENDING** — the box is suspended
+(`100% packet loss`, `No route to host`, no WoL), so the default's cost on the XTX is NOT measured and no cross-host
+number is claimed; 202.0 ms stands as the XTX fallback figure.  Full detail in `NEXT.md`'s top section.
+
+---
+
 ## THE BF16-PROJECTION PAIR — `bf16_gemv` + `bf16_gemv_split` (one shared shader) — and the 8 SPECULATIVE-DRAFTER ROWS LABELLED CLASS C (2026-10-05)
 
 The SECOND soft edge the batch-5 REACHABILITY AUDIT raised is CLOSED by porting BOTH members of the

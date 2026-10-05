@@ -110,6 +110,22 @@
 #   inject-verify.sh bf16-gemv-row-base     bf16_gemv.comp  index the weight row with the OUTPUT stride
 #                                       -> must FAIL  "bf16_gemv"
 #
+#   (the SAMPLER family - the default SPLIT path, its f32 sibling, the `sample_tokens` choice, the coupled drafter)
+#   inject-verify.sh sampler-split-merge-drop-parts  common/sampler_select.glsl  drain the running list before
+#                                       the partition's -> must FAIL  "sampler_split:"
+#   inject-verify.sh sampler-select-penalty-drop  common/sampler_select.glsl  zero the HOISTED penalty's count
+#                                       (the per-partition penalty cache added when the split's per-round window
+#                                       rescan was removed: 348.95 ms -> 13.53 ms on the Arc) -> must FAIL
+#                                       "sampler_split: the repeat penalty"
+#   inject-verify.sh sampler-kernel-f32-top-p-boundary  common/sampler_tail.glsl  drop the >= top_p boundary
+#                                       -> must FAIL  "sampler_kernel_f32: one survivor (top_p cut of one)"
+#   inject-verify.sh sample-tokens-choice-temp0-to-sampled  harness/vk_gate.cpp  temp 0 no longer routes to
+#                                       the argmax -> must FAIL  "sample_tokens: temperature 0"
+#   inject-verify.sh coupled-draft-counter-off-by-one  coupled_sample.comp  drop the +1 of
+#                                       `coupled_draft_counter` -> must FAIL  "coupled_draft: the counter"
+#   inject-verify.sh coupled-draft-window-start  coupled_penalize.comp  drop the draft index j from the
+#                                       window start -> must FAIL  "coupled_draft: the window"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -251,6 +267,18 @@ case "$name" in
     old=$'                else take_a = (sc_sel_lg[a] > sc_tmp_lg[c]) ||\n                              (sc_sel_lg[a] == sc_tmp_lg[c] && sc_sel_id[a] < sc_tmp_id[c]);'
     new=$'                else take_a = (a < ncur);   // INJECTION: the merge drains the running list first'
     want="FAIL  sampler_split:" ;;
+  sampler-select-penalty-drop)
+    # THE PENALTY HOIST (`common/sampler_select.glsl`).  `sampler_row_topk` now computes each partition
+    # element's penalised logit ONCE, into the lane's registers (the engine's own `s[kSplitPerLane]` shape),
+    # and runs the k rounds over the CACHED values - instead of re-reading the logit and re-scanning the
+    # whole penalty window on every round.  Measured on the Arc at vocab 248320 / n_tokens 1 / k 64 / window
+    # 64: 348.95 ms with the per-round rescan, 13.53 ms with the hoist.  Zeroing the count makes the wrong
+    # rule the RAW logit; the split's penalty arm (id 100 hit 8x, `penalty_repeat = 4`) must move its head
+    # from 4200 back to 100, so the arm is not decorative.
+    file="$SH/common/sampler_select.glsl"; spv="sampler_split"; comp="$SH/sampler_split.comp"
+    old=$'                s = sc_penalized(s, cnt, pc.penalty_repeat, pc.penalty_freq, pc.penalty_present);'
+    new=$'                s = sc_penalized(s, 0, pc.penalty_repeat, pc.penalty_freq, pc.penalty_present);   // INJECTION: the hoisted penalty dropped (zero count)'
+    want="FAIL  sampler_split: the repeat penalty" ;;
   coupled-draft-counter-off-by-one)
     # THE coupled rule: a draft at cell c is verified by a row drawn with counter c+1, so the drafter draws with
     # counter c+1 too.  Dropping the +1 makes it draw with c - a different (still valid) Philox stream and a worse

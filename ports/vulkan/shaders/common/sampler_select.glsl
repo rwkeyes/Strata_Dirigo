@@ -24,6 +24,8 @@
 #define PORT_SAMPLER_SELECT_GLSL
 
 #define SC_SPAN 4096                     // logits per partition, the engine's kSplitBlockSpan
+#define SC_LANES 256                     // the workgroup width this include documents
+#define SC_PER_LANE (SC_SPAN / SC_LANES) // the partition logits one lane holds: its register slice
 
 shared int sc_tmp_id[SC_KMAX];           // the current partition's top-k
 shared float sc_tmp_lg[SC_KMAX];
@@ -69,19 +71,43 @@ void sampler_row_topk(int t, int k) {
         const int lo = b * SC_SPAN;
         const int hi = min(lo + SC_SPAN, nvb);
 
+        // ---- the partition's PENALISED logits, computed ONCE per element into the lane's registers ----
+        // A lane's candidates are `lo + lid + SC_LANES*j`, j in [0, SC_PER_LANE) - its SLICE of the partition.
+        // This is the engine's own shape (`s[kSplitPerLane]`): the penalty (and the logit read) happens once
+        // per element, and the k rounds scan the CACHED values.  The port's first form re-read the logit and
+        // re-scanned the whole penalty window on EVERY round - O(k * span * hlen), where the engine is
+        // O(span + hits * hlen).  Measured on the Arc at vocab 248320 / n_tokens 1 / k 64 / window 64:
+        // 348.95 ms with the per-round rescan against 12.66 ms with the penalty scan removed entirely, so
+        // this hoist is the one that matters (the k-round scan itself is the remainder).
+        float sc_pv[SC_PER_LANE];
+        int sc_pi[SC_PER_LANE];
+        for (int j = 0; j < SC_PER_LANE; ++j) {
+            const int v = lo + int(lid) + SC_LANES * j;
+            float s = uintBitsToFloat(0xff800000u);    // past the partition's end: -inf with the sentinel id
+            int id = nvb;
+            if (v < hi) {
+                s = LO_.x[row + uint(v)];
+                id = v;
+#ifdef PORT_SAMPLER_USE_HIST
+                int cnt = 0;
+                for (int q = 0; q < hlen; ++q) if (HI_.h[hbase + q] == v) ++cnt;
+                s = sc_penalized(s, cnt, pc.penalty_repeat, pc.penalty_freq, pc.penalty_present);
+#endif
+            }
+            sc_pv[j] = s;
+            sc_pi[j] = id;
+        }
+
         // ---- the partition's top-k: k rounds of a workgroup argmax over the not-yet-taken ----
         float prev_v = uintBitsToFloat(0x7f800000u);   // +inf, id -1: round 0 takes every logit
         int prev_i = -1;
         for (int i = 0; i < k; ++i) {
             float bv = uintBitsToFloat(0xff800000u);   // -inf
             int best = nvb;                            // the sentinel loses every comparison
-            for (int v = lo + int(lid); v < hi; v += 256) {
-                float s = LO_.x[row + uint(v)];
-#ifdef PORT_SAMPLER_USE_HIST
-                int cnt = 0;
-                for (int q = 0; q < hlen; ++q) if (HI_.h[hbase + q] == v) ++cnt;
-                s = sc_penalized(s, cnt, pc.penalty_repeat, pc.penalty_freq, pc.penalty_present);
-#endif
+            for (int j = 0; j < SC_PER_LANE; ++j) {
+                const float s = sc_pv[j];
+                const int v = sc_pi[j];
+                // `j` ascends with `v`, and the comparison is strict, so the lowest id still wins a tie.
                 if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
             }
             sc_rv[lid] = bv;

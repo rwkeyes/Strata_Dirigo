@@ -357,37 +357,70 @@ void bench_iq2s(Ctx& ctx, const std::string& dir, int n_out, int reps, int warmu
 }
 
 // =========================================================================================================
-// THE SAMPLER - sampler_kernel_f32 (the portable path for devices without shaderFloat64; the target
-// hardware).  One workgroup per token over the full vocabulary.
+// THE SAMPLER - the ENGINE'S DEFAULT measured against the ONE-BLOCK f32 fallback, at the same shape and on
+// the same device.  `sample_tokens` (src/kernels/cuda/sampler.cu:1005-1026) takes the SPLIT whenever
+// `sampled_path() == Split` (the default - neither STRATA_OLD_SAMPLER nor STRATA_SAMPLER_ONE_BLOCK set),
+// `n_blocks = ceil(n_vocab / 4096) <= 64` and `n_tokens <= 64` (kSplitMaxBlocks / kSplitMaxRows).  At the
+// model's vocab 248320 that is 61 blocks, so the SPLIT is what the engine runs and the one-block kernel is
+// the FALLBACK (a vocabulary wider than 262144, more than 64 rows, a captured stream, or no scratch).
+// The `sampler_split` rows are therefore the DEFAULT's cost; the `sampler_kernel_f32` row is the fallback's.
+// Both are ONE workgroup per token over the vocabulary.  The split accumulates its tail in double, so it is
+// SKIPPED BY NAME on a device without shaderFloat64.
 // =========================================================================================================
 
 void bench_sampler(Ctx& ctx, const std::string& dir, int n_vocab, int reps, int warmups) {
     const int history_len = 64;                         // the artifact's window
-    std::vector<float> row((size_t) n_vocab);
-    for (int i = 0; i < n_vocab; ++i) row[(size_t) i] = 0.25f * rndf();
-    row[7] = 9.0f; row[1234] = 8.0f; row[99999 % n_vocab] = 7.5f;  // a shortlist worth filtering
+    const int max_tokens = 64;                          // the engine's kSplitMaxRows (its split bound)
+    std::vector<float> row((size_t) n_vocab * max_tokens);
+    for (size_t i = 0; i < row.size(); ++i) row[i] = 0.25f * rndf();
+    for (int t = 0; t < max_tokens; ++t) {              // a shortlist worth filtering, per row
+        float* r = row.data() + (size_t) t * n_vocab;
+        r[7] = 9.0f; r[1234] = 8.0f; r[99999 % n_vocab] = 7.5f;
+    }
     std::vector<int32_t> hist((size_t) history_len, -1);
-    for (int i = 0; i < 8; ++i) hist[(size_t) i] = 7;
-    Buf b_l = alloc(ctx, (size_t) n_vocab * 4), b_h = alloc(ctx, (size_t) history_len * 4), b_o = alloc(ctx, 4);
-    ctx.write(b_l, row.data(), (size_t) n_vocab * 4);
-    ctx.write(b_h, hist.data(), (size_t) history_len * 4);
+    for (int i = 0; i < 8; ++i) hist[(size_t) i] = 7;   // a real penalty hit on the head token
+    Buf b_l = alloc(ctx, row.size() * 4), b_h = alloc(ctx, (size_t) history_len * 4),
+        b_o = alloc(ctx, (size_t) max_tokens * 4);
+    ctx.write(b_l, row.data(), row.size() * 4);
+    ctx.write(b_h, hist.data(), hist.size() * 4);
     struct Pc {
         int n_vocab, n_tokens, history_len, penalty_last_n, top_k, min_keep;
         float temperature, top_p, min_p, penalty_repeat, penalty_freq, penalty_present;
         uint32_t seed_lo, seed_hi, counter_lo, counter_hi;
     } pc{};
-    pc.n_vocab = n_vocab; pc.n_tokens = 1; pc.history_len = history_len; pc.penalty_last_n = history_len;
+    pc.n_vocab = n_vocab; pc.history_len = history_len; pc.penalty_last_n = history_len;
     pc.top_k = 64; pc.min_keep = 1; pc.temperature = 1.0f; pc.top_p = 0.95f; pc.min_p = 0.0f;
     pc.penalty_repeat = 1.0f; pc.penalty_freq = 0.0f; pc.penalty_present = 0.0f;
     pc.seed_lo = 0x12345678u; pc.seed_hi = 0x9abcdef0u; pc.counter_lo = 0; pc.counter_hi = 0;
-    VkPipeline p = ctx.pipeline(dir + "/sampler_kernel_f32.spv", 3, (uint32_t) sizeof(Pc));
-    // ONE dispatch per timed batch: this kernel's top-k is k rounds over the whole row in ONE workgroup, so a
-    // single dispatch is already long; batching them would just make one command buffer rival a driver timeout.
-    Timing t = time_kernel(ctx, p, {&b_l, &b_h, &b_o}, &pc, (uint32_t) sizeof(pc), 1 /*groups*/, 1 /*groups_y*/,
-                           1 /*batch*/, reps < 5 ? reps : 5, warmups < 2 ? warmups : 2);
+    const int sreps = reps < 5 ? reps : 5, swarm = warmups < 2 ? warmups : 2;
     char shape[64];
+
+    // ---- THE ONE-BLOCK f32 FALLBACK.  ONE dispatch per timed batch: its top-k is k rounds over the whole row
+    // in ONE workgroup, already long enough that batching would rival a driver timeout.
+    pc.n_tokens = 1;
+    VkPipeline p_f32 = ctx.pipeline(dir + "/sampler_kernel_f32.spv", 3, (uint32_t) sizeof(Pc));
+    Timing tf = time_kernel(ctx, p_f32, {&b_l, &b_h, &b_o}, &pc, (uint32_t) sizeof(pc), 1 /*groups*/, 1 /*groups_y*/,
+                            1 /*batch*/, sreps, swarm);
     std::snprintf(shape, sizeof shape, "vocab=%d n_tokens=1", n_vocab);
-    report("sampler_kernel_f32", shape, t, (double) n_vocab, 0.0);
+    report("sampler_kernel_f32", shape, tf, (double) n_vocab, 0.0);
+
+    // ---- THE DEFAULT: the SPLIT, at the single-token decode shape AND at the engine's row bound.
+    if (!ctx.info().shader_float64) {
+        std::printf("SKIP sampler_split              | device has no shaderFloat64 (its tail accumulates in double)\n");
+    } else {
+        double split1 = 0.0;
+        VkPipeline p_split = ctx.pipeline(dir + "/sampler_split.spv", 3, (uint32_t) sizeof(Pc));
+        for (int nt : {1, max_tokens}) {
+            pc.n_tokens = nt;
+            Timing ts = time_kernel(ctx, p_split, {&b_l, &b_h, &b_o}, &pc, (uint32_t) sizeof(pc), (uint32_t) nt, 1, 1,
+                                    sreps, swarm);
+            std::snprintf(shape, sizeof shape, "vocab=%d n_tokens=%d", n_vocab, nt);
+            report(nt == 1 ? "sampler_split" : "sampler_split_64", shape, ts, (double) n_vocab * nt, 0.0);
+            if (nt == 1) split1 = ts.med;
+        }
+        std::printf("XPAIR sampler_split/sampler_kernel_f32 vocab=%d  %.4f / %.4f  = %.3f  (the DEFAULT over the fallback)\n",
+                    n_vocab, split1, tf.med, tf.med > 0 ? split1 / tf.med : 0.0);
+    }
     ctx.free(b_l); ctx.free(b_h); ctx.free(b_o);
 }
 
