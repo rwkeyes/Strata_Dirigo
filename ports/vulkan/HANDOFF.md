@@ -137,14 +137,29 @@ the target is the 7900 XTX.**  Do not re-open it.
 
 ## 6. OPEN ITEMS
 
-1. **The 7900 XTX gate run** - the first run on the target, pending the `third_party` copy (section 3).  Expect
-   gfx1100-specific findings from the coopmat / fp64 / shared-memory probes; the port's reductions are barrier trees
-   on purpose, so they do not depend on subgroup size (RDNA3 offers wave32/wave64 against the Arc's 32).
-2. **The sampler's remaining variants**: split-warp and coupled/draft-staging (speculative decoding), the
+1. **THE 7900 XTX RUN IS DONE, AND IT FOUND TWO THINGS - THE FIRST WORK FOR A FRESH SESSION.**
+   `radeon_icd 267/1/1`, `lvp_icd 259/1/3`, `nvidia_icd (Quadro K620) 263/0/2`, EXIT=1.  The K620 being CLEAN is a
+   good datum in itself (a 2014 Kepler passes everything).  The two failures are both "another implementation
+   disagrees" walks, and neither is explained yet:
+
+   * **`radeon_icd` (the target, gfx1100): `kv_q4 round trip: append (rotated) -> gather, inside the Q4_0 group
+     bound` - 3071/3072, worst 0.414.**  It passes on the Arc, on vega's llvmpipe AND on vega's radeon iGPU.  The
+     arithmetic in `kv_q4_gather.comp` is a LONE multiply (`float(kc - 8) * kd`) plus an f16 conversion, so
+     CONTRACTION IS RULED OUT (there is no multiply-add to fuse) - do not start by adding `precise`.  Most likely a
+     near-the-bound value plus the driver's f16 rounding, but the failing INDEX must be printed first; the case
+     reports `worst` but not where.
+   * **`lvp_icd`: `quantize_q8_0 (ggml bytes)` - 256/268, worst 12 differing bytes.**  This is the SAME lavapipe
+     driver that passes on vega, on a NEWER Mesa (26.0.8 here against 25.2.8 there), so the case's expectation is
+     version-sensitive - check whether the engine's rule admits both answers before tightening anything.
+
+   Both are the cross-implementation arm earning its keep; neither is a reason to distrust the port's other 267
+   verdicts on the target.
+2. **The sampler's remaining variants** (see below) and the ten kernels of section 4.
+3. **The sampler's remaining variants**: split-warp and coupled/draft-staging (speculative decoding), the
    `sample_tokens` entry point that chooses between the paths, and the **portable f32 sibling** every other double
    kernel in this port has (the Arc here reports `fp64 = 1` while Intel's own article says Arc has none - the case
    SKIPS rather than passes on a device without fp64).
-3. **The ten kernels** of section 4, in whatever order the first-token path wants them.
+4. **The ten kernels** of section 4, in whatever order the first-token path wants them.
 
 ---
 
