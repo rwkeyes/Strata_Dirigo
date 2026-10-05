@@ -1,0 +1,79 @@
+// ports/vulkan/shaders/kv_f16_append.comp - the f16 KV append: one token's K/V into the paged cache.
+// Ported from src/kernels/cuda/qsa.cu (`kv_append_kernel`).  This is the WRITE half of the pair whose read half is
+// kv_f16_gather: what lands here is exactly what the gather later copies into the attention's window, so the two
+// share one row formula and the gate runs them in series.
+//
+//     pos  = step[kStepPos]                                    the cell being written
+//     page = table[pos / page_size]
+//     row  = (page * kv_heads + h) * page_size + (pos % page_size)
+//     pool[row * head_dim + d] = fp16(cur[h * head_dim + d])
+//
+// ONE THREAD PER ELEMENT, BOTH SIDES: the source is one thread per (h, d) over kv_heads * head_dim, and the port
+// spreads K and V across the same grid (`idx >= kv_heads * head_dim` is the V half) so one dispatch writes the whole
+// token.  The arithmetic here is the CONVERSION - the current K/V arrives as f32 and the pool is f16 - so the
+// engine's bit-exact conversion does the work (common/f16_bits.glsl), and the case compares pool BYTES against the
+// same conversion rather than a tolerance: a wrong rounding here is invisible until it moves a logit.
+//
+// TWO DESTINATIONS, ONE KERNEL - the choice the q8 append makes in this port, for the same reason.  The source
+// writes the VRAM page only when the block is RESIDENT (`table[pos / page_size] >= 0`) and ALWAYS writes the host
+// copy, and those are two different row formulas: the VRAM row uses the PHYSICAL page from the table, the host
+// identity layout uses the LOGICAL page index.  `host_layout` selects the formula instead of a second kernel being
+// kept in step by hand.
+//
+// A NEGATIVE PAGE MEANS NO VRAM WRITE AT ALL - not a write to row 0, and not a skip of the host copy.  Both are
+// gate arms with sentinels, because "we did not write" is only evidence if the place we did not write was checked.
+//
+// THE STEP BUFFER IS READ AT DISPATCH TIME, and the grid is fixed geometry (kv_heads * head_dim), not the token's
+// live size - so a recorded launch is replay-safe by construction, and re-appending the same `pos` overwrites the
+// same cell, which is what a recomputed decode step needs.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+// The engine's fp16 conversion lives in one place (shaders/common/f16_bits.glsl) - see that file for why
+// `packHalf2x16` is not used: it saturates where the engine returns infinity.
+#include "common/f16_bits.glsl"
+#define f16_from_f32(f) f16_from_f32_port(f)
+
+layout(set = 0, binding = 0, std430) buffer KPOOL { uint16_t p[]; } KP_;
+layout(set = 0, binding = 1, std430) buffer VPOOL { uint16_t p[]; } VP_;
+layout(set = 0, binding = 2, std430) readonly buffer TAB { int t[]; } TAB_;
+layout(set = 0, binding = 3, std430) readonly buffer STEP { int s[]; } STEP_;
+layout(set = 0, binding = 4, std430) readonly buffer KC { float x[]; } KC_;
+layout(set = 0, binding = 5, std430) readonly buffer VC { float x[]; } VC_;
+
+layout(push_constant) uniform Pc {
+    int kv_heads;
+    int head_dim;
+    int page_size;
+    int host_layout;   // 0 = the page table decides the row (a negative page skips the write)
+                       // non-zero = the identity layout, always written (the KV-streaming host copy)
+} pc;
+
+void main() {
+    const int idx = int(gl_GlobalInvocationID.x);
+    const int per = pc.kv_heads * pc.head_dim;
+    if (idx >= 2 * per) return;                      // the grid is over both sides; surplus threads exit
+    const bool is_v = idx >= per;
+    const int rem = is_v ? (idx - per) : idx;        // the source's `i`: h * head_dim + d, one side at a time
+    const int h = rem / pc.head_dim;
+    const int d = rem - h * pc.head_dim;
+
+    const int pos = STEP_.s[0];                      // kStepPos == 0 in qsa.hpp's enum
+
+    int row;
+    if (pc.host_layout != 0) {
+        row = ((pos / pc.page_size) * pc.kv_heads + h) * pc.page_size + (pos % pc.page_size);
+    } else {
+        const int page = TAB_.t[pos / pc.page_size];
+        if (page < 0) return;                        // not resident: NO write, to either layout
+        row = (page * pc.kv_heads + h) * pc.page_size + (pos % pc.page_size);
+    }
+
+    const uint16_t v = uint16_t(f16_from_f32(is_v ? VC_.x[rem] : KC_.x[rem]));
+    if (is_v) VP_.p[row * pc.head_dim + d] = v;
+    else KP_.p[row * pc.head_dim + d] = v;
+}

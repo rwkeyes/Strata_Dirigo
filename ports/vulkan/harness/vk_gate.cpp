@@ -1524,6 +1524,269 @@ void case_qsa_select(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE F16 KV APPEND (src/kernels/cuda/qsa.cu, `kv_append_kernel`) - the write half of the gather's pair
+// ----------------------------------------------------------------------------------------------------------
+
+// One token's current K/V, deterministic in (pos, element), so a cell written at the wrong position is a different
+// number rather than the same number twice.
+static void f16_cur_at(float* kcur, float* vcur, int32_t pos, uint32_t kv_heads, uint32_t head_dim) {
+    for (uint32_t h = 0; h < kv_heads; ++h) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const float base = 0.25f * (float) (pos % 17);
+            kcur[h * head_dim + d] = base + (float) (h * 7 + (d % 13)) * 0.01f - 0.5f;
+            vcur[h * head_dim + d] = -base + (float) (h * 3 + (d % 29)) * 0.02f;
+        }
+    }
+}
+
+void case_kv_f16_append(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "kv_f16_append.spv")) return;
+    if (!ctx.info().storage_buffer_16bit) {
+        skip("kv_f16 append", "device lacks storageBuffer16BitAccess - the pool is f16");
+        return;
+    }
+    const uint32_t kv_heads = 2, head_dim = 256, page_size = 16, pages = 16, rows = pages * page_size;
+    const uint32_t pool_elems = rows * kv_heads * head_dim;
+    const uint16_t SENT = 0xDEADu;
+    std::vector<int32_t> table(pages);
+    for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) (pages - 1 - i);   // REVERSED on purpose
+    VkPipeline pa = ctx.pipeline(dir + "/kv_f16_append.spv", 6, 16);
+    const uint32_t groups = (uint32_t) ((2 * kv_heads * head_dim + kLocalSize - 1) / kLocalSize);
+
+    auto run_append = [&](Buf& b_kp, Buf& b_vp, Buf& b_tab, Buf& b_step, Buf& b_kc, Buf& b_vc, int32_t pos,
+                          int32_t host_layout) {
+        const std::vector<int32_t> step = {pos, pos + 1, pos / (int32_t) kQsaR, 8, 0};
+        ctx.write(b_step, step.data(), step.size() * 4);
+        struct { int kv_heads, head_dim, page_size, host_layout; } pc{(int) kv_heads, (int) head_dim, (int) page_size,
+                                                                     host_layout};
+        ctx.dispatch(pa, {&b_kp, &b_vp, &b_tab, &b_step, &b_kc, &b_vc}, &pc, sizeof(pc), groups);
+    };
+    // The row the source's formula picks, computed for EVERY element so the untouched ones can be checked too.
+    // THE TABLE IS A PARAMETER: an oracle that reads a different page table than the one bound predicts a write the
+    // kernel is right to skip, and its own diagnostic then misreports why (that happened here once).
+    auto expect = [&](std::vector<uint16_t>& want_k, std::vector<uint16_t>& want_v, const float* kcur, const float* vcur,
+                      const std::vector<int32_t>& tab, int32_t pos, int32_t host_layout) {
+        std::fill(want_k.begin(), want_k.end(), SENT);
+        std::fill(want_v.begin(), want_v.end(), SENT);
+        if (host_layout == 0 && tab[pos / (int32_t) page_size] < 0) return;        // not resident: nothing at all
+        const int32_t page = (host_layout != 0) ? (pos / (int32_t) page_size) : tab[pos / (int32_t) page_size];
+        for (uint32_t h = 0; h < kv_heads; ++h) {
+            const uint32_t row = (uint32_t) ((page * (int32_t) kv_heads + (int32_t) h) * (int32_t) page_size +
+                                             (pos % (int32_t) page_size));
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                want_k[row * head_dim + d] = f16_from_f32(kcur[h * head_dim + d]);
+                want_v[row * head_dim + d] = f16_from_f32(vcur[h * head_dim + d]);
+            }
+        }
+    };
+
+    std::vector<float> kcur((size_t) kv_heads * head_dim), vcur((size_t) kv_heads * head_dim);
+    std::vector<uint16_t> want_k(pool_elems), want_v(pool_elems), got_k(pool_elems), got_v(pool_elems);
+
+    // ---- (1) three positions through the VRAM path: a page's middle, its first cell, its last cell -----------
+    {
+        int bad = 0, checked = 0;
+        const int32_t positions[3] = {40, 32, 47};               // mid-page, page start, page end (page 2 = cells 32..47)
+        for (int32_t pos : positions) {
+            f16_cur_at(kcur.data(), vcur.data(), pos, kv_heads, head_dim);
+            Buf b_kp = ctx.alloc(pool_elems * 2), b_vp = ctx.alloc(pool_elems * 2);
+            Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(20);
+            Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+            std::vector<uint16_t> sent(pool_elems, SENT);
+            ctx.write(b_kp, sent.data(), sent.size() * 2);
+            ctx.write(b_vp, sent.data(), sent.size() * 2);
+            ctx.write(b_tab, table.data(), table.size() * 4);
+            ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+            ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+            run_append(b_kp, b_vp, b_tab, b_step, b_kc, b_vc, pos, 0);
+            ctx.read(b_kp, got_k.data(), got_k.size() * 2);
+            ctx.read(b_vp, got_v.data(), got_v.size() * 2);
+            expect(want_k, want_v, kcur.data(), vcur.data(), table, pos, 0);
+            for (uint32_t i = 0; i < pool_elems; ++i) {
+                if (got_k[i] != want_k[i]) ++bad;
+                if (got_v[i] != want_v[i]) ++bad;
+                ++checked;
+            }
+            ctx.free(b_kp); ctx.free(b_vp); ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+        }
+        std::printf("      three cells (page middle, first, last) written to the row the page table names; "
+                    "every other element of both pools checked against the sentinel\n");
+        verdict("kv_f16 append: the physical row, one cell, both K and V", bad == 0, bad, checked * 2, 0.0,
+                "pool bytes not equal to fp16(cur) at the named row");
+    }
+
+    // ---- (2) a NON-RESIDENT block: no write at all, to either layout ----------------------------------------
+    {
+        std::vector<int32_t> hole_table(table);
+        hole_table[2] = -1;                                      // cells 32..47 are not resident
+        int bad = 0, checked = 0;
+        for (int host_layout = 0; host_layout < 2; ++host_layout) {
+            const int32_t pos = 40;
+            f16_cur_at(kcur.data(), vcur.data(), pos, kv_heads, head_dim);
+            Buf b_kp = ctx.alloc(pool_elems * 2), b_vp = ctx.alloc(pool_elems * 2);
+            Buf b_tab = ctx.alloc(hole_table.size() * 4), b_step = ctx.alloc(20);
+            Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+            std::vector<uint16_t> sent(pool_elems, SENT);
+            ctx.write(b_kp, sent.data(), sent.size() * 2);
+            ctx.write(b_vp, sent.data(), sent.size() * 2);
+            ctx.write(b_tab, hole_table.data(), hole_table.size() * 4);
+            ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+            ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+            run_append(b_kp, b_vp, b_tab, b_step, b_kc, b_vc, pos, host_layout);
+            ctx.read(b_kp, got_k.data(), got_k.size() * 2);
+            ctx.read(b_vp, got_v.data(), got_v.size() * 2);
+            // host_layout 0: a negative page means NO write.  host_layout 1: the identity copy is always written,
+            // which is the whole point of the KV-streaming host pool.
+            expect(want_k, want_v, kcur.data(), vcur.data(), hole_table, pos, host_layout);
+            for (uint32_t i = 0; i < pool_elems; ++i) {
+                if (got_k[i] != want_k[i]) ++bad;
+                if (got_v[i] != want_v[i]) ++bad;
+                ++checked;
+            }
+            const uint32_t untouched = (uint32_t) std::count(want_k.begin(), want_k.end(), SENT);
+            std::printf("      negative page, host_layout=%d: %s (%u of %u elements must still be sentinel)\n",
+                        host_layout,
+                        untouched == pool_elems ? "nothing written" : "the identity row written anyway", untouched,
+                        pool_elems);
+            ctx.free(b_kp); ctx.free(b_vp); ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+        }
+        verdict("kv_f16 append: a non-resident block writes NOTHING; the host layout writes anyway", bad == 0, bad,
+                checked * 2, 0.0, "a skipped write landed somewhere, or the host copy was skipped");
+    }
+
+    // ---- (3) re-appending the same pos overwrites the same cell ---------------------------------------------
+    {
+        const int32_t pos = 40;
+        Buf b_kp = ctx.alloc(pool_elems * 2), b_vp = ctx.alloc(pool_elems * 2);
+        Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(20);
+        Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+        std::vector<uint16_t> sent(pool_elems, SENT);
+        ctx.write(b_kp, sent.data(), sent.size() * 2);
+        ctx.write(b_vp, sent.data(), sent.size() * 2);
+        ctx.write(b_tab, table.data(), table.size() * 4);
+        f16_cur_at(kcur.data(), vcur.data(), pos, kv_heads, head_dim);
+        ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+        ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+        run_append(b_kp, b_vp, b_tab, b_step, b_kc, b_vc, pos, 0);
+        f16_cur_at(kcur.data(), vcur.data(), pos + 100, kv_heads, head_dim);   // different values, same position
+        ctx.write(b_kc, kcur.data(), kcur.size() * 4);
+        ctx.write(b_vc, vcur.data(), vcur.size() * 4);
+        run_append(b_kp, b_vp, b_tab, b_step, b_kc, b_vc, pos, 0);
+        ctx.read(b_kp, got_k.data(), got_k.size() * 2);
+        ctx.read(b_vp, got_v.data(), got_v.size() * 2);
+        expect(want_k, want_v, kcur.data(), vcur.data(), table, pos, 0);
+        int bad = 0;
+        for (uint32_t i = 0; i < pool_elems; ++i) {
+            if (got_k[i] != want_k[i]) ++bad;
+            if (got_v[i] != want_v[i]) ++bad;
+        }
+        std::printf("      the same pos appended twice: the cell holds the SECOND token's values\n");
+        verdict("kv_f16 append: re-appending a position overwrites it (a recomputed step)", bad == 0, bad,
+                (int) pool_elems * 2, 0.0, "the second append did not land on the same cell");
+        ctx.free(b_kp); ctx.free(b_vp); ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+    }
+
+    // ---- (4) THE CHAIN: append six tokens, gather exactly those cells, attend ---------------------------------
+    // The write half and the read half share one row formula; running them in series is the only way to test that.
+    // Six positions across a page boundary (31 is page 1's last cell, 32 is page 2's first), so two page-table
+    // entries are in play.
+    {
+        const uint32_t width = 6;
+        const int32_t first = 31;
+        std::vector<int32_t> ids(width);
+        for (uint32_t i = 0; i < width; ++i) ids[i] = first + (int32_t) i;
+        Buf b_kp = ctx.alloc(pool_elems * 2), b_vp = ctx.alloc(pool_elems * 2);
+        Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(20);
+        Buf b_kc = ctx.alloc(kcur.size() * 4), b_vc = ctx.alloc(vcur.size() * 4);
+        std::vector<uint16_t> sent(pool_elems, SENT);
+        ctx.write(b_kp, sent.data(), sent.size() * 2);
+        ctx.write(b_vp, sent.data(), sent.size() * 2);
+        ctx.write(b_tab, table.data(), table.size() * 4);
+        std::vector<std::vector<float>> kc(width), vc(width);
+        std::vector<uint16_t> kwo((size_t) rows * kv_heads * head_dim, SENT), vwo((size_t) rows * kv_heads * head_dim, SENT);
+        for (uint32_t i = 0; i < width; ++i) {
+            kc[i].resize((size_t) kv_heads * head_dim);
+            vc[i].resize((size_t) kv_heads * head_dim);
+            f16_cur_at(kc[i].data(), vc[i].data(), ids[i], kv_heads, head_dim);
+            ctx.write(b_kc, kc[i].data(), kc[i].size() * 4);
+            ctx.write(b_vc, vc[i].data(), vc[i].size() * 4);
+            run_append(b_kp, b_vp, b_tab, b_step, b_kc, b_vc, ids[i], 0);
+            // the window the gather is supposed to produce: row i holds the cell the append just wrote
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                const uint32_t row = (uint32_t) ((table[ids[i] / (int32_t) page_size] * (int32_t) kv_heads + (int32_t) h) *
+                                                     (int32_t) page_size +
+                                                 (ids[i] % (int32_t) page_size));
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    kwo[((size_t) i * kv_heads + h) * head_dim + d] = f16_from_f32(kc[i][h * head_dim + d]);
+                    vwo[((size_t) i * kv_heads + h) * head_dim + d] = f16_from_f32(vc[i][h * head_dim + d]);
+                }
+                (void) row;
+            }
+        }
+        // the gather, over the appended cells
+        Buf b_ids = ctx.alloc(width * 4);
+        ctx.write(b_ids, ids.data(), ids.size() * 4);
+        const std::vector<int32_t> gstep = {(int32_t) (first + 5), (int32_t) (first + 6), 0, (int32_t) width, 0};
+        std::vector<int32_t> gsteps_full(16, 0);
+        std::copy(gstep.begin(), gstep.end(), gsteps_full.begin());
+        Buf b_gstep = ctx.alloc(gsteps_full.size() * 4);
+        ctx.write(b_gstep, gsteps_full.data(), gsteps_full.size() * 4);
+        const uint32_t per4 = head_dim / 4;
+        const uint32_t capacity_groups = (uint32_t) (((size_t) rows * kv_heads * per4 + kLocalSize - 1) / kLocalSize);
+        struct { int kv_heads, head_dim, page_size; } gpc{(int) kv_heads, (int) head_dim, (int) page_size};
+        VkPipeline pg = ctx.pipeline(dir + "/kv_f16_gather.spv", 5, 12);
+        Buf b_k = ctx.alloc((size_t) rows * kv_heads * head_dim * 2), b_v = ctx.alloc((size_t) rows * kv_heads * head_dim * 2);
+        std::vector<uint16_t> sent_win((size_t) rows * kv_heads * head_dim, SENT);
+        ctx.write(b_k, sent_win.data(), sent_win.size() * 2);
+        ctx.write(b_v, sent_win.data(), sent_win.size() * 2);
+        ctx.dispatch(pg, {&b_kp, &b_tab, &b_ids, &b_gstep, &b_k}, &gpc, sizeof(gpc), capacity_groups);
+        ctx.dispatch(pg, {&b_vp, &b_tab, &b_ids, &b_gstep, &b_v}, &gpc, sizeof(gpc), capacity_groups);
+        std::vector<uint16_t> got_win((size_t) rows * kv_heads * head_dim);
+        ctx.read(b_k, got_win.data(), got_win.size() * 2);
+        int win_bad = 0;
+        for (uint32_t i = 0; i < width; ++i)
+            for (uint32_t h = 0; h < kv_heads; ++h)
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t j = ((size_t) i * kv_heads + h) * head_dim + d;
+                    if (got_win[j] != kwo[j]) ++win_bad;
+                }
+        std::printf("      chain: 6 tokens appended at %d..%d (across a page boundary), gathered, attended; "
+                    "%d window mismatches\n", first, first + 5, win_bad);
+        verdict("kv_f16 append -> gather: the appended cells are what the window holds", win_bad == 0, win_bad,
+                (int) (width * kv_heads * head_dim), 0.0, "window values not equal to the appended cells");
+
+        std::vector<float> q((size_t) 24 * 256);
+        for (float& x : q) x = rndf(1.0f);
+        std::vector<uint16_t> mb(256);
+        for (uint32_t c = 0; c < 256; ++c) mb[c] = f16_from_f32(rndf(0.6f));
+        std::vector<double> want((size_t) 24 * 256, 0.0);
+        attn_ref_24x256(want, q, kwo, vwo, mb, width);
+        Buf b_q = ctx.alloc(q.size() * 4), b_m = ctx.alloc(512), b_o = ctx.alloc((size_t) 24 * 256 * 4);
+        ctx.write(b_q, q.data(), q.size() * 4);
+        ctx.write(b_m, mb.data(), 512);
+        std::vector<float> nanp((size_t) 24 * 256, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(b_o, nanp.data(), nanp.size() * 4);
+        VkPipeline pattn = ctx.pipeline(dir + "/attn_decode_short.spv", 5, 8);
+        struct { uint32_t width, use_mask; } apc{width, 1u};
+        ctx.dispatch(pattn, {&b_q, &b_k, &b_v, &b_m, &b_o}, &apc, sizeof(apc), 24);
+        std::vector<float> got((size_t) 24 * 256);
+        ctx.read(b_o, got.data(), got.size() * 4);
+        int bad = 0;
+        double worst = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double g = (double) got[i];
+            const double rel = std::fabs(g - want[i]) / (std::fabs(want[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 1e-4 || std::fabs(g - want[i]) <= 1e-5)) ++bad;
+        }
+        verdict("kv_f16 append -> gather -> attention, end to end", bad == 0, bad, (int) got.size(), worst,
+                "values outside tolerance (worst rel err)");
+        ctx.free(b_kp); ctx.free(b_vp); ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc);
+        ctx.free(b_ids); ctx.free(b_gstep); ctx.free(b_k); ctx.free(b_v); ctx.free(b_q); ctx.free(b_m); ctx.free(b_o);
+    }
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -7112,6 +7375,7 @@ int main(int argc, char** argv) {
     case_attn_decode_short(ctx, dir);      // the short-step decode attention (the attention block's first kernel)
     case_kv_f16_gather(ctx, dir);          // the f16 KV gather: the window the attention reads, and the grid rule
     case_qsa_select(ctx, dir);             // the selection: block scores + the weighted top-k, and the chain to attention
+    case_kv_f16_append(ctx, dir);          // the KV append: the cache's write half, chained into the gather
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

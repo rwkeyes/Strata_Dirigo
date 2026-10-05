@@ -302,7 +302,8 @@ private:
     uint32_t queue_family_ = 0;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
-    VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
+    VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;      // the CURRENT pool; the set below grows when it fills
+    std::vector<VkDescriptorPool> desc_pools_;         // every pool created, so all of them are destroyed
     uint32_t mem_type_ = 0;
     // The two types stage 4 selects, chosen once at device creation (see the constructor): real VRAM
     // (DEVICE_LOCAL, no mapping) where the device has one, and a mappable host-visible type for transfers,
@@ -319,6 +320,14 @@ private:
     // One allocation, shared by all three entry points above so the refusal, the ledger and the printed
     // message cannot drift between them.  `vram_account` decides which account it is charged to.
     Buf alloc_impl(uint64_t bytes, uint32_t type_index, bool vram_account, const char* what);
+
+    // A descriptor set for `layout`, out of a pool that GROWS.  One set is allocated per pipeline (and per
+    // dispatch inside a recorded step) and none is recycled, so a fixed `maxSets` is a silent ceiling on how
+    // many cases the gate can hold - and it appears as VK_ERROR_OUT_OF_POOL_MEMORY at the END of a long run on
+    // whichever implementation has the most to do, which reads like a kernel failure and is not one.  Measured:
+    // RADV hit it after four new cases took the gate past 64 sets, while the same binary passed on the Arc.
+    VkDescriptorSet set_alloc(VkDescriptorSetLayout layout);
+    VkDescriptorPool new_desc_pool();
 
     // ---- staging transfers: a one-shot command buffer and a fence, per transfer -------------------------
     // A backend pools these (stage 5's problem, not a correctness one) - the same call the descriptor sets and

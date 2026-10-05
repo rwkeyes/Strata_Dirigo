@@ -369,18 +369,11 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     pci.queueFamilyIndex = queue_family_;
     VK_CHECK(vkCreateCommandPool(dev_, &pci, nullptr, &cmd_pool_));
 
-    // 8 storage-buffer descriptors per set is the widest kernel a first slice needs (4 in gdn_gate); the
-    // general harness keeps N flexible by sizing the pool from the widest pipeline it is asked for.
-    VkDescriptorPoolSize ps{};
-    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps.descriptorCount = 256;
-    VkDescriptorPoolCreateInfo dpci{};
-    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = 64;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &ps;
-    VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &desc_pool_));
+    // 256 storage-buffer descriptors per pool, 64 sets each - and MORE POOLS when those run out (set_alloc).
+    // A FIXED ceiling here is a silent limit on how many cases the gate can hold: it surfaces as
+    // VK_ERROR_OUT_OF_POOL_MEMORY at the end of a long run, on whichever implementation has the most to do.
+    desc_pools_.push_back(new_desc_pool());
+    desc_pool_ = desc_pools_.back();
 
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
@@ -456,7 +449,8 @@ Ctx::~Ctx() {
         if (pv.set_layout) vkDestroyDescriptorSetLayout(dev_, pv.set_layout, nullptr);
     }
     if (rec_fence_) vkDestroyFence(dev_, rec_fence_, nullptr);   // the recorded step's fence: one fence for every submission
-    if (desc_pool_) vkDestroyDescriptorPool(dev_, desc_pool_, nullptr);
+    for (VkDescriptorPool pool : desc_pools_) vkDestroyDescriptorPool(dev_, pool, nullptr);
+    desc_pools_.clear();
     if (cmd_pool_) vkDestroyCommandPool(dev_, cmd_pool_, nullptr);
     if (dev_) vkDestroyDevice(dev_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
@@ -699,6 +693,48 @@ void Ctx::free(Buf& b) {
     b = Buf{};
 }
 
+// One descriptor pool.  64 sets is plenty for a case, and set_alloc() creates another when it is not - see the
+// ceiling note in the header.
+VkDescriptorPool Ctx::new_desc_pool() {
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps.descriptorCount = 256;
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpci.maxSets = 64;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &pool));
+    return pool;
+}
+
+// A set out of the current pool, or out of a NEW one when that pool is full.  Nothing is recycled - the gate
+// allocates one set per pipeline and an extra per dispatch inside a recorded step - so the only thing that keeps
+// the case count from being capped is growing here.
+VkDescriptorSet Ctx::set_alloc(VkDescriptorSetLayout layout) {
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = desc_pool_;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult r = vkAllocateDescriptorSets(dev_, &dsai, &set);
+    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        desc_pools_.push_back(new_desc_pool());
+        desc_pool_ = desc_pools_.back();
+        dsai.descriptorPool = desc_pool_;
+        r = vkAllocateDescriptorSets(dev_, &dsai, &set);
+        // Say what happened: a case that allocates a lot is worth knowing about, and the alternative is a
+        // mysterious failure at the end of an unrelated case.
+        std::fprintf(stderr, "  (descriptor pool %u created: the previous one was full)\n",
+                     (unsigned) desc_pools_.size());
+    }
+    VK_CHECK(r);
+    return set;
+}
+
 VkCommandBuffer Ctx::begin_oneshot() {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo cbai{};
@@ -850,13 +886,9 @@ VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t p
     VK_CHECK(vkCreatePipelineLayout(dev_, &plci, nullptr, &pv.layout));
 
     // A descriptor set per pipeline, allocated up front and never reset: the gate runs each kernel a handful
-    // of times, so recycling is a stage-3 optimisation, not a correctness one.
-    VkDescriptorSetAllocateInfo dsai{};
-    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool = desc_pool_;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &pv.set_layout;
-    VK_CHECK(vkAllocateDescriptorSets(dev_, &dsai, &pv.set));
+    // of times, so recycling is a stage-3 optimisation, not a correctness one.  `set_alloc` grows the pool if
+    // this many pipelines no longer fit - the case count is not a capacity limit of the harness.
+    pv.set = set_alloc(pv.set_layout);
 
     const std::vector<uint8_t> code = read_file(spv_path);
     VkShaderModuleCreateInfo smci{};
@@ -905,14 +937,7 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     // reading whatever the LAST one bound.  (The same class of trap the grouped-expert wave hit with one buffer
     // pointer standing in for two.)  A real backend pools these sets; the gate allocates them out of desc_pool_,
     // which the device destroys with the pool, so a re-recording leaks a handful of sets and nothing else.
-    if (fresh_set) {
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = desc_pool_;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &set_layout;
-        VK_CHECK(vkAllocateDescriptorSets(dev_, &dsai, &set));
-    }
+    if (fresh_set) set = set_alloc(set_layout);
 
     std::vector<VkDescriptorBufferInfo> info(bufs.size());
     std::vector<VkWriteDescriptorSet> writes(bufs.size());

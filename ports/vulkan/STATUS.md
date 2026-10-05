@@ -9,17 +9,17 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
-short-step decode attention, the f16 KV gather and the QSA selection landed, the box's GPU run was **221 passed /
-0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup
-size 32) - 209 / 0 / 3 on llvmpipe and 212 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the
-discrete card is gone (both skip cooperative matrix, whose driver does not advertise the extension, and the prefill
-SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
+short-step decode attention, the f16 KV gather, the QSA selection and the f16 KV append landed, the box's GPU run
+was **226 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
+Vulkan 1.4.318, subgroup size 32) - 214 / 0 / 3 on llvmpipe and 217 / 0 / 2 on the radeon ICD, which now picks the
+AMD iGPU because the discrete card is gone (both skip cooperative matrix, whose driver does not advertise the
+extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 212/0/2 becomes 211/1/2 when its intermittent
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 217/0/2 becomes 216/1/2 when its intermittent
 budget-requery case fires.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
-stale five times in two days; read the last line of your own run.** All three available implementations are exercised
+stale six times in two days; read the last line of your own run.** All three available implementations are exercised
 again by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 62 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
+box after the swap (`NEXT.md`). 63 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -103,6 +103,18 @@ contributes 1, not R, because getting this wrong selects cells that do not exist
 is part of the contract, since downstream the position is the window row and the mask is indexed by it.  Seven
 selection arms (a budget cut inside a block, three-way ties at the boundary, a zero-weight tail, a 1-cell tail, both
 identity cases, and everything-but-one-cell), three falsifications.  Arc 221/0/0.
+
+**The KV append closed the decode loop, and the harness had a ceiling this increment hit (2026-10-04).**
+`kv_f16_append.comp` (`src/kernels/cuda/qsa.cu`) is the WRITE half of the gather's pair - a token's f32 K/V converted
+and stored into the paged f16 cache at the row the page table names.  Four rules, four arms: the conversion is
+compared as BYTES (it is the arithmetic), a negative page writes NOTHING at all (the injection "treat a non-resident
+block as page 0" is caught by that arm and by nothing else), the two layouts (physical page vs identity host copy)
+are one kernel with a flag, and re-appending a position overwrites it.  The chain runs append -> gather -> attention
+over six tokens appended across a page boundary, at worst rel 8.37e-06.  **And the first full run came back
+`FAIL radeon_icd` with no numbers: `VK_ERROR_OUT_OF_POOL_MEMORY`, because the harness's descriptor pool had a
+hardcoded `maxSets = 64` and one set per pipeline.**  That is a ceiling on the CASE COUNT, not on a kernel, and it
+fails at whichever implementation runs last - fixed by growing the pool on demand and printing when it does
+(`descriptor pool 2 created`).  Arc 226/0/0.
 
 | Case | Verdict | Method |
 |---|---|---|

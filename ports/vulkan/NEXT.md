@@ -425,9 +425,65 @@ siblings in the per-token path.
 
 
 
+## THE ATTENTION BLOCK, KERNEL 4: the KV append - the cache's write half, and the first chain that closes the loop
+
+**What was ported.**  `kv_append_kernel` (`src/kernels/cuda/qsa.cu`): one token's current K/V into the paged f16
+cache.  This is the WRITE half of the pair whose read half is `kv_f16_gather`, and the two share one row formula:
+
+    pos  = step[kStepPos]                                    the cell being written
+    page = table[pos / page_size]
+    row  = (page * kv_heads + h) * page_size + (pos % page_size)
+    pool[row * head_dim + d] = fp16(cur[h * head_dim + d])
+
+The decode step's data path is now closed at both ends: a token's K/V is written into the pool by this kernel, the
+selection picks cells, the gather copies those cells into the window, and the attention reads it.
+
+**Four things the port had to get right, all of them gated:**
+
+1. **The conversion is the arithmetic.**  The current K/V arrives as f32 and the pool is f16, so the engine's
+   bit-exact conversion (`common/f16_bits.glsl`) does the work and the case compares pool BYTES against it - not a
+   tolerance.  A wrong rounding here is invisible until it moves a logit.
+2. **A negative page means NO write at all** - not a write to row 0, and not a skipped host copy.  Measured: the
+   injection "treat a non-resident block as page 0" is caught by exactly this arm and by nothing else, which is the
+   whole argument for having an arm per rule rather than one broad comparison.
+3. **Two destinations, one kernel** - the same choice the q8 append already makes in this port.  The VRAM row uses
+   the PHYSICAL page from the table; the host identity layout uses the LOGICAL page index, always written.  They are
+   two formulas selected by `host_layout`, not two kernels kept in step by hand.
+4. **Re-appending a position overwrites the same cell**, which is what a recomputed decode step needs - and the grid
+   is fixed geometry (`kv_heads * head_dim`), so a recorded launch is replay-safe by construction.
+
+**Evidence.**  Arc: **226 passed / 0 failed / 0 skipped** (five new verdicts).  Three positions (a page's middle, its
+first cell, its last cell) each leave every other element of BOTH pools at the sentinel - 786432 comparisons, which
+is what makes "one cell, the right row" a measurement rather than a claim.  Both host-layout branches of the
+non-resident case (nothing written vs the identity row written anyway, with the untouched count printed).  And the
+chain: six tokens appended at cells 31..36 - deliberately across a page boundary, so two page-table entries are in
+play - gathered into the window with 0 mismatches, attended, and matched against a double-precision oracle at worst
+rel 8.37e-06.
+
+**Falsified (three injections, each verified to have applied at exactly one site):**  the VRAM row using the LOGICAL
+page index instead of the table's entry -> 5 arms, chain at worst rel 1.57e+05; a non-resident block treated as page
+0 -> the non-resident arm; both halves of the grid writing K -> 4 arms incl. the chain.
+
+**A harness bug worth recording, because its symptom was a confident lie.**  The oracle lambda closed over the
+REVERSED page table even in the non-resident arm, so it predicted a write the kernel was right to skip, and the
+arm's own diagnostic then announced "the identity row written anyway" for `host_layout = 0`.  The kernel was correct
+throughout.  Two lessons: an oracle must take the actual bound inputs as parameters (a closed-over fixture is a
+second source of truth), and a diagnostic derived from the same faulty fixture misreports in a confident voice.
+
+**THE HARNESS HAD A CASE-COUNT CEILING, and this increment hit it.**  The first full run after the append case came
+back `FAIL radeon_icd` with no numbers at all - `vkAllocateDescriptorSets -> VK_ERROR_OUT_OF_POOL_MEMORY` at the END
+of the run, because `maxSets` was a hardcoded 64, one set per pipeline, nothing recycled.  Four new cases had taken
+the gate past it.  It looked exactly like a kernel failure on RADV and was not one: the same binary passed on the
+Arc, and the pool is the harness's, not the kernel's.  Fixed by growing: `set_alloc()` allocates a fresh pool when
+the current one is full and SAYS SO on stderr (`descriptor pool 2 created`), so the next time a case pushes past 64
+sets the reason is printed instead of inferred.  Worth remembering as a class: **a fixed capacity in the test harness
+is a limit on the test suite**, and it fails at whichever implementation is exercised last.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
-**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 62 kernels, 18 shared includes, one
+**THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 63 kernels, 18 shared includes, one
 generated table file (four IQ grids). The gate prints its own totals - `bash ports/vulkan/gates/run_gate.sh`,
 which compiles every shader from source - and this line has gone stale three times in two days, so run it rather
 than quote it. The last two boxes it ran on: a Radeon RX 7900 XTX host (160 / 0 / 0 on RADV and on radeon, 154 /
