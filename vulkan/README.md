@@ -201,3 +201,27 @@ user's call; `ports/vulkan/NEXT.md`'s I2-continued section reports it and does n
   `fused_gdn_step_norm`).
 
 
+
+## The CUDA-runtime shim + the engine's own targets (2026-10-05)
+
+The engine's host TUs call the CUDA runtime DIRECTLY, so a Vulkan engine build needs an answer for those names.
+`vulkan/include/cuda_compat/cuda_runtime.h` (put FIRST on the include path - the `include/strata/platform/hip_compat/`
+mechanism) + `vulkan/src/compat/cuda_runtime.cpp` implement them over this device layer: arena allocation
+(`cudaMalloc`), the STAGING copies (`cudaMemcpy`/`cudaMemcpyAsync`/`cudaMemcpy2DAsync`), host-visible coherent
+memory (`cudaHostAlloc`/`cudaHostGetDevicePointer`/`cudaFreeHost`), `cudaMemsetAsync` as a staged fill,
+`cudaDeviceSynchronize` as the submission fence, and a real error enum + `cudaGetErrorString` +
+`cudaPeekAtLastError`/`cudaGetLastError`.  Every place CUDA could NOT be honoured exactly is stated in the
+header: `cudaEventElapsedTime` is a HOST wall-clock figure (this device layer enables no Vulkan timestamp query),
+`cudaFree` releases nothing (the arena is a bump allocator), a mapped host pointer is NOT device-dereferenceable
+(the doorbell replacement is `src/device/sync.*`), and the CUDA graph API / stream capture is NOT provided
+(deferred to I5).  `strata_vk_cudart_smoke` (new) RUNS every entry point on the Arc and checks the bytes.
+
+The one-layer-body link (`src/core/layer.cpp` vs the backend + the shim) drops **`170 -> 118` undefined references
+with the 53 distinct `strata::kernels::` symbols UNCHANGED**: the shim resolves all 12 CUDA-runtime symbols.
+
+`vulkan/CMakeLists.txt` also defines the ENGINE'S OWN targets now, mirroring `../sycl/CMakeLists.txt`:
+`strata_vulkan_core`, `strata_vulkan_engine`, `strata_vulkan_spec`, `strata_vulkan_kernels_cpu` and the
+`strata_vulkan` executable, so a `-DSTRATA_ENABLE_VULKAN=ON` configure has an engine binary and not just the
+backend library.  Excluded (and why): the three `src/core/*.cu`, the prefill path, the parity/bench TUs, and the
+native-expert/ggml half of the CPU kernels.  The `STRATA_VERSION` define moved ABOVE the backend-option blocks in
+the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.cpp` compile.

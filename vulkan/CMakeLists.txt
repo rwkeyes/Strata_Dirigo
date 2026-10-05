@@ -74,3 +74,88 @@ message(STATUS "Strata: Vulkan backend (experimental) - device layer + sync (the
                "the engine entry points (fwht256 + 11 elementwise/glue + 5 doorbell + the cvec module + "
                "all 14 GDN/DeltaNet mixer kernels) + strata_vk_entry_smoke; see "
                "ports/vulkan/plan/BACKEND-INTEGRATION.md")
+
+# ============================================================================================================
+# THE CUDA-RUNTIME COMPATIBILITY SHIM (deliverable A of the approved hybrid route)
+# ============================================================================================================
+# The engine's host TUs call the CUDA runtime directly (`cudaMalloc`, `cudaMemcpy`, `cudaHostAlloc`, ...).  On
+# this backend those names are answered HERE, over the port's device layer.  `cuda_compat/` is put FIRST on the
+# include path of every engine-facing target (PUBLIC below), so `#include <cuda_runtime.h>` resolves to the
+# shim - exactly the mechanism `include/strata/platform/hip_compat/` uses on the HIP build.  The engine's
+# headers and sources are NOT edited.
+strata_vulkan_resolve(_cudart src/compat/cuda_runtime.cpp)
+add_library(strata_vulkan_cudart STATIC ${_cudart})
+target_include_directories(strata_vulkan_cudart PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_compat     # <cuda_runtime.h> resolves HERE on an engine TU
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/device)
+target_compile_definitions(strata_vulkan_cudart PUBLIC STRATA_ENABLE_VULKAN=1)
+target_link_libraries(strata_vulkan_cudart PUBLIC strata_vulkan_device)
+
+# The shim RUNNING (not merely linking): every entry point exercised end to end on a real device.
+add_executable(strata_vk_cudart_smoke tests/cudart_smoke.cpp)
+target_link_libraries(strata_vk_cudart_smoke PRIVATE strata_vulkan_cudart)
+
+# ============================================================================================================
+# THE ENGINE'S OWN TARGETS (deliverable B) - so a -DSTRATA_ENABLE_VULKAN=ON configure has an engine binary and
+# not just the backend library.  This mirrors `../sycl/CMakeLists.txt`'s shape (the established precedent): the
+# engine's sources join through `strata_vulkan_resolve()`, a migrated copy under `vulkan/` when one exists and
+# `${STRATA_ROOT}/` otherwise.  The engine's HEADERS are never edited.
+#
+# WHAT IS EXCLUDED, and why (reported, per the increment):
+#   * the three `src/core/*.cu` files (device.cu, pinned.cu, remote_expert_opt.cu) - CUDA device code; on this
+#     backend the device layer is `vulkan/src/device/`, so they are not compiled.
+#   * the PREFILL path (`src/prefill/*`) - not ported (BACKEND-INTEGRATION.md §4); its symbols are simply not
+#     provided, so a prefill-calling TU links later or not at all.
+#   * the parity/bench TUs (`src/kernels/*_parity.cpp`, `bench/`) - they are oracles against the CUDA path.
+#   * the native-expert / ggml-cpu half of `strata_kernels_cpu` (`src/kernels/cpu/native_expert.cpp`,
+#     `iq_avx*.cpp`) - it needs the ggml sources the Vulkan configuration does not build.
+# The targets below CONFIGURE; whether a given TU links is the plan's own increments (I4/I5) and is measured,
+# not asserted, in ports/vulkan/NEXT.md.
+# ============================================================================================================
+find_package(Threads REQUIRED)
+
+# The engine targets are EXCLUDE_FROM_ALL: they CONFIGURE (the deliverable) and build by NAME, but their
+# graph-API-dependent TUs (graph.cpp, session.cpp) do not compile until I5 declares the CUDA graph API, so
+# sweeping them into the default `all` would break `cmake --build` for the backend + smokes that DO build.
+
+strata_vulkan_resolve(_vspec src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+add_library(strata_vulkan_spec STATIC EXCLUDE_FROM_ALL ${_vspec})
+target_include_directories(strata_vulkan_spec PUBLIC ${STRATA_ROOT}/include)
+target_link_libraries(strata_vulkan_spec PUBLIC strata_vulkan_cudart)
+
+strata_vulkan_resolve(_vcpu src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+                      src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+add_library(strata_vulkan_kernels_cpu STATIC EXCLUDE_FROM_ALL ${_vcpu})
+target_include_directories(strata_vulkan_kernels_cpu PUBLIC ${STRATA_ROOT}/include)
+target_link_libraries(strata_vulkan_kernels_cpu PUBLIC strata_vulkan_cudart Threads::Threads)
+# The AVX-512 / AVX2 source flags, mirrored from the top-level `strata_kernels_cpu`: without them
+# `expert.cpp`'s VNNI/VBMI intrinsics do not compile (measured - "target specific option mismatch").
+if(MSVC)
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+else()
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/expert.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+endif()
+
+strata_vulkan_resolve(_vcore src/core/graph.cpp src/core/weights.cpp src/core/layout.cpp src/platform/memory.cpp)
+add_library(strata_vulkan_core STATIC EXCLUDE_FROM_ALL ${_vcore})
+target_include_directories(strata_vulkan_core PUBLIC ${STRATA_ROOT}/include)
+target_link_libraries(strata_vulkan_core PUBLIC strata_vulkan_cudart strata_vulkan_kernels)
+
+strata_vulkan_resolve(_vengine
+  src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
+  src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+  src/core/conversation_memory.cpp src/core/peer_experts.cpp)
+add_library(strata_vulkan_engine STATIC EXCLUDE_FROM_ALL ${_vengine})
+target_link_libraries(strata_vulkan_engine PUBLIC strata_vulkan_core strata_vulkan_kernels_cpu)
+
+strata_vulkan_resolve(_vmain src/program/generate.cpp)
+add_executable(strata_vulkan EXCLUDE_FROM_ALL ${_vmain})
+target_link_libraries(strata_vulkan PRIVATE strata_vulkan_engine strata_vulkan_spec)
+
+message(STATUS "Strata: Vulkan engine targets (deliverable B) - strata_vulkan_core / strata_vulkan_engine / "
+               "strata_vulkan_spec / strata_vulkan_kernels_cpu / strata_vulkan (executable) + the CUDA-runtime "
+               "shim strata_vulkan_cudart + strata_vk_cudart_smoke")

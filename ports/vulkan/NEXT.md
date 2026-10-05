@@ -100,6 +100,115 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## THE CUDA-RUNTIME SHIM + THE ENGINE'S OWN TARGETS (the approved hybrid route, deliverables A+B) — AND HOW FAR ONE LAYER GETS TOWARD RUNNING (2026-10-05, `vega`)
+
+**THE APPROVED ROUTE, IMPLEMENTED.** The user chose *"Hybrid: shim the ~13 symbols needed to link and run one
+layer now, design the graph mapping later at I5"*.  This increment delivers the shim (A), the build-system
+change (B), and takes one layer body as far toward RUNNING as the still-unported kernels allow (C).  The CUDA
+graph API and stream capture stay DEFERRED (D).
+
+**DELIVERABLE A — THE SHIM.** `vulkan/include/cuda_compat/cuda_runtime.h` (put FIRST on the include path, the
+`hip_compat/` mechanism) + `vulkan/src/compat/cuda_runtime.cpp`, a `cuda_runtime.h`-compatible surface over the
+port's device layer.  The engine's headers and sources are NOT edited.  The FINAL symbol list is the predicted
+fourteen — `cudaMalloc`, `cudaFree`, `cudaMemcpy`, `cudaMemcpyAsync`, `cudaMemcpy2DAsync`, `cudaMemsetAsync`
+(+`cudaMemset`), `cudaHostAlloc`, `cudaHostGetDevicePointer`, `cudaFreeHost`, `cudaEventCreate`
+(+`cudaEventCreateWithFlags`), `cudaEventRecord`, `cudaEventElapsedTime` (+`cudaEventSynchronize`/`Destroy`),
+`cudaDeviceSynchronize`, `cudaPeekAtLastError` — plus `cudaGetLastError`, `cudaGetErrorString`, `cudaMemGetInfo`,
+`cudaStreamSynchronize` and the host-compile decorations (`__host__`/`__device__`/`__forceinline__`), which the
+compiler demanded.  NOT in the predicted fourteen and ADDED because the linker/compiler demanded them: none of
+the nineteen *functions* are referenced by the one-layer-body link beyond the twelve below, so `cudaMalloc`,
+`cudaFree`, `cudaMemset`, `cudaGetErrorString`, `cudaMemGetInfo`, `cudaStreamSynchronize` and the two extra event
+forms are implemented for the WIDER program but are NOT on this link's path.  **The one-layer-body link's actual
+runtime demand is TWELVE symbols** (`cudaDeviceSynchronize`, `cudaEventCreate`, `cudaEventElapsedTime`,
+`cudaEventRecord`, `cudaFreeHost`, `cudaHostAlloc`, `cudaHostGetDevicePointer`, `cudaMemcpy`, `cudaMemcpy2DAsync`,
+`cudaMemcpyAsync`, `cudaMemsetAsync`, `cudaPeekAtLastError`) — `cudaMalloc`/`cudaFree` of the predicted fourteen
+are NOT reached by `layer.cpp`.
+
+**WHERE CUDA COULD NOT BE HONOURED EXACTLY, AND WHAT THE NUMBER THEREFORE CANNOT MEAN** (all stated in the header
+too): `cudaEventElapsedTime` is a **HOST wall-clock** figure (`std::chrono`) — this device layer enables NO
+Vulkan timestamp query, so it CANNOT mean device execution time; `cudaDeviceSynchronize` is the submission fence
+and is VACUOUS here (every `Ctx::dispatch` already fences and waits), so it does not wait for async work because
+this backend has none; `cudaFree` releases NOTHING (the arena is a bump allocator) — memory returns only at
+`stream_close`, so an alloc/free loop exhausts the arena; a mapped host pointer is **NOT device-dereferenceable**
+(the arena is DEVICE_LOCAL/unmappable, so `cudaHostGetDevicePointer` returns a host pointer the SHIM resolves;
+the engine's zero-copy handshake is answered by `src/device/sync.*`, not by that pointer); a device->device
+`cudaMemcpy` is STAGED through the host (two transfers, not a device-side copy); `cudaMemsetAsync` is a staged
+fill (no memset shader).  `cudaMemGetInfo` is HONEST (the device's own `VK_EXT_memory_budget` figure minus the
+reserve); the error enum and `cudaGetErrorString` are real, and `cudaPeekAtLastError`/`cudaGetLastError` carry the
+shim's OWN last error, not a constant.
+
+**DELIVERABLE B — THE BUILD-SYSTEM CHANGE.** `vulkan/CMakeLists.txt` now defines the ENGINE'S OWN targets,
+mirroring `../sycl/CMakeLists.txt`'s `strata_resolve` shape through `strata_vulkan_resolve()`:
+`strata_vulkan_core`, `strata_vulkan_engine`, `strata_vulkan_spec`, `strata_vulkan_kernels_cpu` and the
+`strata_vulkan` EXECUTABLE — so a `-DSTRATA_ENABLE_VULKAN=ON` configure has an engine binary and not just the
+backend library.  The `STRATA_VERSION` ordering defect is fixed by moving
+`add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")` ABOVE the backend-option blocks in the top-level
+`CMakeLists.txt` (each of them `return()`s before the old line, so the define never reached the Vulkan/SYCL
+configuration — the exact reason `src/program/generate.cpp` failed to compile).  The mutual-exclusion
+`FATAL_ERROR` behaviour is unchanged.  **EXCLUDED to configure** (reported as asked): the three `src/core/*.cu`
+(`device.cu`, `pinned.cu`, `remote_expert_opt.cu`), the whole PREFILL path (`src/prefill/*`), the parity/bench
+TUs (`src/kernels/*_parity.cpp`, `bench/`), and the native-expert/ggml-cpu half of `strata_kernels_cpu`
+(`native_expert.cpp`, `iq_avx*.cpp`).  **WALL TIMES (vega):** CONFIGURE **0.23 s** (was 0.16 s; the engine
+targets added ~0.07 s of CMake graph), BUILD of `strata_vk_cudart_smoke` + `strata_vk_entry_smoke` **3.45 s**.
+
+**DELIVERABLE C — THE LINK BAR AND HOW FAR THE LAYER GOT.** The bar is measured with the STANDARD recipe
+(`$HOME/vkbuild-vulkan` reconfigured and rebuilt from the current tree first) and the shim in the link line:
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                       # -> 118  (was 170)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                                # -> 53   (unchanged)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                              # -> 51   (unchanged)
+
+**THE BAR MOVED `170 -> 118` undefined references; the 53 distinct `strata::kernels::` symbols are UNCHANGED and
+the 12 CUDA-runtime symbols are ALL RESOLVED (0 left).**  Two readings are recorded because the port's total is a
+`grep -c`, and GNU ld BATCHES repeated undefined references ("...: more undefined references to `X' follow"), so
+the raw-reference total is not a pure linear count: at this HEAD the twelve CUDA symbols carry **46 raw reference
+mentions** (45 `undefined reference to` lines + one batched `more` line for `cudaMemsetAsync`), and resolving
+them also re-batched `LayerView::name`'s messages (39 -> 32 prefix lines) — hence 170 -> 118 is **-52 raw lines
+for -12 distinct symbols**.  The task's quoted bar (`188`, the I2e HEAD) is pre-I3: the shim removes the same
+twelve; on I3's HEAD (`6747bd5`) the measured before/after is **170 -> 118**.
+
+**HOW FAR THE LAYER GOT TOWARD RUNNING.** The shim RUNS: `strata_vk_cudart_smoke` executes every entry point on
+the Arc and PASSES (raw line `strata_vk_cudart_smoke: PASS`, exit 0) — allocate, host->device->host bit-exact,
+mapped-host upload, `cudaMemcpy2DAsync` de-pitch, a staged `cudaMemsetAsync`, event timing, `cudaMemGetInfo`
+(28.64 GiB free / 31.89 GiB total), and the real error path.  A FULL SINGLE-LAYER FORWARD DOES NOT RUN, and the
+blocker is precise: the one-layer-body link still carries **53 unresolved `strata::kernels::` entry points**
+(matvec/GEMV/KV 15 + attention/QSA/MoE/GR/PLE/rope 36 + other 2) plus the engine's own cross-TU symbols
+(`LayerView::name`, `WeightTable::find`, `NativeEmbed::gather_one`, `native_embed`, `main`).  A layer cannot run
+until those entry points are ported (the plan's I4/I5).  What the shim removes is the ENTIRE
+runtime-not-kernels blocker: with it in the link line there are ZERO `cuda*` undefined references left.
+
+**DELIVERABLE D — THE DEFERRED GRAPH CALLS ON THE LAYER'S CALL PATH (for I5's design).** `src/core/layer.cpp`,
+the layer BODY itself, calls **NONE** of `cudaGraph*`/`cudaStreamBeginCapture`/`EndCapture` — the layer is
+capture-clean.  The graph calls live one level up, on the DRIVER/STEP-RECORDER path: `src/core/graph.cpp`
+(`cudaStreamBeginCapture:49`, `cudaStreamEndCapture:55`, `cudaGraphInstantiate:65`, `cudaGraphLaunch:77`,
+`cudaGraphGetNodes:59`, `cudaGraphDestroy:41`, `cudaGraphExecDestroy:42`), `src/core/session.cpp`
+(`cudaStreamBeginCapture:228`, `cudaStreamEndCapture:245`, `cudaGraphInstantiate:252`, `cudaGraphLaunch:284`,
+`cudaGraphDestroy:256`, `cudaGraphExecDestroy:489`) and `src/program/generate.cpp` (`cudaLaunchHostFunc:5165`).
+So I5's graph mapping is a STEP-RECORDER problem (`graph.cpp`/`session.cpp`), not a layer-body one — the layer
+can be driven by the port's already-built recorded-step mechanism (`Ctx::record_begin/record_dispatch/replay`).
+
+**RESULTS (vega).**  Engine CONFIGURE under `-DSTRATA_ENABLE_VULKAN=ON` is CLEAN and now yields the engine
+targets; the backend + the shim + both smoke targets BUILD clean; `strata_vulkan_spec` and
+`strata_vulkan_kernels_cpu` COMPILE + LINK.  `strata_vulkan_core` and `strata_vulkan_engine` CONFIGURE but their
+COMPILE stops at the DEFERRED CUDA graph API: `include/strata/core/graph.hpp:81` needs `cudaGraph_t` /
+`cudaGraphExec_t` (which the shim, per the user's I5 deferral, deliberately does NOT declare), so `graph.cpp`
+and `session.cpp` do not compile under the shim.  That is the precise declaration work I5 must add - it is NOT a
+defect of the build-system change (the targets exist and configure).  The shim smoke PASSES on the Arc.  Port gate on `vega`: **Arc (intel_icd) 552/0/0 (exit 0), llvmpipe 540/0/3** — IDENTICAL to the I3
+baseline (no shader, kernel or case changed).  The radeon iGPU arm read **542/1/2**; the one failure is the
+**pre-existing** characterised `bf16_gemv n_in=2560 n_out=128 130/131 worst 2.36` defect (the non-deterministic
+RADV bug at the top of this file), NOT this increment — no shader or case was touched.  `check_port_map.py`
+passes (`168 — 78 kernel, 61 host, 29 todo; 111 shaders built, 92 claimed`) and `make_port_map.py` regenerates
+`PORT-MAP.tsv` byte-identically.  `z820b` is PENDING (no XTX/K620 number).  The plan was NOT re-scoped.
+
 ## INCREMENT I3 — THE FIRST EIGHT MATVEC / GEMV / KV ENTRY POINTS (the weight-side math + the KV cache) AND THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **THE BAR (the running line): `188 → 170` undefined references / `59 → 53` distinct full-signature
