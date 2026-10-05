@@ -26,13 +26,13 @@
 // WHY THESE AND NOT THE WHOLE GROUP (the group is 36).  PLE and GR (`ple_block`, `ple_history_advance`,
 // `gr_read`, `gr_write`, `fused_gr_*`) sit in `block_layer_pre`'s shared stages and run for EVERY layer, GDN or
 // QSA - they are not the non-GDN body and are their own increment.  The stage-3 attention entry
-// `qsa_decode_attn_step` (layer.cpp:980) and its sibling `native_flash_attn_short_step` (:995) are REPORTED, not
-// wired: the map claims both are served by `attn_decode_short`, whose own header says it is
-// `native_flash_attn_short_step` (a gathered [capacity,2,256] f16 WINDOW), while `qsa_decode_attn_step`'s
-// contract (qsa_decode_attn.hpp) reads the KV POOLS through the page table with an int8/q4 option and takes a
-// scratch - a different kernel.  No shader in this tree matches that contract, so it is a SHADER-PORT job, not
-// a stub (see the header note there; it is the same class as I3's `s_gemv_q8_0_split`).  `qsa_index_step`,
-// `topk_512_step`, `qsa_attend_step` and `native_qsa_indexer_append` are PORT-MAP `todo` (no shader either).
+// `qsa_decode_attn_step` (layer.cpp:980) has NO shader in this tree and its contract (`qsa_decode_attn.hpp`)
+// reads the KV POOLS through the page table - a DIFFERENT kernel from the map's claimed `attn_decode_short`,
+// whose own header says it is `native_flash_attn_short_step` (a gathered [capacity,2,256] f16 WINDOW).  It is
+// wired here as the NINTH entry point (below), driving the new `qsa_decode_attn.spv`.  Its sibling
+// `native_flash_attn_short_step` (:995) remains UNWIRED (a diagnostic-only branch, `native_flash_attn_short`
+// default false); `qsa_index_step`, `topk_512_step`, `qsa_attend_step` and `native_qsa_indexer_append` are
+// PORT-MAP `todo` (no shader either).
 //
 // ============================================================================================================
 // THE WIRING PATTERN (the plan's §2, not an invention)
@@ -74,6 +74,7 @@
 #include "strata/kernels/rope_scaling.hpp"   // RopeScaling / rope_scaling / rope_scaling_set
 #include "strata/kernels/qsa.hpp"            // QsaShapes / qsa_step_fill / kStepCount
 #include "strata/kernels/qsa_select.hpp"     // qsa_block_scores / qsa_block_topk
+#include "strata/kernels/qsa_decode_attn.hpp"  // qsa_decode_attn_step / qsa_decode_attn_scratch_floats
 #include "strata/kernels/native_router.hpp"  // native_router_top10
 #include "strata/vulkan/vk_backend.hpp"      // the backend's seam: Stream, stream_of
 #include "vk_arena.hpp"                      // the arena + pointer->buffer resolution
@@ -323,6 +324,70 @@ void native_router_top10(Stream& s, const float* logits, int32_t* ids, float* we
     s.ctx->dispatch(pipe, {&lv, &iv, &wv}, &pc, sizeof(pc), 1);
 }
 
+// ---- 9. `qsa_decode_attn_step` -> qsa_decode_attn.spv.  THE DEFAULT QSA DECODE ATTENTION (layer.cpp:980): the
+//        KV POOLS read DIRECTLY through the page table and the selection ids - no gather copy - with an online
+//        softmax, one workgroup per query head.  Storage mode 0 = f16 pools (the shipped `--kv fp16` default),
+//        mode 1 = int8 codes + fp16 scale per 64 values (`kv_q8.hpp`).  The q4_0 pool and the K8V4 hybrid are
+//        REFUSED rather than dispatched against storage this shader does not implement - the port's loud-refusal
+//        rule; a wrong pool read is a plausible token, not a fault.
+//
+//        The engine's `scratch` (the CUDA's chunk partials) is REQUIRED by the contract but NOT read here: this
+//        re-derivation keeps the softmax state in registers, so the scratch layout is the CUDA's alone.  The
+//        wrapper still refuses a null scratch (the engine's own contract refuses one) so a wiring bug is loud.
+void qsa_decode_attn(Stream& s, const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
+                     const int32_t* step, int64_t cap, const strata::kernels::QsaShapes& sh, float* scratch,
+                     float* attn) {
+    const int64_t nh = sh.n_head, kh = sh.n_head_kv, hd = sh.head_dim, ps = sh.page_size;
+    if (nh <= 0 || kh <= 0 || hd <= 0 || ps <= 0 || cap <= 0) return;
+    if (nh % kh != 0) refuse("qsa_decode_attn_step", "n_head is not a multiple of n_head_kv");
+    if (!pools.page_table || !ids || !step || !q || !attn || !scratch)
+        refuse("qsa_decode_attn_step", "a required pointer is null");
+    // The storage mode is chosen the way the CUDA chooses it (which pointers are non-null).
+    const int mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+                    : (pools.k_q != nullptr ? 1 : 0));
+    if (mode == 2) refuse("qsa_decode_attn_step", "the Q4_0 pool storage is not implemented in this shader");
+    if (mode == 3) refuse("qsa_decode_attn_step", "the K8V4 hybrid pool storage is not implemented in this shader");
+    if (mode == 1 && hd % 64 != 0) refuse("qsa_decode_attn_step", "head_dim is not a multiple of 64 (int8 scale group)");
+    Buf qv{}, tv{}, iv{}, sv{}, ov{}, kpv{}, vpv{}, kqv{}, vqv{}, ksv{}, vsv{};
+    if (!arena_resolve(s, q, (uint64_t) nh * (uint64_t) hd * 4, qv) ||
+        !arena_resolve(s, pools.page_table, 4, tv) ||    // the table's extent is unknown here; 4 B is the port's check
+        !arena_resolve(s, ids, (uint64_t) cap * 4, iv) ||
+        !arena_resolve(s, step, 20, sv) ||               // kStepCount * 4
+        !arena_resolve(s, attn, (uint64_t) nh * (uint64_t) hd * 4, ov))
+        refuse("qsa_decode_attn_step", "a pointer is not inside this stream's arena");
+    if (mode == 0) {
+        if (!pools.k_pool || !pools.v_pool) refuse("qsa_decode_attn_step", "the f16 pools are missing");
+        if (!arena_resolve(s, pools.k_pool, (uint64_t) kh * (uint64_t) hd * 2, kpv) ||
+            !arena_resolve(s, pools.v_pool, (uint64_t) kh * (uint64_t) hd * 2, vpv))
+            refuse("qsa_decode_attn_step", "a pool pointer is not inside this stream's arena");
+        kqv = vqv = ksv = vsv = tv;   // unused lanes bind the page table (never read in mode 0) - no null descriptor
+    } else {
+        if (!pools.k_q || !pools.v_q || !pools.k_scale || !pools.v_scale)
+            refuse("qsa_decode_attn_step", "the int8 pools are incomplete");
+        if (!arena_resolve(s, pools.k_q, (uint64_t) kh * (uint64_t) hd, kqv) ||
+            !arena_resolve(s, pools.v_q, (uint64_t) kh * (uint64_t) hd, vqv) ||
+            !arena_resolve(s, pools.k_scale, (uint64_t) kh * (uint64_t) (hd / 64) * 2, ksv) ||
+            !arena_resolve(s, pools.v_scale, (uint64_t) kh * (uint64_t) (hd / 64) * 2, vsv))
+            refuse("qsa_decode_attn_step", "an int8 pool pointer is not inside this stream's arena");
+        kpv = vpv = tv;   // unused lanes bind the page table (never read in mode 1)
+    }
+    struct Push {
+        int32_t n_head;
+        int32_t kv_heads;
+        int32_t head_dim;
+        int32_t page_size;
+        int32_t mode;
+    } pc{};
+    pc.n_head = (int32_t) nh;
+    pc.kv_heads = (int32_t) kh;
+    pc.head_dim = (int32_t) hd;
+    pc.page_size = (int32_t) ps;
+    pc.mode = mode;
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/qsa_decode_attn.spv", 11, sizeof(pc));
+    s.ctx->dispatch(pipe, {&qv, &kpv, &vpv, &kqv, &vqv, &ksv, &vsv, &tv, &iv, &sv, &ov}, &pc, sizeof(pc),
+                    (uint32_t) nh);
+}
+
 }  // namespace strata::vulkan
 
 // ---- the engine's entry points: the symbols include/strata/kernels/*.hpp declare --------------------------
@@ -397,6 +462,23 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 //     (moe_route, layer.cpp - the expert routing)
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
     strata::vulkan::native_router_top10(*need_stream("native_router_top10", stream), logits, ids, weights);
+}
+
+// qsa_decode_attn.hpp: `void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+//     const int32_t* step, int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream);`
+//     (layer.cpp:980 - THE DEFAULT decode attention, the fast-attn branch of the shipped configuration).
+void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
+                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
+    strata::vulkan::qsa_decode_attn(*need_stream("qsa_decode_attn_step", stream), q, pools, ids, step, cap, s,
+                                    scratch, attn);
+}
+
+// qsa_decode_attn.hpp: `uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);`  (a `host` row:
+//     `layer.cpp:771/774` ask for the scratch SIZE, not for a dispatch).  A pure function of `cap` and the head
+//     count, transcribed from `qsa_decode_attn.cu` (`CHUNK = 64`, `HD = 256`): chunks * n_head * (HD + 2) + 64.
+uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
+    const int64_t chunks = (cap + 63) / 64;
+    return (uint64_t) chunks * (uint64_t) s.n_head * (uint64_t) (256 + 2) + 64;
 }
 
 // ---- the `host` row: the rope CONSTANTS (rope_scaling.hpp) -------------------------------------------------

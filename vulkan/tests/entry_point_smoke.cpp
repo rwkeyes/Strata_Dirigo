@@ -16,6 +16,8 @@
 #include "strata/kernels/fused_gdn.hpp"           // fused_gdn_conv_l2 / fused_gdn_ab
 #include "strata/kernels/native_gdn_preprocess.hpp"  // native_gdn_conv_silu / native_gdn_l2_norm
 #include "strata/kernels/native_gdn.hpp"            // native_gdn_step / native_gdn_enabled
+#include "strata/kernels/qsa.hpp"                  // QsaShapes (the KV-pool decode attention's geometry)
+#include "strata/kernels/qsa_decode_attn.hpp"      // qsa_decode_attn_step / qsa_decode_attn_scratch_floats
 #include "strata/kernels/bf16_bits.hpp"     // bf16_from_f32: the engine's own converter, included not transcribed
 #include "strata/kernels/f16_bits.hpp"      // f16_from_f32: ditto, for f32_to_f16_bulk
 #include "strata/vulkan/vk_backend.hpp"
@@ -835,6 +837,78 @@ int main(int argc, char** argv) {
                 check(nm, bad == 0);
             }
         }
+    }
+
+    {   // qsa_decode_attn_step: the DEFAULT decode attention - the KV POOLS read through the PAGE TABLE.
+        const int NH = 4, KH = 2, HD = 256, PS = 4, PAGES = 8;
+        const int rows = PAGES * KH * PS;
+        std::vector<uint16_t> kp((size_t) rows * HD), vp((size_t) rows * HD);
+        for (int r = 0; r < rows; ++r)
+            for (int d = 0; d < HD; ++d) {
+                kp[(size_t) r * HD + d] = strata::kernels::f16_from_f32(0.01f * (float) ((r * 7 + d * 3) % 100 - 50));
+                vp[(size_t) r * HD + d] = strata::kernels::f16_from_f32(0.01f * (float) ((r * 11 + d * 5) % 100 - 50));
+            }
+        std::vector<int32_t> table(PAGES);
+        for (int i = 0; i < PAGES; ++i) table[i] = PAGES - 1 - i;
+        table[5] = -1;                                     // page 5 is NOT resident: cell 20 is masked
+        std::vector<int32_t> ids = {3, 17, 20, 8, 30, 11};
+        const int n_ids = (int) ids.size();
+        std::vector<int32_t> step = {0, 0, 0, n_ids, 0};
+        std::vector<float> q((size_t) NH * HD);
+        for (size_t i = 0; i < q.size(); ++i) q[i] = 0.05f * (float) ((int) (i % 17) - 8);
+        strata::kernels::QsaShapes shp{};
+        shp.n_head = NH; shp.n_head_kv = KH; shp.head_dim = HD; shp.page_size = PS;
+        const int G = NH / KH;
+        std::vector<float> want((size_t) NH * HD, 0.0f);
+        for (int h = 0; h < NH; ++h) {
+            const int kvh = h / G;
+            std::vector<int> rr;
+            std::vector<double> sc;
+            for (int c = 0; c < n_ids; ++c) {
+                const int cell = ids[c];
+                const int page = table[cell / PS];
+                if (page < 0) continue;
+                const int row = (page * KH + kvh) * PS + (cell % PS);
+                double dot = 0;
+                for (int d = 0; d < HD; ++d) dot += (double) q[(size_t) h * HD + d] * (double) strata::kernels::f32_from_f16(kp[(size_t) row * HD + d]);
+                rr.push_back(row); sc.push_back(dot / std::sqrt((double) HD));
+            }
+            if (rr.empty()) continue;
+            double mx = -1e300; for (double v : sc) mx = std::max(mx, v);
+            double den = 0; for (double v : sc) den += std::exp(v - mx);
+            for (int d = 0; d < HD; ++d) {
+                double acc = 0;
+                for (size_t i = 0; i < rr.size(); ++i) acc += std::exp(sc[i] - mx) * (double) strata::kernels::f32_from_f16(vp[(size_t) rr[i] * HD + d]);
+                want[(size_t) h * HD + d] = (float) (acc / den);
+            }
+        }
+        float* dq = strata::vulkan::arena_alloc<float>(*s, q.size());
+        uint16_t* dk = strata::vulkan::arena_alloc<uint16_t>(*s, kp.size());
+        uint16_t* dv = strata::vulkan::arena_alloc<uint16_t>(*s, vp.size());
+        int32_t* dt = strata::vulkan::arena_alloc<int32_t>(*s, table.size());
+        int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, ids.size());
+        int32_t* ds = strata::vulkan::arena_alloc<int32_t>(*s, step.size());
+        float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) NH * HD);
+        float* dscr = strata::vulkan::arena_alloc<float>(*s, strata::kernels::qsa_decode_attn_scratch_floats(n_ids, shp));
+        strata::vulkan::stream_write(*s, dq, q.data(), q.size() * 4);
+        strata::vulkan::stream_write(*s, dk, kp.data(), kp.size() * 2);
+        strata::vulkan::stream_write(*s, dv, vp.data(), vp.size() * 2);
+        strata::vulkan::stream_write(*s, dt, table.data(), table.size() * 4);
+        strata::vulkan::stream_write(*s, di, ids.data(), ids.size() * 4);
+        strata::vulkan::stream_write(*s, ds, step.data(), step.size() * 4);
+        strata::kernels::QsaAttnPools pools{};
+        pools.k_pool = dk; pools.v_pool = dv; pools.page_table = dt;
+        strata::kernels::qsa_decode_attn_step(dq, pools, di, ds, n_ids, shp, dscr, dout, s);
+        std::vector<float> got((size_t) NH * HD);
+        strata::vulkan::stream_read(*s, dout, got.data(), got.size() * 4);
+        int bad = 0; double worst = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double e = std::fabs((double) got[i] - (double) want[i]);
+            worst = std::max(worst, e / (std::fabs((double) want[i]) + 1e-30));
+            if (!(e <= 1e-4 * std::fabs((double) want[i]) + 1e-6)) ++bad;
+        }
+        std::printf("  qsa_decode_attn_step wrapper vs the engine's rule (double, worst rel %.3g)\n", worst);
+        check("qsa_decode_attn_step", bad == 0);
     }
 
     strata::vulkan::stream_close(s);

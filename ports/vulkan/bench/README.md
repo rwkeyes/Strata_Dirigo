@@ -246,6 +246,30 @@ the transcendental gap.  The XTX's 1.019 is a 2 µs difference on a 6.1k-element
 resolution; the K620's 0.904 is the same magnitude the other way.  **Recorded as measured, not tuned** — a native
 kernel is not required to be faster, and the point of this increment is the branch, not the throughput.
 
+### The DEFAULT QSA decode attention — `qsa_decode_attn` (SOLO row) — measured 2026-10-05
+
+`qsa_decode_attn_step` (`layer.cpp:980`) is the engine's DEFAULT decode attention (the `g_fast_attn` branch, whose
+defaults the shipped launch keeps) and had no shader in this tree until this batch.  The port's shader
+(`qsa_decode_attn.comp`) re-derives the engine's CHUNK+MERGE CUDA onto **one workgroup per query head with
+barrier-tree reductions** (subgroup ops are banned here) and an ONLINE softmax, needing no scratch.  It is a
+**SOLO** row — there was no second implementation to pair against — timed at the artifact's geometry
+(`n_head=24 kv_heads=2 head_dim=256 page_size=4`) across the engine's real selection widths
+(`qsa_selection_width`, `idx_top_k = 2048`).  `reps=3 warmups=1 batch=1`; `vega`'s Arc B70.
+
+| `qsa_decode_attn` | Arc B70 med (ms) |
+|---|---:|
+| `n_ids=256` | **0.3797** |
+| `n_ids=1024` | **1.2946** |
+| `n_ids=2048` (the engine's real width) | **2.5203** |
+
+**The cost is LINEAR in `n_ids`, and that is the honest shape of this kernel:** it does ONE workgroup barrier-tree
+reduction PER CELL per head, because the port's reduction rule bans subgroup ops and the CUDA's chunked
+decomposition (each block reducing 64 cells, then a merge) is the PERFORMANCE form this port did not take.  At the
+artifact's 12 QSA layers a ~2.5 ms per-layer attention is the correctness-first price; the row is recorded so the
+next performance increment has a baseline.  Bit-identity with the chunked CUDA is NOT claimed (the softmax
+summation order differs); the gate measures the difference against a double transcription of the rule (worst rel
+9.65e-04 on the masked arm, within the abs floor).
+
 ### The class-B NATIVE vs LEGACY pairs, batch 2 — the GDN / DeltaNet MIXER — measured 2026-10-05
 
 The mixer runs on **36 of the model's 48 layers**.  These are the first three native mixer kernels, each timed

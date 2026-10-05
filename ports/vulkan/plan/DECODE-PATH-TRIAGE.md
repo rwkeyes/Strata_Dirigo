@@ -522,7 +522,7 @@ answer can be re-checked when a default changes.
 | 6 | `s_gemv_q8k_split` | todo (C) | **no** | `layer.cpp:172` (same) and `layer.cpp:1017` (`!w_attno->native_data`); shipped `attn_output` is native |
 | 7 | `qsa_index_step` | todo (C) | **no** | `layer.cpp:973` `else` of `if (g_fast_select)`; `g_fast_select` defaults true → the ported `qsa_block_scores`/`qsa_block_topk` |
 | 8 | `topk_512_step` | todo (C) | **no** | same `g_fast_select` decision (`layer.cpp:973`) |
-| 9 | `qsa_attend_step` | todo (C) | **no** | `layer.cpp:1002` `else` of `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)`; defaults true/false/null → the ported `qsa_decode_attn_step` |
+| 9 | `qsa_attend_step` | todo (C) | **no** | `layer.cpp:1002` `else` of `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)`; defaults true/false/null → `qsa_decode_attn_step` (CORRECTED 2026-10-05: this row said "the PORTED `qsa_decode_attn_step`" — but that symbol had NO shader until the correction below; the selected branch was a HOLE) |
 | 10 | `fused_gr_read` | todo (C) | **no** | `layer.cpp:1253`/`:1276` `fused = g_fused_gr && fused_gr_supported(...)`; the GR contract forces `layer_set_fused_gr(false)` |
 | 11 | `add_streams_broadcast` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:497` in `MtpDrafter::record_forward`, unconditional; the drafter runs when `o.spec > 0` (`generate.cpp:7796`) and the shipped launch sets `--spec 4 --mtp` |
 | 12 | `fused_gr_read_multi` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:510`/`:571`/`:620`, unconditional; also `verify.cpp:693`/`:1142` (verifier only) |
@@ -635,4 +635,39 @@ workgroup-per-row decomposition, only the activation precision differs → a WAS
 `todo → kernel`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  The eight drafter rows keep
 kind `todo` in the TSV (its kind vocabulary is `kernel`/`host`/`todo`) but carry a `class C` reason string and
 are classified in the AUDIT above, so the map no longer reports them as open forward-path work.
+
+# THE THIRD HOLE — `qsa_decode_attn_step`, the DEFAULT decode attention (CORRECTED 2026-10-05)
+
+The REACHABILITY AUDIT's row 9 recorded `qsa_attend_step` as the class-C member and *"the ported
+`qsa_decode_attn_step`"* as the SELECTED branch of the fast-attention decision.  **That was wrong: the selected
+branch had no shader, and it is the engine's DEFAULT attention.**  Settled from the engine's own code:
+
+* **The call site** `src/core/layer.cpp:978-980`: `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)
+  { ... qsa_decode_attn_step(...); }`.
+* **Every flag, its default, and what the shipped launch sets:** `g_fast_attn` **true** (`layer.cpp:42`; the
+  launch writes `layer_set_fast_attn(!o.no_fast_attn)` at `generate.cpp:2280`, and `o.no_fast_attn` defaults
+  **false**); `native_flash_attn_short` **false** (`layer.cpp:92`; `o.native_flash_attn_short` defaults **false**
+  at `generate.cpp:272` and only `--native-flash-attn-short` sets it, NOT `--native`); `dump` is the caller's
+  argument and the decode path passes **nullptr** (`bb.dump`, `layer.cpp:1259`).
+* All three are the shipped defaults, so the `if` branch — `qsa_decode_attn_step` — IS reached.
+* **Its contract** (`include/strata/kernels/qsa_decode_attn.hpp`) reads the KV **POOLS** through the PAGE TABLE
+  with an int8/q4 option and a scratch — NOT the gathered `[cap,2,256]` f16 WINDOW of `attn_decode_short` (which
+  its own header states is `native_flash_attn_short_step`).  PORT-MAP's `qsa_decode_attn_step → attn_decode_short`
+  row was therefore a false mapping.
+
+**Both are corrected.**  `ports/vulkan/shaders/qsa_decode_attn.comp` ports the pools-through-the-page-table
+kernel (f16 pools — the shipped `--kv fp16` default — and int8; q4_0/K8V4 refused), wired as
+`strata::kernels::qsa_decode_attn_step` in `vulkan/src/kernels/qsa_vk.cpp` plus the `host` row
+`qsa_decode_attn_scratch_floats`; proved by `case_qsa_decode_attn` (bitwise wrapper==shader and both against a
+double transcription of the engine's rule) and falsified by
+`gates/inject-verify.sh qsa-decode-attn-drop-kv-head`.  PORT-MAP's row now reads
+`qsa_decode_attn_step  kernel  qsa_decode_attn`.  The one-layer-body link moves `94 → 91` raw / `35 → 33`
+full-signature / `33 → 31` name-only; the attention/QSA/MoE/GR/PLE/rope group falls **27 → 25**.  Full detail in
+`NEXT.md`'s top section.
+
+**The lesson, stated the way the previous two holes stated it:** a capability answer is a ROUTING decision, and
+so is a class label — **the audit asserted a symbol was ported without checking that a shader existed for its
+CONTRACT**, and the wrong PORT-MAP pairing (`attn_decode_short`) is what made the assertion look true.  A
+`kernel` row's named shader must be the kernel the symbol's own header describes, not merely a shader whose file
+name is `*attn*`.
 

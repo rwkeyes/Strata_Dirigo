@@ -15,6 +15,42 @@ stale input read (a single-element mutation of the previous/zero/byte-zeroed for
 a stale word would persist on re-dispatch). **The case is not skipped on radeon and the bound is not
 widened.** Full detail and evidence paths in `NEXT.md`'s top section.
 
+## THE DEFAULT QSA DECODE ATTENTION — `qsa_decode_attn_step` WAS A REACHABLE HOLE, NOW PORTED (2026-10-05, `vega`)
+
+**The default decode attention had NO shader in this tree — a HOLE of the class the previous two batches found.**
+The symbol `qsa_decode_attn_step` (`layer.cpp:980`) is reached inside
+`if (g_fast_attn && !native_flash_attn_short && dump == nullptr)` — every input the SHIPPED configuration's
+default: `g_fast_attn` **true** (`layer.cpp:42`), `native_flash_attn_short` **false** (`layer.cpp:92`; set only by
+`--native-flash-attn-short`, NOT by `--native`), `dump` **nullptr** on the decode path.  It reads the KV POOLS
+through the PAGE TABLE — a DIFFERENT kernel from `attn_decode_short` (which its own header says is
+`native_flash_attn_short_step`, a gathered `[cap,2,256]` f16 window).  PORT-MAP's mapping and the reachability
+audit's row were both wrong; both are corrected.
+
+**Ported:** `ports/vulkan/shaders/qsa_decode_attn.comp` — the pools read directly through the page table (no
+gather), one workgroup per query head, online softmax; mode 0 = f16 pools (the shipped `--kv fp16` default),
+mode 1 = int8 codes + fp16 scale/64; q4_0 and K8V4 refused loudly.  The engine's chunk+merge CUDA is re-derived
+onto one workgroup with barrier-tree reductions (subgroup ops banned) and needs no scratch — bit-identity with
+the chunked CUDA is NOT claimed; the gate MEASURES the difference against a DOUBLE transcription of the rule.
+Wired in `vulkan/src/kernels/qsa_vk.cpp` (9th entry point) + the `host` row `qsa_decode_attn_scratch_floats`.
+
+| case | rule (the engine's OWN CUDA = the oracle) | measured (vega Arc) | falsified by |
+|---|---|---|---|
+| `qsa_decode_attn` (3 arms: page_size 4/1/8) | `qsa_decode_attn.cu`: `row=(page*kv_heads+kvh)*page_size+(cell%page_size)`, `s=(Σ q·k)/sqrt(head_dim)`, softmax over resident cells, `attn=Σ w·v` | wrapper == shader path **6144/6144 w 0** x3; shader vs rule **w 9.65e-04 / 2.01e-04 / 5.92e-04** (abs floor 1e-5) | `qsa-decode-attn-drop-kv-head` -> **FAIL 0/6144 w 2.26e+04** |
+
+**THE LINK PROGRESS — the one-layer-body link: `94 → 91` undefined references / `35 → 33` distinct
+full-signature `strata::kernels::` symbols / `33 → 31` name-only.**  The attention/QSA/MoE/GR/PLE/rope group falls
+**27 → 25** (glue 0 · matvec/GEMV/KV 6 · GDN mixer 0 · other 2); the two symbols resolved are
+`qsa_decode_attn_step` and `qsa_decode_attn_scratch_floats`.  Measured with `$HOME/vkbuild-vulkan` reconfigured +
+rebuilt from the tree first (never `-G Ninja`); recipe + group table in `NEXT.md`'s top section.
+
+**RESULTS (vega).**  Gate: Arc (intel_icd) **612/0/0** (exit 0), llvmpipe **600/0/3**, Ryzen iGPU (radeon_icd)
+**603/0/2** — **+9 verdicts per arm**, 0 failed.  `strata_vk_entry_smoke` RUNS the new wrapper (PASS, worst rel
+2.92e-05).  `check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo; 112 shaders built, 93 claimed`);
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (one row: `qsa_decode_attn_step → qsa_decode_attn`).
+Bench (Arc, SOLO row): **0.38 / 1.29 / 2.52 ms** at n_ids 256 / 1024 / 2048 — linear in the selection width, the
+honest cost of the correctness form (the CUDA's chunk form is the fast one and was not ported).  **`z820b`
+PENDING.**  CUDA graph API untouched.
+
 ## INCREMENT I5 (ENGINE) — the ATTENTION / QSA / rope entry points (the non-GDN body's next eight) + A CROSS-CUTTING WEIGHT-INDEXING DEFECT FOUND AND FIXED (2026-10-05, `vega`)
 
 **THE EIGHT, in the order the non-GDN body `qsa_layer` (`src/core/layer.cpp:876`) reaches them** (the plan's list is

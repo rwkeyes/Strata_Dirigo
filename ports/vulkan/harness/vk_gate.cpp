@@ -17675,6 +17675,197 @@ void case_native_router_top10_entry(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE DEFAULT QSA DECODE ATTENTION (src/kernels/cuda/qsa_decode_attn.cu, `qsa_decode_attn_step`).
+// ----------------------------------------------------------------------------------------------------------
+// The engine's DEFAULT decode attention: `layer.cpp:978` `if (g_fast_attn && !native_flash_attn_short &&
+// dump == nullptr)`, with `g_fast_attn` default TRUE (`layer.cpp:42`) and `native_flash_attn_short` a diagnostic
+// that defaults FALSE (`layer.cpp:92`) - the SHIPPED branch.  It reads the KV POOLS through the PAGE TABLE and
+// the selection ids with NO gather copy (unlike `attn_decode_short`, which reads a gathered [cap,2,256] window).
+//
+// THE FIXTURE gives each thing a plausible wrong reading would get wrong its OWN DISTINCT observable:
+//   * the pool's row index INTERLEAVES the KV head at the PAGE level - `(page*kv_heads + h)*page_size + off` -
+//     so reading head-major (`(page*page_size + off)*kv_heads + h`) lands on another head's data;
+//   * the PAGE TABLE is a PERMUTATION of the pages, so the IDENTITY reading `page = cell / page_size` picks a
+//     different page;
+//   * two pages are marked -1 (not resident), so cells in them are MASKED - the engine's `srow[c] < 0` arm.
+//
+// THE ORACLE is a double transcription of the ENGINE'S RULE (from qsa_decode_attn.cu, NOT from this port's
+// shader): `row = (page*n_kv_heads + kvh)*page_size + (cell % page_size)`, `s = (sum_d q*k) * 1/sqrt(head_dim)`,
+// softmax over the resident cells, `attn[d] = sum_c w * v`.  It is NOT a re-derivation of the shader's ONLINE
+// softmax: the shader's structure (one workgroup per query head, a running max/sum/value rescaled per cell)
+// does not appear here, so a SHARED mistake would have to live in the rule itself - and the rule is the
+// engine's own.  The margin check below proves the fixture SEPARATES the rule from its rivals host-side.
+enum { ATTN_RULE = 0, ATTN_IDENTITY_PAGE = 1, ATTN_HEAD_NOT_PAGED = 2 };
+
+static void qsa_attn_ref(std::vector<double>& want, const std::vector<float>& q, const std::vector<uint16_t>& kp,
+                         const std::vector<uint16_t>& vp, const std::vector<int32_t>& table,
+                         const std::vector<int32_t>& ids, int nh, int kh, int hd, int ps, int rival) {
+    const int G = nh / kh;
+    const double scale = 1.0 / std::sqrt((double) hd);
+    want.assign((size_t) nh * hd, 0.0);
+    std::vector<int> rows;
+    std::vector<double> sc;
+    for (int head = 0; head < nh; ++head) {
+        const int kvh = head / G;
+        rows.clear();
+        sc.clear();
+        for (size_t c = 0; c < ids.size(); ++c) {
+            const int cell = ids[c];
+            const int page = (rival == ATTN_IDENTITY_PAGE) ? (cell / ps) : table[(size_t) (cell / ps)];
+            if (page < 0) continue;                       // masked: no score, no weight, no value
+            const int row = (rival == ATTN_HEAD_NOT_PAGED) ? (page * ps + (cell % ps)) * kh + kvh
+                                                           : (page * kh + kvh) * ps + (cell % ps);
+            double dot = 0.0;
+            for (int d = 0; d < hd; ++d)
+                dot += (double) q[(size_t) head * hd + d] *
+                       (double) strata::kernels::f32_from_f16(kp[(size_t) row * hd + d]);
+            rows.push_back(row);
+            sc.push_back(dot * scale);
+        }
+        if (rows.empty()) continue;                       // all masked -> output 0 (the engine's L == 0 arm)
+        double mx = -1e300;
+        for (double s : sc) mx = std::max(mx, s);
+        double den = 0.0;
+        for (double s : sc) den += std::exp(s - mx);
+        for (int d = 0; d < hd; ++d) {
+            double acc = 0.0;
+            for (size_t i = 0; i < rows.size(); ++i)
+                acc += std::exp(sc[i] - mx) * (double) strata::kernels::f32_from_f16(vp[(size_t) rows[i] * hd + d]);
+            want[(size_t) head * hd + d] = acc / den;
+        }
+    }
+}
+
+static void qsa_decode_attn_arm(Ctx& ctx, const std::string& dir, int page_size, int n_ids, bool masked_pages,
+                                const char* what) {
+    const int KH = 2, NH = 24, HD = 256, PAGES = 16;
+    const int rows = PAGES * KH * page_size;
+    std::vector<uint16_t> kp((size_t) rows * HD), vp((size_t) rows * HD);
+    for (int p = 0; p < PAGES; ++p)
+        for (int h = 0; h < KH; ++h)
+            for (int off = 0; off < page_size; ++off)
+                for (int d = 0; d < HD; ++d) {
+                    const size_t row = ((size_t) p * KH + h) * page_size + off;
+                    kp[row * HD + d] = f16_from_f32((float) ((p * 37 + h * 101 + off * 17 + (d * 7) % 233) % 400 - 200) * 0.01f);
+                    vp[row * HD + d] = f16_from_f32((float) ((p * 53 + h * 19 + off * 29 + (d * 11) % 197) % 400 - 200) * 0.01f);
+                }
+    std::vector<int32_t> table(PAGES);
+    for (int i = 0; i < PAGES; ++i) table[i] = PAGES - 1 - i;      // a PERMUTATION (reverse)
+    if (masked_pages) { table[7] = -1; table[2] = -1; }            // two pages NOT resident
+    std::vector<int32_t> ids;
+    for (int c = 0; c < n_ids; ++c) ids.push_back((c * 5 + 3) % (PAGES * page_size));
+    std::vector<int32_t> step = {0, 0, 0, n_ids, 0};              // kStepWidth == 3
+    std::vector<float> q((size_t) NH * HD);
+    for (float& x : q) x = rndf(1.0f);
+
+    // ---- the oracle, and the MARGIN: the rival readings must MOVE it, or the fixture would not separate them.
+    std::vector<double> ref, rival_ident, rival_head;
+    qsa_attn_ref(ref, q, kp, vp, table, ids, NH, KH, HD, page_size, ATTN_RULE);
+    qsa_attn_ref(rival_ident, q, kp, vp, table, ids, NH, KH, HD, page_size, ATTN_IDENTITY_PAGE);
+    qsa_attn_ref(rival_head, q, kp, vp, table, ids, NH, KH, HD, page_size, ATTN_HEAD_NOT_PAGED);
+    int moved = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        if (std::fabs(rival_ident[i] - ref[i]) > 1e-3 * (std::fabs(ref[i]) + 1e-3)) ++moved;
+        if (std::fabs(rival_head[i] - ref[i]) > 1e-3 * (std::fabs(ref[i]) + 1e-3)) ++moved;
+    }
+    std::printf("      %s: ids=%d pages=%d page_size=%d masked_pages=%d; rivals move the oracle on %d of %d cells\n",
+                what, n_ids, PAGES, page_size, masked_pages ? 1 : 0, moved, (int) (2 * ref.size()));
+    {
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "qsa_decode_attn margin (%s): the identity-page and head-major rivals move the rule", what);
+        verdict(tag, moved > 0, moved > 0 ? 0 : 1, 1, 0.0, "the fixture does not separate the rule from its rivals");
+    }
+
+    // ---- THE SHADER PATH (the harness device), and the ENGINE WRAPPER (an engine stream, EnginePin-pinned).
+    Buf b_q = ctx.alloc(q.size() * 4), b_k = ctx.alloc(kp.size() * 2), b_v = ctx.alloc(vp.size() * 2);
+    Buf b_t = ctx.alloc(table.size() * 4), b_i = ctx.alloc(ids.size() * 4), b_s = ctx.alloc(step.size() * 4);
+    Buf b_o = ctx.alloc((size_t) NH * HD * 4);
+    ctx.write(b_q, q.data(), q.size() * 4);
+    ctx.write(b_k, kp.data(), kp.size() * 2);
+    ctx.write(b_v, vp.data(), vp.size() * 2);
+    ctx.write(b_t, table.data(), table.size() * 4);
+    ctx.write(b_i, ids.data(), ids.size() * 4);
+    ctx.write(b_s, step.data(), step.size() * 4);
+    std::vector<float> nanp((size_t) NH * HD, std::numeric_limits<float>::quiet_NaN());
+    ctx.write(b_o, nanp.data(), nanp.size() * 4);
+    {
+        VkPipeline p = ctx.pipeline(dir + "/qsa_decode_attn.spv", 11, 20);
+        struct { int32_t n_head, kv_heads, head_dim, page_size, mode; } pc{NH, KH, HD, page_size, 0};
+        // mode 0 (f16 pools): the int8 lanes (bindings 3..6) are UNREAD - bound to the page table (never
+        // dereferenced) so no descriptor is null.  This is the wrapper's own choice, exercised here.
+        ctx.dispatch(p, {&b_q, &b_k, &b_v, &b_t, &b_t, &b_t, &b_t, &b_t, &b_i, &b_s, &b_o}, &pc, sizeof(pc),
+                     (uint32_t) NH);
+    }
+    std::vector<float> got_sh((size_t) NH * HD);
+    ctx.read(b_o, got_sh.data(), got_sh.size() * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("qsa_decode_attn: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(b_q); ctx.free(b_k); ctx.free(b_v); ctx.free(b_t); ctx.free(b_i); ctx.free(b_s); ctx.free(b_o);
+        return;
+    }
+    strata::kernels::QsaShapes shp{};
+    shp.n_head = NH; shp.n_head_kv = KH; shp.head_dim = HD; shp.page_size = page_size;
+    float* dq = strata::vulkan::arena_alloc<float>(*s, q.size());
+    uint16_t* dk = strata::vulkan::arena_alloc<uint16_t>(*s, kp.size());
+    uint16_t* dv = strata::vulkan::arena_alloc<uint16_t>(*s, vp.size());
+    int32_t* dt = strata::vulkan::arena_alloc<int32_t>(*s, table.size());
+    int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, ids.size());
+    int32_t* ds = strata::vulkan::arena_alloc<int32_t>(*s, step.size());
+    float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) NH * HD);
+    const uint64_t scratch_floats = strata::kernels::qsa_decode_attn_scratch_floats(ids.size(), shp);
+    float* dscr = strata::vulkan::arena_alloc<float>(*s, scratch_floats);
+    strata::vulkan::stream_write(*s, dq, q.data(), q.size() * 4);
+    strata::vulkan::stream_write(*s, dk, kp.data(), kp.size() * 2);
+    strata::vulkan::stream_write(*s, dv, vp.data(), vp.size() * 2);
+    strata::vulkan::stream_write(*s, dt, table.data(), table.size() * 4);
+    strata::vulkan::stream_write(*s, di, ids.data(), ids.size() * 4);
+    strata::vulkan::stream_write(*s, ds, step.data(), step.size() * 4);
+    strata::kernels::QsaAttnPools pools{};
+    pools.k_pool = dk; pools.v_pool = dv; pools.page_table = dt;
+    strata::kernels::qsa_decode_attn_step(dq, pools, di, ds, (int64_t) ids.size(), shp, dscr, dout, s);  // ENGINE WRAPPER
+    std::vector<float> got_en((size_t) NH * HD);
+    strata::vulkan::stream_read(*s, dout, got_en.data(), got_en.size() * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < got_en.size(); ++i) {
+        uint32_t a, b; std::memcpy(&a, &got_sh[i], 4); std::memcpy(&b, &got_en[i], 4); if (a != b) ++bad_bw;
+    }
+    char tag[200];
+    std::snprintf(tag, sizeof tag, "qsa_decode_attn (%s): engine wrapper == shader path, bitwise", what);
+    verdict(tag, bad_bw == 0, bad_bw, (int) got_en.size(), 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+
+    int bad = 0, nonfinite = 0;
+    double worst = 0;
+    for (size_t i = 0; i < got_sh.size(); ++i) {
+        const double g = (double) got_sh[i];
+        if (!std::isfinite(g)) { ++nonfinite; ++bad; continue; }
+        const double rel = std::fabs(g - ref[i]) / (std::fabs(ref[i]) + 1e-30);
+        worst = std::max(worst, rel);
+        if (!(rel <= 1e-4 || std::fabs(g - ref[i]) <= 1e-5)) ++bad;
+    }
+    std::snprintf(tag, sizeof tag, "qsa_decode_attn (%s): shader path vs the engine's rule (double)", what);
+    std::printf("      %s: out[0] = %.6g want %.6g | non-finite %d of %d | worst rel %.3g\n", what,
+                (double) got_sh[0], ref[0], nonfinite, (int) got_sh.size(), worst);
+    verdict(tag, bad == 0, bad, (int) got_sh.size(), worst, "values outside tolerance (worst rel err)");
+    ctx.free(b_q); ctx.free(b_k); ctx.free(b_v); ctx.free(b_t); ctx.free(b_i); ctx.free(b_s); ctx.free(b_o);
+}
+
+void case_qsa_decode_attn(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "qsa_decode_attn.spv")) return;
+    if (!ctx.info().storage_buffer_16bit) {
+        skip("qsa_decode_attn", "device lacks storageBuffer16BitAccess - the f16 pools are f16");
+        return;
+    }
+    qsa_decode_attn_arm(ctx, dir, 4, 12, true, "page_size=4, 12 ids, 2 pages masked");   // the artifact's granule
+    qsa_decode_attn_arm(ctx, dir, 1, 8, false, "page_size=1 (unpaged), 8 ids, none masked");
+    qsa_decode_attn_arm(ctx, dir, 8, 16, true, "page_size=8, 16 ids, 2 pages masked");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -17947,6 +18138,7 @@ int main(int argc, char** argv) {
     case_native_qsa_gate_apply_entry(ctx, dir);        // native_qsa_gate_apply        -> native_qsa_gate_apply.spv        (layer.cpp:1010)
     case_qsa_gate_apply_f32_entry(ctx, dir);           // qsa_gate_apply_f32           -> qsa_gate_apply_f32.spv           (layer.cpp:1011)
     case_native_router_top10_entry(ctx, dir);          // native_router_top10          -> native_router_top10.spv          (layer.cpp:370)
+    case_qsa_decode_attn(ctx, dir);                    // qsa_decode_attn_step         -> qsa_decode_attn.spv              (layer.cpp:980, the DEFAULT)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

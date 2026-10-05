@@ -110,6 +110,10 @@
 #   inject-verify.sh bf16-gemv-row-base     bf16_gemv.comp  index the weight row with the OUTPUT stride
 #                                       -> must FAIL  "bf16_gemv"
 #
+#   (the DEFAULT QSA decode attention: the KV pools read through the PAGE TABLE, `qsa_decode_attn_step`)
+#   inject-verify.sh qsa-decode-attn-drop-kv-head  qsa_decode_attn.comp  drop the KV head term from the pool
+#                                       row index -> must FAIL  "qsa_decode_attn (page_size=4"
+#
 #   (the SAMPLER family - the default SPLIT path, its f32 sibling, the `sample_tokens` choice, the coupled drafter)
 #   inject-verify.sh sampler-split-merge-drop-parts  common/sampler_select.glsl  drain the running list before
 #                                       the partition's -> must FAIL  "sampler_split:"
@@ -439,6 +443,15 @@ case "$name" in
     old=$'    const float raw = qfull.v[h * 2u * hd + hd + d];   // the SECOND half: [query, gate] per head'
     new=$'    const float raw = qfull.v[h * 2u * hd + d];   // INJECTION: the gate read from the FIRST half'
     want="FAIL  native_qsa_gate_apply" ;;
+  qsa-decode-attn-drop-kv-head)
+    # `qsa_decode_attn_step` is the DEFAULT decode attention (layer.cpp:980): it reads the KV POOLS through the
+    # page table.  The pool row INTERLEAVES the KV head at the page level - `(page*kv_heads + kvh)*page_size +
+    # (cell % page_size)`.  Dropping the `kvh` term makes BOTH KV heads read head 0's data: the whole GQA
+    # grouping collapses and every head's output moves, so the shader-path arm against the engine's rule must FAIL.
+    file="$SH/qsa_decode_attn.comp"; spv="qsa_decode_attn"
+    old=$'        const int row = (page * pc.kv_heads + kvh) * pc.page_size + (cell % pc.page_size);'
+    new=$'        const int row = page * pc.page_size + (cell % pc.page_size);   // INJECTION: the kv head term dropped'
+    want="FAIL  qsa_decode_attn (page_size=4" ;;
   native-caps-gdn-false)
     # THE GDN FLAG'S own falsification, and it is batch 4's capability point: `native_gdn_enabled()` now answers
     # TRUE because ALL NINE gated symbols (the six native kernels and the three fused paths) have shaders.  The

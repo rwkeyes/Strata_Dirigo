@@ -135,7 +135,7 @@ qsa_block_scores	kernel	qsa_block_scores
 qsa_block_topk	kernel	qsa_block_topk
 qsa_decode_attn_batch	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 qsa_decode_attn_scratch_floats	host	a size
-qsa_decode_attn_step	kernel	attn_decode_short
+qsa_decode_attn_step	kernel	qsa_decode_attn
 qsa_gate_apply_f32	kernel	qsa_gate_apply_f32
 qsa_index_step	todo	no shader in this tree yet
 qsa_real_shapes	host	a shape description

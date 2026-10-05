@@ -665,6 +665,49 @@ void bench_qsa_gate_pair(Ctx& ctx, const std::string& dir, int reps, int warmups
     ctx.free(ba); ctx.free(bq); ctx.free(bo);
 }
 
+// THE DEFAULT QSA DECODE ATTENTION: `qsa_decode_attn_step` (layer.cpp:980) - the KV POOLS read through the PAGE
+// TABLE with an online softmax.  This is the port's RE-DERIVATION of the engine's chunk+merge CUDA onto ONE
+// WORKGROUP PER QUERY HEAD with barrier-tree reductions (subgroup ops are banned; the CUDA's own header calls
+// the chunked decomposition the performance form, and this is the correctness form).  It is a SOLO row: the
+// symbol had NO shader in this tree before this batch, so there is no second implementation to pair against.
+// Timed at the artifact's geometry (24 query heads, 2 KV heads, head_dim 256, page_size 4) across the engine's
+// real selection widths (`qsa_selection_width`, `idx_top_k = 2048`), so the row is the cost of the attention the
+// engine actually runs.  The pool is a CONSTANT f16 pattern (1.0 K / 0.5 V) - the arithmetic and the traffic are
+// the same as for any data, and a timing row needs no fixture.
+void bench_qsa_decode_attn(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int NH = 24, KH = 2, HD = 256, PS = 4, PAGES = 2048 / PS + 8;
+    const int rows = PAGES * KH * PS;
+    std::vector<uint16_t> kp((size_t) rows * HD, 0x3C00u), vp((size_t) rows * HD, 0x3800u);   // f16 1.0 / 0.5
+    std::vector<int32_t> table(PAGES);
+    for (int i = 0; i < PAGES; ++i) table[i] = i;
+    std::vector<float> q((size_t) NH * HD);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = 0.02f * (float) ((int) (i % 13) - 6);
+    Buf bq = alloc(ctx, q.size() * 4), bk = alloc(ctx, kp.size() * 2), bv = alloc(ctx, vp.size() * 2);
+    Buf bt = alloc(ctx, table.size() * 4), bi = alloc(ctx, (size_t) 2048 * 4), bs = alloc(ctx, 5 * 4);
+    Buf bo = alloc(ctx, (size_t) NH * HD * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, kp.data(), kp.size() * 2);
+    ctx.write(bv, vp.data(), vp.size() * 2);
+    ctx.write(bt, table.data(), table.size() * 4);
+    const int widths[] = {256, 1024, 2048};               // the engine's real `n_ids` grows to idx_top_k = 2048
+    for (int n_ids : widths) {
+        std::vector<int32_t> ids((size_t) n_ids);
+        for (int c = 0; c < n_ids; ++c) ids[(size_t) c] = (c * 3) % (PAGES * PS);
+        std::vector<int32_t> step = {0, 0, 0, n_ids, 0};
+        ctx.write(bi, ids.data(), ids.size() * 4);
+        ctx.write(bs, step.data(), step.size() * 4);
+        struct { int32_t n_head, kv_heads, head_dim, page_size, mode; } pc{NH, KH, HD, PS, 0};
+        VkPipeline p = ctx.pipeline(dir + "/qsa_decode_attn.spv", 11, sizeof(pc));
+        const Timing t = time_kernel(ctx, p, {&bq, &bk, &bv, &bt, &bt, &bt, &bt, &bt, &bi, &bs, &bo}, &pc,
+                                     sizeof(pc), (uint32_t) NH, 1, 1, reps, warmups);
+        char shape[96];
+        std::snprintf(shape, sizeof shape, "n_head=%d kv_heads=%d head_dim=%d n_ids=%d page_size=%d", NH, KH, HD,
+                      n_ids, PS);
+        report("qsa_decode_attn (default)", shape, t, (double) NH * HD, 0.0);
+    }
+    ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bt); ctx.free(bi); ctx.free(bs); ctx.free(bo);
+}
+
 // =========================================================================================================
 // THE PERFORMANCE TIER, class B, batch 2: the native GDN / DeltaNet MIXER kernels, each against the legacy
 // kernel it replaces at the same shape on the same device.  Same XPAIR convention (native/legacy, < 1.0 faster).
@@ -1200,6 +1243,7 @@ int main(int argc, char** argv) {
     bench_moe_combine_pair(ctx, dir, reps, warmups);
     bench_rms_norm_pair(ctx, dir, reps, warmups);
     bench_qsa_gate_pair(ctx, dir, reps, warmups);   // class B: native_qsa_gate_apply <- qsa_gate_apply_f32
+    bench_qsa_decode_attn(ctx, dir, reps, warmups); // the DEFAULT QSA decode attention (qsa_decode_attn_step)
     // batch 2: the native GDN / DeltaNet mixer kernels (conv+SiLU, l2_norm, beta_gate).
     bench_gdn_conv_silu_pair(ctx, dir, reps, warmups);
     bench_gdn_l2_norm_pair(ctx, dir, reps, warmups);

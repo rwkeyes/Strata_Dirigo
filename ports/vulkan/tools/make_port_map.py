@@ -111,7 +111,7 @@ TABLE = {
     'qsa_block_topk':                 ('kernel', 'qsa_block_topk'),
     # The QSA gate pair's LEGACY member: `native_qsa_enabled() == false` (the QSA half of the branch policy).
     'qsa_gate_apply_f32':             ('kernel', 'qsa_gate_apply_f32'),
-    'qsa_decode_attn_step':           ('kernel', 'attn_decode_short'),
+    'qsa_decode_attn_step':           ('kernel', 'qsa_decode_attn'),
     'quantize_q8_':                   ('kernel', 'quantize_q8_0 quantize_q8_1 quantize_q8_K quantize_q8_0_scaled'),
     'quantize_q8_0':                  ('kernel', 'quantize_q8_0'),
     'quantize_q8_0_scaled':           ('kernel', 'quantize_q8_0_scaled'),

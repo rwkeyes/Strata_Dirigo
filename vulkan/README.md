@@ -281,3 +281,28 @@ the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.c
   full-signature / **42 -> 33** name-only.  The attention/QSA/MoE/GR/PLE/rope group falls **36 -> 27**.  All 35
   remaining are referenced by `layer.cpp` itself; the only other structural blocker is the deferred CUDA graph API
   (I5's).
+
+## What the NEXT batch adds: the DEFAULT QSA decode attention was a HOLE, and is now ported (2026-10-05)
+
+* **`qsa_decode_attn_step` is REACHABLE, and it had no shader** - so it was a HOLE of the class the two batches
+  before it found.  Its call site (`src/core/layer.cpp:980`) is inside
+  `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)`, whose three inputs are ALL the shipped
+  configuration's defaults: `g_fast_attn` **true** (`layer.cpp:42`), `native_flash_attn_short` **false**
+  (`layer.cpp:92`, set only by `--native-flash-attn-short`, NOT by `--native`), `dump` **nullptr** on the decode
+  path.  It reads the KV POOLS through the PAGE TABLE - a DIFFERENT kernel from `attn_decode_short` (which is
+  `native_flash_attn_short_step`, a gathered `[cap,2,256]` f16 window), so PORT-MAP's mapping and the
+  reachability audit's row were both wrong.  Both are corrected.
+* `ports/vulkan/shaders/qsa_decode_attn.comp` - the pools read directly through the page table (no gather), one
+  workgroup per query head, online softmax, mode 0 = f16 pools (the shipped `--kv fp16` default), mode 1 = int8
+  codes + fp16 scale / 64; q4_0 and the K8V4 hybrid are refused loudly.  The engine's chunk+merge CUDA is
+  RE-DERIVED onto one workgroup with barrier-tree reductions (subgroup ops banned) and needs no scratch; the gate
+  MEASURES the difference against a DOUBLE transcription of the engine's rule.
+* Wired in `vulkan/src/kernels/qsa_vk.cpp` as `strata::kernels::qsa_decode_attn_step` (its 9th entry point) plus
+  the `host` row `qsa_decode_attn_scratch_floats`; `strata_vk_entry_smoke` runs it.  Proved by
+  `case_qsa_decode_attn` (3 arms, the shader path vs the ENGINE WRAPPER BITWISE and both vs the rule),
+  FALSIFIED by `gates/inject-verify.sh qsa-decode-attn-drop-kv-head` -> `FAIL ... 0/6144 worst 2.26e+04`.
+* **THE LINK PROGRESS:** `94 -> 91` undefined references / `35 -> 33` full-signature / `33 -> 31` name-only; the
+  attention/QSA/MoE/GR/PLE/rope group falls **27 -> 25**.  Gate on `vega`: Arc 612/0/0 (exit 0), llvmpipe 600/0/3,
+  radeon iGPU 603/0/2.  `PORT-MAP.tsv` regenerates byte-identically (one row: `qsa_decode_attn_step -> qsa_decode_attn`).
+  Bench (Arc): `qsa_decode_attn` 0.38 / 1.29 / **2.52 ms** at n_ids 256 / 1024 / 2048 - linear in the selection
+  width, the honest cost of the correctness form.

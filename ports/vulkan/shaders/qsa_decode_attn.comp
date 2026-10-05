@@ -1,0 +1,132 @@
+// ports/vulkan/shaders/qsa_decode_attn.comp - the DEFAULT QSA decode attention: the KV POOLS read directly
+// through the PAGE TABLE (src/kernels/cuda/qsa_decode_attn.cu, `qsa_decode_attn_step`).
+//
+// ============================================================================================================
+// WHAT THIS IS, AND WHY IT WAS MISSING
+// ============================================================================================================
+// `qsa_decode_attn_step` is the engine's DEFAULT decode attention (`src/core/layer.cpp:980`), reached whenever
+// `g_fast_attn && !native_flash_attn_short && dump == nullptr` - which is the shipped configuration (`g_fast_attn`
+// defaults TRUE at `layer.cpp:42`; `native_flash_attn_short` is a diagnostic that defaults FALSE).  It is NOT
+// `native_flash_attn_short_step`'s gathered `[capacity,2,256]` f16 WINDOW (`attn_decode_short.comp`); it reads the
+// KV POOLS through the page table and the selection ids with NO gather copy, and it has an int8/f16 storage
+// option.  The map had mapped the symbol at `attn_decode_short`, which is a different kernel - so this tree had
+// nothing to answer the default attention.  This shader is that answer.
+//
+// ============================================================================================================
+// THE ENGINE'S RULE (transcribed from qsa_decode_attn.cu, NOT from any shader)
+// ============================================================================================================
+// For one query head `h`, with `kvh = h / (n_head / n_head_kv)`:
+//
+//     n_ids   = step[kStepWidth]                                    (the real selection count)
+//     cell    = ids[c]                       for c in [0, n_ids)
+//     page    = page_table[cell / page_size]                        (int32; -1 = not resident)
+//     row     = (page * n_kv_heads + kvh) * page_size + (cell % page_size)
+//                                                                    the pool row (head interleaved at PAGE level)
+//     s_c     = ( sum_d q[h][d] * k_pool[row][d] ) * (1 / sqrt(head_dim))     the scaled score
+//     out[h][d] = sum_c softmax_c(s) * v_pool[row][d]
+//
+// A cell whose page is -1 (KV streaming could not make it resident) is MASKED: it contributes no score, no
+// weight and no value, exactly as the CUDA's `srow[c] < 0` arm does.  If no cell is valid the output is 0.0 (the
+// CUDA's `L > 0.0f ? acc / L : 0.0f`).
+//
+// ============================================================================================================
+// WHAT IS PORTED, AND HOW IT DIFFERS FROM THE CUDA (deliberately)
+// ============================================================================================================
+// The CUDA splits the work: a CHUNK kernel (one block per (chunk of 64 cells, kv head), softmax partials in
+// scratch) then a MERGE kernel (log-sum-exp the chunk partials).  That decomposition exists for a GPU with many
+// blocks; the port's one-workgroup-per-query-head form below computes the SAME rule with an ONLINE softmax (a
+// running max `m`, running denominator `ell`, running value `acc`, each rescaled by `exp(m_old - m_new)`), which
+// is mathematically the identical softmax and needs no scratch.  The port's reduction rule bans subgroup ops, so
+// the score dot is a workgroup barrier tree (`common/wg_reduce.glsl`), one reduction per cell.
+//
+// WHAT THIS IS NOT: bit-identical to the CUDA's chunk+merge.  The softmax is a sum of exponentials and the
+// addition order differs (online vs chunk-then-merge), so the last bits differ.  The gate measures the
+// difference against a DOUBLE transcription of the rule above (the same fixture, computed on the host) rather
+// than asserting it away - the `attn_decode_short` precedent.
+//
+// ============================================================================================================
+// STORAGE MODES.  mode 0 = f16 pools (the shipped default: `--kv fp16`), mode 1 = int8 codes + fp16 scale per 64
+// values (`kv_q8.hpp`, KV_Q8_GROUP = 64).  q4_0 and the K8V4 hybrid are NOT implemented here; the wrapper REFUSES
+// them loudly rather than dispatching a wrong read.
+// ============================================================================================================
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Q  { float q[]; } QB;      // [n_head * head_dim]
+layout(set = 0, binding = 1, std430) readonly buffer KP { uint16_t p[]; } KPF;   // f16 pool, mode 0
+layout(set = 0, binding = 2, std430) readonly buffer VP { uint16_t p[]; } VPF;   // f16 pool, mode 0
+layout(set = 0, binding = 3, std430) readonly buffer KQ { int8_t c[]; } KQC;     // int8 codes, mode 1
+layout(set = 0, binding = 4, std430) readonly buffer VQ { int8_t c[]; } VQC;     // int8 codes, mode 1
+layout(set = 0, binding = 5, std430) readonly buffer KS { uint16_t s[]; } KSC;   // f16 scale / 64, mode 1
+layout(set = 0, binding = 6, std430) readonly buffer VS { uint16_t s[]; } VSC;   // f16 scale / 64, mode 1
+layout(set = 0, binding = 7, std430) readonly buffer TAB { int t[]; } TABB;      // page table, int32
+layout(set = 0, binding = 8, std430) readonly buffer IDS { int v[]; } IDSB;      // selection ids
+layout(set = 0, binding = 9, std430) readonly buffer STEP { int s[]; } STB;      // step[kStepWidth] = n_ids
+layout(set = 0, binding = 10, std430) buffer OUT { float o[]; } OB;              // [n_head * head_dim]
+
+layout(push_constant) uniform Pc {
+    int n_head;
+    int kv_heads;
+    int head_dim;
+    int page_size;
+    int mode;      // 0 = f16 pools, 1 = int8 codes + fp16 scale/64
+} pc;
+
+#include "common/wg_reduce.glsl"
+
+// One K or V element of pool row `row`, dimension `d`, in the shader's storage mode.  The head-dimension guard is
+// the CALLER's (a lane with d >= head_dim passes 0 into the reduction, so no lane leaves the barrier tree).
+float k_at(int row, int d) {
+    if (pc.mode == 0) return unpackHalf2x16(uint(KPF.p[row * pc.head_dim + d])).x;
+    const float sc = unpackHalf2x16(uint(KSC.s[row * (pc.head_dim / 64) + d / 64])).x;
+    return float(KQC.c[row * pc.head_dim + d]) * sc;
+}
+float v_at(int row, int d) {
+    if (pc.mode == 0) return unpackHalf2x16(uint(VPF.p[row * pc.head_dim + d])).x;
+    const float sc = unpackHalf2x16(uint(VSC.s[row * (pc.head_dim / 64) + d / 64])).x;
+    return float(VQC.c[row * pc.head_dim + d]) * sc;
+}
+
+void main() {
+    const int head = int(gl_WorkGroupID.x);
+    if (head >= pc.n_head) return;                     // grid is exactly n_head; guard is workgroup-uniform
+    const int d = int(gl_LocalInvocationIndex);        // this invocation OWNS output dimension d
+    const int G = pc.n_head / pc.kv_heads;
+    const int kvh = head / G;
+    const int hd = pc.head_dim;
+    const bool live = d < hd;
+    const float qd = live ? QB.q[head * hd + d] : 0.0f;
+    const float scale = inversesqrt(float(hd));
+    const int n_ids = STB.s[3];                        // kStepWidth - the real count, never a push constant
+
+    // ONLINE softmax over the valid cells: running max m, running denom ell, running value acc.
+    float m = -3.4e38f;                                // ~ -inf; a finite first score makes corr = 0 exactly
+    float ell = 0.0f;
+    float acc = 0.0f;
+    for (int c = 0; c < n_ids; ++c) {
+        const int cell = IDSB.v[c];
+        const int page = TABB.t[cell / pc.page_size];
+        if (page < 0) continue;                        // not resident: masked.  cell/kvh are uniform -> uniform
+        const int row = (page * pc.kv_heads + kvh) * pc.page_size + (cell % pc.page_size);
+        // THE SCORE: each lane's own dim's product, then ONE workgroup barrier-tree sum.  The dot is inside the
+        // scale (the CUDA multiplies the reduced sum by `scale`, so this is the same product, same order).
+        const float part = live ? qd * k_at(row, d) : 0.0f;
+        const float s = wg_sum(part) * scale;
+        // Rescale the running accumulators and fold this cell in.  `corr` is exp(m_old - m_new): 0 on the first
+        // valid cell (m_old = -inf), 1 while the max does not move.
+        const float nm = max(m, s);
+        const float corr = exp(m - nm);
+        const float p = exp(s - nm);
+        ell = ell * corr + p;
+        if (live) acc = acc * corr + p * v_at(row, d);
+        m = nm;
+    }
+    // The CUDA writes `acc / L` when L > 0 and 0.0 otherwise (attn_merge_kernel's last line).  Every cell masked
+    // is that second case - the engine's documented "no valid key" value, not a NaN.
+    if (live) OB.o[head * hd + d] = (ell > 0.0f) ? (acc / ell) : 0.0f;
+}
