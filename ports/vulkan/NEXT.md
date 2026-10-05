@@ -1,5 +1,67 @@
 # Start here next session
 
+## THE PERFORMANCE TIER'S HARNESS LANDED — a throughput benchmark with a real baseline — **DONE 2026-10-05**
+
+The port is correct-but-slow **by construction** (every fast path is dodged by a capability contract:
+`native_gdn_enabled() == false`, `gr_set_native_mmvf(false)`, `layer_set_fused_gr(false)`), so the native/fused
+kernels are the next tier — and **no performance claim could be made or checked, because the port had no
+benchmark at all**.  This increment adds one, `ports/vulkan/bench/`, and hands back the baseline the fused
+kernels will be judged against.  It does **not** touch the numeric gate: `gates/run_gate.sh` +
+`harness/vk_gate.cpp` remain the correctness authority, and the gate was re-run green after this commit.
+
+**WHAT IT IS.**  `bench/vk_bench.cpp` — a runner that loads the port's own `.spv` kernels and times them per
+device, built on the port's own device layer (`harness/vk_compute.*`).  A batch of `K` dispatches of one
+kernel is recorded into a single command buffer (one compute→compute barrier between dispatches), warmed 2–3
+replays, then timed over `reps` **replays of the batch**; the reported figure is the **median per-dispatch
+time** with min/max beside it.  Timing is **wall clock around the fence** (`vkQueueFences` via
+`replay_recorded`), because the device layer exposes no timestamp/`VkQueryPool` path — so the number includes
+one submit + fence wait per batch, amortised over `K`, and its floor is ~5–15 µs on the fast GPUs.  What is
+timed is the **kernel dispatch only** (inputs resident; no transfer in the loop).  `bench/run_bench.sh`
+compiles the measured kernels from source into `bench/build/spv/` and runs the binary under **every Vulkan
+ICD** that reports a device, then prints a cross-ICD comparison.  The full method, the run command, the
+per-kernel shapes and units, and the two baseline tables are in **`bench/README.md`**.
+
+**THE BASELINE (medians, reps=9, sampler 5), GMAC/s where the kernel does a reduction.**  vega Arc B70:
+`gdn_step` 0.0469 ms (50.3 GMAC/s); `iq2s_mmvq` n_out=2048 0.0464 ms (112.9 GMAC/s); `iq_dequant` BF16
+0.0130 ms; `quantize_q8_K` 0.0875 ms; `sampler_kernel_f32` **546.9 ms**.  Box XTX: `gdn_step` 0.1050 ms
+(22.5 GMAC/s); `iq2s_mmvq` n_out=2048 0.0198 ms (**264.3 GMAC/s**, fastest on every kernel); `quantize_q8_K`
+0.0732 ms; `sampler_kernel_f32` **202.0 ms**.  The GDN chain's other five kernels are 0.0026–0.030 ms
+everywhere.  Full tables per device (Arc, Ryzen iGPU, llvmpipe / XTX, K620, llvmpipe) in `bench/README.md`.
+
+**THE FIRST PROBLEM THE BASELINE NAMES: the one-block sampler.**  202 ms/token on the XTX and 547 ms on the
+Arc.  `sampler_kernel_f32`'s top-k is `k` rounds, each a block-argmax over the **whole** vocabulary with an
+inner loop over the taken ids and the history — cost ~ `k · vocab · (k + history)`, three orders of magnitude
+above every other kernel here.  It is the **one-block** path; the engine's default is the **split** sampler
+(4096-logit partitions), which the port has (`sampler_split.comp`) but this harness does not yet measure.
+This is the performance tier's first target.
+
+**THE HARNESS PROVES IT MEASURES SOMETHING REAL, two ways, both in the raw output.**  (1) Cross-ICD: the same
+binary under every ICD orders physically on both boxes — on the box `iq2s_mmvq` XTX 0.0198 vs llvmpipe 23.78 =
+**1201×**; on vega `iq2s_mmvq` Arc 0.0464 vs llvmpipe 6.2754 = **135×**.  (2) 4×-work sizing: the same kernel
+at 1024 vs 256 superblocks / n_out 2048 vs 512 scales ≈4× exactly where the work exceeds the timer's floor —
+Ryzen iGPU `iq2s` **3.90× for 4× work**, K620 **3.57×**, llvmpipe **3.60×**.  **Stated negative:** on the
+fastest GPUs the sizing arm reads **~1×** (`iq_dequant` Arc 0.0145→0.0158, XTX 0.0155→0.0162) because both
+sizes sit below the fence-clock floor; the cross-ICD arm, not the sizing arm, is the primary evidence.  That
+is the honest limit of a fence-clock timer, and it is why a device-timestamp path is the obvious next step.
+
+**TWO FINDINGS THE RUN ITSELF PRODUCED.**  (a) The **Ryzen iGPU (RADV) hard-recovered** on the harness's
+first form of the sampler row — a *batch of 8* live full-vocabulary sampler dispatches in one command buffer.
+The harness now runs the sampler **last** and records **one dispatch per batch** for it, and it completed on
+every ICD; a launch-shape hazard, contained and documented, not a kernel defect.  (b) **A device-layer
+robustness gap:** on the box's **RADV / Mesa 26.0.8** an exhausted descriptor pool returns
+**`VK_ERROR_FRAGMENTED_POOL`**, and `Ctx::set_alloc` listed only `OUT_OF_POOL_MEMORY` (what vega's Mesa
+25.2.8 returns), so the grow-on-demand path never fired and the XTX arm aborted at the first pool exhaustion.
+Fixed in `harness/vk_compute.cpp` (both codes grow the pool) — the numeric gate never fills a pool, so this
+changes no gate verdict; it makes the header's "no fixed ceiling" promise true on a second Mesa version.
+
+**GATE TOTALS AFTER THE COMMIT (same tree content as the runs below).**  vega: intel (Arc) **384/0/0**,
+llvmpipe **372/0/3**, radeon-iGPU **374/1/2** — the single failure is the documented intermittent
+`budget: independent requery agrees` flake (that arm has read 375/0/2 on other runs).  Box `z820b`: primary
+arm (XTX) **380/0/1** on re-run, lvp **372/0/3**, nvidia (K620) **375/0/2** — the primary arm's first run
+read 379/1/1, the same `budget` flake, cleared on re-run; 0 failed on every arm; the only skip is the
+pre-existing M8 `prefill split`.  These are identical to the pre-increment readings — the numeric gate is
+undisturbed.
+
 ## CLASS A IS CLOSED — `indexer_key_append`, `gr_write`, `gr_read`, and M-A RE-DEFINED — **DONE 2026-10-05**
 
 This increment lands the last three class-A forward-path kernels of `plan/DECODE-PATH-TRIAGE.md`, SETTLES the

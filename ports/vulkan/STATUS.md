@@ -1,5 +1,48 @@
 # Status — what is done, what is verified, what is not
 
+## THE PERFORMANCE TIER'S HARNESS LANDED (2026-10-05)
+
+The port had **no throughput harness at all**, so no performance claim could be made or checked.  This
+increment adds one — **`ports/vulkan/bench/`** (`vk_bench.cpp` + `run_bench.sh` + `README.md`) — and hands
+back the baseline the native/fused kernels will be judged against.  It is **separate and opt-in**: it does not
+change what `gates/run_gate.sh` does, and the numeric gate was re-run green on both boxes after the commit
+(see `NEXT.md`'s top section for the totals line).
+
+**Method (full text in `bench/README.md`):** each kernel is timed as a batch of `K` dispatches recorded into
+one command buffer (compute→compute barrier between dispatches), warmed 2–3 replays, timed over `reps`
+replays of the batch (median per-dispatch, min/max printed, `reps=9`, sampler 5).  Synchronisation is **wall
+clock around the fence** — the device layer exposes no timestamp path — so the number includes one
+submit+fence per batch and its floor is ~5–15 µs on the fast GPUs; only the **kernel dispatch** is timed
+(inputs resident, no transfer in the loop).  `run_bench.sh` compiles the measured kernels from source and runs
+the binary under **every ICD** that reports a device.
+
+**Baseline, medians (reps=9; sampler 5):**
+
+| kernel | vega Arc B70 | vega Ryzen iGPU | box XTX | box K620 | llvmpipe |
+|---|---:|---:|---:|---:|---:|
+| `gdn_step` (S=128 h_v=48) | 0.0469 ms / 50.3 GMAC/s | 0.5313 | 0.1050 / 22.5 GMAC/s | 0.4859 | 0.5015 |
+| `iq2s_mmvq` n_out=2048 | 0.0464 ms / 112.9 GMAC/s | 0.9762 | 0.0198 / **264.3 GMAC/s** | 0.6887 | 6.2754 |
+| `iq_dequant_f32` BF16 | 0.0130 ms | 0.0195 | 0.0140 | 0.0391 | 0.1444 |
+| `quantize_q8_K` (65536) | 0.0875 ms | 0.2039 | 0.0732 | 0.2394 | 0.1938 |
+| `sampler_kernel_f32` (vocab 248320) | **546.9 ms** | 299.6 | **202.0 ms** | 353.8 | 1164.7 |
+
+The GDN chain's other five kernels are 0.0026–0.030 ms everywhere; the Q8_0/ Q8_1 quantisers and the other
+IQ dequantiser arms are in `bench/README.md`.  **The baseline names a real problem:** the one-block sampler is
+**202 ms/token on the XTX and 547 ms on the Arc**, because its top-k is `k` full-vocabulary rounds with an
+inner loop over taken ids and history (~ `k · vocab · (k + history)`).  It is the engine's *non-default* path
+(the default is the split sampler, `sampler_split.comp`, not yet measured here) and it is the performance
+tier's first target.
+
+**Distinguishability, measured:** cross-ICD ordering is physical on both boxes with ratios far outside noise
+(box `iq2s_mmvq` XTX vs llvmpipe = **1201×**; vega Arc vs llvmpipe = **135×**); the 4×-work sizing arm scales
+≈4× where the work exceeds the timer floor (Ryzen iGPU `iq2s` **3.90×**) and reads ~1× on the fastest GPUs
+where it does not — stated as the honest limit of a fence-clock timer, not hidden.
+
+**One shared-file change, and why it is safe:** `harness/vk_compute.cpp`'s `Ctx::set_alloc` now treats
+`VK_ERROR_FRAGMENTED_POOL` as pool exhaustion too (Mesa 26.0.8's code for it, vs Mesa 25.2.8's
+`OUT_OF_POOL_MEMORY`), so the grow-on-demand path that the header promises fires on both.  The numeric gate
+never fills a descriptor pool, so no gate verdict depends on it; the gate was re-run to prove that.
+
 ## CLASS A IS CLOSED, and M-A IS RE-DEFINED (2026-10-05)
 
 The last three class-A forward-path kernels are LANDED and gated: **`indexer_key_append`** (the QSA indexer

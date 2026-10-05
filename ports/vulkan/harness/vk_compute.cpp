@@ -742,7 +742,14 @@ VkDescriptorSet Ctx::set_alloc(VkDescriptorSetLayout layout) {
     dsai.pSetLayouts = &layout;
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkResult r = vkAllocateDescriptorSets(dev_, &dsai, &set);
-    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+    // AN EXHAUSTED POOL HAS TWO PERMITTED RESULT CODES, AND WHICH ONE A DRIVER RETURNS IS VERSION-SPECIFIC.
+    // The spec allows VK_ERROR_OUT_OF_POOL_MEMORY or VK_ERROR_FRAGMENTED_POOL for the same condition; this
+    // list held only the first, so on a driver that reports the second (measured: RADV / Mesa 26.0.8 on the
+    // 7900 XTX) the grow-on-demand path never fired and the allocation aborted.  Both mean "this pool is
+    // full, make another", which is the whole point of the growth below.  The numeric gate never fills a pool
+    // (it allocates a set per pipeline), so this only makes the ceiling that the header describes actually
+    // unreachable on every driver.
+    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
         desc_pools_.push_back(new_desc_pool());
         desc_pool_ = desc_pools_.back();
         dsai.descriptorPool = desc_pool_;
