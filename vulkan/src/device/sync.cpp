@@ -27,11 +27,15 @@ uint32_t groups_for(uint64_t n_elems) { return (uint32_t) ((n_elems + kLocalSize
 // The publish/consume copy is the ported `copy.spv` (2 storage buffers, push {int n}).  It is a shader and
 // not `vkCmdCopyBuffer` on purpose: the copy must run on the COMPUTE queue, ordered with the shaders that
 // produced the payload, and it is the shader the port's own recorded-step case has already gated.
-VkPipeline copy_pipeline(Handoff& h) {
-    return h.ctx->pipeline(h.spv_dir + "/copy.spv", 2, sizeof(int32_t));
+VkPipeline copy_pipeline(Ctx& ctx, const std::string& spv_dir) {
+    return ctx.pipeline(spv_dir + "/copy.spv", 2, sizeof(int32_t));
 }
 
-void copy_regions(Handoff& h, const Buf& src, const Buf& dst, uint64_t bytes, const char* what) {
+// The shared body of every handshake copy: `src -> dst`, dispatched and (by `Ctx::dispatch`) fenced.  Shared by
+// `sync_copy_fenced` (the engine's doorbell entry points) and the Handoff operations below, so there is ONE
+// definition of the primitive the whole handshake rests on.
+void copy_body(Ctx& ctx, const std::string& spv_dir, const Buf& src, const Buf& dst, uint64_t bytes,
+               const char* what) {
     if (bytes == 0) return;
     if (bytes % kElem != 0) {
         std::fprintf(stderr, "strata::vulkan::sync: %s: %llu bytes is not a whole number of floats\n", what,
@@ -48,10 +52,19 @@ void copy_regions(Handoff& h, const Buf& src, const Buf& dst, uint64_t bytes, co
         int32_t n;
     } pc{};
     pc.n = (int32_t) n;
-    h.ctx->dispatch(copy_pipeline(h), {&src, &dst}, &pc, sizeof(pc), groups_for(n));
+    ctx.dispatch(copy_pipeline(ctx, spv_dir), {&src, &dst}, &pc, sizeof(pc), groups_for(n));
+}
+
+void copy_regions(Handoff& h, const Buf& src, const Buf& dst, uint64_t bytes, const char* what) {
+    copy_body(*h.ctx, h.spv_dir, src, dst, bytes, what);
 }
 
 }  // namespace
+
+void sync_copy_fenced(Ctx& ctx, const std::string& spv_dir, const Buf& src, const Buf& dst, uint64_t bytes,
+                      const char* what) {
+    copy_body(ctx, spv_dir, src, dst, bytes, what);
+}
 
 Handoff* sync_open(Ctx& ctx, uint64_t payload_bytes, uint64_t answer_bytes, std::string spv_dir) {
     Handoff* h = new Handoff();

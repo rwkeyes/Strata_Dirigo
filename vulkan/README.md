@@ -93,10 +93,27 @@ On top of the adopted layer, `vk_arena.*` adds:
   submission FENCE (every submit is fenced and waited, so a publish that returns is a publish the host can
   read), host->device is a HOST-DRIVEN SPLIT SUBMISSION (the consumer is submitted only after the host has
   written the answer), so no kernel ever waits.  The header states what each CUDA call site is for and why
-  this mechanism; the gate's `case_sync_handoff` pins the ordering.
-* `src/kernels/elementwise_vk.cpp` - the first three glue entry points the LAYER BODY reaches, in order:
-  `silu_inplace` (`src/core/layer.cpp:257`), `scale_inplace` (:276), `f32_to_bf16_bulk` (:290).  Each is the
-  thin wrapper the engine header declares; the gate's `case_*_entry` re-runs it through the ENGINE wrapper
-  bitwise against the port's own shader path.
-* `strata_vk_entry_smoke` now RUNS fwht256 + the three glue wrappers + the handoff on the device, on the
-  CMake-built object code (the numeric proof stays in the port's gate).
+  this mechanism; the gate's `case_sync_handoff` pins the ordering.  `sync_copy_fenced` exposes the one fenced
+  copy the whole handshake is built on, so the engine's doorbell symbols reuse it rather than duplicating it.
+* `src/kernels/elementwise_vk.cpp` - the six glue entry points the LAYER BODY reaches, in order:
+  `silu_inplace` (`src/core/layer.cpp:257`), `scale_inplace` (:276), `f32_to_bf16_bulk` (:290), `gdn_gate`
+  (:300), `rms_norm_weighted` (:880) and `embedding_gather` (:1083).  Each is the thin wrapper the engine
+  header declares; the gate's `case_*_entry` re-runs it through the ENGINE wrapper bitwise against the port's
+  own shader path and against the explicit oracle.
+* `src/kernels/doorbell_vk.cpp` - the five `doorbell_*` symbols `layer.cpp:380/389` and `session.cpp:873` call,
+  answered from `sync.*`: device->host is the fenced publish (+ the ring), host->device `doorbell_wait` submits
+  NOTHING (the host writes the answer first; an un-answered handoff is a loud refusal, never a spin).
+* `strata_vk_entry_smoke` now RUNS fwht256 + the six glue wrappers + the five `doorbell_*` + the handoff on the
+  device, on the CMake-built object code (the numeric proof stays in the port's gate).
+
+## What the engine-program measurement found (2026-10-05)
+
+I2's numbers are the port's own backend + smoke target.  The ENGINE'S OWN PROGRAM is a separate matter and it
+was measured, not estimated: under `STRATA_ENABLE_VULKAN=ON` the top-level `CMakeLists.txt` `return()`s before
+`src/` is configured, so (1) CONFIGURE builds the backend only; (2) COMPILE of `src/core/*.cpp` and
+`src/program/generate.cpp` is clean except `STRATA_VERSION` (a top-level `add_compile_definitions` after the
+`return()`); (3) LINK of one layer body fails with 80 distinct `strata::kernels::` symbols (4 answered) and 12
+CUDA-runtime symbols — the engine calls the CUDA runtime directly in 18 host files; (4) the deepest
+engine-linked target that runs is `strata_vk_entry_smoke`.  Whether that is I5's wiring or a re-scope is the
+user's call; `ports/vulkan/NEXT.md`'s I2-continued section reports it and does not re-scope it.
+

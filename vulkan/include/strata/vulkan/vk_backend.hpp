@@ -52,4 +52,14 @@ void silu_inplace(Stream& s, float* x, int64_t n);
 void scale_inplace(Stream& s, float* x, int64_t n, float factor);
 void f32_to_bf16_bulk(Stream& s, const float* x, uint16_t* y, int64_t n);
 
+// ---- I2, CONTINUED: the next three the layer body reaches (vulkan/src/kernels/elementwise_vk.cpp) -----------
+// `gdn_gate` (layer.cpp:300, the GDN gate) -> shader gdn_gate.spv (4 float[] buffers, push {int h_v; int n_tokens})
+// `rms_norm_weighted` (layer.cpp:880, the QSA norm) -> shader rms_norm.spv (X rw, W read, push {int rows; int cols; float eps})
+// `embedding_gather` (layer.cpp:1083, the token embedding) -> shader embedding_gather.spv (5 buffers, push PC)
+void gdn_gate(Stream& s, const float* alpha, const float* dt, const float* ssm_a, float* gate, int64_t n_tokens,
+              int64_t h_v);
+void rms_norm_weighted(Stream& s, float* x, const float* w, int64_t rows, int64_t cols, float eps);
+void embedding_gather(Stream& s, const uint8_t* codes, const float* scales, const float* offsets, int64_t n,
+                      int code_bits, int code_bias, int group_elems, float* out);
+
 }  // namespace strata::vulkan

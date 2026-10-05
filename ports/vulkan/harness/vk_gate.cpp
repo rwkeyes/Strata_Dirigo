@@ -13658,6 +13658,137 @@ void case_sync_handoff(Ctx& ctx, const std::string& dir) {
     verdict("sync doorbell: the ring is monotonic, one per device publish", ring_ok, ring_ok ? 0 : 1, 2, 0.0,
             "the ring did not read 1 then 2 - it is not counting publications");
 
+    // ---- (E) THE ENGINE'S `doorbell_*` SYMBOLS, the five answered this increment.  These are the symbols
+    //          `layer.cpp:380/389` and `session.cpp:873` actually call; each maps onto the split submission
+    //          above (vulkan/src/device/sync.hpp is the design, vulkan/src/kernels/doorbell_vk.cpp the body).
+    //          DEVICE -> HOST is the fenced publish; the ring is the host's own count (the fence IS the ring).
+    //          HOST -> DEVICE is `doorbell_wait`, which SUBMITS NOTHING - it is the handoff boundary.  THE
+    //          FALSIFICATION (calling it before the host has answered) is REASONED, NOT EXECUTED: it is a loud
+    //          refusal, and the deadlock a translating spin would show is already pinned by arm (B) above.
+    {
+        const uint32_t ND = 512, KD = 8;
+        float* dx = strata::vulkan::arena_alloc<float>(*s, ND);
+        float* dx_out = strata::vulkan::arena_alloc<float>(*s, ND);
+        int32_t* dids = strata::vulkan::arena_alloc<int32_t>(*s, KD);
+        int32_t* dids_out = strata::vulkan::arena_alloc<int32_t>(*s, KD);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, KD);
+        float* dw_out = strata::vulkan::arena_alloc<float>(*s, KD);
+        uint32_t* dseq = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+        uint32_t* dflag = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+
+        std::vector<float> x(ND), w(KD);
+        std::vector<int32_t> ids(KD);
+        for (uint32_t i = 0; i < ND; ++i) x[i] = rndf(2.0f);
+        for (uint32_t i = 0; i < KD; ++i) { ids[i] = 100 + (int32_t) i; w[i] = rndf(1.0f); }
+        strata::vulkan::stream_write(*s, dx, x.data(), ND * 4);
+        strata::vulkan::stream_write(*s, dids, ids.data(), KD * 4);
+        strata::vulkan::stream_write(*s, dw, w.data(), KD * 4);
+        {   // the DEVICE produces dx (scale in place), so the payload the host reads below is DEVICE-written.
+            strata::vulkan::Buf bx{};
+            arena_resolve(*s, dx, (uint64_t) ND * 4, bx);
+            VkPipeline p = ectx.pipeline(dir + "/scale.spv", 1, 8);
+            struct { int32_t n; float sc; } pc{(int32_t) ND, -2.5f};
+            ectx.dispatch(p, {&bx}, &pc, sizeof(pc), groups_for(ND));
+        }
+
+        strata::kernels::doorbell_publish(dx, dids, dw, (int64_t) ND, (int64_t) KD, dx_out, dids_out, dw_out, dseq, s);
+        std::vector<float> gx(ND), gw(KD);
+        std::vector<int32_t> gids(KD);
+        uint32_t gseq = 0;
+        strata::vulkan::stream_read(*s, dx_out, gx.data(), ND * 4);
+        strata::vulkan::stream_read(*s, dids_out, gids.data(), KD * 4);
+        strata::vulkan::stream_read(*s, dw_out, gw.data(), KD * 4);
+        strata::vulkan::stream_read(*s, dseq, &gseq, sizeof(uint32_t));
+        int bad_pub = 0, bad_tok = 0, bad_w = 0;
+        for (uint32_t i = 0; i < ND; ++i) {
+            uint32_t u, v;
+            std::memcpy(&u, &gx[i], 4);
+            const float want = x[i] * -2.5f;
+            std::memcpy(&v, &want, 4);
+            if (u != v) ++bad_pub;
+        }
+        for (uint32_t i = 0; i < KD; ++i) {
+            if (gids[i] != ids[i]) ++bad_tok;
+            uint32_t u, v;
+            std::memcpy(&u, &gw[i], 4); std::memcpy(&v, &w[i], 4);
+            if (u != v) ++bad_w;
+        }
+        verdict("doorbell_publish: device->host payload ordered (the fence is the ring)",
+                (bad_pub + bad_tok + bad_w) == 0, bad_pub + bad_tok + bad_w, (int) (ND + 2u * KD), 0.0,
+                "the published words differ from the device's own output - the fence did not order the publish");
+        verdict("doorbell_publish: the ring reads 1 after one publish", gseq == 1u, gseq == 1u ? 0 : 1, 1, 0.0,
+                "the ring did not advance exactly once");
+
+        strata::kernels::doorbell_ring(dseq, s);
+        uint32_t r2 = 0;
+        strata::vulkan::stream_read(*s, dseq, &r2, sizeof(uint32_t));
+        strata::kernels::doorbell_publish_value(dx, dids, dw, (int64_t) ND, (int64_t) KD, dx_out, dids_out, dw_out,
+                                                dseq, 7u, s);
+        uint32_t r3 = 0;
+        strata::vulkan::stream_read(*s, dseq, &r3, sizeof(uint32_t));
+        const bool ring_inc_store = (r2 == 2u && r3 == 7u);
+        verdict("doorbell_ring / publish_value: increment then store", ring_inc_store, ring_inc_store ? 0 : 2, 2, 0.0,
+                "the ring did not read 2 then 7");
+
+        // ---- doorbell_publish_res: `ids` ALWAYS copied; `x` only when a selected id is a MISS.  The no-miss
+        //      arm leaves x_out at a sentinel, so the conditional copy is observable; the miss arm must move it.
+        {
+            const int n_expert = 128;                        // ids are 100..107, so all in range
+            int32_t* dres = strata::vulkan::arena_alloc<int32_t>(*s, n_expert);
+            std::vector<int32_t> res((size_t) n_expert, 1);  // every expert resident
+            strata::vulkan::stream_write(*s, dres, res.data(), (size_t) n_expert * 4);
+            const float sentinel = -999.0f;
+            std::vector<float> send(ND, sentinel);
+            strata::vulkan::stream_write(*s, dx_out, send.data(), ND * 4);
+            strata::kernels::doorbell_publish_res(dx, dids, dres, n_expert, (int64_t) ND, (int64_t) KD,
+                                                  dx_out, dids_out, dseq, s);
+            std::vector<float> nr(ND);
+            std::vector<int32_t> nri(KD);
+            uint32_t r4 = 0;
+            strata::vulkan::stream_read(*s, dx_out, nr.data(), ND * 4);
+            strata::vulkan::stream_read(*s, dids_out, nri.data(), KD * 4);
+            strata::vulkan::stream_read(*s, dseq, &r4, sizeof(uint32_t));
+            int bad_res = 0;
+            for (uint32_t i = 0; i < ND; ++i) if (nr[i] != sentinel) ++bad_res;   // no miss -> x NOT copied
+            for (uint32_t i = 0; i < KD; ++i) if (nri[i] != ids[i]) ++bad_res;    // ids are copied in every case
+            // now ONE miss (expert 100): the same call must copy x.
+            res[100] = -1;
+            strata::vulkan::stream_write(*s, dres, res.data(), (size_t) n_expert * 4);
+            strata::kernels::doorbell_publish_res(dx, dids, dres, n_expert, (int64_t) ND, (int64_t) KD,
+                                                  dx_out, dids_out, dseq, s);
+            strata::vulkan::stream_read(*s, dx_out, nr.data(), ND * 4);
+            for (uint32_t i = 0; i < ND; ++i) {
+                uint32_t u, v;
+                std::memcpy(&u, &nr[i], 4);
+                const float want = x[i] * -2.5f;
+                std::memcpy(&v, &want, 4);
+                if (u != v) ++bad_res;
+            }
+            verdict("doorbell_publish_res: ids always copied, x only on a missed residency", bad_res == 0, bad_res,
+                    (int) (2u * ND + 2u * KD), 0.0,
+                    "the residency rule did not hold - x was copied with everything resident, or not copied on a miss");
+        }
+
+        uint32_t served = 0;                        // the host answers: the flag reaches the CURRENT ring value
+        strata::vulkan::stream_read(*s, dseq, &served, sizeof(uint32_t));
+        strata::vulkan::stream_write(*s, dflag, &served, sizeof(uint32_t));
+        strata::kernels::doorbell_wait(dflag, dseq, s);   // returns, submitting nothing: no kernel waits
+        std::vector<float> answer2(N);
+        for (uint32_t i = 0; i < N; ++i) answer2[i] = payload[i] + 2.0f;
+        strata::vulkan::sync_write_answer(*h, answer2.data(), (uint64_t) N * 4);
+        strata::vulkan::sync_consume(*h, out, (uint64_t) N * 4);
+        ectx.read(out, got.data(), (uint64_t) N * 4);
+        int bad_wait = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            uint32_t u, v;
+            std::memcpy(&u, &got[i], 4); std::memcpy(&v, &answer2[i], 4);
+            if (u != v) ++bad_wait;
+        }
+        verdict("doorbell_wait: the host->device consumer after the boundary reads the host's answer",
+                bad_wait == 0, bad_wait, (int) N, 0.0,
+                "the answer written before the consumer was not the one read - the host-side handoff is not ordered");
+    }
+
     strata::vulkan::sync_close(h);
     ectx.free(src);
     ectx.free(out);
@@ -13837,6 +13968,264 @@ void case_f32_to_bf16_entry(Ctx& ctx, const std::string& dir) {
     verdict("f32_to_bf16_bulk entry point: engine wrapper == bf16_from_f32", bad_oracle == 0, bad_oracle, (int) N,
             0.0, "words differ - the wrapper converted the wrong fixture");
     ctx.free(bx); ctx.free(by);
+}
+
+// I2 CONTINUED, the next three glue entry points.  Same proof shape as the first three (A) shader path,
+// (B) ENGINE WRAPPER through the arena, (C) BITWISE between them (same SPIR-V, same device), (D) the port's
+// existing case's oracle - so two paths that agree cannot share a defect.  Each is pinned to the harness's own
+// device (EnginePin; see the note above case_sync_handoff).
+
+// `gdn_gate` (layer.cpp:300) -> gdn_gate.spv.  The fixture is case_gdn_gate's: every third head is large so the
+// softplus branch is CROSSED (a fixture that never exceeds 20 cannot see it at all).
+void case_gdn_gate_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gdn_gate.spv")) return;
+    for (int n_tokens : {1, 3}) {
+        const int h_v = 48, n = n_tokens * h_v;
+        std::vector<float> alpha(n), dt(h_v), a(h_v), want(n);
+        for (int t = 0; t < n_tokens; ++t)
+            for (int h = 0; h < h_v; ++h) {
+                const int i = t * h_v + h;
+                alpha[i] = ((h % 3) == 0) ? (22.0f + 6.0f * (float) (h % 17)) : rndf(3.0f);
+            }
+        for (int h = 0; h < h_v; ++h) {
+            dt[h] = rndf(0.5f);
+            a[h] = -(std::fabs(rndf(1.0f)) + 0.1f);
+        }
+        for (int t = 0; t < n_tokens; ++t)
+            for (int h = 0; h < h_v; ++h) {
+                const int i = t * h_v + h;
+                want[i] = softplus_ref(alpha[i] + dt[h]) * a[h];
+            }
+
+        // (A) the port's shader path, exactly as case_gdn_gate runs it.
+        Buf bA = ctx.alloc(n * 4), bD = ctx.alloc(h_v * 4), bS = ctx.alloc(h_v * 4), bG = ctx.alloc(n * 4);
+        ctx.write(bA, alpha.data(), n * 4);
+        ctx.write(bD, dt.data(), h_v * 4);
+        ctx.write(bS, a.data(), h_v * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/gdn_gate.spv", 4, 8);
+            struct { int32_t h_v; int32_t n_tokens; } pc{h_v, n_tokens};
+            ctx.dispatch(p, {&bA, &bD, &bS, &bG}, &pc, sizeof(pc), groups_for(n));
+        }
+        std::vector<float> ref(n);
+        ctx.read(bG, ref.data(), n * 4);
+
+        // (B) THE ENGINE WRAPPER.
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("gdn_gate entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bA); ctx.free(bD); ctx.free(bS); ctx.free(bG);
+            return;
+        }
+        float* dA = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dD = strata::vulkan::arena_alloc<float>(*s, h_v);
+        float* dS = strata::vulkan::arena_alloc<float>(*s, h_v);
+        float* dG = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, dA, alpha.data(), n * 4);
+        strata::vulkan::stream_write(*s, dD, dt.data(), h_v * 4);
+        strata::vulkan::stream_write(*s, dS, a.data(), h_v * 4);
+        strata::kernels::gdn_gate(dA, dD, dS, dG, (int64_t) n_tokens, (int64_t) h_v, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dG, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        // (C) BITWISE vs the port's shader path.
+        int bad = 0;
+        for (int i = 0; i < n; ++i) {
+            uint32_t u, v;
+            std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4);
+            if (u != v) ++bad;
+        }
+        char tag[192];
+        std::snprintf(tag, sizeof tag, "gdn_gate entry point (n_tokens=%d): engine wrapper == shader path, bitwise",
+                      n_tokens);
+        verdict(tag, bad == 0, bad, n, 0.0,
+                "words differ - the arena views, the pipeline or the dispatch the wrapper uses does not match the "
+                "ported shader's own path");
+
+        // (D) vs the explicit oracle (softplus(alpha+dt)*ssm_a), case_gdn_gate's tolerance.
+        int bad_oracle = 0;
+        double worst = 0;
+        for (int i = 0; i < n; ++i) {
+            if (!close_enough(got[i], want[i], 5e-6, 1e-30)) ++bad_oracle;
+            const double r = std::fabs((double) got[i] - want[i]) / (std::fabs((double) want[i]) + 1e-30);
+            worst = std::max(worst, r);
+        }
+        std::snprintf(tag, sizeof tag, "gdn_gate entry point (n_tokens=%d): engine wrapper vs softplus oracle",
+                      n_tokens);
+        verdict(tag, bad_oracle == 0, bad_oracle, n, worst, "relative (tol 5e-6: driver exp 9e-7 + log1p 2e-7)");
+        ctx.free(bA); ctx.free(bD); ctx.free(bS); ctx.free(bG);
+    }
+}
+
+// `rms_norm_weighted` (layer.cpp:880) -> rms_norm.spv.  Shapes are case_rms_norm's; the weighted=false arm is the
+// one that exercises the wrapper's null-weight path (ones are supplied; the shader path passes ones too, so the
+// two must still agree BITWISE).
+void case_rms_norm_weighted_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "rms_norm.spv")) return;
+    struct Shape { int rows, cols; bool weighted; };
+    const Shape shapes[] = {{2, 256, true}, {8, 1024, false}, {3, 4096, true}};
+    for (const Shape& sh : shapes) {
+        const int rows = sh.rows, cols = sh.cols;
+        const uint64_t n = (uint64_t) rows * cols;
+        std::vector<float> x(n), w(n), want(n);
+        for (uint64_t i = 0; i < n; ++i) { x[i] = rndf(1.0f); w[i] = sh.weighted ? rndf(1.0f) + 0.5f : 1.0f; }
+        // double-precision reference of the same formula (case_rms_norm's own oracle)
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const double inv = 1.0 / std::sqrt(acc / (double) cols + 1e-6);
+            for (int c = 0; c < cols; ++c) {
+                const uint64_t i = (uint64_t) r * cols + c;
+                want[i] = (float) ((double) x[i] * (double) w[i] * inv);
+            }
+        }
+
+        // (A) the port's shader path (dispatch is exactly `rows` workgroups, one per row).
+        Buf bx = ctx.alloc(n * 4), bw = ctx.alloc(n * 4);
+        ctx.write(bx, x.data(), n * 4);
+        ctx.write(bw, w.data(), n * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/rms_norm.spv", 2, 12);
+            struct { int32_t rows; int32_t cols; float eps; } pc{rows, cols, 1e-6f};
+            ctx.dispatch(p, {&bx, &bw}, &pc, sizeof(pc), (uint32_t) rows);
+        }
+        std::vector<float> ref(n);
+        ctx.read(bx, ref.data(), n * 4);
+
+        // (B) THE ENGINE WRAPPER.
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("rms_norm_weighted entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bx); ctx.free(bw);
+            return;
+        }
+        float* dx = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dw = sh.weighted ? strata::vulkan::arena_alloc<float>(*s, n) : nullptr;
+        strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+        if (dw != nullptr) strata::vulkan::stream_write(*s, dw, w.data(), n * 4);
+        strata::kernels::rms_norm_weighted(dx, dw, rows, cols, 1e-6f, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dx, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        // (C) BITWISE vs the port's shader path.
+        int bad = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint32_t u, v;
+            std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4);
+            if (u != v) ++bad;
+        }
+        char tag[192];
+        std::snprintf(tag, sizeof tag, "rms_norm_weighted entry point r=%d c=%d w=%d: engine wrapper == shader path, bitwise",
+                      rows, cols, (int) sh.weighted);
+        verdict(tag, bad == 0, bad, (int) n, 0.0,
+                "words differ - the arena view, the weight binding or the dispatch the wrapper uses does not match "
+                "the ported shader's own path");
+
+        // (D) vs the double oracle, case_rms_norm's tolerance.
+        int bad_oracle = 0;
+        double worst = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], want[i], 3e-3, 1e-6)) ++bad_oracle;
+            const double r = std::fabs((double) got[i] - want[i]) / (std::fabs((double) want[i]) + 1e-30);
+            worst = std::max(worst, r);
+        }
+        std::snprintf(tag, sizeof tag, "rms_norm_weighted entry point r=%d c=%d w=%d: engine wrapper vs double ref",
+                      rows, cols, (int) sh.weighted);
+        verdict(tag, bad_oracle == 0, bad_oracle, (int) n, worst, "relative (tol 3e-3)");
+        ctx.free(bx); ctx.free(bw);
+    }
+}
+
+// `embedding_gather` (layer.cpp:1083) -> embedding_gather.spv.  The CUDA entry point decodes ONE plane, so both
+// paths run the shader's single-plane mode (has_tokens = 0); the arms are case_embedding_gather's, chosen for the
+// two distinct traps its header names (LSB-first packing at 4 and 2 bits; the two roundings on a probe where a
+// fused mul-add would differ).
+void case_embedding_gather_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "embedding_gather.spv")) return;
+    struct Arm {
+        const char* what;
+        int bits, bias, group_elems, n;
+        bool with_offsets, fma_probe;
+    };
+    const Arm arms[] = {
+        {"S8, per-group scales and offsets",                    8,  0, 16, 512, true,  false},
+        {"S4: two codes per byte, the LOW bits first",          4,  0, 16, 512, true,  false},
+        {"S2 with a non-zero code bias",                        2, -1, 16, 512, true,  false},
+        {"the two roundings, on values a fused mul-add would split", 8, -8, 1, 512, true, true},
+    };
+    struct Pc {
+        int n, code_bits, code_bias, group_elems;
+        uint32_t row_codes, row_groups;
+        int has_offsets, has_tokens, single_token;
+    };
+    VkPipeline ps = ctx.pipeline(dir + "/embedding_gather.spv", 5, sizeof(Pc));
+    for (const Arm& a : arms) {
+        std::vector<uint8_t> codes, dummy;
+        std::vector<float> scales, offs;
+        std::vector<int32_t> toks;
+        uint32_t row_codes = 0, row_groups = 0;
+        embedding_fixture(a.bits, a.group_elems, 1, a.n, codes, scales, offs, toks, row_codes, row_groups, a.fma_probe);
+        std::vector<float> want(a.n, 0.0f);
+        int fd = 0;
+        embedding_want(a.bits, a.bias, a.group_elems, a.n, codes.data(), scales.data(),
+                       a.with_offsets ? offs.data() : nullptr, want.data(), &fd);
+
+        // (A) the port's shader path, single plane (has_tokens = 0, single_token = 0).
+        Buf b_c = ctx.alloc(codes.size()), b_s = ctx.alloc(scales.size() * 4),
+            b_o = ctx.alloc(a.with_offsets ? offs.size() * 4 : 4), b_t = ctx.alloc(4), b_y = ctx.alloc((size_t) a.n * 4);
+        ctx.write(b_c, codes.data(), codes.size());
+        ctx.write(b_s, scales.data(), scales.size() * 4);
+        if (a.with_offsets) ctx.write(b_o, offs.data(), offs.size() * 4);
+        Pc pc{};
+        pc.n = a.n; pc.code_bits = a.bits; pc.code_bias = a.bias; pc.group_elems = a.group_elems;
+        pc.row_codes = row_codes; pc.row_groups = row_groups;
+        pc.has_offsets = a.with_offsets ? 1 : 0; pc.has_tokens = 0; pc.single_token = 0;
+        ctx.dispatch(ps, {&b_c, &b_s, &b_o, &b_t, &b_y}, &pc, sizeof(pc), uint32_t((a.n + 255) / 256));
+        std::vector<float> ref(a.n);
+        ctx.read(b_y, ref.data(), (size_t) a.n * 4);
+
+        // (B) THE ENGINE WRAPPER.
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("embedding_gather entry point: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(b_c); ctx.free(b_s); ctx.free(b_o); ctx.free(b_t); ctx.free(b_y);
+            return;
+        }
+        uint8_t* dc = strata::vulkan::arena_alloc<uint8_t>(*s, row_codes);
+        float* ds = strata::vulkan::arena_alloc<float>(*s, row_groups);
+        float* dof = a.with_offsets ? strata::vulkan::arena_alloc<float>(*s, row_groups) : nullptr;
+        float* dy = strata::vulkan::arena_alloc<float>(*s, a.n);
+        strata::vulkan::stream_write(*s, dc, codes.data(), row_codes);
+        strata::vulkan::stream_write(*s, ds, scales.data(), row_groups * 4);
+        if (dof != nullptr) strata::vulkan::stream_write(*s, dof, offs.data(), row_groups * 4);
+        strata::kernels::embedding_gather(dc, ds, dof, a.n, a.bits, a.bias, a.group_elems, dy, s);  // THE ENGINE WRAPPER
+        std::vector<float> got(a.n);
+        strata::vulkan::stream_read(*s, dy, got.data(), (size_t) a.n * 4);
+        strata::vulkan::stream_close(s);
+
+        // (C) BITWISE vs the shader path; (D) BITWISE vs the engine's own two-rounding rule (the contract).
+        int bad = 0, bad_oracle = 0;
+        for (int i = 0; i < a.n; ++i) {
+            uint32_t u, v;
+            std::memcpy(&u, &ref[i], 4); std::memcpy(&v, &got[i], 4);
+            if (u != v) ++bad;
+            if (std::memcmp(&want[i], &got[i], sizeof(float)) != 0) ++bad_oracle;
+        }
+        char tag[256];
+        std::snprintf(tag, sizeof tag, "embedding_gather entry point: %s (wrapper == shader path, bitwise)", a.what);
+        verdict(tag, bad == 0, bad, a.n, 0.0,
+                "words differ - the arena views, the push constants or the dispatch the wrapper uses does not match "
+                "the ported shader's own path");
+        std::snprintf(tag, sizeof tag, "embedding_gather entry point: %s (wrapper == the two-rounding rule)", a.what);
+        verdict(tag, bad_oracle == 0, bad_oracle, a.n, 0.0,
+                "a value is not bitwise the engine's two-rounding rule (a fused mul-add port would land here)");
+        ctx.free(b_c); ctx.free(b_s); ctx.free(b_o); ctx.free(b_t); ctx.free(b_y);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -14048,6 +14437,10 @@ int main(int argc, char** argv) {
     case_silu_inplace_entry(ctx, dir);           // silu_inplace      -> silu_f32.spv
     case_scale_inplace_entry(ctx, dir);          // scale_inplace     -> scale.spv
     case_f32_to_bf16_entry(ctx, dir);            // f32_to_bf16_bulk  -> f32_to_bf16.spv
+    // I2, continued: the next three the layer body reaches (layer.cpp:300/880/1083), same wrapper proof.
+    case_gdn_gate_entry(ctx, dir);               // gdn_gate          -> gdn_gate.spv
+    case_rms_norm_weighted_entry(ctx, dir);      // rms_norm_weighted -> rms_norm.spv
+    case_embedding_gather_entry(ctx, dir);       // embedding_gather  -> embedding_gather.spv
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

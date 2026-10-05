@@ -178,6 +178,140 @@ int main(int argc, char** argv) {
         s->ctx->free(out);
     }
 
+    // ---- I2, continued: the next three glue wrappers + the five doorbell_* entry points ------------------
+    {   // gdn_gate: softplus(alpha + dt) * ssm_a  (the engine's rule; every third head crosses the softplus branch)
+        const int h_v = 48, n_tok = 2, n = n_tok * h_v;
+        std::vector<float> alpha(n), dt(h_v), sa(h_v);
+        uint32_t st = 4242u;
+        for (float& v : alpha) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f) * 6.0f - 3.0f; }
+        for (int h = 0; h < h_v; h += 3) alpha[(size_t) h] = 22.0f + (float) h;   // cross the x > 20 branch
+        for (float& v : dt) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f) - 0.5f; }
+        for (float& v : sa) { st = st * 1664525u + 1013904223u; v = -(((st >> 8) / 16777216.0f) + 0.1f); }
+        float* dA = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dD = strata::vulkan::arena_alloc<float>(*s, h_v);
+        float* dS = strata::vulkan::arena_alloc<float>(*s, h_v);
+        float* dG = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, dA, alpha.data(), n * 4);
+        strata::vulkan::stream_write(*s, dD, dt.data(), h_v * 4);
+        strata::vulkan::stream_write(*s, dS, sa.data(), h_v * 4);
+        strata::kernels::gdn_gate(dA, dD, dS, dG, n_tok, h_v, s);
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dG, got.data(), n * 4);
+        int bad = 0;
+        double worst = 0;
+        for (int i = 0; i < n; ++i) {
+            const float x = alpha[i] + dt[i % h_v];
+            const float want = (x > 20.0f ? x : (float) std::log1p(std::exp((double) x))) * sa[i % h_v];
+            const double rel = std::fabs((double) got[i] - want) / (std::fabs((double) want) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 5e-6)) ++bad;
+        }
+        std::printf("  gdn_gate wrapper vs softplus oracle (worst rel %.3g)\n", worst);
+        check("gdn_gate", bad == 0);
+    }
+    {   // rms_norm_weighted: the QSA norm, weighted and unweighted, vs the double reference
+        int bad = 0;
+        for (int weighted = 0; weighted < 2; ++weighted) {
+            const int rows = 4, cols = 256;
+            const uint64_t n = (uint64_t) rows * cols;
+            std::vector<float> x(n), w(n);
+            uint32_t st = 77u;
+            for (uint64_t i = 0; i < n; ++i) {
+                st = st * 1664525u + 1013904223u;
+                x[i] = ((st >> 8) / 16777216.0f) * 2.0f - 1.0f;
+                w[i] = weighted ? (((st >> 8) / 16777216.0f) + 0.5f) : 1.0f;
+            }
+            float* dx = strata::vulkan::arena_alloc<float>(*s, n);
+            float* dw = weighted ? strata::vulkan::arena_alloc<float>(*s, n) : nullptr;
+            strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+            if (dw != nullptr) strata::vulkan::stream_write(*s, dw, w.data(), n * 4);
+            strata::kernels::rms_norm_weighted(dx, dw, rows, cols, 1e-6f, s);
+            std::vector<float> got(n);
+            strata::vulkan::stream_read(*s, dx, got.data(), n * 4);
+            for (int r = 0; r < rows; ++r) {
+                double acc = 0;
+                for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+                const double inv = 1.0 / std::sqrt(acc / (double) cols + 1e-6);
+                for (int c = 0; c < cols; ++c) {
+                    const uint64_t i = (uint64_t) r * cols + c;
+                    const float want = (float) ((double) x[i] * (double) w[i] * inv);
+                    const double rel = std::fabs((double) got[i] - want) / (std::fabs((double) want) + 1e-30);
+                    if (!(rel <= 3e-3)) ++bad;
+                }
+            }
+        }
+        check("rms_norm_weighted (weighted + unweighted) vs double ref", bad == 0);
+    }
+    {   // embedding_gather: S4 packing, per-group scales + offsets, vs the engine's two-rounding rule
+        const int n = 512, group_elems = 16, bits = 4, per_byte = 8 / bits;
+        const uint32_t row_codes = (uint32_t) ((n + per_byte - 1) / per_byte);
+        const uint32_t row_groups = (uint32_t) ((n + group_elems - 1) / group_elems);
+        std::vector<uint8_t> codes(row_codes, 0);
+        std::vector<float> scales(row_groups), offs(row_groups);
+        for (int i = 0; i < n; ++i) {
+            const int code = (i * 7) % (1 << bits);
+            codes[i / per_byte] |= uint8_t((code & ((1 << bits) - 1)) << ((i % per_byte) * bits));
+        }
+        for (uint32_t k = 0; k < row_groups; ++k) { scales[k] = 0.1f + 0.01f * (float) (k % 7); offs[k] = 0.1f * (float) (k % 5) - 0.2f; }
+        uint8_t* dc = strata::vulkan::arena_alloc<uint8_t>(*s, row_codes);
+        float* ds = strata::vulkan::arena_alloc<float>(*s, row_groups);
+        float* dof = strata::vulkan::arena_alloc<float>(*s, row_groups);
+        float* dy = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, dc, codes.data(), row_codes);
+        strata::vulkan::stream_write(*s, ds, scales.data(), row_groups * 4);
+        strata::vulkan::stream_write(*s, dof, offs.data(), row_groups * 4);
+        strata::kernels::embedding_gather(dc, ds, dof, n, bits, 0, group_elems, dy, s);
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dy, got.data(), (size_t) n * 4);
+        int bad = 0;
+        for (int i = 0; i < n; ++i) {
+            const unsigned code = (unsigned(codes[i / per_byte]) >> ((i % per_byte) * bits)) & ((1u << bits) - 1u);
+            const int64_t g = i / group_elems;
+            const float want = (float) (int(code) + 0) * scales[(size_t) g] + offs[(size_t) g];
+            if (!words_equal(got[i], want)) ++bad;
+        }
+        check("embedding_gather == the two-rounding rule, bitwise", bad == 0);
+    }
+    {   // the five doorbell_* entry points, on the arena (the engine's own symbols)
+        const uint32_t D = 256, K = 8;
+        float* dx = strata::vulkan::arena_alloc<float>(*s, D);
+        float* dxo = strata::vulkan::arena_alloc<float>(*s, D);
+        int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, K);
+        int32_t* dio = strata::vulkan::arena_alloc<int32_t>(*s, K);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, K);
+        float* dwo = strata::vulkan::arena_alloc<float>(*s, K);
+        uint32_t* dseq = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+        uint32_t* dflag = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+        std::vector<float> xin(D), win(K);
+        std::vector<int32_t> iin(K);
+        for (uint32_t i = 0; i < D; ++i) xin[i] = (float) i * 0.5f - 32.0f;
+        for (uint32_t i = 0; i < K; ++i) { iin[i] = 200 + (int32_t) i; win[i] = (float) i * 0.25f; }
+        strata::vulkan::stream_write(*s, dx, xin.data(), D * 4);
+        strata::vulkan::stream_write(*s, di, iin.data(), K * 4);
+        strata::vulkan::stream_write(*s, dw, win.data(), K * 4);
+        strata::kernels::doorbell_publish(dx, di, dw, (int64_t) D, (int64_t) K, dxo, dio, dwo, dseq, s);
+        std::vector<float> gx(D), gw(K);
+        std::vector<int32_t> gi(K);
+        uint32_t gseq = 0;
+        strata::vulkan::stream_read(*s, dxo, gx.data(), D * 4);
+        strata::vulkan::stream_read(*s, dio, gi.data(), K * 4);
+        strata::vulkan::stream_read(*s, dwo, gw.data(), K * 4);
+        strata::vulkan::stream_read(*s, dseq, &gseq, 4);
+        bool ok = (gseq == 1u);
+        for (uint32_t i = 0; i < D; ++i) ok = ok && words_equal(gx[i], xin[i]);
+        for (uint32_t i = 0; i < K; ++i) ok = ok && gi[i] == iin[i] && words_equal(gw[i], win[i]);
+        check("doorbell_publish: device->host ordered, ring == 1", ok);
+        strata::kernels::doorbell_ring(dseq, s);
+        uint32_t r2 = 0; strata::vulkan::stream_read(*s, dseq, &r2, 4);
+        strata::kernels::doorbell_publish_value(dx, di, dw, (int64_t) D, (int64_t) K, dxo, dio, dwo, dseq, 5u, s);
+        uint32_t r3 = 0; strata::vulkan::stream_read(*s, dseq, &r3, 4);
+        check("doorbell_ring then publish_value: ring == 2 then 5", r2 == 2u && r3 == 5u);
+        uint32_t served = r3;
+        strata::vulkan::stream_write(*s, dflag, &served, 4);
+        strata::kernels::doorbell_wait(dflag, dseq, s);        // returns: no kernel waits
+        check("doorbell_wait: returns without a device wait", true);
+    }
+
     strata::vulkan::stream_close(s);
     std::printf("strata_vk_entry_smoke: %s\n", g_bad == 0 ? "PASS" : "FAIL");
     return g_bad == 0 ? 0 : 1;

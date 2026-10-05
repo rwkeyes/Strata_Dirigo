@@ -149,4 +149,14 @@ void sync_write_answer(Handoff& h, const void* src, uint64_t bytes);
 // the ORDER is established by the host calling this, not by a kernel spinning for the host.
 void sync_consume(Handoff& h, const Buf& dst, uint64_t bytes);
 
+// ---- THE FENCED COPY THE HANDSHAKE IS BUILT ON, exposed for the engine's doorbell entry points ------------
+// The `sync_*` functions above drive a `Handoff`; the engine's `doorbell_*` entry points
+// (`src/kernels/cuda/elementwise.cu`'s handshake, answered here in `vulkan/src/kernels/doorbell_vk.cpp`) hold
+// RAW DEVICE POINTERS instead, so they cannot hold a Handoff.  Both directions of the handshake are this ONE
+// primitive - a copy on the compute queue followed by the fenced submit `Ctx::dispatch` performs - so it is
+// exposed rather than duplicated.  On return the copy is COMPLETE and ordered: every byte is visible to the
+// host (a publish) or to the device (a consume).  It submits no waiting kernel; it does not spin.
+void sync_copy_fenced(Ctx& ctx, const std::string& spv_dir, const Buf& src, const Buf& dst, uint64_t bytes,
+                      const char* what);
+
 }  // namespace strata::vulkan

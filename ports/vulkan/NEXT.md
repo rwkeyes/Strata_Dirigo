@@ -100,6 +100,94 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I2 (CONTINUED) — the `doorbell_*` symbols answered, the next three glue kernels, AND THE ENGINE-PROGRAM GAP (2026-10-05, `vega`)
+
+The rest of I2's engine half, plus the measurement the increments never had: **what it actually takes to compile
+the ENGINE'S OWN program under `STRATA_ENABLE_VULKAN=ON`.**  Every number here was measured on `vega`; the box
+`z820b` is down, so no XTX/K620 number is claimed.
+
+**THE ENGINE-PROGRAM GAP — MEASURED, NOT ESTIMATED (deliverable A).** Under `STRATA_ENABLE_VULKAN=ON` the
+top-level `CMakeLists.txt` `return()`s after `add_subdirectory(vulkan)`, so none of `src/` is configured. The
+gap was measured by compiling the engine's own host translation units with the backend's flags
+(`g++ -std=c++20 -Iinclude -Ivulkan/include -I vulkan/src/device -DSTRATA_ENABLE_VULKAN=1`):
+
+1. **CONFIGURE — clean, 0.16 s.**  The backend target only.  The top-level block returns before
+   `add_compile_definitions(STRATA_VERSION=...)`, `strata_core`, `strata_kernels`, `strata_engine`,
+   `strata_prefill`, `strata`, `strata_spec` and `strata_kernels_cpu`.
+2. **COMPILE — clean but for ONE define.**  All of `src/core/*.cpp` and `src/program/generate.cpp` compile as
+   ordinary C++20.  `generate.cpp` is the only failure: `STRATA_VERSION` (used at :958, :3867, :5700) is not
+   defined, because the `add_compile_definitions` at top-level line 37 sits AFTER the `return()`.  No engine
+   header assumes CUDA in a way that blocks the compile — a system `cuda_runtime.h` (`/usr/include`) satisfies
+   the `#include`, and the engine's own CUDA headers are declarations only.
+3. **LINK — the wall.**  A minimal engine-linked target (one layer body, `src/core/layer.cpp`, linked against
+   `libstrata_vulkan_kernels.a` + `libstrata_vulkan_device.a`) fails with **214 undefined references**, of which
+   **80 distinct `strata::kernels::` symbols** (the backend answers 4: `fwht256_cuda`, `silu_inplace`,
+   `scale_inplace`, `f32_to_bf16_bulk`; I3/I4/I5 own the rest) and **12 CUDA RUNTIME symbols** —
+   `cudaMalloc`, `cudaMemcpy`, `cudaMemcpy2DAsync`, `cudaMemcpyAsync`, `cudaMemsetAsync`, `cudaHostAlloc`,
+   `cudaHostGetDevicePointer`, `cudaFreeHost`, `cudaEventCreate/Record/ElapsedTime`, `cudaDeviceSynchronize`,
+   `cudaPeekAtLastError`.  Across `src/core/*.cpp` + `src/program/*.cpp` the engine calls the CUDA runtime
+   API directly in **18 host files** (≈100 distinct API names: streams, events, graphs, peer access, pinned/mapped
+   host memory, `cudaMemGetInfo`).
+4. **RUN — the deepest engine-linked target that links and runs is `strata_vk_entry_smoke` (I1/I2)**: it PASSES
+   on the Arc, now running fwht256 + six glue wrappers + the five `doorbell_*` symbols.  One layer body does NOT
+   link, so no token can be produced.
+
+**VERDICT — THIS IS A RE-SCOPE THE USER MUST APPROVE, NOT I5's WIRING.**  The plan (§1) prices the engine side
+as *kernels-namespace symbols*: 53 `kernel` + 18 device-crossing `host` rows + 19 class-A = 90 entry points, and
+I5 is "2 kernel rows + wiring the recorded decode step into `generate.cpp`".  The measurement shows a SECOND,
+uncounted surface the plan does not name and I5 does not cover: **the CUDA runtime API called directly by 18
+engine host `.cpp` files**, plus the engine's non-GPU libraries (`strata_core`'s `device.cu`/`pinned.cu`/
+`graph.cpp`, `strata_kernels_cpu` + ggml, `strata_prefill`, `strata_spec`) and the `STRATA_VERSION` define.  The
+SYCL port's route for exactly this was to MIGRATE the host files that call the runtime (`sycl/CMakeLists.txt`:
+"only host files that called the CUDA runtime were migrated") and ship a `cuda_runtime` shim.  The Vulkan plan
+says it does not edit engine headers and prices "implement N symbols" — it has no line item for a runtime shim
+or 18 migrated host files.  **Per the batch's instruction, this is NOT re-scoped here; it is measured and
+reported for the user to approve.**  What is certain: I5 as written (2 kernel rows + step wiring) is NOT
+sufficient to produce a token.
+
+**THE `doorbell_*` SYMBOLS ANSWERED (deliverable B).**  New `vulkan/src/kernels/doorbell_vk.cpp` answers the
+five symbols `layer.cpp:380/389` and `session.cpp:873` call, each mapped onto the split submission
+`vulkan/src/device/sync.hpp` designed:
+
+| symbol | direction | the mapping |
+|---|---|---|
+| `doorbell_publish` | device→host | the fenced publish copy of x/ids/weights (`sync_copy_fenced`, the SAME primitive `sync_publish` uses), then the ring raised by one.  THE FENCE IS THE RING: the fenced submit returning IS "the host may read the payload". |
+| `doorbell_publish_value` | device→host | the same publish; the ring STORED (the HIP `STRATA_DOORBELL_STORE=1` variant). |
+| `doorbell_publish_res` | device→host | `ids` copied always, `x` only when a selected id is a miss — the miss decision is a pure function, so it is evaluated on the host and the copy stays a device→host transfer.  P6-verifier-only. |
+| `doorbell_ring` | device→host | the ring alone (the fallback when the fused publish is off). |
+| `doorbell_wait` | host→device | **SUBMITS NOTHING.**  The CUDA form is a one-thread kernel that SPINS on host memory; this backend forbids a waiting kernel.  The host writes the answer BEFORE calling it, the consumer is a later fenced submission, and `doorbell_wait` enforces only the ordering contract — an un-answered handoff is a LOUD REFUSAL, never a hang. |
+
+The ring is the HOST's own count (sync.hpp's stated choice: "the fence is the ring", the count "lives where it is
+read").  `sync_copy_fenced` was exposed from `sync.*` so both directions of the handshake have ONE definition.
+**PROOF (extended `case_sync_handoff`, arms E — not a parallel case):** `doorbell_publish` device→host ordered
+**528/528**, ring reads 1; `doorbell_ring`/`publish_value` increment-then-store **2/2**; `doorbell_wait` then the
+host-submitted consumer reads the host's answer **1024/1024**.  The falsification (calling `doorbell_wait` before
+the host answers) is a refusal, REASONED not executed — a submitted spin is what this port forbids.
+
+**THE NEXT THREE GLUE KERNELS (deliverable C).**  Added to `vulkan/src/kernels/elementwise_vk.cpp`, engine
+headers unchanged, in the order the layer body reaches them — `gdn_gate` (`layer.cpp:300`), `rms_norm_weighted`
+(`:880`), `embedding_gather` (`:1083`).  Each is proved by a new `case_*_entry` through the ENGINE WRAPPER,
+bitwise against the port's own shader path AND against the explicit oracle, each pinned to the harness device
+(`EnginePin`):
+
+| kernel | shader | wrapper == shader path | wrapper vs oracle |
+|---|---|---|---|
+| `gdn_gate` | gdn_gate.spv | 48/48 + 144/144 bitwise | 48/48 + 144/144, worst rel 2.71e-07 / 2.27e-07 (tol 5e-6) |
+| `rms_norm_weighted` | rms_norm.spv | 512/512 + 8192/8192 + 12288/12288 bitwise | 512/8192/12288 all pass, worst rel 1.4e-07 (tol 3e-3) |
+| `embedding_gather` | embedding_gather.spv | 512/512 ×4 arms bitwise | 512/512 ×4 bitwise vs the two-rounding rule |
+
+The `rms_norm_weighted` wrapper supplies ones for the CUDA contract's null weight (Vulkan has no null descriptor);
+the unweighted arm is exercised and still agrees BITWISE with the shader path.
+
+**RESULTS.**  Engine CONFIGURE 0.16 s / BUILD 1.95 s (`-DSTRATA_ENABLE_VULKAN=ON`; the option `return()`s before
+the CUDA engine, so this builds the backend + smoke).  `strata_vk_entry_smoke` RUNS on the Arc and passes every
+arm (fwht256 + six glue wrappers + the five `doorbell_*` + the handoff).  Gate on `vega`: **Arc 477/0/0,
+llvmpipe 465/0/3**; the radeon iGPU is NON-DETERMINISTIC, and three consecutive runs gave **467/1/2** (the
+documented `budget: independent requery` flake), **466/2/2** (the open `bf16_gemv` defect), and **468/0/2** —
+the pre-existing characterised defects, unchanged by this batch (Arc +22 and lvp +22 verdicts over I2's totals).
+`check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo; 111 shaders built, 92 claimed`) and
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **`z820b` PENDING.**
+
 ## INCREMENT I2 — THE DOORBELL REDESIGN + THE FIRST THREE GLUE ENTRY POINTS — **DONE 2026-10-05** (`vega`)
 
 The engine half of I2.  The plan's I2 list is NOT an order, and the doorbell was the increment's named biggest

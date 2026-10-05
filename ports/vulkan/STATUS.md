@@ -42,6 +42,31 @@ body, the first three glue kernels `gdn_layer` (the mixer for 36 of 48 layers) r
 the port's own shader path AND against the explicit oracle: scale 1000/1000, silu 1000/1000 bitwise (worst
 7.97e-07 vs the double reference), f32_to_bf16 1024/1024.  The engine's headers are unchanged.
 
+**I2 CONTINUED (2026-10-05, same `vega`).**  The rest of I2's engine half, plus the engine-program measurement.
+(a) The five `doorbell_*` symbols `layer.cpp:380/389` and `session.cpp:873` call are answered in the new
+`vulkan/src/kernels/doorbell_vk.cpp` from `sync.*`: DEVICE->HOST is the fenced publish (the ring is the host's
+own count - "the fence is the ring"); HOST->DEVICE is `doorbell_wait`, which SUBMITS NOTHING (the host writes
+the answer first; an un-answered handoff is a loud refusal, never a spin), so no kernel ever waits.
+`sync_copy_fenced` was exposed from `sync.*` as the ONE copy primitive both the Handoff operations and the
+doorbell symbols use.  `case_sync_handoff` gained arms E rather than a parallel case: publish device->host
+ordered 528/528 with ring == 1, ring/publish_value 2/2, `doorbell_wait`+consumer 1024/1024.
+(b) The next three glue kernels the layer body reaches - `gdn_gate` (:300), `rms_norm_weighted` (:880),
+`embedding_gather` (:1083) - are wired and proved by `case_*_entry` through the ENGINE WRAPPER, bitwise against
+the shader path AND against the oracle (gdn_gate 48/48+144/144, worst rel 2.7e-07 vs softplus; rms_norm_weighted
+512/512+8192/8192+12288/12288, worst rel 1.4e-07 vs the double ref; embedding_gather 512/512 on four arms,
+bitwise vs the two-rounding rule).  The `rms_norm_weighted` wrapper supplies ones when the CUDA contract's
+null weight is passed (Vulkan has no null descriptor).
+(c) THE ENGINE-PROGRAM GAP, MEASURED: under `STRATA_ENABLE_VULKAN=ON` the top-level `CMakeLists.txt` `return()`s
+before `src/` is configured, so the engine's own program is never compiled.  CONFIGURE 0.16 s builds the backend
+only; COMPILE of `src/core/*.cpp` + `src/program/generate.cpp` is clean except `STRATA_VERSION` (a top-level
+`add_compile_definitions` after the `return()`); LINK of one layer body fails with 214 undefined references (80
+distinct `strata::kernels::`, 4 answered; 12 CUDA-runtime symbols - the engine calls the CUDA runtime directly
+in 18 host files); RUN - only `strata_vk_entry_smoke` links and runs.  **This is reported as a RE-SCOPE for the
+user to approve, NOT as I5's wiring**: the plan prices the engine side as kernels-namespace symbols and has no
+line item for a CUDA-runtime host shim / 18 migrated host files.  See `NEXT.md`'s I2-continued section.  Gate on
+`vega`: Arc 477/0/0, llvmpipe 465/0/3, radeon non-deterministic (the pre-existing `budget` flake and the open
+`bf16_gemv` defect; a green run is 468/0/2).  Port map unchanged and byte-identical on regeneration.
+
 **A GATE HAZARD, FOUND AND FIXED IN THE CASE (NOT A KERNEL BUG).** The gate's own `case_icd_resolution`
 (~:4673) calls `unsetenv("VK_ICD_FILENAMES")` and never restores it, so every later `*_entry` case's second
 `VkInstance` enumerated EVERY ICD and took the Intel Arc while the harness `ctx` sat on the arm's ICD.  The

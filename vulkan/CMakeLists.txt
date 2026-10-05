@@ -57,7 +57,8 @@ target_link_libraries(strata_vulkan_device PUBLIC Vulkan::Vulkan)
 
 # --- the kernel translation units: one engine entry point per symbol, behind the macro -----------------------
 strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp
-  src/kernels/elementwise_vk.cpp)   # I2: silu_inplace / scale_inplace / f32_to_bf16_bulk
+  src/kernels/elementwise_vk.cpp
+  src/kernels/doorbell_vk.cpp)   # I2: the engine's doorbell_* (the split submission; sync.* is the design)
 add_library(strata_vulkan_kernels STATIC ${_kernels})
 target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
 
