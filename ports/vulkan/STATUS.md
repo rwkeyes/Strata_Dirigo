@@ -196,6 +196,14 @@ three fixtures were strengthened BEFORE injecting, on noticing that equal logits
 membership check cannot see too FEW survivors.  Three of the nine injections also needed the compile target corrected
 to the shader that INCLUDES the file rather than the include itself.
 
+**The gate now checks the PORT MAP before it runs a single kernel.**  `tools/check_port_map.py` verifies
+`PORT-MAP.tsv` - the classification of every `kernels::` symbol the DECODE path (`src/core/`) calls into kernel /
+host / todo - against the engine's sources and the built shaders, and fails on an invented symbol, on a `kernel` row
+naming a shader that is not built, and on any decode-path symbol the map does not mention.  That last rule is the
+point: a new call site cannot join the decode path unnoticed.  It says 77 symbols - 17 kernel, 50 host, **10 todo** -
+so the decode path's remaining GPU work is ten named kernels rather than the ~250 KB of prefill and fused-MoE code.
+Falsified three ways before landing.
+
 | Case | Verdict | Method |
 |---|---|---|
 | harness self-test (copy) | PASS 1024/1024 | bit-exact — proves bindings, push range and host-read barrier |
