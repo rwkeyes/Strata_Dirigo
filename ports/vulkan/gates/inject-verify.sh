@@ -131,6 +131,15 @@ case "$name" in
     old=$'        parts.v[row + i] += hit_out.v[row + i];'
     new=$'        parts.v[row + i] = hit_out.v[row + i];   // INJECTION: the accumulate dropped'
     want="FAIL  moe_hit_add" ;;
+  sampler-split-merge-drop-parts)
+    # The split's whole content is the MERGE: a row's list is the ordered union of its 4096-logit partitions'
+    # lists.  Taking the running list first (instead of comparing the two heads) appends each partition after
+    # the first to the tail of what is already there, so everything past the first partition is lost - which the
+    # multi-partition arms (12288, 248320) must catch and a one-partition row cannot.
+    file="$SH/common/sampler_select.glsl"; spv="sampler_split"; comp="$SH/sampler_split.comp"
+    old=$'                else take_a = (sc_sel_lg[a] > sc_tmp_lg[c]) ||\n                              (sc_sel_lg[a] == sc_tmp_lg[c] && sc_sel_id[a] < sc_tmp_id[c]);'
+    new=$'                else take_a = (a < ncur);   // INJECTION: the merge drains the running list first'
+    want="FAIL  sampler_split:" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

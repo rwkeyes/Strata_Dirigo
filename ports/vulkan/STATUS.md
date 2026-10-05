@@ -138,6 +138,21 @@ INVISIBLE - the fixture now splits that bit across both halves.  **+4 verdicts o
 port map still reads **77 symbols - 28 kernel, 49 host, 0 todo**, and `make_port_map.py` regenerates `PORT-MAP.tsv`
 byte-identically.
 
+**THE SPLIT SAMPLER landed - the engine's DEFAULT sampled path (2026-10-05).**  `sampler_split.comp` is
+`sampler_split_part_kernel` + `sampler_split_merge_kernel` (`src/kernels/cuda/sampler.cu`) with the `sampled_tail_warp`
+tail: a row is cut into 4096-logit partitions, each keeps its own top_k, and the ordered lists are merged (exact).
+This is the path `sample_tokens` takes by default for a sampled request; the one-block `sampler_kernel` is the
+`STRATA_OLD_SAMPLER=1` reference.  The tail now lives ONCE in `common/sampler_tail.glsl`, in both arithmetic
+variants (`sampler_tail_f64`, and the portable `sampler_tail_f32` for the device the f64 one cannot run on), and the
+partition+merge selection in `common/sampler_select.glsl` - so the split and the coupled merge share them and the
+parity is by construction.  Falsified by `gates/inject-verify.sh sampler-split-merge-drop-parts` -> `FAIL
+sampler_split: three partitions ... 9/16`.  **+7 verdicts on every implementation, and the parity arm reads 60/60
+(the split's token EQUALS `sampler_kernel`'s on every seed of every arm, the engine's own bit-for-bit claim): vega
+Arc 340/0/0** (`run_gate.sh` exit 0), llvmpipe 328/0/3, radeon-iGPU 331/0/2.  The increment also FOUND a real class:
+the merge's first version was a forward IN-PLACE pass, whose write index runs ahead of its read index once a
+partition entry is taken - it read `dev 4200 want 100` on the top_p arm, and only the multi-partition arms could see
+it.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the

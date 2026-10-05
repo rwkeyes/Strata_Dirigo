@@ -1,0 +1,66 @@
+// ports/vulkan/shaders/sampler_split.comp - the SPLIT sampled path: the default the engine runs when a request
+// is sampled rather than greedy.  Ported from `sampler_split_part_kernel` + `sampler_split_merge_kernel`
+// (src/kernels/cuda/sampler.cu), with the tail from `sampled_tail_warp`.
+//
+// THE SPLIT IS THE ALGORITHM, not a performance detail.  The engine cuts a row into 4096-logit partitions, keeps
+// each partition's top-k, and merges the ordered lists - EXACT, because the first k of a union are within the
+// first k of each part and a merge of ordered lists is ordered.  That is a different selection from
+// `sampler_kernel`'s k rounds over the WHOLE row (O(k x n) vs O(n) per partition), and the engine asserts the two,
+// and the one-block kernel, "pick the same token, bit for bit" - which is exactly the parity this port gates.
+//
+// This port runs it as ONE workgroup per row (common/sampler_select.glsl walks the row's partitions and merges
+// them), because this port's reductions are barrier trees and not `__shfl_xor` trees - the design decision in
+// wg_reduce.glsl, for Intel where the driver picks a subgroup width per kernel.  The selection and the tail
+// arithmetic are the engine's, term for term, and live in the shared includes so the split, the one-block f32
+// sibling and the coupled merge cannot drift apart.
+//
+// `temperature == 0` is NOT greedy here either: the tail's `inv_t` is zero, so every survivor scales to zero and
+// the draw is UNIFORM over the shortlist.  Greedy is `sampler_greedy.comp`.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_ARB_gpu_shader_fp64 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float x[]; } LO_;
+layout(set = 0, binding = 1, std430) readonly buffer HIST { int h[]; } HI_;
+layout(set = 0, binding = 2, std430) buffer OUT { int o[]; } OUT_;
+
+layout(push_constant) uniform Pc {
+    int n_vocab;
+    int n_tokens;
+    int history_len;
+    int penalty_last_n;
+    int top_k;              // 1..63 as given; 0 ("off") and anything wider keep 64
+    int min_keep;           // a floor under the top_p cut
+    float temperature;
+    float top_p;
+    float min_p;
+    float penalty_repeat;
+    float penalty_freq;
+    float penalty_present;
+    uint seed_lo;
+    uint seed_hi;
+    uint counter_lo;
+    uint counter_hi;
+} pc;
+
+#define PORT_SAMPLER_USE_HIST
+#define PORT_SAMPLER_WANT_F64
+#include "common/sampler_tail.glsl"
+#include "common/sampler_select.glsl"
+
+void main() {
+    const int t = int(gl_WorkGroupID.x);
+    if (t >= pc.n_tokens) return;                 // workgroup-uniform: the barrier trees below are legal
+
+    const int k = sc_k(pc.top_k, pc.n_vocab);
+    sampler_row_topk(t, k);
+
+    int pick = 0;
+    float prob = 1.0;
+    sampler_tail_f64(k, pc.temperature, pc.top_p, pc.min_p, pc.min_keep,
+                     pc.seed_lo, pc.seed_hi, pc.counter_lo, pc.counter_hi, t, pick, prob);
+    if (gl_LocalInvocationIndex == 0u) OUT_.o[t] = pick;
+}

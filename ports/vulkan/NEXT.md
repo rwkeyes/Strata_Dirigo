@@ -41,6 +41,45 @@ driver builtin.  The `quantize_q8_0_scaled` sibling was already independent of i
 rule), and this was the only f64 use of `roundEven` in the port.  **Honest limit:** this is a property of that
 Mesa build, measured here and not reproduced upstream; the shader no longer depends on it either way.
 
+## THE SPLIT SAMPLER - the DEFAULT sampled path, and the ordered merge - **DONE AND VERIFIED 2026-10-05**
+
+`sampler_split.comp`, from `sampler_split_part_kernel` + `sampler_split_merge_kernel` (src/kernels/cuda/sampler.cu),
+with the tail from `sampled_tail_warp`.  This is the path `sample_tokens` takes by default for a sampled request
+(the one-block `sampler_kernel` is the `STRATA_OLD_SAMPLER=1` reference), and it is a different SELECTION from that
+kernel's: a row is cut into **4096-logit partitions**, each keeps its own `top_k`, and the ordered lists are
+**merged** - exact, because the first k of a union lie within the first k of each part and a merge of ordered lists
+is ordered.  The engine asserts its three sampled paths "pick the same token, bit for bit", and that parity is a
+gate arm here.
+
+**The shared machinery, so the port's three tails cannot drift.**  `common/sampler_tail.glsl` owns the chain's tail
+(top_p cut, min_p prefix, temperature on the survivors, softmax, one Philox draw) in BOTH arithmetic variants -
+`sampler_tail_f64` (the engine's, needs shaderFloat64) and `sampler_tail_f32` (the portable sibling, compiled by the
+same file) - and the selection-list shared arrays.  `common/sampler_select.glsl` owns the partition+merge selection.
+The f64 half is compiled only where a shader defines `PORT_SAMPLER_WANT_F64`, so the f32 sibling does not carry the
+capability through an include it never calls.  The split and (next) the coupled merge share both files; the parity
+this buys is BY CONSTRUCTION rather than a careful copy.
+
+**A measured defect the multi-partition arms found, and it is a real class.**  The first merge was a forward pass
+IN PLACE.  That is wrong: the write index `o = a + c` runs ahead of the read index `a` as soon as a partition entry
+is taken (`c > 0`), overwriting running-list entries a later `a` still has to read.  It read `dev 4200 want 100`
+on the top_p arm - a plausible token from a corrupted list - and only the arms whose top logits sit in DIFFERENT
+partitions could see it (a one-partition row exercises no merge at all).  Fixed by merging into a separate array
+(`sc_mrg_*`) and copying back; all five arms then read `bit-exact`, worst dev-vs-rule 0.
+
+**Falsified.**  `gates/inject-verify.sh sampler-split-merge-drop-parts` makes the merge drain the running list
+before the partition's (`else take_a = (a < ncur)`, so every partition after the first appends to the tail and is
+lost): `FAIL  sampler_split: three partitions: the merge interleaves the lists   9/   16  worst 0`.
+
+**Measured.**  vega, this commit: **Intel Arc (BMG G31) 340 passed / 0 failed / 0 skipped** (`run_gate.sh` exit 0),
+intel_icd 340/0/0, llvmpipe 328/0/3, radeon-iGPU 331/0/2.  That is **+7 verdicts** on every implementation (five
+split arms + the parity arm + the group arm).  The parity arm reads **60/60** (the split's token equals
+`sampler_kernel`'s on every seed of every arm), which is the engine's own bit-for-bit claim, measured.
+
+**What it still needs.**  The split is f64-only (its tail accumulates in double, like the engine's), so it carries
+the same fp64 requirement as `sampler_kernel` - the portable f32 sibling settles that next.
+
+
+
 ## M-A: the standalone dequantiser's LAST TWO FORMATS - IQ2_XXS and IQ2_XS - **DONE AND VERIFIED 2026-10-05**
 
 `iq_dequant_f32` covered 14 formats and REFUSED the remaining two `is_iq` types by name: IQ2_XXS (ggml type 16) and

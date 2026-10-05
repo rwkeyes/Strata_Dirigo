@@ -9212,6 +9212,108 @@ void case_sampler_kernel(Ctx& ctx, const std::string& dir) {
             "a wrong chain order, cut boundary, tie rule or RNG would land here");
 }
 
+// === THE SPLIT SAMPLER (src/kernels/cuda/sampler.cu: sampler_split_part + sampler_split_merge) ================
+//
+// The engine's DEFAULT sampled path, and a different SELECTION from `sampler_kernel`'s: a row is cut into
+// 4096-logit partitions, each keeps its own top_k, and the ordered lists are merged (exact - the first k of a
+// union are within the first k of each part, and a merge of ordered lists is ordered).  The engine asserts its
+// sampled paths "pick the same token, bit for bit", so the case checks TWO things on the same row: the token
+// equals a host chain built from the same selection and tail, AND the token equals `sampler_kernel`'s.  The arms
+// put the top logits in DIFFERENT partitions, so the MERGE is exercised - a one-partition row cannot tell the
+// split from a single block.
+void case_sampler_split(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "sampler_split.spv")) return;
+    if (!have(dir, "sampler_kernel.spv")) return;   // the parity reference
+    if (!ctx.info().shader_float64) {
+        skip("sampler_split", "device has no fp64 - this path's tail accumulates in double (see sampler_kernel_f32)");
+    }
+    struct Arm {
+        const char* what;
+        int n_vocab, top_k, min_keep, n_seeds, expect_first;
+        float temperature, top_p, min_p, pen_rep, pen_freq, pen_pres;
+    };
+    const Arm arms[] = {
+        {"one partition equals the host chain",                 4096,  1, 1,  4,      0, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"three partitions: the merge interleaves the lists",  12288,  4, 1, 16,    100, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"61 partitions (248320): the merge runs to the end", 248320,  4, 1,  8,    500, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"the top_p cut reads the merged list",                12288, 64, 1, 16,    100, 1.0f, 0.50f, 0.0f, 1.0f, 0, 0},
+        {"temperature 0 is UNIFORM over the merged shortlist",  4096,  8, 1, 16,     -1, 0.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+    };
+    struct Pc {
+        int n_vocab, n_tokens, history_len, penalty_last_n, top_k, min_keep;
+        float temperature, top_p, min_p, penalty_repeat, penalty_freq, penalty_present;
+        uint32_t seed_lo, seed_hi, counter_lo, counter_hi;
+    };
+    VkPipeline p_split = ctx.pipeline(dir + "/sampler_split.spv", 3, sizeof(Pc));
+    VkPipeline p_block = ctx.pipeline(dir + "/sampler_kernel.spv", 3, sizeof(Pc));
+    const int history_len = 64;
+    int bad_total = 0, checks_total = 0, parity_total = 0, parity_bad = 0;
+
+    for (const Arm& a : arms) {
+        const uint32_t nv = (uint32_t) a.n_vocab;
+        std::vector<float> row((size_t) nv, -50.0f);
+        std::vector<int32_t> hist((size_t) history_len, 9999);   // no penalty hits (9999 is no candidate here)
+        if (a.n_vocab == 4096) {
+            for (int v = 0; v < 64 && v < a.n_vocab; ++v) row[(size_t) v] = 1.0f;   // equal survivors
+        } else if (a.n_vocab == 12288) {
+            row[100] = 9.0f; row[4200] = 8.0f; row[8300] = 7.0f; row[12000] = 6.0f;  // partitions 0,1,2,2
+        } else {
+            row[500] = 9.0f; row[5000] = 8.0f; row[200000] = 7.0f; row[247000] = 6.0f;  // partitions 0,1,48,60
+        }
+        const SamplerSpec spec{a.n_vocab, a.top_k, a.min_keep, a.temperature, a.top_p, a.min_p,
+                               a.pen_rep, a.pen_freq, a.pen_pres};
+        const SamplerSel sel = sampler_select(row, hist, history_len, spec);
+        int fixture_bad = 0;
+        if (a.expect_first >= 0 && (sel.ids.empty() || sel.ids[0] != a.expect_first)) {
+            // The fixture must still mean what the arm's label claims, or the arm is decorative.
+            std::printf("      %-58s STALE FIXTURE: head %d, arm expects %d\n", a.what,
+                        sel.ids.empty() ? -1 : sel.ids[0], a.expect_first);
+            fixture_bad = 1;
+        }
+        Buf b_l = ctx.alloc(row.size() * 4), b_h = ctx.alloc(hist.size() * 4), b_o = ctx.alloc(4);
+        ctx.write(b_l, row.data(), row.size() * 4);
+        ctx.write(b_h, hist.data(), hist.size() * 4);
+
+        int bad = fixture_bad, distinct = 0, pb = 0;
+        std::vector<int32_t> seen;
+        for (int si = 0; si < a.n_seeds; ++si) {
+            const uint64_t seed = 0x1234567890abcdefULL + uint64_t(si) * 0x9E3779B97F4A7C15ULL;
+            Pc pc{};
+            pc.n_vocab = a.n_vocab; pc.n_tokens = 1; pc.history_len = history_len;
+            pc.penalty_last_n = history_len; pc.top_k = a.top_k; pc.min_keep = a.min_keep;
+            pc.temperature = a.temperature; pc.top_p = a.top_p; pc.min_p = a.min_p;
+            pc.penalty_repeat = a.pen_rep; pc.penalty_freq = a.pen_freq; pc.penalty_present = a.pen_pres;
+            pc.seed_lo = uint32_t(seed); pc.seed_hi = uint32_t(seed >> 32); pc.counter_lo = 0; pc.counter_hi = 0;
+            int32_t got = -1, gotb = -1;
+            ctx.write(b_o, &got, 4);
+            ctx.dispatch(p_split, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), 1);
+            ctx.read(b_o, &got, 4);
+            ctx.write(b_o, &gotb, 4);
+            ctx.dispatch(p_block, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), 1);
+            ctx.read(b_o, &gotb, 4);
+            ++checks_total; ++parity_total;
+            const int want = sampler_pick(sel, a.temperature, seed, 0);
+            if (got != want) ++bad;
+            if (got != gotb) ++pb;                 // the engine's bit-for-bit parity between its sampled paths
+            if (!sel.ids.empty() && std::find(sel.ids.begin(), sel.ids.end(), got) != sel.ids.end()) {
+                if (std::find(seen.begin(), seen.end(), got) == seen.end()) { seen.push_back(got); ++distinct; }
+            }
+        }
+        if (a.expect_first == -1 && distinct < 5) ++bad;   // "uniform, not greedy" has to actually spread
+        std::printf("      %-58s vocab %6d top_k %2d -> %2d distinct, %d bad, %d parity-mismatch\n",
+                    a.what, a.n_vocab, a.top_k, distinct, bad, pb);
+        char label[240];
+        std::snprintf(label, sizeof label, "sampler_split: %s", a.what);
+        verdict(label, bad == 0, bad, a.n_seeds, 0.0, "not the transcribed chain's token");
+        bad_total += bad; parity_bad += pb;
+        ctx.free(b_l); ctx.free(b_h); ctx.free(b_o);
+    }
+    verdict("sampler_split: the merged selection equals the block kernel's", parity_bad == 0, parity_bad,
+            parity_total, 0.0, "the engine claims its sampled paths pick the same token bit for bit");
+    verdict("sampler_split: five arms against the transcribed chain", bad_total == 0, bad_total, checks_total, 0.0,
+            "a wrong partition, merge order or tail would land here");
+}
+
 // === THE EMBEDDING GATHER (src/kernels/cuda/verify_kernels.cu) ===============================================
 // packed codes + per-group scales (+ optional per-group offsets) -> a float row, for a table of tokens.
 //
@@ -10197,6 +10299,7 @@ int main(int argc, char** argv) {
     case_descriptor_offset(ctx, dir);      // binding a row slice (the engine's pointer arithmetic, made bindable)
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
+    case_sampler_split(ctx, dir);          // the split sampler: partition top-k + the ordered merge (the default path)
     case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
     case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)
     case_gather_rows(ctx, dir);            // M-A: the MTP draft head's opaque-byte row gather
