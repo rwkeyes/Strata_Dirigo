@@ -491,6 +491,50 @@ void bench_quantize_q8_K(Ctx& ctx, const std::string& dir, int reps, int warmups
     ctx.free(bx); ctx.free(b_blocks);
 }
 
+// THE S-FAMILY SPLIT GEMV over a QUANTIZED activation: the pair `shared_expert`'s canonical path dispatches
+// (this batch).  Three rows, the SHARED EXPERT's own projection shapes: the gate/up projection at Q8_K (n_in
+// 2560 -> n_out 640, group 64 and group 32) and `ffn_down_shexp` at Q8_0 (n_in 640 -> n_out 2560, group 32 -
+// the shape Q8_K is structurally impossible for).  The shader is ONE for both activation kinds; only `q8k` and
+// the form change, so these are the honest per-dispatch costs of the shared expert's three GEMVs.
+void bench_s_gemv_q8_split(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    if (!ctx.info().storage_buffer_8bit) {
+        std::printf("SKIP s_gemv_q8_split              | device lacks storageBuffer8BitAccess\n");
+        return;
+    }
+    struct Case { bool q8k; int bits, bias, group, n_in, n_out; const char* shape; };
+    const Case cases[] = {
+        {true,  4, 0, 64, 2560, 640, "Q8_K n_in=2560 n_out=640 group=64 (gate/up)"},
+        {true,  8, 0, 32, 2560, 640, "Q8_K n_in=2560 n_out=640 group=32 (S8)"},
+        {false, 8, 0, 32,  640, 2560, "Q8_0 n_in=640 n_out=2560 group=32 (ffn_down_shexp)"},
+    };
+    for (const Case& c : cases) {
+        const int per_byte = 8 / c.bits, n_groups = c.n_in / c.group;
+        const int blk_elems = c.q8k ? 256 : 32, blk_bytes = c.q8k ? 292 : 34;
+        const int n_blocks = c.n_in / blk_elems;
+        std::vector<uint8_t> act((size_t) n_blocks * blk_bytes, 0);
+        for (size_t i = 0; i < act.size(); ++i) act[i] = (uint8_t) ((i * 13 + 7) & 0xFF);
+        std::vector<uint8_t> codes((size_t) c.n_out * (c.n_in / per_byte), 0);
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) ((i * 37 + 11) & 0xFF);
+        std::vector<float> scales((size_t) c.n_out * n_groups, 0.0f);
+        for (size_t i = 0; i < scales.size(); ++i) scales[i] = 0.01f * (float) (1 + (i % 7));
+        Buf ba = alloc(ctx, act.size()), bc = alloc(ctx, codes.size()), bs = alloc(ctx, scales.size() * 4);
+        Buf bo = alloc(ctx, scales.size() * 4 + 16), by = alloc(ctx, (size_t) c.n_out * 4 + 64);
+        ctx.write(ba, act.data(), act.size());
+        ctx.write(bc, codes.data(), codes.size());
+        ctx.write(bs, scales.data(), scales.size() * 4);
+        ctx.write(bo, scales.data(), scales.size() * 4);   // the OFFSET binding is always bound (never read)
+        const int byte_shift = (per_byte == 4) ? 2 : ((per_byte == 2) ? 1 : 0);
+        int group_shift = 0; while ((1 << group_shift) < c.group) ++group_shift;
+        struct { int n_in, n_out, code_bits, byte_shift, bias, codebook, group_shift, has_offset, q8k; } pc{
+            c.n_in, c.n_out, c.bits, byte_shift, c.bias, 0, group_shift, 0, c.q8k ? 1 : 0};
+        VkPipeline p = ctx.pipeline(dir + "/s_gemv_q8_split.spv", 5, (int) sizeof(pc));
+        Timing t = time_kernel(ctx, p, {&ba, &bc, &bs, &bo, &by}, &pc, sizeof(pc), (uint32_t) c.n_out, 1, 16, reps,
+                               warmups);
+        report("s_gemv_q8_split", c.shape, t, (double) c.n_out, (double) c.n_in * c.n_out);
+        ctx.free(ba); ctx.free(bc); ctx.free(bs); ctx.free(bo); ctx.free(by);
+    }
+}
+
 // =========================================================================================================
 // THE PERFORMANCE TIER, class B: the NATIVE fast paths against the LEGACY kernel each replaces, at the
 // SAME shape on the SAME device.  This is the harness's whole purpose - a class-B increment's claim is its
@@ -1235,6 +1279,7 @@ int main(int argc, char** argv) {
         std::printf("SKIP quantize_q8_1             | device lacks storageBuffer8BitAccess\n");
     }
     bench_quantize_q8_K(ctx, dir, reps, warmups);
+    bench_s_gemv_q8_split(ctx, dir, reps, warmups);   // this batch: the shared expert's split-GEMV pair
 
     // THE PERFORMANCE TIER, class B: native vs legacy, same shape, same device (a native/legacy ratio < 1 is
     // faster).  Before the sampler, which is the heavy one.

@@ -553,14 +553,36 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     strata::vulkan::moe_combine_impl(*need_stream("moe_combine", stream), parts, weights, shared, y, n_embd, k);
 }
 
-// fused_gr.hpp: `bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);`  (a `host` row:
-//     `block_layer_pre`/`block_layer_post`, `layer.cpp:1189`/`:1328`).  Transcribed from `fused_gr.cu:1164`:
-//     a pure GEOMETRY predicate (N=2560, HC=4, LR=320), NOT a capability answer - a backend cannot return
-//     false without lying about the geometry.  It is SHORT-CIRCUITED off on this port (`g_fused_gr` is
-//     forced false by the GR contract, and `&&` evaluates left to right), so it is never CALLED at runtime;
-//     it must still LINK, and the case pins the predicate itself.
+// fused_gr.hpp: `bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);`  (layer.cpp:1188/1328,
+//     the `fused = g_fused_gr && fused_gr_supported(...)` test in `block_layer_pre`/`block_layer_post`).
+//
+// **A REACHABILITY DEFECT FOUND WHILE WIRING `shared_expert` (this batch), AND FIXED AT ITS CAUSE.**  The
+// previous batch left this returning the CUDA's GEOMETRY predicate (`n_embd==2560 && hc==4 && hc_lr==320`) on
+// the reasoning that "a backend cannot return false without lying about the geometry", and recorded that
+// `fused_gr_read` "leaves the forward path" because `g_fused_gr` "is forced false by the GR contract".
+// **THAT CLAIM WAS FALSE OF THE CODE.**  `g_fused_gr` (layer.cpp:42) DEFAULTS false, but generate.cpp:2284
+// calls `layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && dump_layers.empty() &&
+// dump_halves.empty() && !o.stage_timing)`, and the shipped `--native` launch sets `o.gr_native_mmvf = true`
+// (generate.cpp:1804) with `no_fused_gr` false (its default) - so on the shipped run `g_fused_gr` IS TRUE, and
+// with this predicate TRUE the fused branch (`fused_gr_read`, layer.cpp:1253/1276) IS the one the layer
+// reaches, while the ported `gr_read` is the NON-selected branch.  **This is the exact shape of the
+// `qsa_decode_attn_step` defect: a class label that was true of a PLAN and false of the CODE.**
+//
+// THE FIX, and why it is this predicate rather than a shader port: the branch is selected by the BACKEND's own
+// answer here, and this backend has NO fused_gr shader.  Answering "the fused read is supported" while having no
+// kernel for it is the lie; answering FALSE is the capability truth, and it is the SAME discipline as
+// `native_mmvq_supported` (matvec_vk.cpp: true only for the six types this tree has shaders for).  With FALSE
+// the engine takes the PORTED unfused read (`gr_read`) - the branch the port's whole GR contract was built
+// against - and `fused_gr_read` becomes genuinely unreachable under every shipped configuration, which is what
+// its LOUD REFUSAL (refusals_vk.cpp) names.  A future batch that ports `fused_gr_down`/`fused_gr_up` flips this
+// to `return n_embd == 2560 && hc == 4 && hc_lr == 320;` and retires the refusal.
+//
+// (The GEOMETRY predicate itself is preserved as a distinct observable: `case_fused_gr_supported_entry` asserts
+// that the CUDA geometry rule would answer TRUE at (2560,4,320) and FALSE elsewhere, and that the backend's
+// capability answer is FALSE everywhere - so the two readings are told apart, not conflated.)
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
-    return n_embd == 2560 && hc == 4 && hc_lr == 320;
+    (void) n_embd; (void) hc; (void) hc_lr;
+    return false;   // no fused_gr shader in this tree: the backend reports what it implements
 }
 
 // ngram.hpp: `void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c,

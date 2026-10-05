@@ -79,6 +79,7 @@
 #include "strata/kernels/qsa.hpp"          // kv_append_step, kv_gather_step (the fp16 KV cache)
 #include "strata/kernels/quantize_act.hpp" // quantize_q8_0, quantize_q8_0_scaled, quantize_q8_K
 #include "strata/kernels/s2_gemv_q8.hpp"   // s2_gemv_q8 (I4)
+#include "strata/kernels/s_gemv.hpp"       // s_gemv_q8k_split, s_gemv_q8_0_split (the S-family split GEMV)
 
 #include "iq_grids_vk.hpp"                 // the I-quant grid tables (a verbatim copy of the port's generated
                                            //   harness header - I1 adopted vk_compute.* the same way)
@@ -415,6 +416,70 @@ void s2_gemv_q8(Stream& s, const uint8_t* act, const uint8_t* codes, const float
     s.ctx->dispatch(pipe, {&av, &cv, &sv, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
 }
 
+// ---- `s_gemv_q8k_split` / `s_gemv_q8_0_split` -> s_gemv_q8_split.spv (ACT, CODES, SCALES, OFFSET, Y; push
+//        {int n_in; int n_out; int code_bits; int byte_shift; int bias; int codebook; int group_shift;
+//         int has_offset; int q8k}; ONE WORKGROUP PER OUTPUT ROW).  The TWO QUANTIZED-ACTIVATION members of the
+//        S-family split GEMV, which `shared_expert`'s canonical path dispatches (shared_expert.cu:284-291): the
+//        projection takes `s_gemv_q8k_split` when its `SForm::act_kind == 1` (a K-quant/IQ weight, its Q8_K
+//        image) and `s_gemv_q8_0_split` otherwise (a legacy weight, its Q8_0 image).  In the CUDA the two are ONE
+//        kernel templated on `<CODE_BITS, Q8K>`; the port carries the activation kind in the push constant
+//        (`q8k`), which is the same one-kernel split with the branch made an argument.
+//
+// SHAPE, from the CUDA: one WARP per output row in `s_gemv_q8_split_kernel`; the port renders it one WORKGROUP
+// per row with the shared reduction (subgroup ops are banned - see wg_reduce.glsl), so the lane's elements are
+// strided by 256 rather than by 32.  The per-lane structure otherwise matches: QE = 16 consecutive elements
+// under ONE scale (`i >> group_shift`), the activation block hoisted out of the sixteen loads, the sixteen
+// accumulators combined by the source's own pairwise tree.  The row's answer is the workgroup sum.
+void s_gemv_q8_split(Stream& s, bool q8k, const uint8_t* act, const uint8_t* codes, const float* scales,
+                     const float* offset, float* y, int64_t n_in, int64_t n_out,
+                     const strata::kernels::SForm& form, const char* who) {
+    if (n_in <= 0 || n_out <= 0) return;
+    // THE ACTIVATION BLOCK.  Q8_K is 292 B / 256 elems, Q8_0 is 34 B / 32 elems; the shader picks the loader
+    // (and the block stride) from `q8k`.  A partial block would read past the activation, so the multiple is
+    // required here rather than discovered by the driver.
+    const int64_t blk_elems = q8k ? 256 : 32;
+    const int64_t blk_bytes = q8k ? 292 : 34;
+    if (n_in % blk_elems != 0)
+        refuse(who, "n_in is not a multiple of the activation block (256 for Q8_K, 32 for Q8_0)");
+    if (form.code_bits != 4 && form.code_bits != 8)
+        refuse(who, "code_bits must be 4 or 8 (S2/Q8_0 is s2_gemv_q8; s2 has no Q8_K contract)");
+    if (form.group_elems <= 0 || (form.group_elems & (form.group_elems - 1)) != 0)
+        refuse(who, "group_elems must be a power of two (the group index is a shift)");
+    // SIXTEEN, NOT FOUR: a lane-iteration takes QE = 16 consecutive elements under ONE scale, so a group smaller
+    // than 16 would read the wrong scale for most of them.  The CUDA launcher makes the same check (line 622).
+    if (form.group_elems % 16 != 0)
+        refuse(who, "group_elems is not a multiple of 16 (the lane octet must lie in one group)");
+    if (n_in % form.group_elems != 0)
+        refuse(who, "n_in is not a multiple of group_elems");
+    const int64_t per_byte = 8 / form.code_bits;              // 2 (S4) or 1 (S8): codes per byte
+    const int64_t n_groups = n_in / form.group_elems;
+    const int64_t codes_per_row = n_in / per_byte;
+    int group_shift = 0;
+    while ((1 << group_shift) < form.group_elems) ++group_shift;
+    const int32_t byte_shift = (per_byte == 4) ? 2 : ((per_byte == 2) ? 1 : 0);
+
+    Buf av{}, cv{}, sv{}, ov{}, yv{};
+    if (!arena_resolve(s, act, (uint64_t) (n_in / blk_elems) * blk_bytes, av) ||
+        !arena_resolve(s, codes, (uint64_t) n_out * (uint64_t) codes_per_row, cv) ||
+        !arena_resolve(s, scales, (uint64_t) n_out * (uint64_t) n_groups * 4, sv) ||
+        !arena_resolve(s, y, (uint64_t) n_out * 4, yv))
+        refuse(who, "a pointer is not inside this stream's arena");
+    // OFFSET IS ALWAYS BOUND (Vulkan has no null descriptor) and never read when `has_offset` is 0, so a form
+    // without an offset binds an already-resolved buffer instead of allocating a dummy - the `qsa_decode_attn`
+    // "unused lanes bind the page table" shape.
+    ov = sv;
+    if (form.has_offset) {
+        if (offset == nullptr) refuse(who, "form says has_offset but offset is null");
+        if (!arena_resolve(s, offset, (uint64_t) n_out * (uint64_t) n_groups * 4, ov))
+            refuse(who, "the offset pointer is not inside this stream's arena");
+    }
+    struct { int32_t n_in, n_out, code_bits, byte_shift, bias, codebook, group_shift, has_offset, q8k; } pc{
+        (int32_t) n_in, (int32_t) n_out, form.code_bits, byte_shift, form.code_bias, (int32_t) form.codebook,
+        group_shift, form.has_offset ? 1 : 0, q8k ? 1 : 0};
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/s_gemv_q8_split.spv", 5, sizeof(pc));
+    s.ctx->dispatch(pipe, {&av, &cv, &sv, &ov, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
+}
+
 // ---- 5 `kv_append_q8_step` -> kv_q8_append.spv (KQ, VQ, KS, VS rw; TAB, STEP, KC, VC ro; push {int kv_heads;
 //        int head_dim; int page_size; int host_layout}; grid = 2 * kv_heads * head_dim/64, one 64-value group
 //        per thread).  THE POOL IS ALWAYS WRITTEN (host_layout 0; the shader itself skips a page the table maps
@@ -700,6 +765,23 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
                     uint16_t* v_scratch, void* stream) {
     strata::vulkan::kv_gather_step(strata::vulkan::stream_for("kv_gather_step", stream), k_pool, v_pool, page_table,
                                    ids, step, max_ids, s, k_scratch, v_scratch);
+}
+
+// ---- the S-FAMILY SPLIT GEMV's two quantized-activation members ------------------------------------------
+// `s_gemv_q8k_split` (Q8_K image, act_kind 1) and `s_gemv_q8_0_split` (Q8_0 image) - the pair `shared_expert`'s
+// canonical path reaches, and the pair that BLOCKED wiring it (ple_vk.cpp's earlier note).  Both drive the ONE
+// shader `s_gemv_q8_split.spv`; the activation kind is the push constant's `q8k`.
+void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset,
+                      float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::s_gemv_q8_split(strata::vulkan::stream_for("s_gemv_q8k_split", stream), /*q8k=*/true, x_q8k,
+                                    codes, scales, offset, y, n_in, n_out, form, "s_gemv_q8k_split");
+}
+void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float* scales, const float* offset,
+                       float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
+    if (n_in <= 0 || n_out <= 0) return;
+    strata::vulkan::s_gemv_q8_split(strata::vulkan::stream_for("s_gemv_q8_0_split", stream), /*q8k=*/false, x_q8_0,
+                                    codes, scales, offset, y, n_in, n_out, form, "s_gemv_q8_0_split");
 }
 
 }  // namespace strata::kernels

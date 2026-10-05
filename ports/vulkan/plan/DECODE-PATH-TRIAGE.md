@@ -695,3 +695,67 @@ true of a SHADER or a PLAN and false of the CODE.
    (:226), and `resolve_kernel` + `copy_kernel` (:204-222).  They have no shader in this tree.  The map row is
    left byte-identical (a kind-table change, like the `gr_read`/`fused_gr_read` one, is a separate fix), but
    they are counted with the NO-SHADER set in `NEXT.md`'s bar, not with the wrappable host rows.
+
+# THE TWO SPLIT GEMVs, `shared_expert`, and THE NINE REACHABILITY VERDICTS (2026-10-05)
+
+This batch ports the S-family split GEMV pair that BLOCKED `shared_expert`, wires `shared_expert`, and settles
+the nine remaining no-shader symbols by reading the engine's own code.  `shared_expert`'s "cannot be wired" note
+in `ple_vk.cpp` is retired: the shader (`s_gemv_q8_split`) was ALREADY in this tree (built by `run_gate.sh`,
+gated by `case_s_gemv_q8_split`); what was missing was the engine-side definition - the `indexer_key_append`
+shape again.
+
+## The nine, each from its own call site (the SHIPPED configuration is the shipped `--native` launch + the
+## backend's own capability answers; EVERY row below is UNREACHABLE, so each is a LOUD REFUSAL in
+## `vulkan/src/kernels/refusals_vk.cpp`, not a shader port)
+
+| symbol | call site | enclosing condition + flag chain (defaults named) | verdict |
+|---|---|---|---|
+| `native_flash_attn_short_step` | layer.cpp:995 | inside `if (native_flash_attn_short)` (:989), itself the `else` of `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)` (:978). `native_flash_attn_short` **default false** (layer.cpp:92), set ONLY by `--native-flash-attn-short` (generate.cpp:2290), which `--native` does NOT set | **UNREACHABLE → refusal** |
+| `qsa_attend_step` | layer.cpp:1002 | the final `else` of the same `native_flash_attn_short` test, inside the `else` at :978. Reached iff `g_fast_attn` **false** (default true, layer.cpp:42), OR nfas true, OR a non-null dump | **UNREACHABLE → refusal** |
+| `qsa_index_step` / `topk_512_step` | layer.cpp:973 | both in the `else` of `if (g_fast_select)` (:968). `g_fast_select` **default true** (layer.cpp:42; generate.cpp:2282) | **UNREACHABLE → refusal** (one each) |
+| `native_qsa_indexer_append` | layer.cpp:945 | inside `if (native_qsa_indexer_enabled())` (:944). The backend ANSWERS that getter **false** (`native_caps_vk.cpp`), selecting the ported `indexer_key_append` (:948) | **UNREACHABLE → refusal** |
+| `kv_stream_reset` / `kv_ring_table` / `kv_stream_resolve` | layer.cpp:707/:709/:757 | `g_kv_resident` **default 0** (layer.cpp:515; generate.cpp:311/1319); `qsa_residency_plan` then leaves `p.mode == 0` (:528), so the state init takes the IDENTITY page table (:702-705) and `qsa_kv_resolve` returns early `if (st.kv_mode != 1)` (:756). Reached only under `--kv-resident N>0` | **UNREACHABLE → refusal** (one each) |
+
+Two of these were already the triage's class C; the four QSA ones and the three KV ones were `todo`/`host`
+mis-kinds.  All nine now have a definition that LINKS and REFUSES with the chain above named in its message.
+
+## `fused_gr_read` — THE REACHABILITY DEFECT SETTLED, AND IT IS THE `qsa_decode_attn_step` SHAPE AGAIN
+
+The previous batch classed `fused_gr_read` C and wrote that "the backend's init calls ... `layer_set_fused_gr(false)`".
+**That call does not exist in this tree** (grep `layer_set_fused_gr` finds only its definition in
+`src/core/layer.cpp:491` and the caller in `src/program/generate.cpp:2284`), and under the shipped `--native`
+launch `o.gr_native_mmvf = true` (generate.cpp:1804) with `no_fused_gr` false, so
+`layer_set_fused_gr(true)` runs.  `g_fused_gr` is therefore **true**, and with
+`fused_gr_supported(2560,4,320)` true (the artifact's geometry) the layer takes `fused_gr_read`
+(layer.cpp:1253/1276) - the UNPORTED branch - while the ported `gr_read` is the non-selected one.  **A HOLE,
+mis-labelled by a claim that was true of a plan and false of the code.**
+
+**The fix is at the cause, and it is a capability answer, not a shader port.**  The branch is selected by
+`fused_gr_supported`, a symbol the BACKEND defines; a backend with no `fused_gr` shader must answer it FALSE -
+the `native_mmvq_supported` discipline ("the backend reports what it implements"), whose CUDA counterpart happens
+to be a geometry test.  `ple_vk.cpp`'s `fused_gr_supported` now returns false, the engine takes the ported
+`gr_read`, and `fused_gr_read` becomes genuinely unreachable (its refusal names the chain).  A batch that ports
+`fused_gr_down`/`fused_gr_up` flips it back and retires the refusal.  `case_fused_gr_supported_entry` now asserts
+BOTH readings distinctly (the backend's answer false everywhere; the geometry rule true at (2560,4,320)), and
+`gates/inject-verify.sh fused-gr-supported-true` re-claims the geometry rule and must FAIL.
+
+## THE MAP-KIND FIX — `kernel` NOW STATES TWO FACTS (the instrument)
+
+`PORT-MAP.tsv`'s `kernel` kind meant only "a shader exists".  It was twice read as "the backend answers the
+symbol the engine calls", and both times a hole hid: `indexer_key_append` (LANDED with no definition) and
+`qsa_decode_attn_step` (a mis-attributed shader).  The kind now requires **BOTH**, checked by
+`tools/check_port_map.py` scanning the backend's own TUs for a definition:
+
+* **`kernel`** = the named shaders are built AND the backend defines the symbol.  A `kernel` row with no
+  backend definition FAILS the gate (the indexer_key_append defect, made impossible).
+* **`shader`** (new) = a shader is built but the backend does NOT define the symbol (the wrapper is missing).
+  A `shader` row that IS defined FAILS (a stale row - promote it to `kernel`).
+
+Applying it found **14 more symbols** whose shader exists and whose engine wrapper does not:
+`bf16_gemv_fp32_mmvf_cols`, `bf16_gemv_fp32_mmvf_multi`, `coupled_draft_sample`, `iq_dequant_f32`,
+`iq_embed_rows`, `moe_grouped_s2`, `moe_hit_add`, `moe_hit_grouped_s2`, `moe_hit_grouped_s2_cpu_order`,
+`moe_hit_grouped_s2_dev`, `moe_hit_select`, `native_expert_grouped`, `sample_tokens`, `shared_expert_multi` -
+plus `s_gemv_split_async` (its shader was mis-attributed to the q8 one).  All 15 are now kinded `shader`; the map
+reads **168 = 65 kernel + 15 shader + 61 host + 27 todo** (was 78/0/61/29).  Falsified by deleting a backend
+definition and requiring the checker to fail (done this batch: `s_gemv_q8_0_split` renamed → checker exit 1;
+restored → exit 0).  `make_port_map.py` regenerates byte-identically.

@@ -110,6 +110,20 @@
 #   inject-verify.sh bf16-gemv-row-base     bf16_gemv.comp  index the weight row with the OUTPUT stride
 #                                       -> must FAIL  "bf16_gemv"
 #
+#   (THIS BATCH: the two S-family split GEMV entry points and the SHARED EXPERT; plus the fused_gr_supported
+#    reachability fix.  The two split GEMVs drive ONE shader, so one engine-side and one shader-side
+#    falsification; the shared expert's falsification is the documented SILU-on-up trap; the fused_gr_supported
+#    one re-claims the unported fused read that the shipped --native launch would then reach - a HOLE.)
+#   inject-verify.sh s-gemv-q8k-flag-flip   vulkan/src/kernels/matvec_vk.cpp  hardwire the push constant's `q8k`
+#                                       to 0 (read a Q8_K buffer as Q8_0) -> must FAIL  "s_gemv_q8k_split entry"
+#   inject-verify.sh s-gemv-q8-split-wrong-act-block  s_gemv_q8_split.comp  use the Q8_0 block STRIDE for the
+#                                       Q8_K image -> must FAIL  "s_gemv_q8k_split entry"
+#   inject-verify.sh shared-expert-silu-on-up  vulkan/src/kernels/shared_expert_vk.cpp  put the SiLU on `up`
+#                                       instead of the GATE -> must FAIL  "shared_expert entry"
+#   inject-verify.sh fused-gr-supported-true   vulkan/src/kernels/ple_vk.cpp  answer the CUDA geometry rule TRUE
+#                                       (claiming the fused read the backend has no shader for) -> must FAIL
+#                                       "fused_gr_supported entry"
+#
 #   (the DEFAULT QSA decode attention: the KV pools read through the PAGE TABLE, `qsa_decode_attn_step`)
 #   inject-verify.sh qsa-decode-attn-drop-kv-head  qsa_decode_attn.comp  drop the KV head term from the pool
 #                                       row index -> must FAIL  "qsa_decode_attn (page_size=4"
@@ -152,7 +166,12 @@ rebuild_harness() {
       "$ROOT/harness/vk_gate.cpp" \
       "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
       "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
-      "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" -lvulkan
+      "$TREE/vulkan/src/device/sync.cpp" \
+      "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
+      "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
+      "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
+      "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
+      "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" -lvulkan
 }
 # A source that must be rebuilt into the GATE (the harness proper, or the engine-side backend the harness links).
 is_harness_src() {
@@ -550,6 +569,39 @@ case "$name" in
     old=$'    const uint wbase = o * npair;                    // row o of the weight is a contiguous run of npair words'
     new=$'    const uint wbase = o * uint(pc.n_out);   // INJECTION: the weight row base uses the OUTPUT stride'
     want="FAIL  bf16_gemv n_in=2560 n_out=512" ;;
+  s-gemv-q8k-flag-flip)
+    # `s_gemv_q8k_split` and `s_gemv_q8_0_split` drive ONE shader; the activation KIND is the push constant's
+    # `q8k`.  Hardwiring it to 0 reads a Q8_K buffer (292 B / 256 elems) as Q8_0 (34 B / 32) - the scale sits at
+    # a different offset and the block stride is wrong, so every Q8_K arm moves.  ENGINE-side backend source, so
+    # the script rebuilds the gate (which links vulkan/src/kernels/matvec_vk.cpp).
+    file="$TREE/vulkan/src/kernels/matvec_vk.cpp"
+    old=$'        group_shift, form.has_offset ? 1 : 0, q8k ? 1 : 0};'
+    new=$'        group_shift, form.has_offset ? 1 : 0, 0};   // INJECTION: the Q8_K activation kind hardwired to Q8_0'
+    want="FAIL  s_gemv_q8k_split entry" ;;
+  s-gemv-q8-split-wrong-act-block)
+    # The activation BLOCK STRIDE the shader hoists out of its 16 loads: Q8_K is 292 B / 256 elems, Q8_0 is 34 B /
+    # 32.  Using the Q8_0 stride for the Q8_K image reads every block's `d` from the wrong byte, which moves the
+    # K-quant arms and nothing else - the shader-side falsification of the pair.
+    file="$SH/s_gemv_q8_split.comp"; spv="s_gemv_q8_split"
+    old=$'        const uint blk_bytes = (pc.q8k != 0) ? 292u : 34u;\n        const uint xb = (i / blk_elems) * blk_bytes;'
+    new=$'        const uint blk_bytes = 34u;   // INJECTION: the Q8_K block stride read as Q8_0\n        const uint xb = (i / blk_elems) * blk_bytes;'
+    want="FAIL  s_gemv_q8k_split entry" ;;
+  shared-expert-silu-on-up)
+    # The documented trap the source settles: SILU GOES ON THE GATE, not on `up`.  Swapping the operands keeps
+    # every shape and produces a plausible number; the case's rival-margin arm proves this moves the reference.
+    # ENGINE-side backend source -> the script rebuilds the gate.
+    file="$TREE/vulkan/src/kernels/shared_expert_vk.cpp"
+    old=$'    strata::vulkan::swiglu_f32(s, gate, up, gate, n_ff);'
+    new=$'    strata::vulkan::swiglu_f32(s, up, gate, gate, n_ff);   // INJECTION: SILU on UP instead of GATE'
+    want="FAIL  shared_expert entry" ;;
+  fused-gr-supported-true)
+    # THE REACHABILITY DEFECT'S falsification: the backend must report the fused read UNSUPPORTED (it has no
+    # fused_gr shader), which keeps the ported `gr_read` on the path.  Answering the CUDA geometry rule TRUE
+    # re-selects the unported `fused_gr_read` (a HOLE under the shipped `--native` launch) and must FAIL.
+    file="$TREE/vulkan/src/kernels/ple_vk.cpp"
+    old=$'    return false;   // no fused_gr shader in this tree: the backend reports what it implements'
+    new=$'    return n_embd == 2560 && hc == 4 && hc_lr == 320;   // INJECTION: the fused read claimed supported (a HOLE)'
+    want="FAIL  fused_gr_supported entry" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

@@ -332,3 +332,34 @@ the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.c
   full-signature / **31 -> 23** name-only.  The attention/QSA/MoE/GR/PLE/rope group falls **25 -> 17**.
   Gate on `vega`: Arc 639/0/0 (exit 0), llvmpipe 627/0/3, radeon iGPU 630/0/2.  **`z820b` PENDING.**
 
+
+## What the split-GEMV / `shared_expert` batch adds (2026-10-05)
+
+* **THE FINDING THE BRIEF GOT WRONG.**  `s_gemv_q8_0_split` / `s_gemv_q8k_split` were recorded `todo` with "no
+  shader in this tree yet", and the same reason was given for `shared_expert` being un-wirable.  **The shader
+  `s_gemv_q8_split` was ALREADY here** - built by `run_gate.sh`, gated by `case_s_gemv_q8_split`; what was missing
+  was the `strata::kernels::` definition the layer links against (the `indexer_key_append` shape).  Wired both in
+  `matvec_vk.cpp` (the CUDA's ONE `s_gemv_q8_split_kernel<CODE_BITS, Q8K>`, with the activation kind carried in the
+  push constant `q8k`), each proved by a `case_*_entry` (wrapper == shader path BITWISE, and both vs the ENGINE'S
+  OWN rule `s_gemv_q8_host_row`, terms-bounded).
+* **`shared_expert` is WIRED** (`vulkan/src/kernels/shared_expert_vk.cpp`): the canonical chain of
+  `shared_expert.cu:242-361` - gate/up GEMV, swiglu, quantise-to-the-down-weight's-contract, down GEMV, the BF16
+  scalar gate, the per-row scale; the native-projection branches delegate to the port's wired `native_mmvq`, and the
+  native-BF16 scalar gate is answered off by this TU's own getter.  Proved by `case_shared_expert_entry` against a
+  double transcription of the whole chain (256/256, worst 0.0475), with the SILU-on-up and no-scalar-gate rivals
+  shown to MOVE the reference.  **A LATENT DEFECT was found and fixed while wiring:** the port's `gemv` lambda read
+  the INPUT activation for the DOWN projection instead of the quantised intermediate the CUDA passes as a
+  parameter (a finite ~1e3x error).
+* **THE NINE NO-SHADER SYMBOLS** are each settled from the engine's own code (call site, enclosing condition,
+  every flag, each default, what the shipped launch sets) and are UNREACHABLE, so each is a LOUD REFUSAL in
+  `vulkan/src/kernels/refusals_vk.cpp` that names its flag chain.  **`fused_gr_read` was mis-classified as
+  unreachable and IS reachable** (the shipped `--native` launch sets `g_fused_gr` true; the "backend forces it
+  false" claim had no code) - fixed by answering the backend-owned `fused_gr_supported` FALSE, which keeps the
+  ported `gr_read` on the path (the `native_mmvq_supported` discipline).
+* **THE INSTRUMENT.**  `PORT-MAP.tsv`'s `kernel` kind now states TWO facts - a shader exists AND the backend
+  defines the symbol - checked by `tools/check_port_map.py` scanning the backend TUs; a new `shader` kind states
+  the middle fact.  The map reads `168 = 65 kernel + 15 shader + 61 host + 27 todo`.
+
+The link progress moved the one-layer-body link **64 -> 41** undefined references / **19 -> 7** full-signature /
+**17 -> 5** name-only.  Gate on `vega`: Arc 669/0/0, llvmpipe 657/0/3, Ryzen iGPU 659/1/2 (the open requery flake).
+**`z820b` PENDING.**

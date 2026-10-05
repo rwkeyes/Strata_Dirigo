@@ -23,8 +23,8 @@ TABLE = {
     # ---- ported: the GPU work has a shader in this tree ----
     'add_inplace':                    ('kernel', 'add'),
     'bf16_gemv_fp32_mmvf':            ('kernel', 'bf16_mmvf_f32'),
-    'bf16_gemv_fp32_mmvf_cols':       ('kernel', 'bf16_mmvf_f32'),
-    'bf16_gemv_fp32_mmvf_multi':      ('kernel', 'bf16_mmvf_f32_multi'),
+    'bf16_gemv_fp32_mmvf_cols':       ('shader', 'bf16_mmvf_f32'),
+    'bf16_gemv_fp32_mmvf_multi':      ('shader', 'bf16_mmvf_f32_multi'),
     # THE BF16-PROJECTION PAIR, the OTHER side of the `native_bf16_projections` setting (layer.cpp:91, default
     # FALSE; set by `--native`/`--native-bf16`).  `project_bf16` (layer.cpp:94-100) reaches them when the
     # setting is OFF, on the main forward path (layer.cpp:291/:292/:367/:918/:962); both are now ported so the
@@ -32,7 +32,7 @@ TABLE = {
     # -> THE REACHABILITY AUDIT and the cases `case_bf16_gemv` / `case_bf16_gemv_split`.
     'bf16_gemv':                      ('kernel', 'bf16_gemv'),        # 1 workgroup/row (split=false call sites)
     'bf16_gemv_split':                ('kernel', 'bf16_gemv'),        # 1 workgroup/row, SAME shader (split=true)
-    'coupled_draft_sample':           ('kernel', 'coupled_penalize coupled_sample'),
+    'coupled_draft_sample':           ('shader', 'coupled_penalize coupled_sample'),
     'cvec_apply':                     ('kernel', 'cvec_apply'),
     'embedding_gather':               ('kernel', 'embedding_gather'),
     'embedding_gather_dev':           ('kernel', 'embedding_gather'),
@@ -60,8 +60,8 @@ TABLE = {
     # The QSA indexer pair's LEGACY member: `native_qsa_indexer_enabled() == false` - the indexer's OWN check,
     # separate from `native_qsa_enabled()`, and the one `layer_verify_compatible()` reads.
     'indexer_key_append':             ('kernel', 'indexer_key_append'),
-    'iq_dequant_f32':                 ('kernel', 'iq_dequant_f32'),
-    'iq_embed_rows':                  ('kernel', 'iq_embed_rows'),
+    'iq_dequant_f32':                 ('shader', 'iq_dequant_f32'),
+    'iq_embed_rows':                  ('shader', 'iq_embed_rows'),
     'kv_append_q4_step':              ('kernel', 'kv_q4_append'),
     'kv_append_q8_step':              ('kernel', 'kv_q8_append'),
     'kv_append_step':                 ('kernel', 'kv_f16_append'),
@@ -69,13 +69,13 @@ TABLE = {
     'kv_gather_q8_step':              ('kernel', 'kv_q8_gather'),
     'kv_gather_step':                 ('kernel', 'kv_f16_gather'),
     'moe_combine':                    ('kernel', 'moe_combine_f32 moe_combine_f64'),
-    'moe_grouped_s2':                 ('kernel', 's2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped'),
-    'moe_hit_add':                    ('kernel', 'moe_hit_add'),
-    'moe_hit_grouped_s2':             ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
-    'moe_hit_grouped_s2_cpu_order':   ('kernel', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
-    'moe_hit_grouped_s2_dev':         ('kernel', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
-    'moe_hit_select':                 ('kernel', 'moe_hit_select'),
-    'native_expert_grouped':          ('kernel', 'native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu'),
+    'moe_grouped_s2':                 ('shader', 's2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped'),
+    'moe_hit_add':                    ('shader', 'moe_hit_add'),
+    'moe_hit_grouped_s2':             ('shader', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
+    'moe_hit_grouped_s2_cpu_order':   ('shader', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
+    'moe_hit_grouped_s2_dev':         ('shader', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
+    'moe_hit_select':                 ('shader', 'moe_hit_select'),
+    'native_expert_grouped':          ('shader', 'native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu'),
     'native_flash_attn_short_step':   ('kernel', 'attn_decode_short'),
     'native_mmvq':                    ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq'),
     'native_q5_k_f32':                ('kernel', 'native_q5_k_f32'),
@@ -121,12 +121,25 @@ TABLE = {
     'rope_neox_apply':                ('kernel', 'rope_neox'),
     'router_top10':                   ('kernel', 'router_top10_f32 router_top10_f64'),
     's2_gemv_q8':                     ('kernel', 's2_gemv_q8'),
-    's_gemv_split_async':             ('kernel', 's_gemv_q8_split'),
-    'sample_tokens':                  ('kernel', 'sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split'),
+    # ---- THE TWO SPLIT GEMV ROWS THAT WERE MIS-RECORDED, now that the pair is wired ---------------------------
+    # `s_gemv_q8_0_split` / `s_gemv_q8k_split` -> the ONE shader `s_gemv_q8_split` (the CUDA's
+    # `s_gemv_q8_split_kernel<CODE_BITS, Q8K>`, one warp/row; the port carries the activation kind in the push
+    # constant).  These two rows read `todo`/`no shader in this tree yet` for a batch AFTER the shader landed -
+    # the SAME conflation the `s_gemv_split_async` row below now makes explicit: a row's `kernel` kind must mean
+    # BOTH "a shader exists" AND "the Vulkan backend defines the symbol the engine calls".
+    's_gemv_q8_0_split':              ('kernel', 's_gemv_q8_split'),
+    's_gemv_q8k_split':               ('kernel', 's_gemv_q8_split'),
+    # `s_gemv_split_async` is the fp16-activation sibling (`s_gemv_split_kernel`, NOT the q8 one) and is reached
+    # ONLY by the standalone driver mains (`overlap_main.cpp`/`concurrent_main.cpp`), never the layer body.  Its
+    # shader (`s_gemv_split`) IS built; the backend does NOT define the symbol.  That is a DISTINCT FACT from a
+    # `kernel` row, so it is kinded `shader` - "a shader exists, the backend does not answer it" - which
+    # `check_port_map.py` requires to be TRUE (a `shader` row that IS defined is a stale row and fails).
+    's_gemv_split_async':             ('shader', 's_gemv_split'),
+    'sample_tokens':                  ('shader', 'sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split'),
     'scale_inplace':                  ('kernel', 'scale'),
     'scatter_rows_f32':               ('kernel', 'scatter_rows_f32'),
     'shared_expert':                  ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32'),
-    'shared_expert_multi':            ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32'),
+    'shared_expert_multi':            ('shader', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32'),
     'silu_inplace':                   ('kernel', 'silu_f32'),
     # ---- the engine's own host side: no dispatch for the port to supply ----
     'build_rope_table':               ('host', 'the engine builds the table; rope_neox is the kernel that reads it'),
@@ -217,9 +230,7 @@ TABLE = {
     'rebase_ptrs':                    ('todo', 'no shader in this tree yet'),
     'resident_plan':                  ('todo', 'no shader in this tree yet'),
     'row_top_prob':                   ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
-    's_gemv_q8_0_split':              ('todo', 'no shader in this tree yet'),
-    's_gemv_q8k_split':               ('todo', 'no shader in this tree yet'),
-    'topk_512_step':                  ('todo', 'no shader in this tree yet'),
+    'topk_512_step':                  ('todo', 'no shader in this tree yet; ANSWERED BY A LOUD REFUSAL (refusals_vk.cpp): --no-fast-select reaches it'),
     'wait_flag_ge':                   ('todo', 'no shader in this tree yet'),
     'wait_flag_ge_or':                ('todo', 'no shader in this tree yet'),
     'window_ids':                     ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
@@ -231,16 +242,24 @@ assert not missing, f"unclassified symbols src/core/ reaches: {missing}"
 assert not extra, f"table rows that src/core/ does not reach: {extra}"
 
 rows = [(s, *TABLE[s]) for s in syms]
-counts = {k: sum(1 for r in rows if r[1] == k) for k in ('kernel', 'host', 'todo')}
+counts = {k: sum(1 for r in rows if r[1] == k) for k in ('kernel', 'shader', 'host', 'todo')}
 out = ROOT / 'ports/vulkan/PORT-MAP.tsv'
 with out.open('w') as f:
     f.write("# ports/vulkan/PORT-MAP.tsv - the DECODE PATH's kernels-namespace symbols (every one src/core/ reaches), classified.\n")
-    f.write("# kernel = GPU work with a shader in this tree; host = the engine's own host side; todo = GPU work not ported.\n")
+    f.write("# kernel = a shader exists in this tree AND the Vulkan backend defines the symbol the engine calls;\n")
+    f.write("# shader = a shader exists in this tree but the backend does NOT define the symbol (the wrapper is missing);\n")
+    f.write("# host = the engine's own host side; todo = GPU work not ported (no shader).\n")
+    f.write("# The `kernel` kind states TWO facts, and check_port_map.py enforces BOTH: a row read as \"kernel\"\n")
+    f.write("# whose symbol the backend does not define is the defect that let indexer_key_append sit LANDED with no\n")
+    f.write("# definition; a `shader` row that IS defined is a stale row.  Never read `kernel` as merely \"a shader\n")
+    f.write("# exists\".\n")
     f.write("# A symbol is in scope whether src/core/ writes it `kernels::X` or bare `X` (a using-directive in scope).\n")
-    f.write("# gates/run_gate.sh checks this file against the engine's sources and the built shaders: an invented\n")
-    f.write("# symbol, a shader that is not built, an unclaimed shader or an unlisted src/core/ symbol all fail.\n")
+    f.write("# gates/run_gate.sh checks this file against the engine's sources, the built shaders AND the backend's own\n")
+    f.write("# definitions: an invented symbol, a shader that is not built, an unclaimed shader, an unlisted src/core/\n")
+    f.write("# symbol, a `kernel` row with no backend definition, or a `shader` row WITH one all fail.\n")
     f.write("# symbol\tkind\tshader(s) or reason\n")
     for s, kind, what in rows:
         f.write(f"{s}\t{kind}\t{what}\n")
-print(f"PORT-MAP.tsv: {len(rows)} decode-path symbols - {counts['kernel']} kernel, {counts['host']} host, {counts['todo']} todo")
+print(f"PORT-MAP.tsv: {len(rows)} decode-path symbols - {counts['kernel']} kernel, {counts['shader']} shader, "
+      f"{counts['host']} host, {counts['todo']} todo")
 print("the holes, named:", ' '.join(s for s, k, _ in ((r[0], r[1], None) for r in rows) if k == 'todo'))

@@ -1,5 +1,130 @@
 # Start here next session
 
+## THE TWO SPLIT GEMVs + `shared_expert`, THE NINE SETTLED REACHABILITY VERDICTS, and THE INSTRUMENT FIX (2026-10-05, `vega`)
+
+**THE BAR (the running line): `64 → 41` undefined references / `19 → 7` distinct full-signature
+`strata::kernels::` symbols / `17 → 5` under the parent's name-only pattern.**  The matvec / GEMV / KV group falls
+**6 → 1**; attention / QSA / MoE / GR / PLE / rope falls **12 → 5**; `other` is 1; glue 0 and GDN 0.  Measured
+with the CURRENT STANDARD recipe (`$HOME/vkbuild-vulkan` is a **Makefiles** build dir, so **never pass `-G
+Ninja`**; reconfigured + rebuilt from the current tree first):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 41   (was 64)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 7    (was 19)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 5    (was 17)
+
+**THE GROUP TABLE (the remaining 7 distinct full-signature symbols).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue** | **0** | all answered |
+| **matvec / GEMV / KV** | **1** | `bf16_gemv_fp32_mmvf_cols` (shader exists — a verifier-only row) |
+| **attention / QSA / MoE / GR / PLE / rope** | **5** | `build_rope_table`, `rope_table_set`, `PleTable::{collect,is_open,issue}` |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **1** | `copy_i32_from_mapped` |
+
+**THE WRAPPABLE / NO-SHADER SPLIT, updated.**  Of the previous batch's 19: **8 WRAPPABLE → 7**
+(`bf16_gemv_fp32_mmvf_cols`, `build_rope_table`, `rope_table_set`, `copy_i32_from_mapped`,
+`PleTable::{collect,is_open,issue}`) and **11 NO-SHADER → 0** — the two split GEMVs were PORTED (and their
+shader was already in the tree; only the engine definition was missing) and the other nine are answered by a
+LOUD REFUSAL each.  `shared_expert` — the 8th "wrappable, partially" — is now wired in FULL.
+
+## DELIVERABLE A — the split GEMV pair, and `shared_expert`
+
+**THE FINDING FIRST, because it is the batch's second instrument lesson.**  PORT-MAP carried `s_gemv_q8_0_split`
+and `s_gemv_q8k_split` as `todo` / "no shader in this tree yet", and `ple_vk.cpp` recorded `shared_expert` as
+un-wirable for the same reason.  **The shader `s_gemv_q8_split` WAS already in the tree** — built by
+`run_gate.sh`, gated by `case_s_gemv_q8_split`.  What was missing was the ENGINE-SIDE definition, exactly the
+`indexer_key_append` shape the triage records ("ported" is a claim about the SYMBOL the layer links against, not
+about a shader or a plan row).  The map's `s_gemv_split_async → s_gemv_q8_split` row was also wrong (the fp16
+split's shader is `s_gemv_split`).
+
+* **Wired** `strata::kernels::s_gemv_q8k_split` / `s_gemv_q8_0_split` in `matvec_vk.cpp` (the CUDA's ONE
+  `s_gemv_q8_split_kernel<CODE_BITS, Q8K>`; the port carries the activation kind in the push constant `q8k`),
+  one workgroup per output row.  Engine headers unchanged.
+* **Proved** by `case_s_gemv_q8k_split_entry` / `case_s_gemv_q8_0_split_entry` (three forms each: S4/S8 Q8_K
+  incl. the offset form; S8/IQ4_NL/S4 Q8_0 incl. the `ffn_down_shexp` n_in=640 shape).  Each runs the SHADER
+  PATH on the harness `ctx` and the ENGINE WRAPPER on its own `EnginePin`-pinned stream, requires them
+  **BITWISE** equal, and requires the wrapper equal to the ENGINE'S OWN RULE (`s_gemv_q8_host_row`, the double
+  transcription of `s_gemv.cu`) bounded by the SUM OF TERMS.  Raw gate lines (vega/Arc): `... bitwise 32/32
+  worst 0` and `... vs the engine's own rule 8/8 worst 0.00766` (S8/Q8_K) — the deepest arm, the offset form,
+  is `8/8 worst 0`.
+* **`shared_expert` wired** in a new TU `vulkan/src/kernels/shared_expert_vk.cpp`: the canonical chain of
+  `shared_expert.cu:242-361` — `gemv(gate)`, `gemv(up)`, `swiglu`, quantise-to-the-down-weight's-contract,
+  `gemv(down)`, the BF16 scalar gate, the per-row scale.  The native-projection branches delegate to the
+  port's already-wired `native_quantize_q8_1` + `native_mmvq` (the shipped `--native` launch CAN make
+  `ffn_down_shexp`'s IQ4_NL native_data non-null); the native-BF16 scalar gate is answered off by this TU's own
+  `shared_expert_native_bf16_enabled() == false` (the `native_*_enabled` pattern).  Proved by
+  `case_shared_expert_entry`: wrapper vs a DOUBLE transcription of the whole chain, **256/256, worst 0.0475**,
+  with TWO rivals given their own observables and host-side margins proving they MOVE the reference (SILU on UP:
+  379.3; the scalar gate dropped: 6325.0).
+* **A LATENT DEFECT FOUND AND FIXED WHILE WIRING (this batch's instance of the class).**  The port's `gemv`
+  lambda CLOSED OVER the input activation (`x_q8_0`/`x_q8k`), so the DOWN projection read the input image
+  instead of the `h_q8_0`/`h_q8k` buffer the two lines above it had just produced — the CUDA passes the
+  activation as a PARAMETER.  The error was ~1e3× the oracle and perfectly finite; the case said so on its first
+  real run.  Fixed at the source (the lambda takes `act80`/`actq8k`), not by loosening an arm.
+* **Falsified, and both bite:** `s-gemv-q8k-flag-flip` (engine: hardwire `q8k=0`) → `FAIL s_gemv_q8k_split
+  entry ... 0/32`; `s-gemv-q8-split-wrong-act-block` (shader: the Q8_0 block stride for the Q8_K image) →
+  `FAIL ... 0/8 worst 5.34e+30`; `shared-expert-silu-on-up` → `FAIL shared_expert entry ... 0/256 worst 5.1e+05`.
+* **Bench (Arc, new rows):** `s_gemv_q8_split` at the shared expert's shapes — **0.0185 ms** (Q8_K 2560→640
+  g64), **0.0195 ms** (Q8_K 2560→640 g32), **0.0440 ms** (Q8_0 640→2560, `ffn_down_shexp`); llvmpipe 1.87 / 2.04
+  / 6.43 ms; Ryzen iGPU 0.20 / 0.27 / 1.02 ms.  Honest per-dispatch costs of the shared expert's three GEMVs.
+
+## DELIVERABLE B — the nine no-shader symbols, each SETTLED from the engine's own code
+
+**All nine are UNREACHABLE under the shipped configuration, so each is a LOUD REFUSAL** (a definition that lets
+the layer LINK and, if ever reached, names the flag chain and exits 2): `vulkan/src/kernels/refusals_vk.cpp`.
+The per-symbol call site, enclosing condition, every flag, its default and what the shipped launch sets are in
+`plan/DECODE-PATH-TRIAGE.md` ("THE NINE REACHABILITY VERDICTS", this batch), and quoted in the refusal's own
+message: `native_flash_attn_short_step` & `qsa_attend_step` (layer.cpp:978/989/1002; `native_flash_attn_short`
+default **false**, only `--native-flash-attn-short`), `qsa_index_step` & `topk_512_step` (layer.cpp:968;
+`g_fast_select` default **true**), `native_qsa_indexer_append` (layer.cpp:944; the backend ANSWERS
+`native_qsa_indexer_enabled()` **false**), and `kv_ring_table` / `kv_stream_reset` / `kv_stream_resolve`
+(layer.cpp:707/709/757; `g_kv_resident` default **0** → mode 0).
+
+**THE FINDING THE MANDATORY ANALYSIS PRODUCED — `fused_gr_read` is the `qsa_decode_attn_step` SHAPE AGAIN.**
+The previous batch classed it C and wrote that "the backend's init calls `layer_set_fused_gr(false)`".  **No such
+call exists in this tree**, and the shipped `--native` launch sets `gr_native_mmvf = true` (generate.cpp:1804)
+with `no_fused_gr` false, so `layer_set_fused_gr(true)` runs (generate.cpp:2284) and `g_fused_gr` IS TRUE.  With
+`fused_gr_supported(2560,4,320)` true the layer reaches `fused_gr_read` — the UNPORTED branch — and the ported
+`gr_read` is the NON-selected one: **a HOLE, mis-labelled by a claim true of a plan and false of the code.**
+**Fixed at the cause**: the branch is selected by `fused_gr_supported`, which the BACKEND defines, and a backend
+with no `fused_gr` shader must answer it FALSE (the `native_mmvq_supported` discipline).  `ple_vk.cpp` now
+returns false, the engine takes the ported `gr_read`, and `fused_gr_read` is genuinely unreachable → its refusal.
+`case_fused_gr_supported_entry` now asserts BOTH readings distinctly (backend false everywhere; the CUDA
+geometry rule true at (2560,4,320)); falsified by `fused-gr-supported-true` → `FAIL fused_gr_supported entry
+... 5/6`.
+
+## DELIVERABLE C — THE INSTRUMENT: `kernel` now states TWO facts
+
+`PORT-MAP.tsv`'s `kernel` kind meant only "a shader exists", and was twice read as "the backend answers the
+symbol the engine calls" (`indexer_key_append`, `qsa_decode_attn_step`).  It now means **a shader exists AND the
+Vulkan backend DEFINES the symbol**, checked by `tools/check_port_map.py` scanning the backend's own TUs; a
+`kernel` row with no definition FAILS the gate.  A new kind **`shader`** states the middle fact (a shader is
+built, the backend does NOT define the symbol); a `shader` row that IS defined also FAILS (a stale row).  Applying
+it found **14 more** unwired-but-shadered symbols (`sample_tokens`, `moe_hit_*`, `native_expert_grouped`,
+`iq_dequant_f32`, `iq_embed_rows`, `coupled_draft_sample`, the `_multi` pair, …) which are now kinded `shader`,
+plus `s_gemv_split_async` (whose shader was mis-attributed to the q8 one).  The map reads
+**`168 = 65 kernel + 15 shader + 61 host + 27 todo`** (was `78/0/61/29`).  **Falsified:** renaming the backend's
+`s_gemv_q8_0_split` definition makes the checker exit 1 with the named FAIL; restoring it returns to exit 0.
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (verified by sha256).
+
+## RESULTS (vega)
+
+Gate: Arc (`intel_icd`) **669/0/0**; llvmpipe **657/0/3** (the 3 documented coopmat/vram skips); Ryzen iGPU
+(`radeon_icd`) **659/1/2** — the ONE failure is the documented, open `budget: independent requery agrees` flake,
+**not one of this batch's cases** (the 3 skips are the coopmat/vram ones).  `check_port_map.py` passes;
+`make_port_map.py` byte-identical; `strata_vk_entry_smoke` builds.  All four new falsifications bite.
+**`z820b` is PENDING** (suspended, no WoL — no XTX/K620 number is claimed).  The CUDA graph API was NOT touched.
+
 ## THE MoE / QSA / GR / PLE TAIL — six more entry points, TWO CLASSIFICATION FINDINGS, and how far M-B is from a LINK (2026-10-05, `vega`)
 
 **THE BAR (the running line): `75 → 64` undefined references / `25 → 19` distinct full-signature

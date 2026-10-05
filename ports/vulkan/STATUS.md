@@ -1,5 +1,23 @@
 # Status — what is done, what is verified, what is not
 
+## THE TWO SPLIT GEMVs + `shared_expert`, NINE REACHABILITY VERDICTS, and THE INSTRUMENT FIX (2026-10-05, `vega`)
+
+**THE BAR MOVED `64 → 41` raw / `19 → 7` full-signature / `17 → 5` name-only.**  Landed: `s_gemv_q8k_split` and
+`s_gemv_q8_0_split` (the pair that BLOCKED `shared_expert`; the shader `s_gemv_q8_split` was already in the tree -
+only the engine definition was missing, the `indexer_key_append` shape), and `shared_expert` itself, wired in full
+in a new `vulkan/src/kernels/shared_expert_vk.cpp`.  The nine remaining no-shader symbols were each settled from
+the engine's own code and are UNREACHABLE under the shipped configuration, so each is a LOUD REFUSAL
+(`vulkan/src/kernels/refusals_vk.cpp`).  **One of them was mis-classified: `fused_gr_read` IS reachable** under the
+shipped `--native` launch (`g_fused_gr` is true; the claim that the backend forces it false was false of the code) -
+fixed at the cause by answering `fused_gr_supported` false, which keeps the PORTED `gr_read` on the path.
+**The instrument:** PORT-MAP's `kernel` kind now means "a shader exists **AND** the backend defines the symbol";
+a new `shader` kind states "a shader exists, the backend does not define it" (15 rows, 14 of them newly surfaced).
+
+Verified on `vega`: gate Arc **669/0/0**, llvmpipe **657/0/3** (documented skips), Ryzen iGPU **659/1/2** (the open
+`budget: independent requery agrees` flake, not this batch).  Four new falsifications bite.  `check_port_map.py`
+passes; `make_port_map.py` byte-identical; all changed `.cu`-derived rules oracled against the engine's own body.
+**`z820b` PENDING.**  Full detail in `NEXT.md`'s top section and `plan/DECODE-PATH-TRIAGE.md`.
+
 ## THE MoE / QSA / GR / PLE TAIL — six more entry points, and TWO CLASSIFICATION FINDINGS (2026-10-05, `vega`)
 
 **THE BAR MOVED `75 → 64` raw / `25 → 19` full-signature / `23 → 17` name-only.**  The six, in the order the

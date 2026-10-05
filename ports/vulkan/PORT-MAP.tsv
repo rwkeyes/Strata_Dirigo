@@ -1,15 +1,22 @@
 # ports/vulkan/PORT-MAP.tsv - the DECODE PATH's kernels-namespace symbols (every one src/core/ reaches), classified.
-# kernel = GPU work with a shader in this tree; host = the engine's own host side; todo = GPU work not ported.
+# kernel = a shader exists in this tree AND the Vulkan backend defines the symbol the engine calls;
+# shader = a shader exists in this tree but the backend does NOT define the symbol (the wrapper is missing);
+# host = the engine's own host side; todo = GPU work not ported (no shader).
+# The `kernel` kind states TWO facts, and check_port_map.py enforces BOTH: a row read as "kernel"
+# whose symbol the backend does not define is the defect that let indexer_key_append sit LANDED with no
+# definition; a `shader` row that IS defined is a stale row.  Never read `kernel` as merely "a shader
+# exists".
 # A symbol is in scope whether src/core/ writes it `kernels::X` or bare `X` (a using-directive in scope).
-# gates/run_gate.sh checks this file against the engine's sources and the built shaders: an invented
-# symbol, a shader that is not built, an unclaimed shader or an unlisted src/core/ symbol all fail.
+# gates/run_gate.sh checks this file against the engine's sources, the built shaders AND the backend's own
+# definitions: an invented symbol, a shader that is not built, an unclaimed shader, an unlisted src/core/
+# symbol, a `kernel` row with no backend definition, or a `shader` row WITH one all fail.
 # symbol	kind	shader(s) or reason
 add_inplace	kernel	add
 add_streams_broadcast	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 bf16_gemv	kernel	bf16_gemv
 bf16_gemv_fp32_mmvf	kernel	bf16_mmvf_f32
-bf16_gemv_fp32_mmvf_cols	kernel	bf16_mmvf_f32
-bf16_gemv_fp32_mmvf_multi	kernel	bf16_mmvf_f32_multi
+bf16_gemv_fp32_mmvf_cols	shader	bf16_mmvf_f32
+bf16_gemv_fp32_mmvf_multi	shader	bf16_mmvf_f32_multi
 bf16_gemv_split	kernel	bf16_gemv
 broadcast_streams	todo	no shader in this tree yet
 build_rope_table	host	the engine builds the table; rope_neox is the kernel that reads it
@@ -19,7 +26,7 @@ copy_i32_from_mapped_unless	host	a mapped-buffer copy
 copy_indexed	host	a device-indexed copy
 copy_or_zero_from_mapped	host	a mapped-buffer copy
 copy_rows_from_mapped	host	a mapped-buffer copy
-coupled_draft_sample	kernel	coupled_penalize coupled_sample
+coupled_draft_sample	shader	coupled_penalize coupled_sample
 coupled_draft_scratch_bytes	host	a size
 coupled_draft_stage	host	the coupled round's mapped staging (a copy; the coupled kernels read it)
 cpu	host	the engine ticks its own clock
@@ -62,8 +69,8 @@ gr_workspace_bytes	host	a size
 gr_workspace_init	host	a workspace hand-out
 gr_write	kernel	gr_write
 indexer_key_append	kernel	indexer_key_append
-iq_dequant_f32	kernel	iq_dequant_f32
-iq_embed_rows	kernel	iq_embed_rows
+iq_dequant_f32	shader	iq_dequant_f32
+iq_embed_rows	shader	iq_embed_rows
 iq_row_bytes	host	a size
 k	host	a constant
 kv_append_q4_step	kernel	kv_q4_append
@@ -84,15 +91,15 @@ kv_stream_resolve	host	the expert file tier: whether a row is resident
 map_ids	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 moe_combine	kernel	moe_combine_f32 moe_combine_f64
 moe_group_resident	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
-moe_grouped_s2	kernel	s2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped
-moe_hit_add	kernel	moe_hit_add
-moe_hit_grouped_s2	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
-moe_hit_grouped_s2_cpu_order	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
-moe_hit_grouped_s2_dev	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
+moe_grouped_s2	shader	s2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped
+moe_hit_add	shader	moe_hit_add
+moe_hit_grouped_s2	shader	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
+moe_hit_grouped_s2_cpu_order	shader	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
+moe_hit_grouped_s2_dev	shader	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
 moe_hit_grouped_scratch_bytes	host	a size
-moe_hit_select	kernel	moe_hit_select
+moe_hit_select	shader	moe_hit_select
 mtp_select	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
-native_expert_grouped	kernel	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
+native_expert_grouped	shader	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
 native_expert_layout	host	a layout description
 native_expert_scratch_bytes	host	a size
 native_flash_attn_short_step	kernel	attn_decode_short
@@ -157,18 +164,18 @@ rope_table_set	host	table bookkeeping
 router_top10	kernel	router_top10_f32 router_top10_f64
 row_top_prob	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 s2_gemv_q8	kernel	s2_gemv_q8
-s_gemv_q8_0_split	todo	no shader in this tree yet
-s_gemv_q8k_split	todo	no shader in this tree yet
-s_gemv_split_async	kernel	s_gemv_q8_split
-sample_tokens	kernel	sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split
+s_gemv_q8_0_split	kernel	s_gemv_q8_split
+s_gemv_q8k_split	kernel	s_gemv_q8_split
+s_gemv_split_async	shader	s_gemv_split
+sample_tokens	shader	sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split
 scale_inplace	kernel	scale
 scatter_rows_f32	kernel	scatter_rows_f32
 shared_expert	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32
-shared_expert_multi	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32
+shared_expert_multi	shader	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32
 shared_expert_native_bf16_enabled	host	a capability check
 shared_expert_scratch_bytes	host	a size
 silu_inplace	kernel	silu_f32
-topk_512_step	todo	no shader in this tree yet
+topk_512_step	todo	no shader in this tree yet; ANSWERED BY A LOUD REFUSAL (refusals_vk.cpp): --no-fast-select reaches it
 wait_flag_ge	todo	no shader in this tree yet
 wait_flag_ge_or	todo	no shader in this tree yet
 window_ids	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)

@@ -18820,19 +18820,29 @@ void case_indexer_key_append_entry(Ctx& ctx, const std::string& dir) {
 // falsifies "always false" - so the arm set itself is the margin.
 void case_fused_gr_supported_entry(Ctx& ctx, const std::string& dir) {
     (void) ctx; (void) dir;
-    struct Arm { int64_t n_embd, hc, hc_lr; bool want; };
-    const Arm arms[] = {{2560, 4, 320, true},  {2561, 4, 320, false}, {2560, 5, 320, false},
-                        {2560, 4, 321, false}, {512, 1, 64, false},  {0, 0, 0, false}};
+    // **THIS CASE NOW ASSERTS THE CAPABILITY CONTRACT, NOT THE GEOMETRY PREDICATE** (this batch).  The previous
+    // batch pinned the CUDA's geometry rule here on the theory that a backend "cannot return false without lying
+    // about the geometry", and that `fused_gr_read` leaves the path because `g_fused_gr` is forced false.  The
+    // second half of that was FALSE of the code: under the shipped `--native` launch `g_fused_gr` IS true
+    // (generate.cpp:1804/2284), so the ONLY input selecting the branch is this predicate, and a backend with no
+    // fused_gr shader must answer FALSE - the `native_mmvq_supported` shape.  The case keeps BOTH readings as
+    // distinct observables: the backend's answer must be FALSE everywhere, while the CUDA GEOMETRY rule (computed
+    // here, not called) is TRUE at (2560,4,320) and FALSE elsewhere - so a change that swapped them would fail.
+    struct Arm { int64_t n_embd, hc, hc_lr; };
+    const Arm arms[] = {{2560, 4, 320}, {2561, 4, 320}, {2560, 5, 320},
+                        {2560, 4, 321}, {512, 1, 64},   {0, 0, 0}};
     const int n = (int) (sizeof arms / sizeof arms[0]);
-    int bad = 0, n_true = 0, n_false = 0;
+    int cap_true = 0, geom_true = 0, geom_false = 0;
     for (const Arm& a : arms) {
-        const bool got = strata::kernels::fused_gr_supported(a.n_embd, a.hc, a.hc_lr);
-        if (got != a.want) ++bad;
-        if (a.want) ++n_true; else ++n_false;
+        if (strata::kernels::fused_gr_supported(a.n_embd, a.hc, a.hc_lr)) ++cap_true;
+        const bool geom = (a.n_embd == 2560 && a.hc == 4 && a.hc_lr == 320);   // fused_gr.cu:1164-1166
+        if (geom) ++geom_true; else ++geom_false;
     }
-    verdict("fused_gr_supported entry: the (2560,4,320) geometry predicate, wrapper == the engine's own rule",
-            bad == 0 && n_true > 0 && n_false > 0, bad, n, 0.0,
-            "geometries where the predicate disagrees with fused_gr.cu (or a degenerate always-true/false rule)");
+    verdict("fused_gr_supported entry: the backend reports the FUSED read unsupported (no fused_gr shader) - "
+            "vs the CUDA geometry rule, a distinct observable",
+            cap_true == 0 && geom_true > 0 && geom_false > 0, cap_true, n, 0.0,
+            "the capability answer must be FALSE everywhere (selecting the ported gr_read) while the geometry rule "
+            "is TRUE at (2560,4,320); a swapped pair of readings fails this arm");
 }
 
 // 4. `shared_expert_scratch_bytes` -> the MoE workspace size (layer.cpp:347).  PURE HOST,
@@ -19016,6 +19026,284 @@ void case_ngram_rows_entry(Ctx& ctx, const std::string& dir) {
                 strata::kernels::ple_oracle::kHashCaseCount, v_sum, v_mask, v_rev, v_cut,
                 strata::kernels::ple_oracle::kHashCaseCount);
 }
+
+// ============================================================================================================
+// THIS BATCH - the two S-family SPLIT GEMV entry points and the SHARED EXPERT.
+// ============================================================================================================
+
+// ---- `s_gemv_q8k_split` / `s_gemv_q8_0_split` -> s_gemv_q8_split.spv (vulkan/src/kernels/matvec_vk.cpp).  THE
+// PAIR `shared_expert`'s canonical path dispatches, and the pair the previous batch reported UN-WIRABLE ("no
+// shader in this tree") although the shader WAS in the tree - what was missing was the engine-side definition.
+// Proof, in the established form: for each form the case runs (A) the shader path on the harness ctx and (B) the
+// ENGINE WRAPPER on its own engine stream (EnginePin), requires (C) them BITWISE equal, and (D) the wrapper
+// equal to the ENGINE'S OWN RULE - `s_gemv_q8_host_row`, the double transcription of `s_gemv.cu`'s decode -
+// bounded by the SUM OF TERMS, never by a relative tolerance.
+static void case_s_gemv_q8_split_entry_impl(Ctx& ctx, const std::string& dir, bool q8k) {
+    const char* tag = q8k ? "s_gemv_q8k_split" : "s_gemv_q8_0_split";
+    if (!have(dir, "s_gemv_q8_split.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip(tag, "device lacks storageBuffer8BitAccess"); return; }
+    struct Form { int bits, bias, group, codebook, n_in, n_out; bool has_offset; const char* note; };
+    const Form forms_q8k[3] = {
+        {4, 0, 64, 0, 2560, 8, false, "S4 / Q8_K, group 64"},
+        {8, 0, 32, 0, 2560, 8, false, "S8 / Q8_K"},
+        {4, 0, 32, 0, 2560, 8, true,  "offset form / Q8_K (the offset's position is observable)"}};
+    const Form forms_q80[3] = {
+        {8, 0, 32, 0, 640, 8, false, "S8 / Q8_0, n_in 640 (ffn_down_shexp: Q8_K is impossible here)"},
+        {4, 0, 32, 1, 640, 8, false, "IQ4_NL codebook / Q8_0"},
+        {4, -8, 32, 0, 2560, 8, false, "S4 (Q4_0 bias) / Q8_0"}};
+    for (int fi = 0; fi < 3; ++fi) {
+        const Form& f = q8k ? forms_q8k[fi] : forms_q80[fi];
+        const int per_byte = 8 / f.bits;
+        const int n_groups = f.n_in / f.group;
+        const int codes_per_row = f.n_in / per_byte;
+        const int blk_elems = q8k ? 256 : 32;
+        const int blk_bytes = q8k ? 292 : 34;
+        const int n_blocks = f.n_in / blk_elems;
+
+        std::vector<uint8_t> act((size_t) n_blocks * blk_bytes, 0);
+        for (int b = 0; b < n_blocks; ++b) {
+            const float d = (b == 1) ? 0.0f : 0.03125f * (float) (b + 1);      // one ZERO block: the bound's floor
+            if (q8k) { std::memcpy(&act[(size_t) b * 292], &d, 4); }
+            else { const uint16_t bits = strata::kernels::f16_from_f32(d);
+                   act[(size_t) b * 34] = (uint8_t) (bits & 0xFF); act[(size_t) b * 34 + 1] = (uint8_t) (bits >> 8); }
+            for (int i = 0; i < blk_elems; ++i)
+                act[(size_t) b * blk_bytes + (q8k ? 4 : 2) + i] = (uint8_t) (int8_t) (((i * 13 + b * 7) % 255) - 127);
+        }
+        std::vector<uint8_t> codes((size_t) f.n_out * codes_per_row, 0);
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) ((i * 37 + 11) & 0xFF);   // every code value
+        std::vector<float> scales((size_t) f.n_out * n_groups, 0.0f), offsets((size_t) f.n_out * n_groups, 0.0f);
+        for (int o = 0; o < f.n_out; ++o)
+            for (int g = 0; g < n_groups; ++g) {
+                const float mag = 0.015625f * (float) (g + 1);
+                scales[(size_t) o * n_groups + g] = ((g % 7) == 5) ? -mag : mag;
+                offsets[(size_t) o * n_groups + g] = 0.5f * (float) (o + 1) - 0.25f * (float) g;
+            }
+        std::vector<float> want(f.n_out, 0.0f);
+        std::vector<double> want_abs(f.n_out, 0.0);
+        for (int o = 0; o < f.n_out; ++o)
+            want[o] = (float) s_gemv_q8_host_row(act, codes, scales, offsets, f.has_offset, f.bits, f.bias,
+                                                 f.codebook, f.group, q8k, o, f.n_in, &want_abs[o]);
+
+        // (A) the shader path on the harness ctx.
+        const size_t padded = (size_t) f.n_out * 4 + 64;
+        Buf ba = ctx.alloc(act.size()), bc = ctx.alloc(codes.size()), bs = ctx.alloc(scales.size() * 4);
+        Buf bo = ctx.alloc(offsets.size() * 4 + 16), by = ctx.alloc(padded);
+        ctx.write(ba, act.data(), act.size());
+        ctx.write(bc, codes.data(), codes.size());
+        ctx.write(bs, scales.data(), scales.size() * 4);
+        ctx.write(bo, offsets.data(), offsets.size() * 4);
+        std::vector<uint8_t> sink(padded, 0x6D); ctx.write(by, sink.data(), sink.size());
+        const int byte_shift = (per_byte == 4) ? 2 : ((per_byte == 2) ? 1 : 0);
+        int group_shift = 0; while ((1 << group_shift) < f.group) ++group_shift;
+        struct { int n_in, n_out, code_bits, byte_shift, bias, codebook, group_shift, has_offset, q8k; } pc{
+            f.n_in, f.n_out, f.bits, byte_shift, f.bias, f.codebook, group_shift, f.has_offset ? 1 : 0, q8k ? 1 : 0};
+        VkPipeline p = ctx.pipeline(dir + "/s_gemv_q8_split.spv", 5, (int) sizeof(pc));
+        ctx.dispatch(p, {&ba, &bc, &bs, &bo, &by}, &pc, sizeof(pc), (uint32_t) f.n_out);
+        std::vector<uint8_t> ref(padded); ctx.read(by, ref.data(), ref.size());
+        ctx.free(ba); ctx.free(bc); ctx.free(bs); ctx.free(bo); ctx.free(by);
+
+        // (B) the ENGINE WRAPPER on its own engine stream (EnginePin-pinned).
+        strata::kernels::SForm sf;
+        sf.code_bits = f.bits; sf.code_bias = f.bias; sf.group_elems = f.group;
+        sf.codebook = f.codebook ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;
+        sf.has_offset = f.has_offset; sf.act_kind = q8k ? 1 : 0;
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+        if (s == nullptr) { verdict(tag, false, 1, 1, 0, "the engine stream did not open"); continue; }
+        uint8_t* da = strata::vulkan::arena_alloc<uint8_t>(*s, act.size());
+        uint8_t* dc = strata::vulkan::arena_alloc<uint8_t>(*s, codes.size());
+        float* ds = strata::vulkan::arena_alloc<float>(*s, scales.size());
+        float* dof = strata::vulkan::arena_alloc<float>(*s, offsets.empty() ? 1 : offsets.size());
+        float* dy = strata::vulkan::arena_alloc<float>(*s, (size_t) f.n_out);
+        strata::vulkan::stream_write(*s, da, act.data(), act.size());
+        strata::vulkan::stream_write(*s, dc, codes.data(), codes.size());
+        strata::vulkan::stream_write(*s, ds, scales.data(), scales.size() * 4);
+        if (!offsets.empty()) strata::vulkan::stream_write(*s, dof, offsets.data(), offsets.size() * 4);
+        // THE ENGINE WRAPPER (the symbol the layer links against)
+        if (q8k) strata::kernels::s_gemv_q8k_split(da, dc, ds, f.has_offset ? dof : nullptr, dy, f.n_in, f.n_out, sf, s);
+        else     strata::kernels::s_gemv_q8_0_split(da, dc, ds, f.has_offset ? dof : nullptr, dy, f.n_in, f.n_out, sf, s);
+        std::vector<uint8_t> got((size_t) f.n_out * 4);
+        strata::vulkan::stream_read(*s, dy, got.data(), got.size());
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+        char lab[220];
+        std::snprintf(lab, sizeof lab, "%s entry (n_in=%d n_out=%d, %s): engine wrapper == shader path, bitwise",
+                      tag, f.n_in, f.n_out, f.note);
+        verdict(lab, bad_bw == 0, bad_bw, (int) got.size(), 0.0,
+                "output bytes differ - the wrapper's views/pipeline/push-constant mismatch the shader path");
+        int bad = 0; double worst = 0, mass = 0;
+        const float* y = reinterpret_cast<const float*>(got.data());
+        for (int o = 0; o < f.n_out; ++o) {
+            mass += std::fabs((double) want[o]);
+            const double ratio = std::fabs((double) y[o] - (double) want[o]) /
+                                 gemv_bound((double) want[o], want_abs[o], 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+        std::snprintf(lab, sizeof lab, "%s entry (%s): engine wrapper vs the engine's own rule (double, terms bound)",
+                      tag, f.note);
+        verdict(lab, bad == 0 && mass > 1e-3, bad, f.n_out, worst, "rows outside the bound / vacuous oracle");
+    }
+}
+void case_s_gemv_q8k_split_entry(Ctx& ctx, const std::string& dir) { case_s_gemv_q8_split_entry_impl(ctx, dir, true); }
+void case_s_gemv_q8_0_split_entry(Ctx& ctx, const std::string& dir) { case_s_gemv_q8_split_entry_impl(ctx, dir, false); }
+
+// ---- `shared_expert` -> s2_gemv_q8 / s_gemv_q8{_0,k}_split + swiglu_f32 + quantize + scalar_gate_f32 + scale_rows
+//      (vulkan/src/kernels/shared_expert_vk.cpp, layer.cpp:417 `moe_shared`).  THE WHOLE CHAIN, oracled against a
+//      DOUBLE transcription of `src/kernels/cuda/shared_expert.cu:242-361`, with TWO rival readings each given its
+//      OWN observable and a host-side margin proving it MOVES the reference (SILU ON UP instead of GATE, and the
+//      scalar gate DROPPED).  The fixture is small but every step is exercised: gate/up are Q8_K (act_kind 1),
+//      down is Q8_0 (act_kind 0) and its activation is the QUANTISED swiglu intermediate, so the down projection
+//      reads a buffer the wrapper produced, not the fixture.
+static double se_silu(double x) { return x / (1.0 + std::exp(-x)); }
+
+static void case_shared_expert_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "swiglu_f32.spv") || !have(dir, "scalar_gate_f32.spv") || !have(dir, "scale_rows.spv") ||
+        !have(dir, "s_gemv_q8_split.spv") || !have(dir, "quantize_q8_0.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("shared_expert entry", "device lacks storageBuffer8BitAccess"); return; }
+    const int64_t n_embd = 256, n_ff = 128;
+
+    // the three forms: gate/up read the Q8_K image (act_kind 1); down reads its own Q8_0 image (act_kind 0).
+    strata::kernels::SForm fg{}, fu{}, fd{};
+    fg.code_bits = 8; fg.group_elems = 32; fg.code_bias = 0; fg.codebook = strata::kernels::Codebook::Affine;
+    fg.has_offset = false; fg.act_kind = 1;
+    fu = fg;
+    fd.code_bits = 8; fd.group_elems = 32; fd.code_bias = 0; fd.codebook = strata::kernels::Codebook::Affine;
+    fd.has_offset = false; fd.act_kind = 0;
+
+    auto plane = [](int64_t n_in, int64_t n_out, int bits, int group, int mul, int add, float smul,
+                    std::vector<uint8_t>& codes, std::vector<float>& scales) {
+        const int per_byte = 8 / bits;
+        codes.assign((size_t) n_out * (n_in / per_byte), 0);
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) ((i * mul + add) & 0xFF);
+        scales.assign((size_t) n_out * (n_in / group), 0.0f);
+        for (size_t i = 0; i < scales.size(); ++i)
+            scales[i] = (((i % 5) == 3) ? -1.0f : 1.0f) * (smul * (float) (1 + (i % 7)));
+    };
+    // **THE THREE PLANES MUST DIFFER, OR THE SILU-ON-UP RIVAL IS INDISTINGUISHABLE.**  gate and up used to be
+    // built by the SAME formula, so `gate == up` and `silu(up)*gate == silu(gate)*up` EXACTLY - the rival could
+    // not move and the arm (correctly) failed.  Different code multipliers AND different scale magnitudes.
+    std::vector<uint8_t> cg, cu, cd; std::vector<float> sg_, su, sd;
+    plane(n_embd, n_ff, 8, 32, 37, 11, 1.0e-3f, cg, sg_);   // gate: [n_ff][n_embd]
+    plane(n_embd, n_ff, 8, 32, 53, 29, 1.3e-3f, cu, su);    // up   (a DIFFERENT plane: codes and scales)
+    plane(n_ff,  n_embd, 8, 32, 29,  7, 1.1e-3f, cd, sd);   // down: [n_embd][n_ff]
+
+    // the activation: 256 elements, quantised to the Q8_K image; x_bf16 the same values rounded.  The
+    // magnitude is chosen so the DOWN projection's Q8_0 image (an fp16 SCALE, max 65504) cannot saturate: the
+    // swiglu intermediate is O(1) here, so its scale is O(0.01) - the FIRST fixture ran O(1e6) and the fp16
+    // scale overflowed to inf, which the oracle then turned into NaN (a fixture bug, not an arm to loosen).
+    std::vector<float> xa((size_t) n_embd, 0.0f);
+    for (int64_t i = 0; i < n_embd; ++i) xa[(size_t) i] = 0.25f * (float) ((i % 11) - 5);
+    std::vector<uint8_t> xq8k((size_t) (n_embd / 256) * 292, 0);
+    { const float d = 0.01f; std::memcpy(xq8k.data(), &d, 4);
+      for (int64_t i = 0; i < n_embd; ++i) xq8k[(size_t) 4 + i] = (uint8_t) (int8_t) ((i * 7 % 251) - 125); }
+    std::vector<uint16_t> xbf16((size_t) n_embd, 0);
+    for (int64_t i = 0; i < n_embd; ++i) xbf16[(size_t) i] = strata::kernels::bf16_from_f32(xa[(size_t) i]);
+    std::vector<uint16_t> ginp((size_t) n_embd, 0);
+    for (int64_t i = 0; i < n_embd; ++i) ginp[(size_t) i] = strata::kernels::bf16_from_f32(0.125f * (float) ((i % 9) - 4));
+
+    // ---- THE ORACLE: the engine's rule in DOUBLE, following shared_expert.cu step for step.
+    //      `s_gemv.cu`'s decode (affine, bias 0): `w = code * scale`.
+    auto dot = [](const std::vector<uint8_t>& codes, const std::vector<float>& scales, int bits, int group,
+                  int64_t n_in, int64_t row, const std::vector<double>& a) -> double {
+        const int per_byte = 8 / bits; const int n_groups = (int) (n_in / group);
+        const int cpr = (int) (n_in / per_byte);
+        double acc = 0.0;
+        for (int64_t i = 0; i < n_in; ++i) {
+            const int g = (int) (i / group);
+            const int code = (codes[(size_t) row * cpr + i / per_byte] >> ((i % per_byte) * bits)) & ((1 << bits) - 1);
+            acc += (double) code * (double) scales[(size_t) row * n_groups + g] * a[(size_t) i];
+        }
+        return acc;
+    };
+    auto act_q8k = [](const std::vector<uint8_t>& blk, int64_t n) {
+        std::vector<double> a((size_t) n); float d; std::memcpy(&d, blk.data(), 4);
+        for (int64_t i = 0; i < n; ++i) {
+            const int8_t q = (int8_t) blk[(size_t) 4 + (i % 256)];
+            a[(size_t) i] = (double) d * (double) q;
+        }
+        return a;
+    };
+    const std::vector<double> a_gate = act_q8k(xq8k, n_embd);
+    std::vector<double> gate((size_t) n_ff), up((size_t) n_ff), h((size_t) n_ff);
+    for (int64_t o = 0; o < n_ff; ++o) {
+        gate[(size_t) o] = dot(cg, sg_, 8, 32, n_embd, o, a_gate);
+        up[(size_t) o] = dot(cu, su, 8, 32, n_embd, o, a_gate);
+        h[(size_t) o] = se_silu(gate[(size_t) o]) * up[(size_t) o];
+    }
+    // the down activation is the QUANTISED swiglu intermediate (ggml Q8_0), then dequantised.
+    std::vector<float> hf((size_t) n_ff); for (int64_t i = 0; i < n_ff; ++i) hf[(size_t) i] = (float) h[(size_t) i];
+    std::vector<uint8_t> hq0((size_t) (n_ff / 32) * 34, 0);
+    for (int64_t b = 0; b < n_ff / 32; ++b) q8_0_ggml_block(&hf[(size_t) b * 32], &hq0[(size_t) b * 34]);
+    std::vector<double> a_down((size_t) n_ff);
+    for (int64_t b = 0; b < n_ff / 32; ++b) {
+        const uint16_t bits = (uint16_t) (hq0[(size_t) b * 34] | (hq0[(size_t) b * 34 + 1] << 8));
+        const double d = (double) strata::kernels::f32_from_f16(bits);
+        for (int j = 0; j < 32; ++j) a_down[(size_t) b * 32 + j] = d * (double) (int8_t) hq0[(size_t) b * 34 + 2 + j];
+    }
+    std::vector<double> out((size_t) n_embd);
+    for (int64_t j = 0; j < n_embd; ++j) out[(size_t) j] = dot(cd, sd, 8, 32, n_ff, j, a_down);
+    double dotg = 0.0;
+    for (int64_t i = 0; i < n_embd; ++i)
+        dotg += (double) strata::kernels::f32_from_bf16(xbf16[(size_t) i]) *
+                (double) strata::kernels::f32_from_bf16(ginp[(size_t) i]);
+    const double sgate = 1.0 / (1.0 + std::exp(-dotg));
+    for (int64_t j = 0; j < n_embd; ++j) out[(size_t) j] *= sgate;
+
+    // ---- THE RIVALS, host-side: SILU ON UP (not gate), and the scalar gate DROPPED.
+    double rival_up = 0.0, rival_nog = 0.0;
+    for (int64_t o = 0; o < n_ff; ++o) rival_up += std::fabs(se_silu(up[(size_t) o]) * gate[(size_t) o] - h[(size_t) o]);
+    for (int64_t j = 0; j < n_embd; ++j) rival_nog += std::fabs(out[(size_t) j] / sgate - out[(size_t) j]);
+
+    // ---- THE WRAPPER, on its own engine stream (EnginePin-pinned).
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) { verdict("shared_expert entry", false, 1, 1, 0, "the engine stream did not open"); return; }
+    const uint64_t scr_bytes = strata::kernels::shared_expert_scratch_bytes(n_ff);
+    uint8_t* dcg = strata::vulkan::arena_alloc<uint8_t>(*s, cg.size());
+    uint8_t* dcu = strata::vulkan::arena_alloc<uint8_t>(*s, cu.size());
+    uint8_t* dcd = strata::vulkan::arena_alloc<uint8_t>(*s, cd.size());
+    float* dsg = strata::vulkan::arena_alloc<float>(*s, sg_.size());
+    float* dsu = strata::vulkan::arena_alloc<float>(*s, su.size());
+    float* dsd = strata::vulkan::arena_alloc<float>(*s, sd.size());
+    uint8_t* dxk = strata::vulkan::arena_alloc<uint8_t>(*s, xq8k.size());
+    uint16_t* dxb = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) n_embd);
+    uint16_t* dgi = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) n_embd);
+    float* dscratch = strata::vulkan::arena_alloc<float>(*s, (size_t) (scr_bytes / 4 + 1));
+    float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) n_embd);
+    strata::vulkan::stream_write(*s, dcg, cg.data(), cg.size());
+    strata::vulkan::stream_write(*s, dcu, cu.data(), cu.size());
+    strata::vulkan::stream_write(*s, dcd, cd.data(), cd.size());
+    strata::vulkan::stream_write(*s, dsg, sg_.data(), sg_.size() * 4);
+    strata::vulkan::stream_write(*s, dsu, su.data(), su.size() * 4);
+    strata::vulkan::stream_write(*s, dsd, sd.data(), sd.size() * 4);
+    strata::vulkan::stream_write(*s, dxk, xq8k.data(), xq8k.size());
+    strata::vulkan::stream_write(*s, dxb, xbf16.data(), (size_t) n_embd * 2);
+    strata::vulkan::stream_write(*s, dgi, ginp.data(), (size_t) n_embd * 2);
+    strata::kernels::shared_expert(dxk /*x_q8_0: unused here*/, dxk /*x_q8k*/, dxb, fg, dcg, dsg, nullptr,
+                                   fu, dcu, dsu, nullptr, fd, dcd, dsd, nullptr, dgi, dscratch, dout,
+                                   n_embd, n_ff, 32, s, nullptr, nullptr);
+    std::vector<float> got((size_t) n_embd, 0.0f);
+    strata::vulkan::stream_read(*s, dout, got.data(), (size_t) n_embd * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad = 0; double worst = 0, mass = 0;
+    for (int64_t j = 0; j < n_embd; ++j) {
+        mass += std::fabs(out[(size_t) j]);
+        const double ratio = std::fabs((double) got[(size_t) j] - out[(size_t) j]) /
+                             gemv_bound(out[(size_t) j], std::fabs(out[(size_t) j]) + 1e-3, 1e-5);
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+    }
+    verdict("shared_expert entry: engine wrapper vs the shared_expert.cu rule (double, whole chain incl. the scalar gate)",
+            bad == 0 && mass > 1e-3, bad, (int) n_embd, worst, "rows outside the bound / vacuous oracle");
+    verdict("shared_expert entry: rivals MOVE the reference (SILU on UP / the scalar gate dropped)",
+            rival_up > 1e-3 && rival_nog > 1e-3, 0, 1, 0.0,
+            "each rival must change the oracle on this fixture (SILU-on-up / no scalar gate)");
+}
+
 
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
@@ -19307,6 +19595,11 @@ int main(int argc, char** argv) {
     case_shared_expert_scratch_bytes_entry(ctx, dir);// shared_expert_scratch_bytes (layer.cpp:347, PURE HOST)
     case_moe_combine_entry(ctx, dir);                // moe_combine               -> moe_combine_f32.spv   (layer.cpp:464)
     case_ngram_rows_entry(ctx, dir);                 // ngram_rows                (layer.cpp:1293, PURE HOST - the PLE hash)
+    // THIS BATCH: the two S-family SPLIT GEMV entry points (the pair that BLOCKED `shared_expert`) and the
+    // shared expert itself.  APPENDED last for the shared-RNG reason every batch above names.
+    case_s_gemv_q8k_split_entry(ctx, dir);           // s_gemv_q8k_split   -> s_gemv_q8_split.spv (shared_expert gate/up)
+    case_s_gemv_q8_0_split_entry(ctx, dir);          // s_gemv_q8_0_split  -> s_gemv_q8_split.spv (shared_expert gate/up/down)
+    case_shared_expert_entry(ctx, dir);              // shared_expert      -> the whole MoE shared chain (layer.cpp:417)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

@@ -62,7 +62,9 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/gdn_vk.cpp
   src/kernels/matvec_vk.cpp
   src/kernels/qsa_vk.cpp
-  src/kernels/ple_vk.cpp)   # the ATTENTION/QSA/rope entry points (the non-GDN half): norm/rope/select/gate/router
+  src/kernels/ple_vk.cpp
+  src/kernels/shared_expert_vk.cpp
+  src/kernels/refusals_vk.cpp)  # shared_expert (the MoE shared stage) + the LOUD REFUSALS (unreachable symbols)
                             # + the PLE/GR shared stages and the MoE routing rows (ple_vk.cpp)
 add_library(strata_vulkan_kernels STATIC ${_kernels})
 target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
