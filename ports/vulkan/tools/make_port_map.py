@@ -77,10 +77,11 @@ TABLE = {
     'native_rope_apply':              ('kernel', 'native_rope_apply'),        # replaces rope_neox_apply
     'native_router_top10':            ('kernel', 'native_router_top10'),      # replaces router_top10
     'native_moe_combine':             ('kernel', 'native_moe_combine'),       # replaces moe_combine
-    # native_qsa_rms_norm_weighted is ported and gated, but `native_qsa_enabled()` ALSO gates the unported
-    # `native_qsa_gate_apply` (layer.cpp:1010), so the backend still answers that check false - see
-    # native_caps_vk.cpp.  The shader exists; the row is `kernel` because the GPU work is done.
+    # native_qsa_rms_norm_weighted is ported and gated, and `native_qsa_gate_apply` now is too (this batch), so
+    # the backend answers `native_qsa_enabled()` TRUE - both symbols its one flag gates have a shader.  The row
+    # for the gate is `kernel` below; see vulkan/src/kernels/native_caps_vk.cpp and case_native_capabilities.
     'native_qsa_rms_norm_weighted':   ('kernel', 'native_qsa_rms_norm_weighted'),   # replaces rms_norm_weighted
+    'native_qsa_gate_apply':          ('kernel', 'native_qsa_gate_apply'),          # replaces qsa_gate_apply_f32
     # THE PERFORMANCE TIER, class B, batch 2: the first three native GDN / DeltaNet MIXER kernels (the mixer is
     # 36 of the model's 48 layers).  Each replaces a legacy kernel already ported (`gdn_conv_step` / `gdn_l2_norm`
     # / `gdn_beta_gate`), and all are gated by the SAME `native_gdn_enabled()` flag - which stays FALSE because
@@ -202,7 +203,6 @@ TABLE = {
     'moe_group_resident':             ('todo', 'no shader in this tree yet'),
     'mtp_select':                     ('todo', 'no shader in this tree yet'),
     'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),
-    'native_qsa_gate_apply':          ('todo', 'no shader in this tree yet'),
     'native_qsa_indexer_append':      ('todo', 'no shader in this tree yet'),
     'native_router_top10_multi':      ('todo', 'no shader in this tree yet'),
     'ple_block_projected':            ('todo', 'no shader in this tree yet'),

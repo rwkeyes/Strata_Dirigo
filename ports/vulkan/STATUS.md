@@ -1,5 +1,50 @@
 # Status — what is done, what is verified, what is not
 
+## THE QSA GATE'S NATIVE MEMBER — class B batch 5 — `native_qsa_enabled()` FLIPS TO TRUE + the REACHABILITY AUDIT (2026-10-05)
+
+`native_qsa_gate_apply` — the LAST symbol `native_qsa_enabled()` gates — is ported, gated against the engine's OWN
+native body (`src/kernels/cuda/native_qsa.cu`'s `gate`, `:69-77`), and MEASURED against the legacy
+`qsa_gate_apply_f32` it replaces.  With both gated symbols now having a shader, the flag's invariant is satisfied
+and **`native_qsa_enabled()` answers TRUE**.  This batch also carries the **REACHABILITY AUDIT** of every remaining
+`todo` row (`plan/DECODE-PATH-TRIAGE.md`) and **fixes the one hole it found**.
+
+| case | rule (the engine's OWN native body = the oracle) | measured (vega Arc) | falsified by |
+|---|---|---|---|
+| `native_qsa_gate_apply` (3 arms 24/256, 4/12, 2/8) | `native_qsa.cu` `gate`: `out = attn * (1/(1+expf(-raw)))`, `raw` = the SECOND half of each head's 2*head_dim block, all f32 | **6152/6152 w 7.89e-07**, 56/56 w 7.54e-07, 24/24 w 7.08e-07 | `native-qsa-gate-first-half` → FAIL 8/6152 w 4.13e+10 |
+| `native capabilities: qsa flag` | `native_qsa_enabled()` == "every gated symbol has a built shader"; both QSA shaders now built | **3/3** — flag **TRUE** | under-claim `native-caps-qsa-false` → FAIL 2/3; over-claim (remove the `.spv`) → FAIL 1/3 |
+
+**The rule is the SAME as the legacy member's; the arithmetic is not.**  The native body computes the sigmoid and
+the product in **f32** (`expf`); the legacy CUDA in **f64**.  The target has no shaderFloat64, so this port's legacy
+shader already computes in f32 — hence the native-vs-legacy pair is a **WASH** on all six devices measured
+(**1.001 Arc / 0.984 iGPU / 1.018 lvp / 1.019 XTX / 0.904 K620 / 1.120 lvp**).  There is no dispatch chain (the QSA
+gate is one dispatch either way), and that is stated rather than invented.  Full table in `bench/README.md`.
+
+**THE FLIP WAS CHECKED.**  `native_qsa_enabled()` gates exactly two symbols — `native_qsa_rms_norm_weighted`
+(`layer.cpp:879`, `mtp.cpp:488/491/514`, `verify.cpp:767`; ported batch 1) and `native_qsa_gate_apply`
+(`layer.cpp:1010`, `verify.cpp:775/883/887`; ported here) — and the verify sites are unreachable because the P6
+verifier cannot init (`layer_verify_compatible` still demands `native_bf16_projections` and `g_fused_gr` false, and
+`native_qsa_indexer_enabled()` false).  Nothing unported becomes reachable.
+
+**THE HOLE AND ITS FIX.**  The audit found `native_qsa_indexer_append` (`layer.cpp:944`, the MAIN forward path of
+all 12 QSA layers every token) reachable because the shipped `--native` sets `o.native_qsa_indexer = true`
+(`generate.cpp:1807`) and calls `native_qsa_indexer_set_enabled` (`:2294`) — while the Vulkan backend defined
+**NEITHER the getter nor the setter**, though the contract named the required answer (`false`).  The backend now
+defines both, answering **false** → the ported `indexer_key_append`.  The map row stays `todo`; the hole was
+reachability.
+
+**THE MAP MOVES BY ONE ROW:** `168 — 75 kernel, 61 host, 32 todo` → **`168 — 76 kernel, 61 host, 31 todo`**;
+`check_port_map.py` passes (`110 shaders built, 91 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.  **Gate, after the commit: vega Arc 436/0/0, lvp 424/0/3, radeon-iGPU 427/0/2 (exit 0)**, +4
+verdicts per arm.  **Box `z820b`: XTX 432/0/1 (the pre-existing M8 skip, so the script exits 1), K620 427/0/2,
+llvmpipe 424/0/3 — 0 failed on every arm.**  The retired injection `native-caps-qsa-true` is recorded in `NEXT.md`.
+
+**THE AUDIT IN ONE LINE:** of the 32 `todo` rows audited, 1 is now `kernel`, **11 are reachable-but-unported** (8
+speculative-drafter symbols reachable only under the shipped `--spec 4 --mtp`; `native_qsa_indexer_append`, now
+flag-closed; and `bf16_gemv`/`bf16_gemv_split` as a soft edge on the unnamed `native_bf16_projections` setting),
+and 20 are unreachable under the current capability answers — each with its deciding call site named.
+
+---
+
 ## THE PERFORMANCE TIER'S FUSED GDN PATHS — class B batch 4 — and `native_gdn_enabled()` FLIPS TO TRUE (2026-10-05)
 
 The three fused **GDN paths** — `fused_gdn_conv_l2`, `fused_gdn_ab`, `fused_gdn_step_norm` — the LAST symbols

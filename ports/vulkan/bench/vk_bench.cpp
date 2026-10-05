@@ -581,6 +581,40 @@ void bench_rms_norm_pair(Ctx& ctx, const std::string& dir, int reps, int warmups
     ctx.free(bx); ctx.free(bg); ctx.free(bo);
 }
 
+// THE QSA GATE PAIR: `native_qsa_gate_apply` against the legacy `qsa_gate_apply_f32` it replaces at the SAME
+// shape.  There is NO dispatch chain here - the layer's QSA gate is ONE dispatch either way
+// (`native_qsa_gate_apply` OR `qsa_gate_apply_f32`, layer.cpp:1010-1012), unlike the fused GDN paths - so this
+// is a drop-in pair and is EXPECTED to wash: both kernels are one thread per output element, no reduction, no
+// shared memory, and (because the target has no shaderFloat64) both compute the sigmoid and the product in f32.
+// The pair is printed so the wash is measured rather than assumed.
+void bench_qsa_gate_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int nh = 24, hd = 256;                 // the artifact: 24 query heads x head_dim 256
+    const size_t n = (size_t) nh * hd;
+    std::vector<float> attn = floats(n), qf = floats((size_t) nh * 2 * hd);
+    Buf ba = alloc(ctx, n * 4), bq = alloc(ctx, (size_t) nh * 2 * hd * 4), bo = alloc(ctx, n * 4);
+    ctx.write(ba, attn.data(), n * 4);
+    ctx.write(bq, qf.data(), qf.size() * 4);
+    struct { int32_t n_head; int32_t head_dim; } pc{nh, hd};
+    const uint32_t groups = (uint32_t) ((n + 255u) / 256u);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "n_head=%d head_dim=%d", nh, hd);
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/qsa_gate_apply_f32.spv", 3, 8);
+        tl = time_kernel(ctx, p, {&ba, &bq, &bo}, &pc, sizeof(pc), groups, 1, 64, reps, warmups);
+        report("qsa_gate_apply_f32 (legacy)", shape, tl, (double) n, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_qsa_gate_apply.spv", 3, 8);
+        tn = time_kernel(ctx, p, {&ba, &bq, &bo}, &pc, sizeof(pc), groups, 1, 64, reps, warmups);
+        report("native_qsa_gate_apply", shape, tn, (double) n, 0.0);
+    }
+    std::printf("XPAIR qsa_gate %s | legacy qsa_gate_apply_f32 | native native_qsa_gate_apply | native/legacy %.3f\n",
+                shape, tn.med / tl.med);
+    ctx.free(ba); ctx.free(bq); ctx.free(bo);
+}
+
 // =========================================================================================================
 // THE PERFORMANCE TIER, class B, batch 2: the native GDN / DeltaNet MIXER kernels, each against the legacy
 // kernel it replaces at the same shape on the same device.  Same XPAIR convention (native/legacy, < 1.0 faster).
@@ -1069,6 +1103,7 @@ int main(int argc, char** argv) {
     bench_router_pair(ctx, dir, reps, warmups);
     bench_moe_combine_pair(ctx, dir, reps, warmups);
     bench_rms_norm_pair(ctx, dir, reps, warmups);
+    bench_qsa_gate_pair(ctx, dir, reps, warmups);   // class B: native_qsa_gate_apply <- qsa_gate_apply_f32
     // batch 2: the native GDN / DeltaNet mixer kernels (conv+SiLU, l2_norm, beta_gate).
     bench_gdn_conv_silu_pair(ctx, dir, reps, warmups);
     bench_gdn_l2_norm_pair(ctx, dir, reps, warmups);

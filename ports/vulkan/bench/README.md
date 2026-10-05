@@ -97,6 +97,7 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `router_top10_f32` vs `native_router_top10` | n_tokens=16, n_expert=512, k=10 | elements/s |
 | `moe_combine_f32` vs `native_moe_combine` | n_embd=2560 k=10 shared=1 | elements/s |
 | `rms_norm` vs `native_qsa_rms_norm_weighted` | rows=128 cols=2560 | elements/s |
+| `qsa_gate_apply_f32` vs `native_qsa_gate_apply` | n_head=24 head_dim=256 | elements/s |
 | `gdn_conv_step` vs `native_gdn_conv_silu` | C=2560 d_conv=4 | elements/s (outputs) |
 | `gdn_conv_step`+`silu_f32` vs `native_gdn_conv_silu` | C=2560 d_conv=4 (the 2-dispatch legacy chain) | elements/s |
 | `gdn_l2_norm` vs `native_gdn_l2_norm` | rows=48 cols=128 | elements/s |
@@ -205,8 +206,8 @@ The same pairs on the **box `z820b`** — the RX 7900 XTX is the primary RADV ta
   kernels are one workgroup per row with the same stride loop; the native body's block-per-row reduction is
   not faster than the legacy warp-per-row one at 2560 columns, and on RADV the extra shared traffic costs a
   little.  **This is a finding, not a defect** - a native kernel need not be faster, and the capability
-  contract still requires the answer to be honest, so `native_qsa_enabled()` stays FALSE anyway (its flag also
-  gates the unported `native_qsa_gate_apply`).  See `STATUS.md`.
+  contract still requires the answer to be honest; the flag has since flipped TRUE (batch 5 ported its last gated
+  symbol, `native_qsa_gate_apply`, so every symbol the flag gates now has a shader).  See `STATUS.md`.
 * **The K620 (a Kepler Quadro) is where the native reductions HURT**: `native_qsa_rms_norm_weighted` is 1.795×
   the legacy there, because the native body's block-per-row tree does more shared-memory traffic than the
   legacy warp-per-row warp-shuffle on a device with no fast shared path.  Reported, not hidden.
@@ -216,6 +217,31 @@ the iGPU the kernel batch is above the ~5-15 µs floor; on llvmpipe the `native_
 floor for the native row (0.2036 ms for 16 tokens) and reads slightly slower than legacy there - a
 toolchain/execution-model artifact of a CPU driver, not a device result.  Both rows are printed so the reader
 sees it.
+
+### The class-B QSA GATE pair — `native_qsa_gate_apply` ← `qsa_gate_apply_f32` — measured 2026-10-05
+
+The last symbol `native_qsa_enabled()` gates (batch 5).  Same `XPAIR` convention (`native/legacy`, **< 1.0 means
+the native kernel is faster**); `reps=9`, shape `n_head=24 head_dim=256` (the artifact).  **There is NO
+two-dispatch chain to measure here** — the QSA layer's gate is ONE dispatch either way
+(`layer.cpp:1010-1012`) — so this is a drop-in pair and only the single pair is reported.
+
+| pair (native ← legacy) | Arc B70 med (ms) n / l | native/legacy | Ryzen iGPU | native/legacy | lvp (vega) | native/legacy |
+|---|---:|---:|---:|---:|---:|---:|
+| `native_qsa_gate_apply` ← `qsa_gate_apply_f32` | 0.0048 / 0.0048 | 1.001 | 0.0213 / 0.0217 | 0.984 | 0.0043 / 0.0042 | 1.018 |
+
+The same pair on the **box `z820b`**:
+
+| pair | XTX (RADV NAVI31) med (ms) n / l | native/legacy | K620 (nvidia) | native/legacy | lvp (box) | native/legacy |
+|---|---:|---:|---:|---:|---:|---:|
+| `native_qsa_gate_apply` ← `qsa_gate_apply_f32` | 0.1011 / 0.0992 | 1.019 | 0.0049 / 0.0054 | 0.904 | 0.0022 / 0.0020 | 1.120 |
+
+**A WASH on all six devices (0.904–1.120), and that is the expected result.**  Both kernels are one thread per
+output element with no reduction and no shared memory, and the RULES are identical — the native body computes
+`attn * sigmoid(second-half gate)` in f32 (`expf`), the legacy CUDA in f64; because the target has no
+`shaderFloat64`, this port's legacy shader **already** computes in f32, so the two device shaders agree to within
+the transcendental gap.  The XTX's 1.019 is a 2 µs difference on a 6.1k-element dispatch, at the fence-clock
+resolution; the K620's 0.904 is the same magnitude the other way.  **Recorded as measured, not tuned** — a native
+kernel is not required to be faster, and the point of this increment is the branch, not the throughput.
 
 ### The class-B NATIVE vs LEGACY pairs, batch 2 — the GDN / DeltaNet MIXER — measured 2026-10-05
 

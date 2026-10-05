@@ -12212,6 +12212,105 @@ void case_native_qsa_rms_norm_weighted(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// PERFORMANCE TIER, class B: `native_qsa_gate_apply`, the QSA attention-output gate's NATIVE member - the LAST
+// symbol `native_qsa_enabled()` gates, and so the one whose shader lets the flag flip.  Oracle: the engine's OWN
+// native body (`src/kernels/cuda/native_qsa.cu`'s `gate`, `:69-77`; wrapper `:120-126`), NOT the legacy member's
+// rule - `qsa_gate_apply_f32` is the RIVAL the bench pairs it against, not the oracle.
+//
+// Rule: `out = attn * sigmoid(q_full[h*2*head_dim + head_dim + d])` - the gate is the SECOND half of each head's
+// 2*head_dim block, and it is a SIGMOID.  The native body computes both in F32 (`expf`); the legacy CUDA computes
+// them in f64 and rounds once, so the two RULES are the same and the only difference is arithmetic - and since
+// the target has no shaderFloat64, this port's legacy shader already computes in f32, which is why the
+// native-vs-legacy pair is a WASH and is reported as one.  The margins here therefore pin the two plausible
+// WRONG rules, checked host-side to move the fixture: the FIRST-half reading (the split is not element-
+// interleaved - qsa_parity.cpp PROPERTY 10) and SiLU instead of sigmoid.
+//
+// HONEST LIMIT: the native body is f32 and so is this shader, so the oracle is that f32 rule transcribed in
+// double and the case MEASURES the transcendental gap rather than claiming bit-exactness.  A NaN-padded tail and
+// a surplus dispatched group make a missing element guard DETECTED.
+void case_native_qsa_gate_apply(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_qsa_gate_apply.spv")) return;
+    struct Shape { int n_head, head_dim; };
+    const Shape shapes[] = {{24, 256}, {4, 12}, {2, 8}};
+    for (const Shape& sh : shapes) {
+        const int nh = sh.n_head, hd = sh.head_dim;
+        const size_t n = (size_t) nh * hd;
+        const uint64_t padded = n + 8u;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> attn(n), qf((size_t) nh * 2 * hd), ref(n);
+        for (auto& x : attn) x = rndf(1.0f);
+        // The SECOND half carries the gate; the FIRST half is filled with a DIFFERENT distribution so the
+        // first-half rival cannot coincide.  Every third gate saturates (-> 0 or 1) and the rest stay in the
+        // responsive band, so the sigmoid's shape is exercised where it can move.
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                qf[(size_t) h * 2 * hd + d] = rndf(0.1f);            // FIRST half: sigmoid ~ 0.5
+                const int k = d % 3;
+                qf[(size_t) h * 2 * hd + hd + d] = (k == 0) ? -25.0f : (k == 1) ? 25.0f : rndf(4.0f);
+            }
+        auto gate_of = [&](int h, int d, bool second) {
+            const size_t gi = second ? (size_t) h * 2 * hd + hd + d : (size_t) h * 2 * hd + d;
+            return (double) qf[gi];
+        };
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                const double g = gate_of(h, d, true);
+                ref[(size_t) h * hd + d] = (float) ((double) attn[(size_t) h * hd + d] *
+                                                    (1.0 / (1.0 + std::exp(-g))));
+            }
+        std::vector<float> r_first(n), r_silu(n);
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                const size_t i = (size_t) h * hd + d;
+                const double gf = gate_of(h, d, false), gs = gate_of(h, d, true);
+                r_first[i] = (float) ((double) attn[i] * (1.0 / (1.0 + std::exp(-gf))));
+                r_silu[i] = (float) ((double) attn[i] * (gs / (1.0 + std::exp(-gs))));
+            }
+        const bool first_moves = rel_l1_f(r_first, ref) > 0.05;
+        const bool silu_moves = rel_l1_f(r_silu, ref) > 0.05;
+
+        Buf ba = ctx.alloc(n * 4), bq = ctx.alloc((size_t) nh * 2 * hd * 4), bo = ctx.alloc(padded * 4);
+        ctx.write(ba, attn.data(), n * 4);
+        ctx.write(bq, qf.data(), qf.size() * 4);
+        std::vector<float> out_init(padded, NaN);   // the OUTPUT sentinel: a stray element write is detected
+        ctx.write(bo, out_init.data(), padded * 4);
+        VkPipeline p = ctx.pipeline(dir + "/native_qsa_gate_apply.spv", 3, 8);
+        struct { int32_t n_head; int32_t head_dim; } pc{nh, hd};
+        ctx.dispatch(p, {&ba, &bq, &bo}, &pc, sizeof(pc), groups_for(n) + 1u);   // one surplus group
+        std::vector<float> got(padded);
+        ctx.read(bo, got.data(), padded * 4);
+
+        int bad = 0, guard_bad = 0;
+        double worst = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 1e-5, 1e-7)) ++bad;
+            worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) /
+                                    (std::fabs((double) ref[i]) + 1e-30));
+        }
+        for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got[i]) || got[i] == 0.0f)) ++guard_bad;
+
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "native_qsa_gate_apply n_head=%d head_dim=%d", nh, hd);
+        const bool ok = bad == 0 && guard_bad == 0 && first_moves && silu_moves;
+        verdict(tag, ok, bad + guard_bad + (first_moves ? 0 : 1) + (silu_moves ? 0 : 1),
+                (int) (n + (padded - n)), worst,
+                "f32 vs the NATIVE rule's double transcription (tol 1e-5) + element-guard NaN + fixture margins");
+        if (!ok) {
+            int printed = 0;
+            for (size_t i = 0; i < n && printed < 4; ++i)
+                if (!close_enough(got[i], ref[i], 1e-5, 1e-7)) {
+                    std::printf("      offender i=%zu want=%.9g got=%.9g\n", i, (double) ref[i], got[i]);
+                    ++printed;
+                }
+            if (!first_moves) std::printf("      FIXTURE: the FIRST-half reading does not move the output\n");
+            if (!silu_moves) std::printf("      FIXTURE: the SiLU reading does not move the output\n");
+        }
+        ctx.free(ba);
+        ctx.free(bq);
+        ctx.free(bo);
+    }
+}
+
 // THE CAPABILITY CONTRACT, CHECKED.  This increment makes the Vulkan backend answer the four native capability
 // checks itself (vulkan/src/kernels/native_caps_vk.cpp) so the engine can take the native branch.  A capability
 // must be TRUE only for a symbol this port implements, and FALSE when the check ALSO gates an unimplemented
@@ -12223,17 +12322,14 @@ void case_native_capabilities(Ctx&, const std::string& dir) {
         {"native_rope_apply", "native_rope_apply.spv", true},
         {"native_router_top10", "native_router_top10.spv", true},
         {"native_moe_combine", "native_moe_combine.spv", true},
-        // the flag ALSO gates native_qsa_gate_apply (layer.cpp:1010), which has no shader: answer false.
-        {"native_qsa_rms_norm_weighted", "native_qsa_rms_norm_weighted.spv", false},
     };
     const bool answers[] = {
         strata::kernels::native_rope_enabled(),
         strata::kernels::native_router_enabled(),
         strata::kernels::native_moe_combine_enabled(),
-        strata::kernels::native_qsa_enabled(),
     };
     int bad = 0;
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < 3; ++i) {
         const bool built = std::filesystem::exists(dir + "/" + entries[i].spv);
         if (!built) { ++bad; std::printf("      capability: %s has no built shader\n", entries[i].sym); }
         if (answers[i] != entries[i].expected) {
@@ -12242,11 +12338,54 @@ void case_native_capabilities(Ctx&, const std::string& dir) {
                         (int) entries[i].expected);
         }
     }
-    // exactly the ported, main-path set may answer true.
-    const bool set_ok = answers[0] && answers[1] && answers[2] && !answers[3];
+    // exactly the ported, main-path set may answer true.  (The QSA flag moved to its OWN invariant arm below,
+    // where it reads like the GDN arm: the flag equals "every symbol it gates has a built shader".)
+    const bool set_ok = answers[0] && answers[1] && answers[2];
     if (!set_ok) ++bad;
-    verdict("native capabilities (vulkan backend)", bad == 0, bad, 4, (double) bad,
-            "answers + built shaders: rope/router/moe true (ported), qsa false (its flag also gates an unported symbol)");
+    verdict("native capabilities (vulkan backend)", bad == 0, bad, 3, (double) bad,
+            "answers + built shaders: rope/router/moe true (ported); the qsa flag has its own arm below");
+
+    // THE QSA FLAG, IN THE SAME INVARIANT FORM AS THE GDN ARM.  `native_qsa_enabled()` gates TWO symbols:
+    //   * `native_qsa_rms_norm_weighted` (layer.cpp:879 normalize_rotate, mtp.cpp:488/491/514, verify.cpp:767)
+    //   * `native_qsa_gate_apply`        (layer.cpp:1010, verify.cpp:883/887)
+    // Both now have a shader (`native_qsa_gate_apply.comp` lands with this batch), so the invariant
+    // `flag == "every gated symbol has a built shader"` demands TRUE - and the backend answers true.
+    //
+    // THE FLIP WAS CHECKED, not assumed: EVERY call site behind this ONE flag was enumerated before it flipped
+    //   * layer.cpp:879 and mtp.cpp:488/491/514 -> native_qsa_rms_norm_weighted, ported + gated;
+    //   * layer.cpp:1010                        -> native_qsa_gate_apply, ported + gated here;
+    //   * verify.cpp:767                        -> native_qsa_rms_norm_weighted, ported + gated;
+    //   * verify.cpp:775/883/887                -> the batched verify gate, native_qsa_gate_apply, ported;
+    // and the P6 verifier that owns the verify.cpp sites CANNOT INIT under this contract: `layer_verify_compatible`
+    // (layer.cpp:476-491) demands `native_bf16_projections` (a setting, default false), `g_fused_gr` (default
+    // false, and the GR contract forces it false), `g_fast_attn`/`g_fast_select` (true), the fused native GDN
+    // (true since batch 4) AND `native_qsa_indexer_enabled()` (false - unported, and this backend answers it
+    // false in native_caps_vk.cpp).  So the verify/MTP sites are unreachable, and even if reached they dispatch
+    // only ported symbols.
+    struct QsaSym { const char* sym; const char* spv; bool ported; };
+    const QsaSym qsa_gated[] = {
+        {"native_qsa_rms_norm_weighted", "native_qsa_rms_norm_weighted.spv", true},   // batch 1
+        {"native_qsa_gate_apply",        "native_qsa_gate_apply.spv",        true},   // this batch (the LAST gated symbol)
+    };
+    const int n_qsa = (int) (sizeof(qsa_gated) / sizeof(qsa_gated[0]));
+    int qsa_bad = 0;
+    bool all_qsa_built = true;
+    for (int i = 0; i < n_qsa; ++i) {
+        const bool built = std::filesystem::exists(dir + "/" + qsa_gated[i].spv);
+        if (!built) all_qsa_built = false;
+        if (qsa_gated[i].ported && !built) {
+            ++qsa_bad;
+            std::printf("      capability: %s is ported but has no built shader\n", qsa_gated[i].sym);
+        }
+    }
+    const bool qsa_answer = strata::kernels::native_qsa_enabled();
+    if (qsa_answer != all_qsa_built) {
+        ++qsa_bad;
+        std::printf("      capability: native_qsa_enabled answered %d while %s gated shader(s) are built\n",
+                    (int) qsa_answer, all_qsa_built ? "ALL" : "NOT all");
+    }
+    verdict("native capabilities: qsa flag", qsa_bad == 0, qsa_bad, 3, (double) qsa_bad,
+            "flag == (every gated symbol built): both QSA gated shaders exist, so the flag is true");
 
     // THE GDN FLAG.  Stated as an INVARIANT rather than a hard-coded boolean: `native_gdn_enabled()` answers
     // TRUE exactly when EVERY symbol it gates has a built shader.
@@ -13387,6 +13526,11 @@ int main(int argc, char** argv) {
     case_fused_gdn_conv_l2(ctx, dir);            // fused_gdn_conv_l2   <- native_gdn_conv_silu + 2x l2_norm
     case_fused_gdn_ab(ctx, dir);                 // fused_gdn_ab        <- 2x bf16 mmvf + beta_gate + gate
     case_fused_gdn_step_norm(ctx, dir);          // fused_gdn_step_norm <- native_gdn_step + native_gdn_out_norm
+    // PERFORMANCE TIER, class B: THE QSA GATE'S NATIVE MEMBER - the LAST symbol `native_qsa_enabled()` gates,
+    // so its shader is what lets that flag flip.  Oracle: the engine's OWN native body (native_qsa.cu's `gate`).
+    // APPENDED last for the same shared-RNG reason; `case_native_capabilities` now requires BOTH the qsa and gdn
+    // flags to answer TRUE.
+    case_native_qsa_gate_apply(ctx, dir);        // native_qsa_gate_apply <- qsa_gate_apply_f32 (both f32 here)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

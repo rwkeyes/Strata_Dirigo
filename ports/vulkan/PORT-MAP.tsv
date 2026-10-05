@@ -112,7 +112,7 @@ native_moe_combine_multi	todo	no shader in this tree yet
 native_q5_k_f32	kernel	native_q5_k_f32
 native_q8_1_bytes	host	a size
 native_qsa_enabled	host	a capability check
-native_qsa_gate_apply	todo	no shader in this tree yet
+native_qsa_gate_apply	kernel	native_qsa_gate_apply
 native_qsa_indexer_append	todo	no shader in this tree yet
 native_qsa_indexer_enabled	host	a capability check
 native_qsa_rms_norm_weighted	kernel	native_qsa_rms_norm_weighted

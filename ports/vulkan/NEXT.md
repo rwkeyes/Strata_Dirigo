@@ -1,5 +1,112 @@
 # Start here next session
 
+## THE QSA GATE'S NATIVE MEMBER — class B batch 5 — **DONE 2026-10-05** — `native_qsa_enabled()` FLIPS TO TRUE,
+## plus the REACHABILITY AUDIT of every remaining `todo` row and ONE HOLE FIXED
+
+This increment ports **`native_qsa_gate_apply`** — the LAST symbol `native_qsa_enabled()` gates, and once it has a
+shader that ONE flag's invariant is satisfied, so **the backend now answers `native_qsa_enabled()` TRUE**.  It also
+carries the **REACHABILITY AUDIT** the task asked for: every remaining `todo` row of `plan/DECODE-PATH-TRIAGE.md`
+is decided against the port's CURRENT capability answers, with its call site and flag chain — and the audit found
+**one reachable-but-unported hole, which this batch FIXES**: `native_qsa_indexer_append` was reachable because its
+gating flag `native_qsa_indexer_enabled()` had **no Vulkan definition at all**.
+
+**THE SYMBOL, and the oracle it was transcribed from.**  `native_qsa_gate_apply` (`src/kernels/cuda/native_qsa.cu`
+`:69-77` body `gate`, wrapper `:120-126`) replaces the legacy `qsa_gate_apply_f32` on the QSA layer's gate
+(`layer.cpp:1010`, `if (native_qsa_enabled()) native_qsa_gate_apply(...) else qsa_gate_apply_f32(...)`).
+
+| symbol (shader) | replaces | the native body's rule (oracle) | case |
+|---|---|---|---|
+| `native_qsa_gate_apply` | `qsa_gate_apply_f32` | `native_qsa.cu`'s `gate`: one thread per output element; `raw = q_full[h*2*head_dim + head_dim + d]` (the **SECOND** half of each head's 2*head_dim block), `out = attn * (1/(1+expf(-raw)))`, all **f32** | 3 arms (`n_head/head_dim` = 24/256 the model, 4/12, 2/8); vs a double transcription of the NATIVE rule, tol 1e-5; margins: the FIRST-half read and SiLU must each MOVE the fixture (checked host-side) |
+
+**THE NATIVE vs THE LEGACY MEMBER: the RULES are the same, the ARITHMETIC is not.**  Both compute
+`attn * sigmoid(second-half gate)`; the native CUDA forms the sigmoid with `expf` and the product in **f32**, the
+legacy CUDA forms both in **f64** and rounds once.  The target has no `shaderFloat64`, so this port's legacy
+shader **already** computes in f32 — so the two DEVICE shaders agree to within the transcendental gap and the
+native-vs-legacy pair is a **WASH**.  That is reported, not tuned away: the case's margins therefore pin the two
+plausible WRONG rules (FIRST half, SiLU), which are the ones this kernel can get wrong.
+
+**THE MEASUREMENT — `native_qsa_gate_apply` ← `qsa_gate_apply_f32`, same shape, same device (`XPAIR` lines;
+ratio is native/legacy, so < 1.0 means the native kernel is faster; `reps=9`).**  There is **NO dispatch chain**
+here — the layer's QSA gate is ONE dispatch either way, unlike the fused GDN paths — so this is a drop-in pair:
+
+| pair (native ← legacy) | Arc B70 | Ryzen iGPU | lvp (vega) | XTX (box) | K620 (box) | lvp (box) |
+|---|---:|---:|---:|---:|---:|---:|
+| `native_qsa_gate_apply` ← `qsa_gate_apply_f32` | 1.001 | 0.984 | 1.018 | 1.019 | 0.904 | 1.120 |
+| med ms native / legacy | 0.0048 / 0.0048 | 0.0213 / 0.0217 | 0.0043 / 0.0042 | 0.1011 / 0.0992 | 0.0049 / 0.0054 | 0.0022 / 0.0020 |
+
+**A WASH on all six devices (0.904–1.120)**, exactly as a same-shape, same-arithmetic drop-in should be: both
+kernels are one thread per output element with no reduction and no shared memory.  Recorded as measured.  (The
+XTX's 1.019 is a 2 µs difference on a 6.1k-element dispatch, at the fence-clock resolution.)  There is no
+chain pair to report, and that is stated rather than invented.
+
+**THE FLIP — batch 4's analysis, done BEFORE the flip.**  `native_qsa_enabled()` gates exactly TWO symbols, and
+EVERY call site behind it was enumerated:
+
+* `native_qsa_rms_norm_weighted` — `layer.cpp:879` (`normalize_rotate`), `mtp.cpp:488/491/514`, `verify.cpp:767`;
+  ported in batch 1 and gated (`case_native_qsa_rms_norm_weighted`).
+* `native_qsa_gate_apply` — `layer.cpp:1010`, and the verify path `verify.cpp:775` (`qb`), `:883`, `:887`;
+  **ported here.**
+
+**Nothing unported becomes reachable, and the reason is checked rather than assumed.**  The verify.cpp sites are
+owned by the **P6 verifier**, which cannot init under this contract: `layer_verify_compatible()` (`layer.cpp:476-491`)
+requires `native_bf16_projections` (a setting, default **false**), `g_fused_gr` (**false**, forced by the GR
+contract), `g_fast_attn`/`g_fast_select` (true), the fused native GDN (**true since batch 4**) AND
+`native_qsa_indexer_enabled()` (**false** — unported).  Three terms remain false, so the verifier is unreachable;
+and even if it were reached, both QSA symbols it dispatches are ported.  **So the flip routes the engine only at
+symbols that have a shader.**  (The flip also changes the verify path's `qb` branch, `verify.cpp:775/883`, from the
+legacy gate to the native gate — both ported.)
+
+**THE HOLE THE AUDIT FOUND, AND THE FIX.**  `native_qsa_indexer_append` (`layer.cpp:944`) is on the MAIN forward
+path of all 12 QSA layers, every token; the shipped launch sets `o.native_qsa_indexer = true`
+(`generate.cpp:1807` → `:2294`), and the port's contract has always *stated* the required answer
+(`native_qsa_indexer_enabled() == false`) — **but the backend never defined the getter or the setter.**  The
+contract was a claim without a body, and the shipped option would have selected the unported symbol (or failed to
+link).  **Fix:** `vulkan/src/kernels/native_caps_vk.cpp` now defines both, answering **false**, which selects the
+ported legacy `indexer_key_append`.  The map row stays `todo` (the native append is still unported) — the hole was
+reachability, not the port.  Full audit in `plan/DECODE-PATH-TRIAGE.md`.
+
+**THE CAPS CASE ENFORCES THE TRUTH, and the invariant is now falsified BOTH WAYS.**  `case_native_capabilities`
+gained a **qsa arm** in the same form as the gdn arm: `native_qsa_rms_norm_weighted` and `native_qsa_gate_apply`
+are marked `ported=true`, every ported symbol's `.spv` is required to exist, and `native_qsa_enabled()` must EQUAL
+"every gated symbol has a built shader" — now **TRUE** (3/3).  Falsified:
+* **under-claim**: `inject-verify.sh native-caps-qsa-false` (answer FALSE while both shaders exist) →
+  `FAIL native capabilities: qsa flag 2/3`.
+* **over-claim**: answer TRUE while a gated shader is ABSENT — reproduced by removing the gate's `.spv` and
+  running the gate binary → `capability: native_qsa_gate_apply is ported but has no built shader` and
+  `FAIL native capabilities: qsa flag 1/3`.
+* **RETIRED**: `native-caps-qsa-true` (answer true while the gate shader was unported) — answering true is now
+  the TRUTH, so it no longer falsifies anything; it prints `RETIRED` and exits 2 (the batch-4 `native-caps-gdn-true`
+  precedent).  The retirement is recorded here as batch 4 recorded its own.
+
+**THE MAP DROPS BY ONE.**  `PORT-MAP.tsv` moved `168 — 75 kernel, 61 host, 32 todo` → **`168 — 76 kernel, 61 host,
+31 todo`** (`native_qsa_gate_apply` todo→kernel); `check_port_map.py` passes (`110 shaders built, 91 claimed`) and
+`make_port_map.py` regenerates the file **byte-identically** (`diff -q`).
+
+**GATE, after the change.  vega:** intel_icd (Arc B70) **436 / 0 / 0** (`run_gate.sh` exit **0**), llvmpipe
+**424 / 0 / 3**, radeon_icd (Ryzen iGPU) **427 / 0 / 2** — **+4 verdicts** on every arm (3 gate arms + the new qsa
+flag arm; the old combined caps verdict went 4→3 and the new qsa arm added one), 0 failed.  **Box (`z820b`):**
+radeon_icd (RX 7900 XTX) **432 / 0 / 1** (the 1 is the pre-existing M8 `prefill split` skip, so `run_gate.sh` exits
+**1** there), llvmpipe **424 / 0 / 3**, nvidia_icd (Quadro K620) **427 / 0 / 2** — **0 failed on every arm**.  The
+Arc's new-case verdicts: `native_qsa_gate_apply` **6152/6152 w 7.89e-07**, 56/56 w 7.54e-07, 24/24 w 7.08e-07; the
+box's: w 7.15e-07 / 7.1e-07 / 6.86e-07.  The shader's build line: `OK native_qsa_gate_apply OpExecutionMode %main
+LocalSize 256 1 1 | census: none` (no subgroup op, barrier or atomic, as the CUDA).  The intermittent
+`budget: independent requery agrees` flake did not fire on either box this run.
+Every falsification was run and BIT: `native-qsa-gate-first-half` → `FAIL native_qsa_gate_apply n_head=24 head_dim=256
+8/6152 w 4.13e+10`; `native-caps-qsa-false` → `FAIL native capabilities: qsa flag 2/3`; the over-claim direction
+above → `FAIL 1/3`; and the batch-1 `native-qsa-rms-norm-eps-on-sum` re-run → `FAIL
+native_qsa_rms_norm_weighted r=8 c=2560 in-place 5128/25608 w 0.98` (a regression check that the rebuilt gate still
+bites).
+
+**THE AUDIT'S DECISION LIST (the task's second deliverable).**  All 32 rows are decided in
+`plan/DECODE-PATH-TRIAGE.md` → "THE REACHABILITY AUDIT".  Briefly: **1 is now `kernel`**; **11 are
+reachable-but-unported** — the 8 speculative-drafter symbols (`add_streams_broadcast`, `fused_gr_read_multi`,
+`window_ids`, `qsa_decode_attn_batch`, `moe_group_resident`, `row_top_prob`, `map_ids`, `mtp_select`), reachable
+ONLY because the shipped `setup.py` writes `--spec 4 --mtp`; `native_qsa_indexer_append` (the hole, now
+flag-closed); and the 2 BF16-projection rows (`bf16_gemv`, `bf16_gemv_split`), reachable only if
+`native_bf16_projections` is false — a **soft edge** the port's contract table does not name; and **20 are
+unreachable under the current answers**, each with its deciding condition.  **The queue's next item is the
+drafter**: if the product ships `--spec 4`, those eight are forward-path dispatches.
+
 ## THE PERFORMANCE TIER'S FUSED GDN PATHS — class B batch 4 — **DONE 2026-10-05** — and `native_gdn_enabled()` FLIPS TO TRUE
 
 This increment ports the **three fused GDN paths** — `fused_gdn_conv_l2`, `fused_gdn_ab`, `fused_gdn_step_norm`

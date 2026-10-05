@@ -1,0 +1,51 @@
+#version 450
+// ports/vulkan/shaders/native_qsa_gate_apply.comp - the class-B QSA attention-output GATE, the native fast
+// path the QSA layer takes when `native_qsa_enabled()` answers true.  Transcribed from the engine's OWN native
+// body: src/kernels/cuda/native_qsa.cu's `gate` kernel (`:69-77`), wrapper `native_qsa_gate_apply` (`:120-126`);
+// contract include/strata/kernels/native_qsa.hpp (`attn/output [head_dim,n_head]`, `q_full [2*head_dim,n_head]`,
+// each row `[query channels, gate channels]`, output `attn*sigmoid(second-half gate)`).  Call site
+// src/core/layer.cpp:1010 (`if (native_qsa_enabled()) native_qsa_gate_apply(...) else qsa_gate_apply_f32(...)`).
+//
+// THE RULE, elementwise over the (n_head, head_dim) attention output:
+//
+//     i   = element id, row-major over (n_head, head_dim)
+//     h   = i / head_dim,  d = i % head_dim
+//     raw = q_full[ h * 2*head_dim + head_dim + d ]   // the SECOND half of each head's 2*head_dim block
+//     out[i] = attn[i] * (1 / (1 + exp(-raw)))        // SIGMOID, all in f32
+//
+// THE NATIVE BODY vs THE LEGACY MEMBER (`qsa_gate_apply_f32`, src/kernels/cuda/qsa.cu:793-810).  Same layout,
+// same sigmoid; the ONLY difference is ARITHMETIC: the native body forms the sigmoid with `expf` and the
+// product in F32, while the legacy CUDA forms both in f64 (`(float)((double)attn * (1.0/(1.0+exp(-g))))`) and
+// rounds once at the end.  The target has no shaderFloat64, so this port's legacy shader ALREADY computes in
+// f32 - so the two DEVICE shaders agree to within the transcendental gap, and the native-vs-legacy bench is a
+// WASH reported as one (bench/README.md).  The native body is the RULE here, not the approximation: this
+// shader reproduces it exactly, and the case's oracle is that rule.
+//
+// WHAT THE CASE PINS (the plausible WRONG rules, not the f32/f64 difference, which is below f32 tolerance):
+//   * the gate is the SECOND half of each head's 2*head_dim block - `q = per_head[:, :head_dim]`,
+//     `gate = per_head[:, head_dim:]`, so the split is NOT element-interleaved (qsa_parity.cpp PROPERTY 10).
+//     Reading the FIRST half is the plausible wrong layout and yields a well-formed, different vector.
+//   * the function is a SIGMOID, not SiLU (this artifact's QSA gate; qwen3.5 uses SiLU).
+// Both are checked host-side to move the fixture before the device is judged.
+//
+// ONE THREAD PER OUTPUT ELEMENT, exactly as the CUDA (256 threads per block, grid `(count + 255) / 256`): no
+// barrier, no subgroup op, no atomic - so the gate's SPIR-V op census is empty, as the source's is.  The row
+// guard makes an over-dispatched group harmless rather than destructive.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer A { float v[]; } attn;   // (n_head, head_dim)
+layout(set = 0, binding = 1, std430) readonly buffer QF { float v[]; } qfull; // (n_head, 2*head_dim)
+layout(set = 0, binding = 2, std430) buffer OUT { float v[]; } outb;          // (n_head, head_dim)
+
+layout(push_constant, std430) uniform PC { int n_head; int head_dim; } pc;
+
+void main() {
+    const uint hd = uint(pc.head_dim);
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n_head) * hd) return;
+    const uint h = i / hd;
+    const uint d = i % hd;
+    const float raw = qfull.v[h * 2u * hd + hd + d];   // the SECOND half: [query, gate] per head
+    const float sig = 1.0f / (1.0f + exp(-raw));       // the native body's f32 sigmoid (`expf`)
+    outb.v[i] = attn.v[i] * sig;                       // the native body's f32 product (no fp16 round)
+}

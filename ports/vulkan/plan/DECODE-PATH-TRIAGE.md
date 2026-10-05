@@ -1,12 +1,15 @@
 # Decode-path triage — the 52 `todo` rows, from the engine's own sources
 #
-# CURRENT 2026-10-05 (after the class-B batch 4, the FUSED GDN PATHS): the map reads **168 = 75 kernel + 61 host + 32 todo**
-# (the class-A set is CLOSED and the performance tier's class-B native fast paths are ALL ported: the four of batch
-# 1, ALL SIX native GDN / DeltaNet mixer kernels (batches 2 and 3), and the THREE fused GDN paths - `fused_gdn_conv_l2`,
-# `fused_gdn_ab`, `fused_gdn_step_norm` - as batch 4.  The three `fused_gdn_*` rows that stood for the class-B batch-4
-# gap are now `kernel`, and with them `native_gdn_enabled()` flips to TRUE.)  M-A is RE-DEFINED over the class-A set at
-# the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted immediately below are the state at
-# `7c317c4`, kept as the record the triage was written against.
+# CURRENT 2026-10-05 (after class-B batch 5, `native_qsa_gate_apply` + the REACHABILITY AUDIT): the map reads
+# **168 = 76 kernel + 61 host + 31 todo** (the LAST symbol `native_qsa_enabled()` gates is now `kernel`, so that flag
+# answers TRUE; the class-A set is CLOSED and the performance tier's class-B native fast paths are ALL ported: the
+# four of batch 1, ALL SIX native GDN / DeltaNet mixer kernels (batches 2 and 3), the THREE fused GDN paths (batch 4)
+# and the QSA gate (batch 5).)  The **REACHABILITY AUDIT** at the end of this file converts the remaining 31 `todo`
+# rows into a decision list under the port's CURRENT capability answers; it found and this batch FIXED one hole
+# (`native_qsa_indexer_append` was reachable because its gating flag `native_qsa_indexer_enabled()` had no Vulkan
+# definition at all).  M-A is RE-DEFINED over the class-A set at the end of this file ("THE RE-DEFINED MILESTONE
+# M-A").  The numbers quoted immediately below are the state at `7c317c4`, kept as the record the triage was written
+# against.
 
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads
@@ -409,6 +412,11 @@ the verifier/MTP/tooling helpers — so a `todo` column of zero would require po
 > | `native_moe_combine_enabled() == false` | the ported weighted combine (class B) |
 > | `gr_set_native_mmvf(false)` **and** `layer_set_fused_gr(false)` | the legacy unfused read (`gr_read`) and write (`gr_write`) |
 >
+> **SUPERSEDED IN PART (batch 5, 2026-10-05):** the GDN and QSA rows above are no longer the current answers —
+> `native_gdn_enabled()` (batch 4) and `native_qsa_enabled()` (batch 5) now answer **TRUE**, and
+> `native_qsa_indexer_enabled()` is now actually defined (`false`).  The CURRENT answers, and the reachability of
+> every remaining `todo` row under them, are in "THE REACHABILITY AUDIT" at the end of this file.
+>
 > **Deliberately out of scope, with the reason:**
 > * **class B (4)** — capability-gated with a PORTED fallback the backend selects by answering the check false.
 > * **class C (8)** — a configuration the launch does not select, whose selected branch IS ported: `bf16_gemv`,
@@ -451,4 +459,115 @@ Counts after the closure batch: **`168 = 62 kernel + 61 host + 45 todo`**, and t
 
 `gr_read` is the tenth because the pair's unfused member is what the GR contract selects; `fused_gr_read` leaves
 the path and is `todo` with that reason.
+
+---
+
+# THE REACHABILITY AUDIT — every `todo` row, against the port's CURRENT capability answers (2026-10-05)
+
+This is a **report**, not code. Its purpose is to convert the map's `todo` count from a number into a DECISION
+LIST: for each remaining row, IS IT REACHABLE on the shipped model's decode path **under the capability answers
+the backend actually gives today**, and if so, through which call site and which flag chain.
+
+**The answers audited against** (the state after batch 4's `native_gdn_enabled() == true` flip and this batch's
+QSA work):
+
+| the backend answers | value | selects |
+|---|---|---|
+| `native_gdn_enabled()` | **true** (batch 4) | the native GDN kernels + the three `fused_gdn_*` paths |
+| `native_qsa_enabled()` | **true** (this batch) | `native_qsa_rms_norm_weighted` + `native_qsa_gate_apply` |
+| `native_qsa_indexer_enabled()` | **false** (this batch; before it, UNANSWERED — see the hole below) | the legacy `indexer_key_append` |
+| `native_rope_enabled()` / `native_router_enabled()` / `native_moe_combine_enabled()` | true | their native member |
+| `gr_set_native_mmvf(false)` + `layer_set_fused_gr(false)` | forced | `gr_read` + the legacy `gr_write`; removes `fused_gr_read` |
+
+Host SETTINGS that gate paths but are not capability answers, with their defaults and whether the shipped launch
+(`setup.py:4224-4227` writes `--pack … --native <shard> --spec 4 --spec-min-p 0.5 --mtp <rt>`) changes them:
+`g_fused_gdn` **true** (layer.cpp:42, default); `g_fast_attn`/`g_fast_select`/`g_shared_early`/`g_publish_kernel`
+**true** (layer.cpp:42); `g_fused_gr` **false**, and the GR contract forces it false; `native_bf16_projections`
+**false** by default, set true by `--native` (`generate.cpp:1805-1807` → `:2286`); `native_flash_attn_short`
+false (not set by `--native`).
+
+**The one hole found and FIXED in this batch: `native_qsa_indexer_append`.**
+
+> `src/core/layer.cpp:944` selects it with `if (native_qsa_indexer_enabled()) native_qsa_indexer_append(...)`,
+> `else indexer_key_append(...)`; the indexer runs on the MAIN forward path of **all 12 QSA layers, every token**
+> (the append at `:917-948` precedes the selection at `:964-1005`).  The shipped `--native` launch sets
+> `o.native_qsa_indexer = true` (`generate.cpp:1807`) and calls `native_qsa_indexer_set_enabled(true)`
+> (`:2294`) — and `native_qsa_indexer_append` has **no shader** in this tree.  The port's contract has ALWAYS
+> named the required answer (`native_qsa_indexer_enabled() == false`, `HANDOFF.md`, `NEXT.md`, the milestone
+> table), but **no Vulkan definition of the getter or the setter existed** — so the contract was a claim without
+> a body, and the shipped option would have selected the unported symbol (or failed to link).  This is the same
+> defect class as batch 4's flag flip: **a capability answer is a ROUTING decision.**
+>
+> **The fix** (this batch): `native_caps_vk.cpp` now DEFINES `native_qsa_indexer_set_enabled` (a no-op) and
+> `native_qsa_indexer_enabled() == false`, which selects the ported legacy `indexer_key_append`.  The row stays
+> `todo` (the native append is still unported) but it is now **unreachable** under the contract — the same shape
+> as the GDN/QSA pairs.
+
+**THE AUDIT TABLE.**  "Reachable?" is evaluated under the answers above.  A reachable-but-unported row is a HOLE
+(DONE = closed this batch; QUEUE = the ordered remaining work); "no" rows state the deciding condition so the
+answer can be re-checked when a default changes.
+
+| # | symbol | class (map) | reachable now? | call site + flag chain that decides it |
+|---|---|---|---|---|
+| 1 | `native_qsa_gate_apply` | todo → **kernel** | — **DONE this batch** | `layer.cpp:1010` `if (native_qsa_enabled())`; shader landed, flag flipped |
+| 2 | `native_qsa_indexer_append` | todo | **was a HOLE → DONE this batch** | `layer.cpp:944` `if (native_qsa_indexer_enabled())`; the flag is now ANSWERED false (was unimplemented), selecting the ported `indexer_key_append` (`:948`) |
+| 3 | `bf16_gemv` | todo (C) | **no** (soft edge) | `layer.cpp:99` in `project_bf16`: `native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)`. The shipped `--native` sets `native_bf16_projections = true` → the PORTED `bf16_gemv_fp32_mmvf`. **Soft edge: the port's contract table does not name this setting**; if the port ever runs without `--native`, `bf16_gemv_split` (the layers' `split=true` calls) becomes reachable and unported. Pin it. |
+| 4 | `bf16_gemv_split` | todo (C) | **no** (soft edge) | same chain; `split=true` is the `gdn_layer` alpha/beta call (`layer.cpp:290-291`) |
+| 5 | `s_gemv_q8_0_split` | todo (C) | **no** | `layer.cpp:172` in `gemv_quantized`, reached only when `w.native_data == nullptr`; the shipped dense weights ARE native (`:142` → `native_mmvq`) |
+| 6 | `s_gemv_q8k_split` | todo (C) | **no** | `layer.cpp:172` (same) and `layer.cpp:1017` (`!w_attno->native_data`); shipped `attn_output` is native |
+| 7 | `qsa_index_step` | todo (C) | **no** | `layer.cpp:973` `else` of `if (g_fast_select)`; `g_fast_select` defaults true → the ported `qsa_block_scores`/`qsa_block_topk` |
+| 8 | `topk_512_step` | todo (C) | **no** | same `g_fast_select` decision (`layer.cpp:973`) |
+| 9 | `qsa_attend_step` | todo (C) | **no** | `layer.cpp:1002` `else` of `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)`; defaults true/false/null → the ported `qsa_decode_attn_step` |
+| 10 | `fused_gr_read` | todo (C) | **no** | `layer.cpp:1253`/`:1276` `fused = g_fused_gr && fused_gr_supported(...)`; the GR contract forces `layer_set_fused_gr(false)` |
+| 11 | `add_streams_broadcast` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:497` in `MtpDrafter::record_forward`, unconditional; the drafter runs when `o.spec > 0` (`generate.cpp:7796`) and the shipped launch sets `--spec 4 --mtp` |
+| 12 | `fused_gr_read_multi` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:510`/`:571`/`:620`, unconditional; also `verify.cpp:693`/`:1142` (verifier only) |
+| 13 | `qsa_decode_attn_batch` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:552`, unconditional; also `verify.cpp:864`/`:878` |
+| 14 | `moe_group_resident` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:579`, unconditional |
+| 15 | `row_top_prob` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:643`, in the drafter's sampling tail (`coupled_rec_` false branch) |
+| 16 | `map_ids` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:644` `if (sub)` (a draft-vocabulary subset file exists — the shipped `--mtp` writes one) |
+| 17 | `mtp_select` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:710`/`:719`/`:738` in `MtpDrafter::draft` |
+| 18 | `window_ids` | todo (D) | **YES — under `--spec 4 --mtp`** | `mtp.cpp:551` `if (window_ > 0)` |
+| 19 | `broadcast_streams` | todo (D) | **no** | `verify.cpp:592`/`:606`; the P6 verifier cannot init (below) |
+| 20 | `fetch_blobs` | todo (D) | **no** | `verify.cpp:1053` |
+| 21 | `gdn_ab_multi` | todo (D) | **no** | `verify.cpp:732` |
+| 22 | `gdn_conv_commit` | todo (D) | **no** | `verify.cpp:1293`/`:1844` |
+| 23 | `gdn_conv_l2_multi` | todo (D) | **no** | `verify.cpp:726`/`:730` |
+| 24 | `gdn_step_norm_multi` | todo (D) | **no** | `verify.cpp:743`/`:748`/`:1294`/`:1845` |
+| 25 | `gpu_stamp` | todo (D) | **no** | `verify.cpp:564`/`:565` (guarded by `prof_on_`/`trace_m_`, both off) |
+| 26 | `native_moe_combine_multi` | todo (D) | **no** | `verify.cpp:1083` |
+| 27 | `native_router_top10_multi` | todo (D) | **no** | `verify.cpp:920` |
+| 28 | `ple_block_projected` | todo (D) | **no** | `verify.cpp:668` |
+| 29 | `rebase_ptrs` | todo (D) | **no** | `verify.cpp:1054` |
+| 30 | `resident_plan` | todo (D) | **no** | `verify.cpp:938`/`:943` |
+| 31 | `wait_flag_ge` | todo (D) | **no** | `verify.cpp:638`/`:1042`/`:1049`/`:1066` |
+| 32 | `wait_flag_ge_or` | todo (D) | **no** | `verify.cpp:1039`/`:1048`/`:1062` |
+
+**THE VERIFIER IS UNREACHABLE, and this is WHY (it is one conjunction, checked, not assumed).**
+`Verifier::init` refuses unless `layer_verify_compatible()` holds (`layer.cpp:476-491`), which requires
+`native_bf16_projections` (a setting, default **false**; the shipped `--native` sets it true but the verifier is
+NOT the forward path), `g_fused_gr` (**false**, and the GR contract forces it false), `g_fused_gdn &&
+native_gdn_enabled()` (**true now**), `g_fast_attn && !native_flash_attn_short` (true), `g_fast_select` (true),
+AND `native_qsa_indexer_enabled()` (**false** — the indexer is unported).  So rows 19-32 are off every path the
+port runs.  **The batch-4 flip did not change this**: it satisfied one term of that conjunction, and three other
+terms keep it false.
+
+**THE REACHABLE-BUT-UNPORTED QUEUE, in the order the work should land.**  The forward-path hole (row 2) is
+closed.  What remains is ELEVEN rows, in two groups:
+
+1. **The speculative drafter's eight (`mtp.cpp`)** — reachable ONLY because the shipped `setup.py` writes
+   `--spec 4 --mtp`; a `--spec 0` run is the whole model and nothing less.  This is the milestone's
+   "judgement, not a measurement" made concrete: under the shipped launch these ARE forward-path dispatches of
+   unported symbols.  Ordered by the drafter's own sequence: `add_streams_broadcast` (497) →
+   `fused_gr_read_multi` (510) → `window_ids`/`qsa_decode_attn_batch` (551/552) → `moe_group_resident` (579) →
+   `fused_gr_read_multi` again (620) → `row_top_prob`/`map_ids` (643/644) → `mtp_select` (710/719/738).
+   `fused_gr_read_multi` is the one the port has a sibling for (`gr_read` + `gr_write` are ported); the rest are
+   new kernels.  **They are class D only under a `--spec 0` product.**
+2. **The two BF16-projection rows (`bf16_gemv`, `bf16_gemv_split`)** — NOT reachable under the shipped launch,
+   but reachable the moment `native_bf16_projections` is false, and **the port's contract table does not name
+   that setting**.  Either port them or pin `layer_set_native_bf16(true)` in the contract; until then this is a
+   documented SOFT EDGE, not a closed hole.
+
+**Counts, stated, not rounded:** of the 32 rows audited, **1 is now `kernel`** (`native_qsa_gate_apply`), **11
+are reachable-but-unported** (8 drafter + `native_qsa_indexer_append` (now flag-closed) + 2 BF16 soft edges),
+and **20 are unreachable under the current answers**, each with the deciding condition named above.
 

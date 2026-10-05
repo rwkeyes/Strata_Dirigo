@@ -117,6 +117,11 @@ the QSA gate and indexer (12 layers), and `gr_write`.
   **MET: YES** (class-A remaining 0; the 45 `todo` rows are `11 capability-off + 4 B + 8 C + 22 D`), with two
   stated soft edges (the shipped `--spec 4` MTP symbols - a judgement - and the `gr_read`/`fused_gr_read` branch
   choice).  Full statement: `plan/DECODE-PATH-TRIAGE.md`.
+  **UPDATE 2026-10-05 (batch 5): the CONTRACT MOVED.**  `native_gdn_enabled()` (batch 4) and `native_qsa_enabled()`
+  (batch 5) now answer **TRUE** - every symbol each flag gates has a shader, so the invariant requires it - and the
+  QSA-indexer flag is now actually ANSWERED (`false`) instead of only stated.  The current answers, and the
+  reachability of every remaining `todo` row under them, are in `plan/DECODE-PATH-TRIAGE.md`'s
+  "THE REACHABILITY AUDIT"; that section supersedes the `*_enabled() == false` list above.
 * **M-B** - **ONE LAYER, end to end, on the GPU with random weights.**  The first thing that proves the BACKEND
   rather than the kernels, and it needs no model at all.  Make it a gate case: a Vulkan-backed single-layer forward
   pass.

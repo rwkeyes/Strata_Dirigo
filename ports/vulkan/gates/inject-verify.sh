@@ -67,8 +67,13 @@
 #                                       -> must FAIL  "native_moe_combine"
 #   inject-verify.sh native-qsa-rms-norm-eps-on-sum    native_qsa_rms_norm_weighted.comp  eps on SUM
 #                                       -> must FAIL  "native_qsa_rms_norm_weighted"
-#   inject-verify.sh native-caps-qsa-true  vulkan/src/kernels/native_caps_vk.cpp  answer qsa true
-#                                       -> must FAIL  "native capabilities"
+#   inject-verify.sh native-qsa-gate-first-half    native_qsa_gate_apply.comp  take the gate from the FIRST half
+#                                       of the 2*head_dim block -> must FAIL  "native_qsa_gate_apply"
+#   inject-verify.sh native-caps-qsa-false  vulkan/src/kernels/native_caps_vk.cpp  answer the QSA flag FALSE
+#                                       while every gated shader exists (this batch ported the LAST gated symbol,
+#                                       `native_qsa_gate_apply`, so the flag now answers TRUE; the pre-batch
+#                                       injection that answered it true was the truth then and is retired)
+#                                       -> must FAIL  "native capabilities: qsa flag"
 #
 #   (performance tier, class B, batch 2 - the native GDN / DeltaNet mixer)
 #   inject-verify.sh native-caps-gdn-false  vulkan/src/kernels/native_caps_vk.cpp  answer the GDN flag FALSE
@@ -378,14 +383,27 @@ case "$name" in
     new=$'    if (pc.has_shared == 0) sum += sh.v[col];        // INJECTION: the shared add inverted'
     want="FAIL  native_moe_combine" ;;
   native-caps-qsa-true)
-    # THE CAPABILITY CONTRACT'S own falsification: the Vulkan backend answers `native_qsa_enabled()` false
-    # because the flag ALSO gates the unported `native_qsa_gate_apply` (layer.cpp:1010).  Answering true would
-    # make the engine dispatch an unimplemented symbol, and the case's expected-answers arm must catch it.
+    # RETIRED in this batch: this answered `native_qsa_enabled()` TRUE while `native_qsa_gate_apply` had no
+    # shader.  Batch 5 ports that symbol, so TRUE is now the TRUTH and the injection no longer falsifies
+    # anything; the mirror lie (answering FALSE while every gated shader exists) is `native-caps-qsa-false`.
+    echo "RETIRED: native-caps-qsa-true - answering true is now the truth (see native-caps-qsa-false)" ; exit 2 ;;
+  native-caps-qsa-false)
+    # THE QSA FLAG'S own falsification, in the same form as batch 4's `native-caps-gdn-false`: this batch ported
+    # the LAST symbol the flag gates (`native_qsa_gate_apply`), so both gated shaders exist and the flag must
+    # answer TRUE.  The lie the invariant must catch is the flag answering FALSE while every gated shader exists.
     # This is the ENGINE-side backend, so the script rebuilds the gate (the capability TU is linked into it).
     file="$TREE/vulkan/src/kernels/native_caps_vk.cpp"
-    old=$'bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported'
-    new=$'bool native_qsa_enabled() { return true; }        // INJECTION: a capability answered true for a symbol that is NOT implemented'
-    want="FAIL  native capabilities" ;;
+    old=$'bool native_qsa_enabled() { return true; }         // native_qsa_rms_norm_weighted + native_qsa_gate_apply, both built'
+    new=$'bool native_qsa_enabled() { return false; }        // INJECTION: the QSA flag answered false while both gated shaders exist'
+    want="FAIL  native capabilities: qsa flag" ;;
+  native-qsa-gate-first-half)
+    # The gate is the SECOND half of each head's 2*head_dim block (qsa_parity.cpp PROPERTY 10 / its
+    # `gate_second_half` rival).  Reading the FIRST half is the plausible wrong layout - and the fixture's first
+    # half is built so its sigmoid differs from the second's, which the case checks host-side before judging.
+    file="$SH/native_qsa_gate_apply.comp"; spv="native_qsa_gate_apply"
+    old=$'    const float raw = qfull.v[h * 2u * hd + hd + d];   // the SECOND half: [query, gate] per head'
+    new=$'    const float raw = qfull.v[h * 2u * hd + d];   // INJECTION: the gate read from the FIRST half'
+    want="FAIL  native_qsa_gate_apply" ;;
   native-caps-gdn-false)
     # THE GDN FLAG'S own falsification, and it is batch 4's capability point: `native_gdn_enabled()` now answers
     # TRUE because ALL NINE gated symbols (the six native kernels and the three fused paths) have shaders.  The
