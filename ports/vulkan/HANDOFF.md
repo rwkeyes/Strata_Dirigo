@@ -160,11 +160,23 @@ the target is the 7900 XTX.**  Do not re-open it.
      not over-tight and was not loosened.  Fixed in the SHADER: `roundEven(double)` is replaced by an explicit
      ties-to-even (`floor` + parity), which the older lavapipe and every other implementation already agreed on.
      A skipped case would be a different matter; this one is a real divergence, recorded.
-2. **The sampler's remaining variants** (see below) and the ten kernels of section 4.
-3. **The sampler's remaining variants**: split-warp and coupled/draft-staging (speculative decoding), the
-   `sample_tokens` entry point that chooses between the paths, and the **portable f32 sibling** every other double
-   kernel in this port has (the Arc here reports `fp64 = 1` while Intel's own article says Arc has none - the case
-   SKIPS rather than passes on a device without fp64).
+2. **The sampler's remaining variants** (CLOSED - see item 3) and the ten kernels of section 4 (CLOSED by M-A).
+3. **The sampler's remaining variants - CLOSED 2026-10-05.**  All four landed, each with a shader, a gated case, a
+   registered falsification and docs, and the full gate green on both boxes:
+   * **the split sampler** (`sampler_split.comp`, the engine's DEFAULT sampled path: 4096-logit partitions, each
+     its own top_k, merged) - `2539912`;
+   * **the coupled/draft-staging path** (`coupled_penalize.comp` + `coupled_sample.comp`, speculative decoding;
+     the counter is `cell + 1`) - `334ca16`;
+   * **`sample_tokens`'s CHOICE** (`case_sample_tokens`: greedy || temp 0 -> the argmax, else the split, with the
+     one-block fallback) - `8fa6816`;
+   * **the portable f32 sibling** (`sampler_kernel_f32.comp`, the sampler's variant for the devices WITHOUT
+     shaderFloat64 that Intel's own article describes) - `06ae153`.
+   The tail and the partition+merge selection now live ONCE in `common/sampler_tail.glsl` /
+   `common/sampler_select.glsl`, so the three sampled paths cannot drift.  `PORT-MAP.tsv` still reads 77 symbols -
+   28 kernel, 49 host, **0 todo**, and regenerates identically.  `NEXT.md`'s top four sections carry the rule,
+   the traps, the evidence and every falsification.  The sampler item is DONE.  (The ten holes §4 lists were
+   closed by M-A - the map's `todo` column is 0; §4 is stale on that point.  What remains on this list is the
+   backend integration of §4.2, a different effort.)
 4. **The ten kernels** of section 4, in whatever order the first-token path wants them.
 
 ---
