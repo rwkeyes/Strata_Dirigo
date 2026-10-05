@@ -161,6 +161,33 @@ verification — which is class D anyway.  It does not require `native_rope`/`na
 `native_moe_combine` to be on (`:478-483` checks `native_bf16`, `g_fused_gr`, `native_gdn`+`g_fused_gdn`,
 `g_fast_attn`, `g_fast_select`, `native_qsa_indexer`), so the four here are safely dodgeable.
 
+### Class B is now PORTED (2026-10-05)
+
+All four class-B symbols have shaders and gated cases, so the "dodge" is retired for the ones the backend can
+turn on.  The Vulkan backend answers the capability checks ITSELF (`vulkan/src/kernels/native_caps_vk.cpp`),
+and the answer is a **symbol-at-a-time truth**, not a blanket `true`:
+
+| class-B symbol | shader | capability check | the Vulkan backend answers | why |
+|---|---|---|---|---|
+| `native_rope_apply` | `native_rope_apply` | `native_rope_enabled()` | **true** | every caller of this check dispatches only `native_rope_apply` (layer.cpp:881, mtp.cpp:515, verify.cpp:769) |
+| `native_router_top10` | `native_router_top10` | `native_router_enabled()` | **true** | the reachable set is `{native_router_top10}` (layer.cpp:370, mtp.cpp:576); the `_multi` variant is verify.cpp:916 only, and the verifier cannot init under this contract |
+| `native_moe_combine` | `native_moe_combine` | `native_moe_combine_enabled()` | **true** | same: layer.cpp:463 and mtp.cpp:601 are the forward path; `_multi` (verify.cpp:1081) is verifier-only |
+| `native_qsa_rms_norm_weighted` | `native_qsa_rms_norm_weighted` | `native_qsa_enabled()` | **FALSE** | this ONE flag ALSO gates the UNPORTED `native_qsa_gate_apply` (layer.cpp:1010, the MAIN QSA path, 12 of 48 layers); answering true would dispatch a symbol with no shader |
+
+**The `native_qsa` row is the point of the "symbol-at-a-time" rule.**  The symbol is ported, gated and measured,
+but the flag it belongs to is shared with an unimplemented sibling, so the honest answer is still `false` — the
+port chooses the legacy branch until that sibling lands.  Setting it true would crash the QSA path, which is
+exactly what the task's warning ("whatever is not ported must still answer false") is about.  See
+`vulkan/src/kernels/native_caps_vk.cpp` and the gate's `case_native_capabilities`, which asserts the four
+answers AND that each ported symbol's `.spv` exists.
+
+**Measured (Arc Pro B70 / ANV, the box's RX 7900 XTX / RADV NAVI31 and Quadro K620, the Ryzen iGPU / RADV, and
+llvmpipe; `ports/vulkan/bench/`):**  the native pair is timed against the legacy kernel each replaces at the
+same shape: `native_rope_apply` **0.301×** of `rope_neox` on the Arc (0.118× on the XTX),
+`native_router_top10` **0.078×** of `router_top10_f32` (0.082× on the XTX), `native_moe_combine` **0.998×**
+(a wash), `native_qsa_rms_norm_weighted` **1.007×** (neutral; 1.117× on the iGPU and 1.795× on the K620 — a
+FINDING, not a win).  The full table is in `bench/README.md`.
+
 ## Class C — the non-selected configuration (7)
 
 Each is reached only in a branch the shipped `--native` launch does **not** select; the selected branch is a

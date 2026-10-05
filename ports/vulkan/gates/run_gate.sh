@@ -77,12 +77,14 @@ for f in "${comps[@]}"; do
     fail "$name (subgroup op in the SPIR-V: $census - the reductions are barrier trees by design; see wg_reduce.glsl)"
   fi
   case "$name" in
-    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down|s2expert_gu_grouped|s2expert_down_grouped|iq1m_mmvq|quantize_q8_1|swiglu_quantize_q8_1|iq2s_mmvq|iq3xxs_mmvq|iq4nl_mmvq|q2_0_mmvq|iq3s_mmvq|iq4xs_mmvq|native_gu_iq2s|native_down_iq4nl|attn_decode_short|qsa_block_scores|qsa_block_topk|fwht256|sampler_greedy|sampler_kernel|sampler_kernel_f32|sampler_split|coupled_sample|cvec_apply|native_q5_k_f32|gdn_l2_norm|gdn_out_norm|indexer_key_append|gr_norm|gr_down|gr_gate|gr_inject)
+    router_top10_f64|router_top10_f32|scalar_gate_f64|rms_norm|native_router_top10|native_qsa_rms_norm_weighted|ple_gnorm|ple_gate|s2_gemv_q8|bf16_mmvf_f32|bf16_mmvf_f32_multi|s_gemv_q8_split|s_gemv_split|scalar_gate_f32|s2expert_gu|s2expert_down|s2expert_gu_grouped|s2expert_down_grouped|iq1m_mmvq|quantize_q8_1|swiglu_quantize_q8_1|iq2s_mmvq|iq3xxs_mmvq|iq4nl_mmvq|q2_0_mmvq|iq3s_mmvq|iq4xs_mmvq|native_gu_iq2s|native_down_iq4nl|attn_decode_short|qsa_block_scores|qsa_block_topk|fwht256|sampler_greedy|sampler_kernel|sampler_kernel_f32|sampler_split|coupled_sample|cvec_apply|native_q5_k_f32|gdn_l2_norm|gdn_out_norm|indexer_key_append|gr_norm|gr_down|gr_gate|gr_inject)
       # A shared-memory exchange needs at least a write barrier and a read barrier; one barrier means the value
       # was exchanged through something else (a subgroup op, or nothing), which is what this arm exists to catch.
       # The census prints "N OpName" run-length PAIRS on one line, so the literal appears once - read the COUNT,
-      # not the number of matches (counting matches reported every shader as having one barrier).
-      barriers="$(sed -n 's/.*\([0-9][0-9]*\) OpControlBarrier.*/\1/p' <<<"$census")"
+      # not the number of matches.  THE OLD `sed` WAS GREEDY (`.*\([0-9][0-9]*\) OpControlBarrier`) and captured
+      # only the LAST digit of a two-digit count, so a kernel with 11 barriers read as 1 and failed this arm while
+      # printing 11 in its own census line; `grep -oE` reads the whole run-length.
+      barriers="$(grep -oE '[0-9]+ OpControlBarrier' <<<"$census" | tail -1 | awk '{print $1}')"
       : "${barriers:=0}"
       [ "$barriers" -ge 2 ] || fail "$name (only $barriers barrier(s) - a shared-memory reduction needs >= 2)"
       ;;
@@ -212,7 +214,7 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
     "$ROOT/harness/vk_gate.cpp" \
     "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
     "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
-    "$TREE/vulkan/src/kernels/fwht_vk.cpp" -lvulkan || exit 1
+    "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" -lvulkan || exit 1
 
 echo "== numeric gate"
 # The gate needs a few MiB of buffers, so it runs with the reserve and its floor at 0: this box's resident local

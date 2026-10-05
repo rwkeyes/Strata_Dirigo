@@ -106,7 +106,7 @@ native_gdn_step	todo	no shader in this tree yet
 native_mmvq	kernel	iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq
 native_mmvq_supported	host	a capability check
 native_mmvq_weight_bytes	host	a size
-native_moe_combine	todo	no shader in this tree yet
+native_moe_combine	kernel	native_moe_combine
 native_moe_combine_enabled	host	a capability check
 native_moe_combine_multi	todo	no shader in this tree yet
 native_q5_k_f32	kernel	native_q5_k_f32
@@ -115,12 +115,12 @@ native_qsa_enabled	host	a capability check
 native_qsa_gate_apply	todo	no shader in this tree yet
 native_qsa_indexer_append	todo	no shader in this tree yet
 native_qsa_indexer_enabled	host	a capability check
-native_qsa_rms_norm_weighted	todo	no shader in this tree yet
+native_qsa_rms_norm_weighted	kernel	native_qsa_rms_norm_weighted
 native_quantize_q8_1	kernel	quantize_q8_1
-native_rope_apply	todo	no shader in this tree yet
+native_rope_apply	kernel	native_rope_apply
 native_rope_enabled	host	a capability check
 native_router_enabled	host	a capability check
-native_router_top10	todo	no shader in this tree yet
+native_router_top10	kernel	native_router_top10
 native_router_top10_multi	todo	no shader in this tree yet
 ngram_rows	host	host-side row bookkeeping
 penalty_rows	host	folded into the samplers in this port: see sampler_greedy/sampler_kernel

@@ -55,7 +55,7 @@ target_compile_definitions(strata_vulkan_device PUBLIC STRATA_ENABLE_VULKAN=1)
 target_link_libraries(strata_vulkan_device PUBLIC Vulkan::Vulkan)
 
 # --- the kernel translation units: one engine entry point per symbol, behind the macro -----------------------
-strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp)
+strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp)
 add_library(strata_vulkan_kernels STATIC ${_kernels})
 target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
 

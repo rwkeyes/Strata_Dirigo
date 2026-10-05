@@ -371,6 +371,146 @@ void bench_quantize_q8_K(Ctx& ctx, const std::string& dir, int reps, int warmups
     ctx.free(bx); ctx.free(b_blocks);
 }
 
+// =========================================================================================================
+// THE PERFORMANCE TIER, class B: the NATIVE fast paths against the LEGACY kernel each replaces, at the
+// SAME shape on the SAME device.  This is the harness's whole purpose - a class-B increment's claim is its
+// before/after, and the ratio is the deliverable.  Each pair prints both rows and an "XPAIR" line with
+// native/legacy so the direction is unambiguous (a ratio < 1.0 means the native kernel is FASTER).
+// A native kernel that is NOT faster is a finding to report, not to tune away.
+// =========================================================================================================
+
+void bench_rope_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int rows = 512, head_dim = 256, n_rot = 64, half = 32, max_pos = 256;
+    std::vector<float> x = floats((size_t) rows * head_dim);
+    std::vector<int> pos((size_t) rows);
+    for (int r = 0; r < rows; ++r) pos[(size_t) r] = r % max_pos;
+    std::vector<float> cs((size_t) max_pos * half), sn((size_t) max_pos * half);
+    for (int p = 0; p < max_pos; ++p)
+        for (int i = 0; i < half; ++i) {
+            const double inv = std::pow(1.0e7, -2.0 * (double) i / (double) n_rot);
+            const double a = (double) p * inv;
+            cs[(size_t) p * half + i] = (float) std::cos(a);
+            sn[(size_t) p * half + i] = (float) std::sin(a);
+        }
+    Buf bx = alloc(ctx, x.size() * 4), bo = alloc(ctx, x.size() * 4), bp = alloc(ctx, (size_t) rows * 4),
+        bc = alloc(ctx, cs.size() * 4), bs = alloc(ctx, sn.size() * 4), bm = alloc(ctx, 4);
+    ctx.write(bx, x.data(), x.size() * 4);
+    ctx.write(bp, pos.data(), (size_t) rows * 4);
+    ctx.write(bc, cs.data(), cs.size() * 4);
+    ctx.write(bs, sn.data(), sn.size() * 4);
+    const int32_t z = 0;
+    ctx.write(bm, &z, 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "rows=%d head_dim=%d n_rot=64", rows, head_dim);
+    // legacy: rope_neox, one thread per ROW (the CUDA's own decomposition) - a host-built float64 table.
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/rope_neox.spv", 6, 16);
+        struct { int32_t rows, head_dim, n_rot, mrope; } pc{rows, head_dim, n_rot, 0};
+        tl = time_kernel(ctx, p, {&bx, &bo, &bc, &bs, &bp, &bm}, &pc, sizeof(pc),
+                         (uint32_t) ((rows + 255) / 256), 1, 16, reps, warmups);
+        report("rope_neox (legacy)", shape, tl, (double) rows * head_dim, 0.0);
+    }
+    // native: one thread per (row, PAIR), the angle computed on device in f32.
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_rope_apply.spv", 4, 40);
+        struct { int32_t rows, head_dim, n_rot, mrope; float theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale; } pc;
+        pc.rows = rows; pc.head_dim = head_dim; pc.n_rot = n_rot; pc.mrope = 0;
+        pc.theta_scale = std::pow(1.0e7f, -2.0f / (float) n_rot);
+        pc.freq_scale = 1.0f; pc.corr_low = 0; pc.corr_high = 0; pc.ext_factor = 0; pc.mscale = 1.0f;
+        tn = time_kernel(ctx, p, {&bx, &bo, &bp, &bm}, &pc, sizeof(pc),
+                         (uint32_t) ((head_dim / 2 + 255) / 256), (uint32_t) rows, 16, reps, warmups);
+        report("native_rope_apply", shape, tn, (double) rows * head_dim, 0.0);
+    }
+    std::printf("XPAIR rope %s | legacy rope_neox | native native_rope_apply | native/legacy %.3f\n", shape,
+                tn.med / tl.med);
+    ctx.free(bx); ctx.free(bo); ctx.free(bp); ctx.free(bc); ctx.free(bs); ctx.free(bm);
+}
+
+void bench_router_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int NE = 512, K = 10, NT = 16;
+    std::vector<float> logits = floats((size_t) NT * NE);
+    Buf bl = alloc(ctx, logits.size() * 4), bi = alloc(ctx, (size_t) NT * K * 4), bw = alloc(ctx, (size_t) NT * K * 4);
+    ctx.write(bl, logits.data(), logits.size() * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "n_tokens=%d n_expert=512 k=10", NT);
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/router_top10_f32.spv", 3, 12);
+        struct { int32_t n_tokens, n_expert, k; } pc{NT, NE, K};
+        tl = time_kernel(ctx, p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT, 1, 16, reps, warmups);
+        report("router_top10_f32 (legacy)", shape, tl, (double) NT * NE, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 4);
+        struct { int32_t n_tokens; } pc{NT};
+        tn = time_kernel(ctx, p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT, 1, 16, reps, warmups);
+        report("native_router_top10", shape, tn, (double) NT * NE, 0.0);
+    }
+    std::printf("XPAIR router %s | legacy router_top10_f32 | native native_router_top10 | native/legacy %.3f\n", shape,
+                tn.med / tl.med);
+    ctx.free(bl); ctx.free(bi); ctx.free(bw);
+}
+
+void bench_moe_combine_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int n_embd = 2560, k = 10;
+    std::vector<float> parts = floats((size_t) k * n_embd), w = floats((size_t) k), sh = floats((size_t) n_embd);
+    Buf bp = alloc(ctx, parts.size() * 4), bw = alloc(ctx, (size_t) k * 4), bs = alloc(ctx, (size_t) n_embd * 4),
+        by = alloc(ctx, (size_t) n_embd * 4);
+    ctx.write(bp, parts.data(), parts.size() * 4);
+    ctx.write(bw, w.data(), (size_t) k * 4);
+    ctx.write(bs, sh.data(), (size_t) n_embd * 4);
+    struct { int32_t n_embd, k, has_shared; } pc{n_embd, k, 1};
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "n_embd=2560 k=10 shared=1");
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/moe_combine_f32.spv", 4, 12);
+        tl = time_kernel(ctx, p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), (uint32_t) ((n_embd + 255) / 256), 1, 64,
+                         reps, warmups);
+        report("moe_combine_f32 (legacy)", shape, tl, (double) n_embd, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, 12);
+        tn = time_kernel(ctx, p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), (uint32_t) ((n_embd + 255) / 256), 1, 64,
+                         reps, warmups);
+        report("native_moe_combine", shape, tn, (double) n_embd, 0.0);
+    }
+    std::printf("XPAIR moe_combine %s | legacy moe_combine_f32 | native native_moe_combine | native/legacy %.3f\n",
+                shape, tn.med / tl.med);
+    ctx.free(bp); ctx.free(bw); ctx.free(bs); ctx.free(by);
+}
+
+void bench_rms_norm_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int rows = 128, cols = 2560;
+    const uint64_t n = (uint64_t) rows * cols;
+    std::vector<float> x = floats(n), g = floats((size_t) cols);
+    Buf bx = alloc(ctx, n * 4), bg = alloc(ctx, (size_t) cols * 4), bo = alloc(ctx, n * 4);
+    ctx.write(bx, x.data(), n * 4);
+    ctx.write(bg, g.data(), (size_t) cols * 4);
+    struct { int32_t rows, cols; float eps; } pc{rows, cols, 1e-6f};
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "rows=%d cols=%d", rows, cols);
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/rms_norm.spv", 2, 12);
+        tl = time_kernel(ctx, p, {&bx, &bg}, &pc, sizeof(pc), (uint32_t) rows, 1, 64, reps, warmups);
+        report("rms_norm (legacy)", shape, tl, (double) n, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_qsa_rms_norm_weighted.spv", 3, 12);
+        tn = time_kernel(ctx, p, {&bx, &bg, &bo}, &pc, sizeof(pc), (uint32_t) rows, 1, 64, reps, warmups);
+        report("native_qsa_rms_norm_weighted", shape, tn, (double) n, 0.0);
+    }
+    std::printf("XPAIR rms_norm %s | legacy rms_norm | native native_qsa_rms_norm_weighted | native/legacy %.3f\n",
+                shape, tn.med / tl.med);
+    ctx.free(bx); ctx.free(bg); ctx.free(bo);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -446,6 +586,13 @@ int main(int argc, char** argv) {
         std::printf("SKIP quantize_q8_1             | device lacks storageBuffer8BitAccess\n");
     }
     bench_quantize_q8_K(ctx, dir, reps, warmups);
+
+    // THE PERFORMANCE TIER, class B: native vs legacy, same shape, same device (a native/legacy ratio < 1 is
+    // faster).  Before the sampler, which is the heavy one.
+    bench_rope_pair(ctx, dir, reps, warmups);
+    bench_router_pair(ctx, dir, reps, warmups);
+    bench_moe_combine_pair(ctx, dir, reps, warmups);
+    bench_rms_norm_pair(ctx, dir, reps, warmups);
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a

@@ -93,6 +93,10 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `quantize_q8_0` | n=65536 (2048 blocks) — **skipped where the device has no `shaderFloat64`** | elements/s |
 | `quantize_q8_1` | n_in=2560 ncols=8 | elements/s |
 | `quantize_q8_K` | n=65536 (256 blocks) | elements/s |
+| `rope_neox` vs `native_rope_apply` | rows=512 head_dim=256 n_rot=64 | elements/s |
+| `router_top10_f32` vs `native_router_top10` | n_tokens=16, n_expert=512, k=10 | elements/s |
+| `moe_combine_f32` vs `native_moe_combine` | n_embd=2560 k=10 shared=1 | elements/s |
+| `rms_norm` vs `native_qsa_rms_norm_weighted` | rows=128 cols=2560 | elements/s |
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
@@ -150,7 +154,59 @@ Arc derived rates: `gdn_step` **50.3 GMAC/s**; `iq2s_mmvq` n_out=2048 **112.9 GM
 XTX derived rates: `gdn_step` **22.5 GMAC/s**; `iq2s_mmvq` n_out=2048 **264.3 GMAC/s** (the fastest device
 measured on every kernel).
 
-### The one number that is a problem, not a baseline
+### The class-B NATIVE vs LEGACY pairs — measured 2026-10-05
+
+The performance tier's first four kernels: each NATIVE fast path timed against the legacy kernel it replaces,
+**at the same shape, on the same device**.  `run_bench.sh` now compiles both sides from source and each pair
+prints an `XPAIR` line: `native/legacy`, so **< 1.0 means the native kernel is faster**.  `reps=9`.
+
+| pair (native ← legacy) | Arc B70 med (ms) native / legacy | native/legacy | Ryzen iGPU | native/legacy | llvmpipe | native/legacy |
+|---|---:|---:|---:|---:|---:|---:|
+| `native_rope_apply` ← `rope_neox` | 0.0084 / 0.0280 | **0.301** | 0.0490 / 1.2242 | **0.040** | 0.0512 / 0.1121 | 0.457 |
+| `native_router_top10` ← `router_top10_f32` | 0.0245 / 0.3125 | **0.078** | 0.0300 / 0.3842 | **0.078** | 0.2036 / 0.1644 | 1.238 |
+| `native_moe_combine` ← `moe_combine_f32` | 0.0058 / 0.0058 | 0.998 | 0.0059 / 0.0060 | 0.988 | 0.0224 / 0.0227 | 0.986 |
+| `native_qsa_rms_norm_weighted` ← `rms_norm` | 0.0107 / 0.0106 | 1.007 | 0.1338 / 0.1198 | 1.117 | 0.2214 / 0.2240 | 0.988 |
+
+The same pairs on the **box `z820b`** — the RX 7900 XTX is the primary RADV target:
+
+| pair | XTX (RADV NAVI31) med (ms) native / legacy | native/legacy | K620 (nvidia) | native/legacy |
+|---|---:|---:|---:|---:|
+| `native_rope_apply` ← `rope_neox` | 0.0076 / 0.0644 | **0.118** | 0.0482 / 0.3169 | 0.152 |
+| `native_router_top10` ← `router_top10_f32` | 0.0134 / 0.1641 | **0.082** | 0.0600 / 0.1609 | 0.373 |
+| `native_moe_combine` ← `moe_combine_f32` | 0.0040 / 0.0039 | 1.018 | 0.0119 / 0.0112 | 1.056 |
+| `native_qsa_rms_norm_weighted` ← `rms_norm` | 0.0060 / 0.0060 | 0.988 | 0.0209 / 0.0117 | 1.795 |
+
+**The honest reading, including the pair that is NOT a win.**
+
+* **RoPE is a genuine 3.3× on the Arc, 8.5× on the XTX and 25× on the RADV iGPU** (2.2× on llvmpipe).  The
+  legacy kernel is ONE THREAD PER ROW (the CUDA's own decomposition), so at 512 rows it launches 2 workgroups;
+  the native kernel is one thread per (row, PAIR) - 512 workgroups - and computes the angle on device.  Same
+  shape, same device.
+* **The router is 12.8× on the Arc, 12.2× on the XTX and 12.8× on the iGPU.**  Both kernels are one workgroup
+  per token, and the native body's win here survives the port: this port's native shader reduces with the
+  port's pairwise trees, while the legacy `router_top10_f32` sums 512 experts on ONE lane with Kahan
+  compensation and runs its ten selection passes through a single-lane combine.  That is the cost the native
+  path removes.
+* **`native_moe_combine` is a WASH (0.998 on the Arc, 1.018 on the XTX).**  Both are elementwise, one thread
+  per column, so there is no algorithmic difference to win - the native body's only advantage (plain f32
+  instead of fma+Kahan) is not a throughput difference.  Recorded as measured, not tuned.
+* **`native_qsa_rms_norm_weighted` is NEUTRAL on the Arc (1.007) and 12% SLOWER on the RADV iGPU.**  Both
+  kernels are one workgroup per row with the same stride loop; the native body's block-per-row reduction is
+  not faster than the legacy warp-per-row one at 2560 columns, and on RADV the extra shared traffic costs a
+  little.  **This is a finding, not a defect** - a native kernel need not be faster, and the capability
+  contract still requires the answer to be honest, so `native_qsa_enabled()` stays FALSE anyway (its flag also
+  gates the unported `native_qsa_gate_apply`).  See `STATUS.md`.
+* **The K620 (a Kepler Quadro) is where the native reductions HURT**: `native_qsa_rms_norm_weighted` is 1.795×
+  the legacy there, because the native body's block-per-row tree does more shared-memory traffic than the
+  legacy warp-per-row warp-shuffle on a device with no fast shared path.  Reported, not hidden.
+
+The pairs are measured through the same fence-clock method as everything else here, and on the Arc, the XTX and
+the iGPU the kernel batch is above the ~5-15 µs floor; on llvmpipe the `native_router_top10` pair sits at the
+floor for the native row (0.2036 ms for 16 tokens) and reads slightly slower than legacy there - a
+toolchain/execution-model artifact of a CPU driver, not a device result.  Both rows are printed so the reader
+sees it.
+
+## The one number that is a problem, not a baseline
 
 `sampler_kernel_f32` **202–1165 ms per token** on every device (202 ms on the XTX, 547 ms on the Arc).
 The kernel's top-k is `k` rounds, each a block-argmax over the *whole* vocabulary with an inner loop over

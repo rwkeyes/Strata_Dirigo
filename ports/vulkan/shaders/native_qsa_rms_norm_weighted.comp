@@ -1,0 +1,61 @@
+// ports/vulkan/shaders/native_qsa_rms_norm_weighted.comp - the class-B FAST weighted RMS norm, ported from
+// src/kernels/cuda/native_qsa.cu's `norm<BlockSize>` kernel (the QSA norm/rope pair's normaliser).
+//
+// THE RULE, the same weighted RMS norm the legacy `rms_norm_weighted` computes:
+//
+//     mean  = sum(input[col]^2) / n_cols
+//     scale = rsqrtf(mean + epsilon)
+//     out[col] = scale * input[col] * gamma[col]
+//
+// WHAT THE NATIVE BODY DOES DIFFERENTLY, and it is the reason this symbol exists separately:
+//
+//   * it REDUCES differently.  The native kernel is one BLOCK per row (256 threads for n_cols < 1024, 1024
+//     threads otherwise); each thread strides the row, a `__shfl_xor_sync` warp tree sums 32 lanes, the eight
+//     (or 32) warp partials go to shared memory, and the first warp combines them.  The legacy `elementwise.cu`
+//     kernel is one WARP per row with a `__shfl_down_sync` tree, four rows per block.  Both are correct sums
+//     that differ in the last bits - and this port reduces with a BARRIER TREE (no subgroup op), which is a
+//     third association again.  So the gate compares against a double-precision reference of the RULE and
+//     REPORTS the gap; it does not claim bit-identity with either CUDA reduction.
+//   * it multiplies as `scale * input * gamma` (scale first, then the weight).  The legacy kernel multiplies
+//     `(input * gamma) * inv` - the same three factors in a different order, which rounds differently.  This
+//     shader keeps the NATIVE order, because that is the body being ported.
+//   * in-place is part of the contract: the engine calls `native_qsa_rms_norm_weighted(data, norm, data, ...)`.
+//     Every read of `input` for the reduction precedes the barrier, and the output loop reads and writes only
+//     its own element, so an aliased binding is exact - as the source's own comment says.
+//
+// ONE WORKGROUP PER ROW (the port's rule, for the vendor-compatibility reason in rms_norm.comp): the dispatch
+// is exactly `rows` groups and the width lives only inside the kernel.  The row guard makes an over-dispatch
+// harmless rather than destructive.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer IN { float v[]; } in_;
+layout(set = 0, binding = 1, std430) readonly buffer G { float v[]; } gamma;
+layout(set = 0, binding = 2, std430) buffer OUT { float v[]; } out_;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int rows; int cols; float eps; } pc;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.rows)) return;
+
+    const uint cols = uint(pc.cols);
+    const uint base = row * cols;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float acc = 0.0;
+    for (uint c = lid; c < cols; c += lsize) {
+        const float t = in_.v[base + c];
+        acc += t * t;
+    }
+    // The native's MEAN (`partial / n_cols`), then `rsqrtf(mean + epsilon)`.  wg_sum is the workgroup-wide
+    // barrier-tree sum (see common/wg_reduce.glsl for the two defects it encodes).
+    const float scale = inversesqrt(wg_sum(acc) / float(pc.cols) + pc.eps);
+    for (uint c = lid; c < cols; c += lsize) {
+        const uint i = base + c;
+        out_.v[i] = scale * in_.v[i] * gamma.v[i];   // the NATIVE order: scale * input * gamma
+    }
+}

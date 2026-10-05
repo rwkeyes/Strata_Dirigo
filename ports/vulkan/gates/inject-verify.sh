@@ -58,6 +58,18 @@
 #   inject-verify.sh gr-read-mean-vs-sum  gr_mean.comp  drop the `/ hc` (the SUM over streams, not the mean)
 #                                       -> must FAIL  "gr_read"
 #
+#   (performance tier, class B - each replaces a legacy kernel)
+#   inject-verify.sh native-rope-adjacent-pairing      native_rope_apply.comp  adjacent-pair convention
+#                                       -> must FAIL  "native_rope_apply"
+#   inject-verify.sh native-router-top10-tie-high-index  common/router_select.glsl  tie -> highest index
+#                                       -> must FAIL  "native_router_top10"
+#   inject-verify.sh native-moe-combine-drop-shared    native_moe_combine.comp  invert the shared add
+#                                       -> must FAIL  "native_moe_combine"
+#   inject-verify.sh native-qsa-rms-norm-eps-on-sum    native_qsa_rms_norm_weighted.comp  eps on SUM
+#                                       -> must FAIL  "native_qsa_rms_norm_weighted"
+#   inject-verify.sh native-caps-qsa-true  vulkan/src/kernels/native_caps_vk.cpp  answer qsa true
+#                                       -> must FAIL  "native capabilities"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -80,7 +92,7 @@ rebuild_harness() {
       "$ROOT/harness/vk_gate.cpp" \
       "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
       "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
-      "$TREE/vulkan/src/kernels/fwht_vk.cpp" -lvulkan
+      "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" -lvulkan
 }
 # A source that must be rebuilt into the GATE (the harness proper, or the engine-side backend the harness links).
 is_harness_src() {
@@ -306,6 +318,46 @@ case "$name" in
     old=$'    mixed.v[d] = m / float(pc.hc);'
     new=$'    mixed.v[d] = m;   // INJECTION: the /hc dropped - a SUM over the streams, not the mean'
     want="FAIL  gr_read" ;;
+  native-qsa-rms-norm-eps-on-sum)
+    # `native_qsa_rms_norm_weighted`'s rule divides the squared sum by `n_cols` (the MEAN) before the eps:
+    # `rsqrt(sum/cols + eps)`.  Putting the eps on the SUM (the gdn_l2_norm convention) scales every output by
+    # sqrt(cols).  The oracle is the rule's double transcription, so this bites on every shape.
+    file="$SH/native_qsa_rms_norm_weighted.comp"; spv="native_qsa_rms_norm_weighted"
+    old=$'    const float scale = inversesqrt(wg_sum(acc) / float(pc.cols) + pc.eps);'
+    new=$'    const float scale = inversesqrt(wg_sum(acc) + pc.eps);   // INJECTION: eps on the SUM, not the mean'
+    want="FAIL  native_qsa_rms_norm_weighted" ;;
+  native-rope-adjacent-pairing)
+    # The native rope's pairing is NEOX - `(pair, pair + n_rot/2)`.  Writing the results to the ADJACENT
+    # (2*pair, 2*pair+1) slots is the plausible wrong convention, and rope_parity.cpp check 3 pins that it
+    # produces correctly-SHAPED output with scrambled content, which a tolerance over all 256 dims would accept.
+    file="$SH/native_rope_apply.comp"; spv="native_rope_apply"
+    old=$'    OB.o[base + pair] = a * c - b * s;\n    OB.o[base + pair + nhalf] = a * s + b * c;'
+    new=$'    OB.o[base + 2 * pair] = a * c - b * s;\n    OB.o[base + 2 * pair + 1] = a * s + b * c;   // INJECTION: the ADJACENT-pair convention'
+    want="FAIL  native_rope_apply" ;;
+  native-router-top10-tie-high-index)
+    # The selection's rule is "the LOWEST index wins a tie" (router_top10_parity.cpp's stable descending argsort).
+    # The scan's strict `>` keeps the lowest index on an exact tie; flipping it to `>=` keeps the HIGHEST.  The
+    # all-equal arm makes every expert tie, so this is caught on that arm and on the 12-way tie arm.
+    file="$SH/native_router_top10.comp"; spv="native_router_top10"
+    old=$'        if (pe > bv) { bv = pe; bi = int(e); }   // STRICT: the lowest index wins a tie'
+    new=$'        if (pe >= bv) { bv = pe; bi = int(e); }   // INJECTION: the tie rule flipped to the highest index'
+    want="FAIL  native_router_top10" ;;
+  native-moe-combine-drop-shared)
+    # The native combine's rule is the shared expert's row added PLAIN (`if (shared) sum += shared[col]`).  The
+    # inverted test drops it when it is present and adds it when it is absent - so BOTH arms move.
+    file="$SH/native_moe_combine.comp"; spv="native_moe_combine"
+    old=$'    if (pc.has_shared != 0) sum += sh.v[col];        // added PLAIN, exactly as the source adds it'
+    new=$'    if (pc.has_shared == 0) sum += sh.v[col];        // INJECTION: the shared add inverted'
+    want="FAIL  native_moe_combine" ;;
+  native-caps-qsa-true)
+    # THE CAPABILITY CONTRACT'S own falsification: the Vulkan backend answers `native_qsa_enabled()` false
+    # because the flag ALSO gates the unported `native_qsa_gate_apply` (layer.cpp:1010).  Answering true would
+    # make the engine dispatch an unimplemented symbol, and the case's expected-answers arm must catch it.
+    # This is the ENGINE-side backend, so the script rebuilds the gate (the capability TU is linked into it).
+    file="$TREE/vulkan/src/kernels/native_caps_vk.cpp"
+    old=$'bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported'
+    new=$'bool native_qsa_enabled() { return true; }        // INJECTION: a capability answered true for a symbol that is NOT implemented'
+    want="FAIL  native capabilities" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

@@ -27,6 +27,10 @@
 // never edited (see ports/vulkan/plan/BACKEND-INTEGRATION.md).
 #include "strata/vulkan/vk_backend.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_router.hpp"
 #include "vk_arena.hpp"
 
 #include <algorithm>
@@ -11865,6 +11869,373 @@ void case_fwht256_entry(Ctx& ctx, const std::string& dir) {
     ctx.free(b_in); ctx.free(b_ref);
 }
 
+// ============================================================================================================
+// THE PERFORMANCE TIER, class B: the NATIVE fast paths, each replacing the legacy kernel already ported.
+//
+// THE ORACLE RULE FOR THIS WHOLE BLOCK.  Each case is against the engine's OWN body for that symbol - the
+// NATIVE `*_cuda` rule (`src/kernels/cuda/native_*.cu`) - and NOT against the legacy kernel's rule.  Where the
+// native body uses different arithmetic (float instead of double, a different reduction, a different multiply
+// order, a fused trigonometric angle instead of a host table) the case TRANSCRIBES the native arithmetic and
+// MEASURES the gap against the engine's double transcription of the same rule.  That is the class-B equivalent
+// of the existing f32-vs-f64 arms: a measured deviation, not a claim of identity.
+// ============================================================================================================
+
+// ---- the native rope's analytic angle, host side, in FLOAT (rope_scaling.hpp's rope_scaled_angle) -----------
+static float rope_yarn_ramp_f(float low, float high, int pair) {
+    const float y = (float(pair) - low) / (high - low > 0.001f ? high - low : 0.001f);
+    const float cl = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+    return 1.0f - cl;
+}
+static void rope_scaled_angle_f(float te, float freq_scale, float corr_low, float corr_high, float ext_factor,
+                                float mscale_in, int pair, float& c, float& s) {
+    float theta = freq_scale * te;
+    float ms = mscale_in;
+    if (ext_factor != 0.0f) {
+        const float ramp = rope_yarn_ramp_f(corr_low, corr_high, pair) * ext_factor;
+        theta = theta * (1.0f - ramp) + te * ramp;
+        ms *= 1.0f + 0.1f * std::log(1.0f / freq_scale);
+    }
+    c = std::cos(theta) * ms;
+    s = std::sin(theta) * ms;
+}
+// The native rotation, in the three readings the case must be able to tell apart.  mode 0 = the engine's NEOX
+// pairing with the partial-rotation tail copied; mode 1 = the ADJACENT-pair rival; mode 2 = rotate every pair
+// (no untouched tail).  A tolerance over all 256 dims cannot distinguish mode 0 from 1, which is why the case
+// checks the rival readings host-side (rel_l1) and the tail BIT-EXACTLY.
+static void rope_ref(const std::vector<float>& x, std::vector<float>& out, int rows, int head_dim, int n_rot,
+                     const std::vector<int>& pos, float theta_scale, float freq_scale, float corr_low,
+                     float corr_high, float ext_factor, float mscale, int mode) {
+    out = x;
+    const int half = n_rot / 2;
+    for (int r = 0; r < rows; ++r) {
+        const int base = r * head_dim;
+        const int npair = (mode == 2) ? head_dim / 2 : half;
+        for (int pair = 0; pair < npair; ++pair) {
+            const float te = (float) pos[r] * std::pow(theta_scale, (float) pair);
+            float c = 0, s = 0;
+            rope_scaled_angle_f(te, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
+            const int i0 = (mode == 1) ? 2 * pair : pair;
+            // mode 0 (NEOX, partial rotation) pairs (p, p + n_rot/2); mode 1 is the adjacent rival; mode 2
+            // rotates EVERY pair, so its second slot is p + head_dim/2 - the "rotate the whole head" rival.
+            const int i1 = (mode == 1) ? 2 * pair + 1 : (mode == 2 ? pair + head_dim / 2 : pair + half);
+            const float a = x[base + i0], b = x[base + i1];
+            out[base + i0] = a * c - b * s;
+            out[base + i1] = a * s + b * c;
+        }
+    }
+}
+
+// `native_rope_apply`: the class-B fast RoPE (src/kernels/cuda/native_rope.cu's `apply<false>`), replacing
+// `rope_neox_apply`.  The native body computes the angle ON DEVICE in float32 (`powf`/`cosf`/`sinf` under
+// --use_fast_math); the legacy body reads a host-built float64 table.  rope_parity.cpp check 5 binds the two
+// paths to 3e-3 relative to the row magnitude, which is the tolerance this case uses - the shader's trig is the
+// driver's, not libm's, and the case MEASURES that.
+void case_native_rope_apply(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_rope_apply.spv")) return;
+    struct Arm { int rows, head_dim; int type; };   // type 0 = None, 1 = YaRN factor 2
+    const Arm arms[] = {{192, 256, 0}, {64, 128, 0}, {96, 256, 1}};
+    for (const Arm& ar : arms) {
+        const int rows = ar.rows, head_dim = ar.head_dim, n_rot = 64;
+        const float freq_base = 1.0e7f;
+        const float theta_scale = std::pow(freq_base, -2.0f / (float) n_rot);
+        float freq_scale = 1.0f, corr_low = 0.0f, corr_high = 0.0f, ext_factor = 0.0f, mscale = 1.0f;
+        if (ar.type == 1) {
+            const double factor = 2.0, orig_ctx = 262144.0, beta_fast = 32.0, beta_slow = 1.0, base = 1.0e7;
+            auto corr_dim = [&](double n_rot_d) {
+                return 64.0 * std::log(orig_ctx / (n_rot_d * 2.0 * 3.14159265358979323846)) / (2.0 * std::log(base));
+            };
+            freq_scale = (float) (1.0 / factor);
+            corr_low = (float) std::floor(corr_dim(beta_fast));
+            corr_high = (float) std::ceil(corr_dim(beta_slow));
+            if (corr_low < 0) corr_low = 0;
+            if (corr_high > (float) (n_rot - 1)) corr_high = (float) (n_rot - 1);
+            ext_factor = 1.0f;
+        }
+        std::vector<float> x((size_t) rows * head_dim);
+        for (auto& v : x) v = rndf(1.0f);
+        std::vector<int> pos((size_t) rows);
+        for (int r = 0; r < rows; ++r) pos[(size_t) r] = (ar.type == 0) ? (r % 32) : ((r * 37) % 256);
+        std::vector<float> ref, rival_adj, rival_full;
+        rope_ref(x, ref, rows, head_dim, n_rot, pos, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, 0);
+        rope_ref(x, rival_adj, rows, head_dim, n_rot, pos, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, 1);
+        rope_ref(x, rival_full, rows, head_dim, n_rot, pos, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, 2);
+        // fixture margins: the NEOX pairing must move the output host-side, and so must the tail being untouched.
+        const bool neox_distinct = rel_l1_f(rival_adj, ref) > 0.05;
+        const bool tail_distinct = rel_l1_f(rival_full, ref) > 0.05;
+        // observability for YaRN: the scaled angle must differ from the unscaled one.  The comparison is over
+        // the ROTATED region only - the untouched tail is a copy in both readings, so including it dilutes the
+        // ratio by head_dim/n_rot and a real scaling difference reads as a small one.
+        bool scale_visible = true;
+        if (ar.type == 1) {
+            std::vector<float> plain;
+            rope_ref(x, plain, rows, head_dim, n_rot, pos, theta_scale, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0);
+            double d = 0, m = 0;
+            for (int r = 0; r < rows; ++r) {
+                const int base = r * head_dim;
+                for (int d2 = 0; d2 < n_rot; ++d2) {
+                    d += std::fabs((double) plain[base + d2] - (double) ref[base + d2]);
+                    m += std::fabs((double) ref[base + d2]);
+                }
+            }
+            scale_visible = d / (m > 1e-30 ? m : 1e-30) > 0.05;
+        }
+        Buf bx = ctx.alloc(x.size() * 4), bo = ctx.alloc(x.size() * 4), bp = ctx.alloc((size_t) rows * 4),
+            bm = ctx.alloc(4);
+        ctx.write(bx, x.data(), x.size() * 4);
+        ctx.write(bp, pos.data(), (size_t) rows * 4);
+        const int32_t dummy = 0;
+        ctx.write(bm, &dummy, 4);
+        VkPipeline p = ctx.pipeline(dir + "/native_rope_apply.spv", 4, 40);
+        struct { int32_t rows, head_dim, n_rot, mrope; float theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale; } pc;
+        pc.rows = rows; pc.head_dim = head_dim; pc.n_rot = n_rot; pc.mrope = 0;
+        pc.theta_scale = theta_scale; pc.freq_scale = freq_scale; pc.corr_low = corr_low; pc.corr_high = corr_high;
+        pc.ext_factor = ext_factor; pc.mscale = mscale;
+        const uint32_t gx = (uint32_t) ((head_dim / 2 + kLocalSize - 1) / kLocalSize);
+        ctx.dispatch(p, {&bx, &bo, &bp, &bm}, &pc, sizeof(pc), gx, (uint32_t) rows);
+        std::vector<float> got(x.size());
+        ctx.read(bo, got.data(), x.size() * 4);
+
+        int bad = 0, tail_bad = 0;
+        double worst = 0;
+        for (int r = 0; r < rows; ++r) {
+            const int base = r * head_dim;
+            double scale = 1e-30;
+            for (int d = 0; d < head_dim; ++d) scale = std::max(scale, (double) std::fabs(x[(size_t) base + d]));
+            for (int d = 0; d < n_rot; ++d) {
+                const double rel = std::fabs((double) got[base + d] - (double) ref[base + d]) / scale;
+                worst = std::max(worst, rel);
+                if (!(rel <= 3.0e-3)) ++bad;
+            }
+            for (int d = n_rot; d < head_dim; ++d) {            // the untouched tail: COPIED, so bit-exact
+                if (got[base + d] != x[(size_t) base + d]) ++tail_bad;
+            }
+        }
+        char tag[80];
+        std::snprintf(tag, sizeof tag, "native_rope_apply hd=%d rows=%d %s", head_dim, rows,
+                      ar.type ? "yarn2" : "none");
+        const bool ok = bad == 0 && tail_bad == 0 && neox_distinct && tail_distinct && scale_visible;
+        verdict(tag, ok, bad + tail_bad + (neox_distinct ? 0 : 1) + (tail_distinct ? 0 : 1) + (scale_visible ? 0 : 1),
+                (int) x.size(), worst,
+                "row-relative vs host analytic rule (tol 3e-3) + bit-exact tail + fixture margins");
+        ctx.free(bx); ctx.free(bo); ctx.free(bp); ctx.free(bm);
+    }
+}
+
+// `native_router_top10`: the class-B fast router (src/kernels/cuda/native_router.cu's `route`), replacing
+// `router_top10`.  Same RULE (softmax over 512, stable descending top-10 with ties by ascending index,
+// renormalise by the ten's own sum with ggml's 2**-14 clamp); the native body does it in plain FLOAT where the
+// legacy kernel uses DOUBLE.  The oracle is the engine's double transcription of the rule (router_top10_parity's
+// `reference`, reused here as router_host_row); ids are compared EXACTLY and the weights' deviation is REPORTED.
+void case_native_router_top10(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_router_top10.spv")) return;
+    const int NE = 512, K = 10;
+    struct Arm { const char* name; int n_tok; int kind; };   // kind 0 random, 1 all-equal, 2 12-way tie, 3 dominant
+    const Arm arms[] = {{"random", 1, 0}, {"random x8", 8, 0}, {"all equal (ties)", 4, 1},
+                        {"12-way exact tie", 4, 2}, {"dominant expert", 4, 3}};
+    std::mt19937 rng(2024);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (const Arm& ar : arms) {
+        const int NT = ar.n_tok;
+        std::vector<float> logits((size_t) NT * NE);
+        for (int t = 0; t < NT; ++t)
+            for (int e = 0; e < NE; ++e) {
+                float v = gauss(rng);
+                if (ar.kind == 1) v = 0.5f;
+                else if (ar.kind == 2) v = (e < 12) ? 2.0f : gauss(rng);
+                else if (ar.kind == 3) v = (e == (t % NE)) ? 20.0f : 0.0f;
+                logits[(size_t) t * NE + e] = v;
+            }
+        std::vector<int> r_ids((size_t) NT * K);
+        std::vector<float> r_w((size_t) NT * K);
+        for (int t = 0; t < NT; ++t)
+            router_host_row(std::vector<float>(logits.begin() + (size_t) t * NE, logits.begin() + (size_t) (t + 1) * NE),
+                            NE, K, r_ids, r_w, t);
+        Buf bl = ctx.alloc(logits.size() * 4), b_ids = ctx.alloc((size_t) NT * K * 4),
+            b_w = ctx.alloc((size_t) NT * K * 4);
+        ctx.write(bl, logits.data(), logits.size() * 4);
+        VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 4);
+        struct { int32_t n_tokens; } pc{NT};
+        ctx.dispatch(p, {&bl, &b_ids, &b_w}, &pc, sizeof(pc), (uint32_t) NT);
+        std::vector<int32_t> ids((size_t) NT * K);
+        std::vector<float> w((size_t) NT * K);
+        ctx.read(b_ids, ids.data(), ids.size() * 4);
+        ctx.read(b_w, w.data(), w.size() * 4);
+        int id_bad = 0, w_bad = 0;
+        double worst = 0;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] != r_ids[i]) ++id_bad;
+            const double rel = std::fabs((double) w[i] - (double) r_w[i]) / (std::fabs((double) r_w[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 1e-5)) ++w_bad;
+        }
+        char tag[80];
+        std::snprintf(tag, sizeof tag, "native_router_top10 %s (f32 vs double)", ar.name);
+        verdict(tag, id_bad == 0 && w_bad == 0, id_bad + w_bad, (int) ids.size(), worst,
+                "ids exact; weights relative vs the rule's double transcription (tol 1e-5)");
+        ctx.free(bl); ctx.free(b_ids); ctx.free(b_w);
+    }
+}
+
+// `native_moe_combine`: the class-B fast combination (src/kernels/cuda/native_moe.cu's `combine`), replacing
+// `moe_combine`.  The native body is PURE FLOAT in a specific order: the first term is a product
+// (`parts[col]*weights[0]`), each later term a separate multiply and add, and the shared row is added PLAIN.  The
+// legacy kernel accumulates in DOUBLE; moe_combine_f32.comp uses fma+Kahan.  The oracle here is a host
+// transcription of the NATIVE float expression, bounded by the row's TERMS (the sum can cancel); the double
+// transcription is reported beside it as the arithmetic change.
+void case_native_moe_combine(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_moe_combine.spv")) return;
+    struct Arm { int n_embd, k; };
+    const Arm arms[] = {{2560, 10}, {2560, 1}, {2500, 10}, {37, 3}};
+    for (const Arm& ar : arms) {
+        const int n_embd = ar.n_embd, k = ar.k;
+        std::vector<float> parts((size_t) k * n_embd), w(k), sh(n_embd);
+        for (auto& v : parts) v = rndf(1.0f);
+        for (auto& v : w) v = 0.1f * (1.0f + rndf(1.0f));
+        for (auto& v : sh) v = rndf(1.0f);
+        for (int has_shared = 1; has_shared >= 0; --has_shared) {
+            std::vector<float> want(n_embd), dbl(n_embd);
+            std::vector<double> want_abs(n_embd);
+            for (int j = 0; j < n_embd; ++j) {
+                // THE NATIVE EXPRESSION, host side: first term a product, each later term mul-then-add.
+                float s = parts[(size_t) j] * w[0];
+                for (int e = 1; e < k; ++e) s += parts[(size_t) e * n_embd + j] * w[e];
+                if (has_shared) s += sh[j];
+                want[j] = s;
+                double acc = 0.0;
+                for (int e = 0; e < k; ++e) acc += (double) w[e] * (double) parts[(size_t) e * n_embd + j];
+                if (has_shared) acc += (double) sh[j];
+                dbl[j] = (float) acc;
+                double mass = 0.0;
+                for (int e = 0; e < k; ++e) mass += std::fabs((double) w[e] * (double) parts[(size_t) e * n_embd + j]);
+                if (has_shared) mass += std::fabs((double) sh[j]);
+                want_abs[(size_t) j] = mass;
+            }
+            Buf bp = ctx.alloc(parts.size() * 4), bw = ctx.alloc((size_t) k * 4),
+                bs = ctx.alloc((size_t) n_embd * 4), by = ctx.alloc((size_t) n_embd * 4);
+            ctx.write(bp, parts.data(), parts.size() * 4);
+            ctx.write(bw, w.data(), (size_t) k * 4);
+            ctx.write(bs, sh.data(), (size_t) n_embd * 4);
+            VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, 12);
+            struct { int32_t n_embd, k, has_shared; } pc{n_embd, k, has_shared};
+            ctx.dispatch(p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), groups_for((uint64_t) n_embd));
+            std::vector<float> got(n_embd);
+            ctx.read(by, got.data(), (size_t) n_embd * 4);
+            int outside = 0, differ = 0;
+            double worst = 0;
+            for (int j = 0; j < n_embd; ++j) {
+                const double ratio = std::fabs((double) got[j] - (double) want[j]) /
+                                     gemv_bound((double) want[j], want_abs[(size_t) j], 1e-6);
+                worst = std::max(worst, ratio);
+                if (ratio > 1.0) ++outside;
+                if (got[j] != dbl[j]) ++differ;
+            }
+            char tag[80];
+            std::snprintf(tag, sizeof tag, "native_moe_combine n=%d k=%d shared=%d", n_embd, k, has_shared);
+            std::printf("      native_moe_combine: %d/%d differ from the double rule (the native f32 arithmetic)\n",
+                        differ, n_embd);
+            verdict(tag, outside == 0, outside, n_embd, worst, "elements outside the term-relative bound");
+            ctx.free(bp); ctx.free(bw); ctx.free(bs); ctx.free(by);
+        }
+    }
+}
+
+// `native_qsa_rms_norm_weighted`: the class-B fast weighted RMS norm (src/kernels/cuda/native_qsa.cu's `norm`),
+// replacing `rms_norm_weighted`.  Same RULE (`scale = rsqrt(sum(x^2)/n_cols + eps)`, `out = scale*x*gamma`); the
+// native body reduces with a BLOCK-per-row tree and multiplies `scale*x*gamma` where the legacy multiplies
+// `(x*gamma)*inv`.  The oracle is a double transcription of the rule; the case also exercises the engine's
+// IN-PLACE call (`native_qsa_rms_norm_weighted(data, norm, data, ...)`) by binding ONE buffer to both sides.
+void case_native_qsa_rms_norm_weighted(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_qsa_rms_norm_weighted.spv")) return;
+    struct Shape { int rows, cols; };
+    const Shape shapes[] = {{8, 2560}, {2, 256}, {3, 1024}};
+    const float eps = 1e-6f;
+    for (const Shape& sh : shapes) {
+        const int rows = sh.rows, cols = sh.cols;
+        const uint64_t n = (uint64_t) rows * cols;
+        const uint64_t padded = n + 2u * (uint64_t) cols + 8;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> x(padded, NaN), g(padded, NaN);
+        for (uint64_t i = 0; i < n; ++i) { x[i] = rndf(1.0f); g[i] = 0.5f + rndf(1.0f); }
+        std::vector<float> ref(padded, NaN);
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const double scale = 1.0 / std::sqrt(acc / (double) cols + (double) eps);
+            for (int c = 0; c < cols; ++c) {
+                const uint64_t i = (uint64_t) r * cols + c;
+                ref[i] = (float) (scale * (double) x[i] * (double) g[i]);
+            }
+        }
+        for (int inplace = 1; inplace >= 0; --inplace) {
+            Buf bx = ctx.alloc(padded * 4), bg = ctx.alloc(padded * 4), bo = ctx.alloc(padded * 4);
+            ctx.write(bx, x.data(), padded * 4);
+            ctx.write(bg, g.data(), padded * 4);
+            std::vector<float> init(padded, NaN);
+            ctx.write(bo, init.data(), padded * 4);
+            VkPipeline p = ctx.pipeline(dir + "/native_qsa_rms_norm_weighted.spv", 3, 12);
+            struct { int32_t rows, cols; float eps; } pc{rows, cols, eps};
+            // in-place binds the SAME buffer to input and output, which is exactly the engine's call shape.
+            const Buf& bin = bx;
+            const Buf& bout = inplace ? bx : bo;
+            ctx.dispatch(p, {&bin, &bg, &bout}, &pc, sizeof(pc), (uint32_t) rows + 2u);   // 2 surplus groups
+            const Buf& src = inplace ? bx : bo;
+            std::vector<float> got(padded);
+            ctx.read(src, got.data(), padded * 4);
+            int bad = 0, guard_bad = 0;
+            double worst = 0;
+            for (uint64_t i = 0; i < n; ++i) {
+                if (!close_enough(got[i], ref[i], 3e-3, 1e-6)) ++bad;
+                worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30));
+            }
+            for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got[i]) || got[i] == 0.0f)) ++guard_bad;
+            char tag[80];
+            std::snprintf(tag, sizeof tag, "native_qsa_rms_norm_weighted r=%d c=%d %s", rows, cols,
+                          inplace ? "in-place" : "out-of-place");
+            verdict(tag, bad == 0 && guard_bad == 0, bad + guard_bad, (int) (n + (padded - n)), worst,
+                    "relative vs the rule's double transcription (tol 3e-3) + row-guard NaN");
+            ctx.free(bo);
+            ctx.free(bx); ctx.free(bg);
+        }
+    }
+}
+
+// THE CAPABILITY CONTRACT, CHECKED.  This increment makes the Vulkan backend answer the four native capability
+// checks itself (vulkan/src/kernels/native_caps_vk.cpp) so the engine can take the native branch.  A capability
+// must be TRUE only for a symbol this port implements, and FALSE when the check ALSO gates an unimplemented
+// symbol - the case asserts exactly that, AND that each ported symbol's .spv is present, so a capability cannot
+// answer true for a shader that was deleted.
+void case_native_capabilities(Ctx&, const std::string& dir) {
+    struct Entry { const char* sym; const char* spv; bool expected; };
+    const Entry entries[] = {
+        {"native_rope_apply", "native_rope_apply.spv", true},
+        {"native_router_top10", "native_router_top10.spv", true},
+        {"native_moe_combine", "native_moe_combine.spv", true},
+        // the flag ALSO gates native_qsa_gate_apply (layer.cpp:1010), which has no shader: answer false.
+        {"native_qsa_rms_norm_weighted", "native_qsa_rms_norm_weighted.spv", false},
+    };
+    const bool answers[] = {
+        strata::kernels::native_rope_enabled(),
+        strata::kernels::native_router_enabled(),
+        strata::kernels::native_moe_combine_enabled(),
+        strata::kernels::native_qsa_enabled(),
+    };
+    int bad = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        const bool built = std::filesystem::exists(dir + "/" + entries[i].spv);
+        if (!built) { ++bad; std::printf("      capability: %s has no built shader\n", entries[i].sym); }
+        if (answers[i] != entries[i].expected) {
+            ++bad;
+            std::printf("      capability: %s answered %d, expected %d\n", entries[i].sym, (int) answers[i],
+                        (int) entries[i].expected);
+        }
+    }
+    // exactly the ported, main-path set may answer true.
+    const bool set_ok = answers[0] && answers[1] && answers[2] && !answers[3];
+    if (!set_ok) ++bad;
+    verdict("native capabilities (vulkan backend)", bad == 0, bad, 4, (double) bad,
+            "answers + built shaders: rope/router/moe true (ported), qsa false (its flag also gates an unported symbol)");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -12030,6 +12401,16 @@ int main(int argc, char** argv) {
     case_rms_norm(ctx, dir);
     case_exp_probe(ctx, dir);
     case_silu(ctx, dir);
+    // PERFORMANCE TIER, class B: the NATIVE fast paths (each replacing a legacy kernel already ported).
+    // RUN LAST, ON PURPOSE: every case above draws from the gate's ONE shared RNG (`g_rng(11)`), so a new case
+    // placed earlier would change the fixture a LATER existing case sees - measured here as `gr_write` going
+    // borderline-fail on lvp and radeon when these ran before it.  Appending keeps every existing case's input
+    // stream byte-identical.
+    case_native_rope_apply(ctx, dir);            // native_rope_apply  <- rope_neox_apply
+    case_native_router_top10(ctx, dir);          // native_router_top10 <- router_top10
+    case_native_moe_combine(ctx, dir);           // native_moe_combine <- moe_combine
+    case_native_qsa_rms_norm_weighted(ctx, dir); // native_qsa_rms_norm_weighted <- rms_norm_weighted
+    case_native_capabilities(ctx, dir);          // the Vulkan backend's capability answers (the branch the engine takes)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

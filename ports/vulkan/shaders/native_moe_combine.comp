@@ -1,0 +1,44 @@
+// ports/vulkan/shaders/native_moe_combine.comp - the class-B FAST MoE combination, ported from
+// src/kernels/cuda/native_moe.cu's `combine` kernel.
+//
+// THE RULE (identical to the legacy `moe_combine`): every output column is the weighted sum of the k routed
+// expert rows plus the shared expert's row, added PLAIN:
+//
+//     out[col] = sum_e parts[e*n_embd + col] * weights[e]  (+ shared[col])
+//
+// WHAT THE NATIVE BODY DOES DIFFERENTLY, and why this is its own shader.  `moe_combine.cu`'s kernel accumulates
+// in DOUBLE and in the reference's own order (`acc += (double)w[e] * (double)parts[e*n_embd+j]`) - and
+// `moe_combine_f32.comp` reproduces that in float with an `fma` term and Kahan compensation.  The native body is
+// PURE FLOAT, in a specific order:
+//
+//     float sum = parts[col] * weights[0];
+//     for (expert = 1; expert < k; ++expert) sum += parts[expert*n_embd + col] * weights[expert];
+//     if (shared) sum += shared[col];
+//
+// Note the first term is the product (`parts*weights[0]`, not `0 + parts*weights[0]`, so no add rounds), and
+// every later term is a separate multiply and add.  The gate case's oracle is a host transcription of THAT
+// float expression, and it reports how many elements differ from the engine's double transcription of the same
+// rule - the honest measure of the arithmetic change.
+//
+// Elementwise and one thread per column: no reduction, no barrier, no subgroup op.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PARTS { float v[]; } parts;
+layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } weights;
+// `sh` and not `shared`: `shared` is a GLSL KEYWORD (the shared-memory qualifier), the same class of trap as
+// `half` and `out` - see moe_combine_f32.comp.
+layout(set = 0, binding = 2, std430) readonly buffer S { float v[]; } sh;
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
+
+layout(push_constant, std430) uniform PC { int n_embd; int k; int has_shared; } pc;
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    if (col >= uint(pc.n_embd)) return;
+    const uint n = uint(pc.n_embd), k = uint(pc.k);
+    float sum = parts.v[col] * weights.v[0];             // the source's first term: a product, not 0 + product
+    for (uint e = 1u; e < k; ++e) sum += parts.v[e * n + col] * weights.v[e];
+    if (pc.has_shared != 0) sum += sh.v[col];        // added PLAIN, exactly as the source adds it
+    y.v[col] = sum;
+}

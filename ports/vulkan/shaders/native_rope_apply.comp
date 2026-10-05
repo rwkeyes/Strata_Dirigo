@@ -1,0 +1,103 @@
+// ports/vulkan/shaders/native_rope_apply.comp - the class-B FAST RoPE, ported from
+// src/kernels/cuda/native_rope.cu's `apply<false>` (the default: no STRATA_ROPE_TABLE path).
+//
+// WHAT MAKES THIS THE FAST PATH, AND WHAT IS *NOT* THE SAME AS `rope_neox.comp`.
+// The legacy kernel (`rope_neox_apply`) is a pure rotation over a HOST-BUILT float64 cos/sin table:
+// `build_rope_table` computes `theta**(-2i/n_rot)`, `pos*inv`, cos/sin in float64 on the CPU and the kernel
+// just reads the table.  The native body computes the angle ON DEVICE, in float32, under `--use_fast_math`:
+//
+//     theta_scale = powf(freq_base, -2.0f / n_rot)          (host, passed in as a float)
+//     theta_extrap = pos * powf(theta_scale, float(pair))   (device fast powf)
+//     rope_scaled_angle(theta_extrap, ...)                  (device cosf/sinf * mscale)
+//
+// `rope_parity.cpp` check 5 pins the two paths against each other at **3e-3 relative to the row magnitude**
+// ("the device side takes fast-math trig at angles up to ~2048 rad, where the fp32 range reduction alone is
+// worth ~1e-4"), which is the honest bar for this shader: its trig is the driver's, not libm's.  The gate case
+// MEASURES that gap against a host transcription of the SAME analytic rule; it does not claim bit-exactness
+// with the table path.
+//
+// THE STRUCTURE IS THE SOURCE'S.  One thread per (row, pair): the CUDA's grid is
+// (head_dim/2 + 127)/128 x rows with 128 threads, i.e. the PAIRS of a row are the x dimension and the row is y.
+// This port keeps that mapping (local_size_x = 256 is the port's single workgroup size; the x grid is
+// ceil((head_dim/2)/256) and the surplus invocations exit).  The legacy kernel is ONE THREAD PER ROW, which is
+// where the native path's parallelism comes from.
+//
+// THE PARTIAL ROTATION AND THE TAIL COME FROM THE SOURCE, verbatim.  Only the first n_rot channels rotate, in
+// NEOX pairs `(i, i + n_rot/2)`; every remaining channel is COPIED.  The source copies the tail as the
+// ADJACENT pairs `(2p, 2p+1)` of the same co-ordinates (pairs p >= n_rot/2), which is the same set of
+// elements as "d >= n_rot" - the gate compares the copied region bit-for-bit, because a port that rotates the
+// whole head_dim looks right on the first n_rot values.
+//
+// mrope: `mrope_pos(tab, pos, pair)` is `tab ? tab[pos*3 + pair%3] : pos` - a null table means the caller's
+// position IS the rotary position (text), a set table makes it a CELL index whose t/h/w sectors (pair % 3)
+// carry that pair's position (the vision path).  A Vulkan descriptor cannot be null, so, exactly as
+// rope_neox.comp does, the flag is explicit: `mrope` 0 = use pos[r] directly; non-zero = index the table.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Xbuf { float x[]; } XB;
+layout(set = 0, binding = 1, std430) buffer Obuf { float o[]; } OB;
+layout(set = 0, binding = 2, std430) readonly buffer Pbuf { int p[]; } PB;
+layout(set = 0, binding = 3, std430) readonly buffer Mbuf { int m[]; } MB;
+
+layout(push_constant, std430) uniform Pc {
+    int rows;
+    int head_dim;
+    int n_rot;
+    int mrope;        // 0 = the positions are rotary positions; non-zero = cell indices into the table
+    float theta_scale;   // powf(freq_base, -2/n_rot), computed on the host as the source does
+    float freq_scale;
+    float corr_low;
+    float corr_high;
+    float ext_factor;
+    float mscale;        // the RAW attn_factor, as ggml's kernels receive it
+} pc;
+
+// `rope_yarn_ramp`, transcribed from rope_scaling.hpp (ggml-cuda/rope.cu): the 0.001 floor is ggml's, kept
+// because `corr_dims` can produce low == high.
+float rope_yarn_ramp(float low, float high, int pair) {
+    float y = (float(pair) - low) / (high - low > 0.001f ? high - low : 0.001f);
+    float clamped = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+    return 1.0f - clamped;
+}
+
+// `rope_scaled_angle`, transcribed from rope_scaling.hpp verbatim: the interpolation is always applied, the
+// correction is mixed in on top, and the log magnitude term rides on ext_factor != 0 (not on the type).
+void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_low, float corr_high, float ext_factor,
+                       float mscale_in, int pair, out float cos_out, out float sin_out) {
+    float theta = freq_scale * theta_extrap;
+    float mscale = mscale_in;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
+        theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
+    }
+    cos_out = cos(theta) * mscale;
+    sin_out = sin(theta) * mscale;
+}
+
+void main() {
+    const int row = int(gl_WorkGroupID.y);
+    const int pair = int(gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x);
+    if (row >= pc.rows || pair >= pc.head_dim / 2) return;   // the x grid is rounded up; surplus exits
+
+    const int nhalf = pc.n_rot / 2;
+    const int base = row * pc.head_dim;
+    if (pair >= nhalf) {
+        // The partial rotation's untouched tail, copied as the source does (the adjacent pairs past n_rot/2).
+        OB.o[base + 2 * pair] = XB.x[base + 2 * pair];
+        OB.o[base + 2 * pair + 1] = XB.x[base + 2 * pair + 1];
+        return;
+    }
+    const int row_pos = PB.p[row];
+    const int p = (pc.mrope != 0) ? MB.m[row_pos * 3 + (pair % 3)] : row_pos;
+    // `mrope_pos` returns an int; the source multiplies it as `float(...) * powf(...)`.
+    const float theta_extrap = float(p) * pow(pc.theta_scale, float(pair));
+    float c = 0.0f, s = 0.0f;
+    rope_scaled_angle(theta_extrap, pc.freq_scale, pc.corr_low, pc.corr_high, pc.ext_factor, pc.mscale, pair, c, s);
+    const float a = XB.x[base + pair];
+    const float b = XB.x[base + pair + nhalf];
+    OB.o[base + pair] = a * c - b * s;
+    OB.o[base + pair + nhalf] = a * s + b * c;
+}

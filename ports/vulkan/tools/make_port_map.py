@@ -72,6 +72,15 @@ TABLE = {
     'native_flash_attn_short_step':   ('kernel', 'attn_decode_short'),
     'native_mmvq':                    ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq'),
     'native_q5_k_f32':                ('kernel', 'native_q5_k_f32'),
+    # THE PERFORMANCE TIER, class B: the native fast paths, each replacing the legacy kernel already ported.
+    # The Vulkan backend answers the checks they belong to itself (vulkan/src/kernels/native_caps_vk.cpp).
+    'native_rope_apply':              ('kernel', 'native_rope_apply'),        # replaces rope_neox_apply
+    'native_router_top10':            ('kernel', 'native_router_top10'),      # replaces router_top10
+    'native_moe_combine':             ('kernel', 'native_moe_combine'),       # replaces moe_combine
+    # native_qsa_rms_norm_weighted is ported and gated, but `native_qsa_enabled()` ALSO gates the unported
+    # `native_qsa_gate_apply` (layer.cpp:1010), so the backend still answers that check false - see
+    # native_caps_vk.cpp.  The shader exists; the row is `kernel` because the GPU work is done.
+    'native_qsa_rms_norm_weighted':   ('kernel', 'native_qsa_rms_norm_weighted'),   # replaces rms_norm_weighted
     'native_quantize_q8_1':           ('kernel', 'quantize_q8_1'),
     'ple_block':                      ('kernel', 'ple_bcast ple_conv ple_gate ple_gnorm'),
     'ple_history_advance':            ('kernel', 'ple_history_advance'),
@@ -183,13 +192,9 @@ TABLE = {
     'native_gdn_l2_norm':             ('todo', 'no shader in this tree yet'),
     'native_gdn_out_norm':            ('todo', 'no shader in this tree yet'),
     'native_gdn_step':                ('todo', 'no shader in this tree yet'),
-    'native_moe_combine':             ('todo', 'no shader in this tree yet'),
     'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),
     'native_qsa_gate_apply':          ('todo', 'no shader in this tree yet'),
     'native_qsa_indexer_append':      ('todo', 'no shader in this tree yet'),
-    'native_qsa_rms_norm_weighted':   ('todo', 'no shader in this tree yet'),
-    'native_rope_apply':              ('todo', 'no shader in this tree yet'),
-    'native_router_top10':            ('todo', 'no shader in this tree yet'),
     'native_router_top10_multi':      ('todo', 'no shader in this tree yet'),
     'ple_block_projected':            ('todo', 'no shader in this tree yet'),
     'qsa_attend_step':                ('todo', 'no shader in this tree yet'),

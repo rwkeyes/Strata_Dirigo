@@ -1,5 +1,44 @@
 # Status — what is done, what is verified, what is not
 
+## THE PERFORMANCE TIER'S FIRST FOUR KERNELS — class B, the NATIVE fast paths (2026-10-05)
+
+The first increment of the PERFORMANCE tier: the **four class-B capability-gated native fast paths** are
+PORTED, GATED, and **MEASURED against the legacy kernel each replaces at the same shape on the same device**,
+with the Vulkan backend's **capability answers wired so the engine can take the native branch**.
+
+| case | rule (the engine's OWN native body = the oracle) | measured (vega Arc) | falsified by |
+|---|---|---|---|
+| `native_rope_apply` (3 arms: hd=256/128 none, hd=256 YaRN×2) | `native_rope.cu` `apply<false>`: device f32 angle (`powf`/`rope_scaled_angle`), one thread per (row,PAIR), NEOX pairing, tail copied | **49152/49152 worst 2.61e-05**, 8192/8192 w 2.77e-05, 24576/24576 w 3.16e-05 (row-relative vs a host transcription, tol 3e-3; tail BIT-EXACT) | `native-rope-adjacent-pairing` → FAIL 37307/49152 w 1.96 |
+| `native_router_top10` (5 arms) | `native_router.cu` `route`: softmax+sum in plain **f32**, top-10 with ties by lowest index, renormalise by the ten's sum (clamp 2⁻¹⁴) | **10/10, 80/80, 40/40, 40/40, 40/40** ids exact; weights worst 2.28e-07 (rel 1e-5) vs `router_top10_parity`'s double rule | `native-router-top10-tie-high-index` → FAIL 0/40 |
+| `native_moe_combine` (4 shapes × shared on/off) | `native_moe.cu` `combine`: pure f32, first term a PRODUCT, shared added PLAIN | all 2560/2560 (and 2500, 37) within the term-relative bound; **904-1347/2560 differ from the double rule** — the measured arithmetic change | `native-moe-combine-drop-shared` → FAIL 0/2560 w 5.21e+05 |
+| `native_qsa_rms_norm_weighted` (3 shapes × in-place/out-of-place) | `native_qsa.cu` `norm`: block-per-row, `scale*x*gamma`; in-place is the engine's call | **25608/25608 w 2.21e-07**, 1032/1032, 5128/5128 (double rule, tol 3e-3 + row-guard NaN) | `native-qsa-rms-norm-eps-on-sum` → FAIL 5128/25608 w 0.98 |
+| `native capabilities (vulkan backend)` | the four capability answers + each ported symbol's `.spv` present | **4/4** answers exact | `native-caps-qsa-true` → FAIL 2/4 |
+
+**THE MEASUREMENT (native/legacy, same shape, same device — < 1.0 is faster; full table in `bench/README.md`).**
+`native_rope_apply` **0.301** on the Arc, **0.118** on the box XTX and 0.040 on the Ryzen iGPU (where the legacy
+one-thread-per-row kernel launches 2 workgroups); `native_router_top10` **0.078** (Arc), **0.082** (XTX), 0.078
+(iGPU); `native_moe_combine` **0.998** (a wash); `native_qsa_rms_norm_weighted` **1.007** on the Arc, 0.988 on
+the XTX, and **1.117 on the iGPU / 1.795 on the K620**.  **The last two are NOT wins and are reported as
+findings, not tuned away** — they are elementwise / same-shape kernels with no algorithmic difference, and on
+the K620 the native block-per-row tree's shared-memory traffic actively hurts.
+
+**THE CAPABILITY CONTRACT, wired in `vulkan/src/kernels/native_caps_vk.cpp` (new).**  The Vulkan backend answers
+the checks itself (a Vulkan build compiles none of `src/kernels/cuda/native_*.cu`): `native_rope_enabled()`,
+`native_router_enabled()`, `native_moe_combine_enabled()` → **true** (each gates only a ported, forward-path
+symbol); **`native_qsa_enabled()` → false**, because that ONE flag ALSO gates the UNPORTED
+`native_qsa_gate_apply` (layer.cpp:1010, the main QSA path, 12 of 48 layers) — so the port stays on the legacy
+branch until that sibling lands.  **A symbol-at-a-time truth, not a blanket `true`.**  Check it with the gate's
+`case_native_capabilities` (asserts the four answers AND the built shaders) or by reading that TU; the
+`native_*_set_enabled` setters are no-ops here so a `--native` launch cannot select an unported symbol.
+
+**THE MAP MOVES BY FOUR ROWS:** `168 — 62 kernel, 61 host, 45 todo` → **`168 — 66 kernel, 61 host, 41 todo`**;
+`check_port_map.py` passes and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **Gate, after
+the last commit: vega Arc 407/0/0, lvp 395/0/3, radeon-iGPU 397/1/2 (the known `budget` flake); box `z820b`
+RADV XTX 403/0/1, lvp 395/0/3, nvidia K620 398/0/2 — 0 failed on every arm on both boxes.**  Two README fixes
+came with it: `run_gate.sh`'s greedy barrier-count `sed` misread 11 barriers as 1 (now `grep -oE`), and the new
+cases had to be APPENDED to `main()` because the gate's one shared RNG makes a new earlier case change a later
+existing case's fixture.  Full detail in `NEXT.md`'s top section.
+
 ## THE PERFORMANCE TIER'S HARNESS LANDED (2026-10-05)
 
 The port had **no throughput harness at all**, so no performance claim could be made or checked.  This
