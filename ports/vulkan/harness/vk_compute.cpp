@@ -51,6 +51,12 @@ bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k, uint32_t tile_m, uint32_t
     return m % tile_m == 0 && n % tile_n == 0 && k % tile_k == 0;
 }
 
+// The attention window: 1..256 live keys (the engine's "width in [1, max_context]" with max_context <= 256) and a
+// cache at least that wide, because the kernel's padding story assumes rows past `width` exist and are zero.
+bool attn_short_shape_ok(uint32_t width, uint32_t capacity) {
+    return width >= 1 && width <= 256 && capacity >= 256;
+}
+
 ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes, uint64_t floor_bytes,
                                        uint32_t cap_percent_of_heap) {
     ReserveDecision d{};

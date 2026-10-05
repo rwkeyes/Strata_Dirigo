@@ -66,3 +66,24 @@ float wg_sum(float v) {
     }
     return rp_partial[0];
 }
+
+// The same tree for a MAXIMUM, added for decode attention - which needs both a max and a sum over the same
+// values, in that order, before it can normalise.  Same shared array on purpose: the leading barrier makes the
+// reuse safe (see above), and a second array would be the same 1 KiB twice.
+//
+// `-inf` is the identity and it is what padding and masked keys contribute, so a workgroup where EVERY entry is
+// -inf returns -inf rather than a NaN - the caller decides what that means (the attention kernel writes its
+// documented degenerate value rather than computing exp(-inf - -inf)).
+float wg_max(float v) {
+    barrier();
+    rp_partial[gl_LocalInvocationIndex] = v;
+    barrier();
+    for (uint step = gl_WorkGroupSize.x >> 1u; step > 0u; step >>= 1u) {
+        if (gl_LocalInvocationIndex < step) {
+            rp_partial[gl_LocalInvocationIndex] = max(rp_partial[gl_LocalInvocationIndex],
+                                                      rp_partial[gl_LocalInvocationIndex + step]);
+        }
+        barrier();
+    }
+    return rp_partial[0];
+}

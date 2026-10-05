@@ -118,6 +118,15 @@ struct ReserveDecision {
 // the kernel actually declares rather than against 16 by name.
 bool gemm_shape_ok(uint32_t m, uint32_t n, uint32_t k, uint32_t tile_m = 16, uint32_t tile_n = 16, uint32_t tile_k = 16);
 
+// The short-step decode attention's precondition, as a testable predicate for the same reason.
+//
+// WHY IT EXISTS: attn_decode_short computes one score per key and drops the keys past `width`.  A width of 0 makes
+// every score -inf, and the kernel then writes its documented degenerate value rather than a wrong token; a width
+// beyond the 256-key window the engine's cache provides would read rows that were never written.  The engine states
+// the rule itself - "the device step must satisfy pos+1 == n_kv == width in [1, max_context]" with
+// "capacity >= 256" - so the port checks it at the boundary instead of discovering it as a wrong number.
+bool attn_short_shape_ok(uint32_t width, uint32_t capacity);
+
 ReserveDecision compute_desktop_reserve(uint64_t requested_bytes, uint64_t heap_total_bytes,
                                        uint64_t floor_bytes, uint32_t cap_percent_of_heap);
 

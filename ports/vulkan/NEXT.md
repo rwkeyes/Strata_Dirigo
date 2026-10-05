@@ -269,6 +269,55 @@ per format for free.
 
 
 
+## THE ATTENTION BLOCK, KERNEL 1: the short-step decode attention - **the engine's contract, re-derived**
+
+**What was ported.**  `native_flash_attn_short_step` (`src/kernels/cuda/native_flash_attn.cu`, called from
+`src/core/layer.cpp`), which the engine's own header describes precisely enough that nothing had to be guessed:
+geometry **Q24 x 256, KV2 x 256**, one query/sequence, **scale = 1/16**, no ALiBi/softcap/sink; q/out contiguous
+`[24, 256]` f32; k/v `[capacity, 2, 256]` f16 with only the first `width` rows initialised; an optional **additive**
+f16 mask of 256 logits broadcast over the heads, `-inf` meaning masked.  The 24 query heads share 2 KV heads - the
+GQA grouping the CUDA encodes as `kv = head / 12`.
+
+**What is NOT claimed, up front.**  This is not the pinned CUDA bit for bit, and it does not try to be: that kernel
+is a VECTOR flash attention pinned to one compiled binary - 128 threads, a lane/float2 mapping, an `__shfl_xor`
+tree over 8 lanes, a streaming online-max pass, and an fma order chosen to reproduce that binary's rounding (its
+comments say so outright).  The port's reduction rule bans subgroup ops anyway.  So the port carries the ALGORITHM -
+score, additive mask, softmax, weighted sum - onto one workgroup per query head with one output dim per thread, and
+measures the difference against a double-precision reference instead of asserting it away.  Engine-token parity for
+this kernel is a stage-6 question with its own tolerance argument.
+
+**Design, and why it is not the CUDA's.**  Each thread OWNS one key's score (thread c does the whole dot for cell c
+serially over 256 dims), so the max and the sum are **two workgroup reductions per token per head** - not one per
+key, which is what a per-cell reduction would cost.  `wg_reduce.glsl` gained `wg_max` for it, sharing the existing
+array behind its own leading barrier.  The softmax is two-pass (max, then exp and sum) rather than streaming: both
+are exact formulations of the same quantity and differ only in f32 rounding order, which the arms measure.
+
+**A shape predicate, for the same reason the GEMM has one.**  `attn_short_shape_ok(width, capacity)` = width in
+[1, 256] and capacity >= 256.  The kernel drops every key past `width`, so a wrong width is a silently wrong token
+rather than an error - the engine carries a status word for exactly this, and the case's first arm is the contract
+itself (width 0 and width 257 must be REFUSED, one live key and a full window must be allowed).
+
+**Evidence.**  Arc: **204 passed / 0 failed / 0 skipped**.  Five arms - 1 live key (the first decode step, which is
+bit-exact against the reference because there is no softmax to round), 3 live keys, a full 256-key window, a full
+window with an additive mask (-inf on a third of the keys), and a masked half window - each 24 heads x 256 dims, each
+against the double oracle.  The two KV heads carry DIFFERENT data in every arm, which is what makes the GQA grouping
+falsifiable.  Tolerance is a relative bound with an absolute floor, and the case prints the worst RELATIVE and worst
+ABSOLUTE deviation beside the reference magnitudes: a masked softmax over 170-odd live keys spreads the weights over
+many orders of magnitude, so the worst relative error (2.25e-2) sits on an output whose absolute deviation is under
+the floor - measured, not assumed.
+
+**Falsification.**  Changing the grouping to the plausible wrong one (`head % KV_HEADS`, interleaved instead of the
+engine's 12-blocks) fails all five arms with exactly half the values correct (3072 of 6144) - the 12 heads that map
+to the same KV head under both rules.  A grouping bug is therefore not something this case can miss, which was the
+point of giving the two KV heads different data.
+
+**What the attention block still needs.**  The prompt path (`qsa_prompt_attn.cu`, 74 KB, and `qsa_select.cu`), the
+QSA selection and indexer logic (`native_qsa*.cu`), the KV gather/write path at f16 (the port has the q8_1 append
+and gather already), and a tiled version of this kernel - the serial 256-dim loops are the right trade for a
+correctness kernel and the wrong one for throughput.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 54 kernels, 17 shared includes, one

@@ -1,0 +1,111 @@
+// ports/vulkan/shaders/attn_decode_short.comp - the engine's SHORT-STEP decode attention
+// (src/kernels/cuda/native_flash_attn.cu, `native_flash_attn_short_step`), RE-DERIVED rather than micro-ported.
+//
+// THE CONTRACT comes from include/strata/kernels/native_flash_attn.hpp, which states it precisely enough that the
+// port does not have to guess at any of it:
+//
+//   geometry    Q24 x 256, KV2 x 256, one query/sequence, SCALE = 1/16, no ALiBi, no softcap, no sink
+//   q / out     contiguous [24, 256] f32
+//   k / v       [capacity, 2, 256] f16, only the first `width` rows initialised; key r's KV head h lives at
+//               k[(r * 2 + h) * 256 + d]
+//   mask        optional: 256 f16 ADDITIVE logits, broadcast over the heads; -inf means masked
+//   width       live keys; rows >= width are ZERO K/V and -inf mask, and are never read
+//
+// The 24 query heads share 2 KV heads - 12 query heads per KV head, the GQA grouping the CUDA encodes as
+// `kv = head / 12`.  A port that got that division wrong would still produce plausible numbers, which is why the
+// gate's fixture gives the two KV heads different data.
+//
+// WHAT THIS IS NOT, stated before anything else: it is NOT the pinned CUDA, bit for bit.  That kernel is a VECTOR
+// flash attention pinned to one compiled binary - 128 threads, a lane/float2 mapping, a `__shfl_xor` tree over 8
+// lanes, a streaming online-max pass, and an fma ORDER chosen to reproduce that binary's rounding (its own
+// comments say so: "the pinned sm120a binary contracts the old-accumulator rescale with the FIRST addition").
+// None of that is a property of the ALGORITHM, and the port's reduction rule bans subgroup ops anyway.  What is
+// ported is the algorithm - score, additive mask, softmax, weighted sum - onto one workgroup per query head with
+// one output dim per thread; the gate measures the difference against a double-precision reference rather than
+// asserting it away, and bit-identity with the pinned binary is left as an engine-integration question.
+//
+// TWO WORKGROUP REDUCTIONS PER TOKEN, not one per key.  Each thread OWNS one key's score (thread c computes the
+// whole dot for cell c, serially over the dims), so the max and the sum are one reduction each for the whole
+// head.  The obvious alternative - a reduction per key cell - would be 256 barrier trees per token per head.
+// What that costs is the two 256-iteration serial loops below, which is the right trade for a correctness kernel
+// and the wrong one for throughput; the fast version tiles K and keeps several cells in flight per thread.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Qb { float q[]; } Q;          // [Q_HEADS * D]
+layout(set = 0, binding = 1, std430) readonly buffer Kb { float16_t k[]; } K;      // [capacity * KV_HEADS * D]
+layout(set = 0, binding = 2, std430) readonly buffer Vb { float16_t v[]; } V;      // [capacity * KV_HEADS * D]
+layout(set = 0, binding = 3, std430) readonly buffer Mb { float16_t m[]; } M;      // [256] additive logits
+layout(set = 0, binding = 4, std430) buffer Ob { float o[]; } O;                   // [Q_HEADS * D]
+
+layout(push_constant, std430) uniform Pc {
+    uint width;       // live keys, 1..256 - a shape the caller must check (see portvk::attn_short_shape_ok)
+    uint use_mask;    // 0 = no mask: the engine's `mask == nullptr` case
+} pc;
+
+#include "common/wg_reduce.glsl"
+
+// The engine's pinned geometry.  Named here rather than taken from push constants because the engine fixes them
+// ("Geometry is exactly Q24x256, KV2x256 ... scale=1/16") and a caller that needs other shapes needs a different
+// kernel, not this one with different numbers.
+const uint Q_HEADS = 24u;
+const uint KV_HEADS = 2u;
+const uint D = 256u;
+const uint KV_PER_Q = Q_HEADS / KV_HEADS;    // 12
+const float SCALE = 0.0625;                  // 1/16, as the header states
+// -inf, as a MACRO rather than a const: glslang does not fold `uintBitsToFloat` into a constant expression
+// ("global const initializers must be constant"), and `-1.0/0.0` is not one either.  The macro expands at each
+// use site, where the call is legal.
+#define NEG_INF (uintBitsToFloat(0xff800000u))
+
+shared float qs[D];          // the head's scaled query, broadcast to every thread
+shared float wt[D];          // the per-key weight, published by the score phase and read by the V phase
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    if (head >= Q_HEADS) return;                 // the grid is rounded up; surplus workgroups exit
+    const uint lid = gl_LocalInvocationIndex;
+    const uint kv = head / KV_PER_Q;
+    const uint width = min(pc.width, D);
+
+    // The query, scaled ONCE on the way in - the CUDA does the same at load (`q[head*256+d] * scale`), so the
+    // scale is inside the dot and not applied to the result.
+    qs[lid] = Q.q[head * D + lid] * SCALE;
+    barrier();
+
+    // PHASE 1 - one key per thread.  Thread c sums the whole dot for key c: every thread needs all of q, which is
+    // why it sits in shared (the read is a broadcast, not a 256-wide gather).
+    float s = NEG_INF;                            // padding and masked keys contribute nothing, by identity
+    if (lid < width) {
+        const uint base = (lid * KV_HEADS + kv) * D;
+        float dot = 0.0;
+        for (uint d = 0u; d < D; ++d) dot += float(K.k[base + d]) * qs[d];
+        // ADDITIVE mask, not multiplicative: the engine's mask is a logit, and -inf is how a key is excluded.
+        if (pc.use_mask != 0u) dot += float(M.m[lid]);
+        s = dot;
+    }
+
+    // PHASE 2 - the max, the exponentials and their sum.  No streaming rescale is needed because the max is known
+    // before any exponential is taken; that is the one structural difference from the CUDA's online pass.
+    const float block_max = wg_max(s);
+    float w = 0.0;
+    if (lid < width) w = exp(s - block_max);
+    wt[lid] = w;
+    barrier();
+    const float denom = wg_sum(w);
+
+    // PHASE 3 - this thread's own output dim, weighted by the published weights.
+    if (!(denom > 0.0)) {
+        // Every key masked (or width 0): the engine's precondition is "at least one valid key must be unmasked",
+        // so this is a caller error - and it is reported as the value the CUDA writes for an unsupported step
+        // rather than as a silent zero (a zero here would look like a legitimate attention output).
+        O.o[head * D + lid] = NEG_INF;
+        return;
+    }
+    float acc = 0.0;
+    for (uint c = 0u; c < width; ++c) acc += wt[c] * float(V.v[(c * KV_HEADS + kv) * D + lid]);
+    O.o[head * D + lid] = acc / denom;
+}

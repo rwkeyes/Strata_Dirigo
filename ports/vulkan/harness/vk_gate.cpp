@@ -56,6 +56,7 @@ using portvk::resolve_icd_library;
 using portvk::parse_so_version;
 using portvk::IcdEntry;
 using portvk::gemm_shape_ok;
+using portvk::attn_short_shape_ok;
 using portvk::MemTypeInfo;
 using portvk::PlanItem;
 using portvk::PlanVerdict;
@@ -760,6 +761,152 @@ void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
     } else {
         skip("prefill split (aligned + remainder)", "this device offers no M8 cooperative-matrix config");
     }
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// THE SHORT-STEP DECODE ATTENTION (src/kernels/cuda/native_flash_attn.cu, `native_flash_attn_short_step`).
+// ----------------------------------------------------------------------------------------------------------
+
+// One attention arm, compared against a double-precision softmax.  The geometry is the engine's pinned one
+// (Q24x256, KV2x256, scale 1/16, additive f16 mask) and the two KV HEADS GET DIFFERENT DATA, so a wrong GQA
+// grouping - the CUDA's `kv = head / 12`, which is the kind of arithmetic that produces plausible numbers when it
+// is wrong - cannot agree with the reference by accident.
+static void attn_arm(Ctx& ctx, const std::string& dir, uint32_t width, bool use_mask, const char* what) {
+    const uint32_t Q_HEADS = 24, KV_HEADS = 2, D = 256, CAP = 256;
+    const float SCALE = 0.0625f;                       // 1/16, the engine's scale
+    if (!attn_short_shape_ok(width, CAP)) {
+        std::printf("      arm skipped: width %u / capacity %u fails the shape contract\n", width, CAP);
+        return;
+    }
+    std::vector<float> q((size_t) Q_HEADS * D);
+    for (float& x : q) x = rndf(1.0f);
+    std::vector<uint16_t> kb((size_t) CAP * KV_HEADS * D), vb((size_t) CAP * KV_HEADS * D);
+    for (uint32_t c = 0; c < CAP; ++c) {
+        for (uint32_t h = 0; h < KV_HEADS; ++h) {
+            for (uint32_t d = 0; d < D; ++d) {
+                const size_t i = ((size_t) c * KV_HEADS + h) * D + d;
+                kb[i] = f16_from_f32(rndf(1.0f) * (h == 0 ? 1.0f : 0.25f));
+                vb[i] = f16_from_f32(rndf(1.0f) * (h == 0 ? 1.0f : 3.0f));
+            }
+        }
+    }
+    std::vector<uint16_t> mb(D, 0);
+    for (uint32_t c = 0; c < D; ++c) mb[c] = f16_from_f32(0.0f);
+    if (use_mask) {
+        for (uint32_t c = 0; c < D; ++c) {
+            // -inf for padding and for one key in three, a live additive logit for the rest.  The mask is
+            // ADDITIVE - the engine's convention - so a kernel that multiplied by it, or ignored it, differs here.
+            if (c >= width || c % 3 == 0) mb[c] = 0xFC00;
+            else mb[c] = f16_from_f32(rndf(0.5f));
+        }
+    }
+
+    // THE ORACLE, in double: the same scaled f32 query, the exact f16 KV values, additive mask, softmax, weighted
+    // sum.  Not a re-derivation of the kernel's structure - a different formulation of the same quantity.
+    std::vector<double> want((size_t) Q_HEADS * D, 0.0);
+    std::vector<double> sc(D);
+    for (uint32_t head = 0; head < Q_HEADS; ++head) {
+        const uint32_t kv = head / (Q_HEADS / KV_HEADS);
+        double mx = -std::numeric_limits<double>::infinity();
+        for (uint32_t c = 0; c < D; ++c) {
+            const bool live = (c < width) && (!use_mask || mb[c] != 0xFC00);
+            if (!live) {
+                sc[c] = -std::numeric_limits<double>::infinity();
+                continue;
+            }
+            double dot = 0.0;
+            for (uint32_t d = 0; d < D; ++d) {
+                const double qs = (double) (q[(size_t) head * D + d] * SCALE);
+                dot += qs * (double) strata::kernels::f32_from_f16(kb[((size_t) c * KV_HEADS + kv) * D + d]);
+            }
+            if (use_mask) dot += (double) strata::kernels::f32_from_f16(mb[c]);
+            sc[c] = dot;
+            mx = std::max(mx, dot);
+        }
+        double den = 0.0;
+        for (uint32_t c = 0; c < D; ++c) den += std::exp(sc[c] - mx);
+        for (uint32_t d = 0; d < D; ++d) {
+            double acc = 0.0;
+            for (uint32_t c = 0; c < D; ++c) {
+                if (sc[c] == -std::numeric_limits<double>::infinity()) continue;
+                acc += std::exp(sc[c] - mx) * (double) strata::kernels::f32_from_f16(vb[((size_t) c * KV_HEADS + kv) * D + d]);
+            }
+            want[(size_t) head * D + d] = acc / den;
+        }
+    }
+
+    Buf b_q = ctx.alloc(q.size() * 4), b_k = ctx.alloc(kb.size() * 2), b_v = ctx.alloc(vb.size() * 2);
+    Buf b_m = ctx.alloc(D * 2), b_o = ctx.alloc((size_t) Q_HEADS * D * 4);
+    ctx.write(b_q, q.data(), q.size() * 4);
+    ctx.write(b_k, kb.data(), kb.size() * 2);
+    ctx.write(b_v, vb.data(), vb.size() * 2);
+    ctx.write(b_m, mb.data(), D * 2);
+    std::vector<float> nanp((size_t) Q_HEADS * D, std::numeric_limits<float>::quiet_NaN());
+    ctx.write(b_o, nanp.data(), nanp.size() * 4);
+    VkPipeline p = ctx.pipeline(dir + "/attn_decode_short.spv", 5, 8);
+    struct { uint32_t width, use_mask; } pc{width, use_mask ? 1u : 0u};
+    ctx.dispatch(p, {&b_q, &b_k, &b_v, &b_m, &b_o}, &pc, sizeof(pc), Q_HEADS);
+
+    std::vector<float> got((size_t) Q_HEADS * D);
+    ctx.read(b_o, got.data(), got.size() * 4);
+    int bad = 0, nonfinite = 0;
+    double worst = 0, worst_abs = 0, worst_abs_at = 0, worst_ref = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double g = (double) got[i];
+        if (!std::isfinite(g)) { ++nonfinite; ++bad; continue; }
+        const double rel = std::fabs(g - want[i]) / (std::fabs(want[i]) + 1e-30);
+        if (rel > worst) { worst = rel; worst_ref = want[i]; }
+        if (std::fabs(g - want[i]) > worst_abs) { worst_abs = std::fabs(g - want[i]); worst_abs_at = want[i]; }
+        // The tolerance is a relative bound with an ABSOLUTE floor, and the floor is not a convenience: a masked
+        // softmax over 170-odd live keys yields weights spread over many orders of magnitude, so some outputs are
+        // tiny and their RELATIVE error is dominated by cancellation in the f32 accumulation.  Both numbers are
+        // printed so that distinction is measured rather than assumed.
+        if (!(rel <= 1e-4 || std::fabs(g - want[i]) <= 1e-5)) ++bad;
+    }
+    char label[160];
+    std::snprintf(label, sizeof label, "attn_decode_short (width=%u%s, %d heads x %d dims)", width,
+                  use_mask ? ", masked" : "", (int) Q_HEADS, (int) D);
+    std::printf("      %s: out[0] = %.6g want %.6g | non-finite %d of %d | worst rel %.3g (ref %.3g) | "
+                "worst abs %.3g (ref %.3g)\n",
+                what, (double) got[0], want[0], nonfinite, (int) got.size(), worst, worst_ref, worst_abs,
+                worst_abs_at);
+    verdict(label, bad == 0, bad, (int) got.size(), worst, "values outside tolerance (worst rel err)");
+    ctx.free(b_q); ctx.free(b_k); ctx.free(b_v); ctx.free(b_m); ctx.free(b_o);
+}
+
+void case_attn_decode_short(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "attn_decode_short.spv")) return;
+    if (!ctx.info().storage_buffer_16bit) {
+        skip("attn_decode_short", "device lacks storageBuffer16BitAccess - the KV cache is f16");
+        return;
+    }
+    // THE SHAPE PREDICATE FIRST.  The kernel drops every key past `width`, so a width the caller got wrong is a
+    // silently wrong token rather than an error - which is exactly why the engine carries a status word for it and
+    // why the port refuses at the boundary instead.
+    {
+        struct S { uint32_t w, cap; bool ok; const char* what; };
+        const S cases[] = {
+            {1, 256, true, "one live key (the first decode step) rejected"},
+            {3, 256, true, "a short window rejected"},
+            {256, 256, true, "a full window rejected"},
+            {0, 256, false, "width 0 was ACCEPTED, and every score would be -inf"},
+            {257, 512, false, "width 257 was accepted: the mask and the cache are 256 wide"},
+            {4, 128, false, "a cache narrower than the window was accepted"},
+        };
+        int bad = 0;
+        for (const S& c : cases) {
+            if (attn_short_shape_ok(c.w, c.cap) != c.ok) {
+                std::printf("      %s\n", c.what);
+                ++bad;
+            }
+        }
+        verdict("attn short shape contract (6)", bad == 0, bad, 6, 0.0, "wrong verdicts");
+    }
+    attn_arm(ctx, dir, 1, false, "1 live key (the first decode step)");
+    attn_arm(ctx, dir, 3, false, "3 live keys, the rest padding");
+    attn_arm(ctx, dir, 256, false, "a full 256-key window");
+    attn_arm(ctx, dir, 256, true, "a full window, additive mask with -inf on a third");
+    attn_arm(ctx, dir, 128, true, "a half window, masked");
 }
 
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
@@ -6341,6 +6488,7 @@ int main(int argc, char** argv) {
     case_device_local_staging(ctx, dir);   // device-local memory + staging + the printed plan (stage 4)
     case_bf16_to_f16(ctx, dir);            // the prefill path's operand conversion (stage 5)
     case_gemm_prefill(ctx, dir);           // THE prefill GEMM: engine layout, both kernels (stage 5)
+    case_attn_decode_short(ctx, dir);      // the short-step decode attention (the attention block's first kernel)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);
