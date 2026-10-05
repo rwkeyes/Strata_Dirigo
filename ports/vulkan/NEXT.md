@@ -1,5 +1,81 @@
 # Start here next session
 
+## `sample_tokens` WIRED — THE STEP THAT PRODUCES A TOKEN — AND THE ORDERED DECODE-PATH LIST THAT SAYS ONLY TWO OF THE 41 REMAINING kernels-NAMESPACE SYMBOLS ARE ON A SINGLE-TOKEN DECODE (2026-10-05, `vega`)
+
+**THE MAP now reads 168 = 75 kernel + 5 shader + 61 host + 27 todo** (was 74/6/61/27): `sample_tokens` moved
+`shader → kernel` and the backend now DEFINES it (`vulkan/src/kernels/sampler_vk.cpp`).  The other five `shader`
+rows (`coupled_draft_sample`, `moe_grouped_s2`, `moe_hit_grouped_s2_cpu_order`, `native_expert_grouped`,
+`shared_expert_multi`) stay `shader` with the classes the ORDERED LIST gives them — none is on a single-token
+decode (below), so none was stubbed.
+
+**THE ENGINE BAR (`138 → **134` raw / `56 → **`55` distinct / `42 → **`41` `strata::kernels::` / CUDA stays `0`**)** —
+`sample_tokens` is the drop.  Measured with the exact whole-archive recipe (four engine libs vs the backend
+`cudart`/`device`; `-lvulkan -lpthread`).  **THE ONE-LAYER-BODY bar is UNCHANGED (`18` raw / `0` kernels-ns** —
+`sample_tokens` is not referenced by `layer.cpp`).
+
+**THE ORDERED DECODE-PATH LIST (the batch's central output) — TWO symbols, in the order the engine reaches
+them.**  Traced from the engine's own code (`generate.cpp`'s token loop → `session.cpp`'s captured block →
+`layer.cpp`), under the shipped `--native` launch and this backend's capability answers:
+
+1. **`copy_from_mapped`** — `src/core/session.cpp:875`, INSIDE the captured per-layer block, UNCONDITIONAL.
+   PORT-MAP kinds it `host`, but `elementwise.cu:226` launches `copy_from_mapped_kernel` — a float4 DEVICE kernel
+   reading MAPPED host memory (the same mis-kind as `copy_i32_from_mapped`).  **UNPORTED and the #1 next item** —
+   and NOT a wrapper: a Vulkan shader cannot dereference host memory, so it must be answered by the port's
+   split-submission handshake (the host re-publishes `parts_dev` before each launch), the seam `sync.hpp` kept for
+   exactly this swap.  See `plan/DECODE-PATH-TRIAGE.md`'s new section.
+2. **`sample_tokens`** — `generate.cpp:7742`, the decode tail.  **WIRED THIS BATCH.**
+
+**Everything else of the 41 is a NON-SELECTED configuration** (the drafter's `--spec 4 --mtp` loop, which the
+contract refuses at `Verifier::init`; the `--expert-cache-cpu-order` A/B arm, default false; the P6 verifier; the
+multi-GPU remote/peer expert tiers; model load: `embed_type_supported`), or the `kernels_cpu` half
+(`strata::kernels::cpu::bf16_rows_dot_multi{,_avx1}` — the name-only pattern collapses both to `cpu`; the file-tier
+`RouterLookahead` prefetch, off on the packed-image launch).  The full ordered table, each symbol's class and the
+flag/default chain that selects it, is in `plan/DECODE-PATH-TRIAGE.md`.
+
+## DELIVERABLE A — `sample_tokens`, the step that PRODUCES A TOKEN
+
+`vulkan/src/kernels/sampler_vk.cpp` defines `strata::kernels::sample_tokens` over the port's ALREADY-GATED shaders,
+following the engine's own path selection (`sampler.cu:1006-1011`): `greedy || temperature <= 0` → the argmax
+(`sampler_greedy.spv`); otherwise the SPLIT (`sampler_split.spv`) — the port's split is ONE workgroup per row with
+the merge in-shader, so it needs NO scratch and NO `cudaMalloc`, and it RECORDS under capture (unlike the CUDA,
+which falls back under capture because ITS split needs a `cudaMalloc`); the f32 one-block sibling
+(`sampler_kernel_f32.spv`) on a device with no `shaderFloat64`.  Engine headers unchanged.
+
+**PROVED BY `case_sample_tokens_entry`** (6 verdicts: three arms × two facts, plus the capture arm), all green on
+the Arc (`intel_icd`), llvmpipe and the Ryzen iGPU:
+
+| arm | wrapper == shader path (bitwise) | wrapper == the engine's own rule |
+|---|---|---|
+| sampled / split (t=1), 12288 vocab, top_k 4, ids 100/4200/8300 in 3 partitions | **1/1, w 0** | **1/1, w 0** (the transcription's pick) |
+| greedy FLAG | **1/1, w 0** | **1/1, w 0** (`sampler_want`) |
+| temperature 0 WITHOUT the flag | — (must equal the argmax) | **1/1, w 0** — `sampler.cu:1006` routes temp 0 to the argmax, NOT the sampled kernel's uniform draw |
+| **CAPTURE ARM** | **4/4, w 0** — records a block containing the wrapper, replays, bitwise equal | |
+
+**THE OTHER FIVE, each classified from the engine's own code (why not finished):** `coupled_draft_sample` and
+`moe_grouped_s2` are CLASS C (the `mtp.cpp` drafter, a configuration the port does not select — `Verifier::init`
+refuses under the contract); `moe_hit_grouped_s2_cpu_order` is CLASS C (the `--expert-cache-cpu-order` A/B arm,
+**default false** → the PORTED `moe_hit_grouped_s2`); `native_expert_grouped` is CLASS D/remote (the P6 verifier +
+the `--expert-cache-remote`/`--peer-device` tiers); `shared_expert_multi` is CLASS D (`verify.cpp:980` only).  A
+definition for any of them would be a wiring for a branch nothing selects — reported, not stubbed.
+
+## RESULTS (vega)
+
+Gate (`run_gate.sh`, background): Arc (`intel_icd`) **735/0/0** (exit 0); llvmpipe **723/0/3** (the documented
+coopmat/vram skips); Ryzen iGPU (`radeon_icd`) **724/2/2**, then **723/3/2**, then **722/4/2** across three runs —
+the ramp is the open, characterised platform-level non-deterministic wrong-value defect, and the failing CASES
+differ each run, which is the point: `qsa_block_scores entry` (71/72), `bf16_gemv_fp32_mmvf_cols entry`
+(2494-2495/2496), `bf16_gemv entry` (510/512 + its oracle arm), `bf16_gemv_fp32_mmvf entry` (255/256),
+`bf16_gemv_fp32_mmvf_multi entry` (620/624), `ple_block entry` (10239/10240) — the same class the README records
+for `bf16_gemv`, `bf16_gemv_split`, `fused_gdn_ab`; this batch adds `qsa_block_scores`, `bf16_gemv_fp32_mmvf*` and
+`ple_block` to that record.  **NONE is one of this batch's cases.**  All six `sample_tokens entry` verdicts PASS on
+all three arms.  `check_port_map.py` passes (`168 — 75 kernel, 5 shader, 61
+host, 27 todo`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (one row: `sample_tokens`).
+**`z820b` is PENDING** (suspended, no WoL — no XTX/K620 number claimed).  The CUDA graph API was NOT touched.
+**Also fixed:** `gates/inject-verify.sh`'s `rebuild_harness` had gone stale AGAIN (missing `iq_vk.cpp`,
+`moe_vk.cpp`, `sampler_vk.cpp` — an engine-side injection would have rebuilt a gate that cannot link and reported
+"NOT FALSIFIED"); it now carries the full TU list, and the new `sample-tokens-entry-temp0-to-sampled` injection
+BITES (`FALSIFIED ... FAIL sample_tokens entry (temperature 0) 1/2`).
+
 ## THE 14 `shader` ROWS: EIGHT WIRED (+ their capture arms) AND THE CUDA SURFACE THAT LETS generate.cpp COMPILE (2026-10-05, `vega`)
 
 **THE MAP now reads 168 = 74 kernel + 6 shader + 61 host + 27 todo** (was 66/14/61/27): eight of the fourteen

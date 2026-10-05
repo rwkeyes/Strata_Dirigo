@@ -68,6 +68,7 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/ple_vk.cpp
   src/kernels/shared_expert_vk.cpp
   src/kernels/rope_vk.cpp                     # the RoPE host rows: build_rope_table + rope_table_set/_for/_release
+  src/kernels/sampler_vk.cpp                  # sample_tokens - the step that PRODUCES A TOKEN (the decode tail)
   src/kernels/refusals_vk.cpp)  # shared_expert (the MoE shared stage) + the LOUD REFUSALS (unreachable symbols)
                             # + the PLE/GR shared stages and the MoE routing rows (ple_vk.cpp)
 # THE ENGINE'S OWN HOST SOURCES the layer body crosses for the PLE table: `PleTable` (collect/is_open/issue)

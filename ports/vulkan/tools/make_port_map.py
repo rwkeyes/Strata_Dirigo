@@ -135,7 +135,7 @@ TABLE = {
     # symbol and the row is `kernel`; the CUDA's async-ness is NOT expressible here (the port's submit fences) and
     # is stated in the wrapper, but the OUTPUT is proved against the port's own `s_gemv_split.spv` path.
     's_gemv_split_async':             ('kernel', 's_gemv_split'),
-    'sample_tokens':                  ('shader', 'sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split'),
+    'sample_tokens':                  ('kernel', 'sampler_greedy sampler_kernel sampler_kernel_f32 sampler_split'),
     'scale_inplace':                  ('kernel', 'scale'),
     'scatter_rows_f32':               ('kernel', 'scatter_rows_f32'),
     'shared_expert':                  ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32'),

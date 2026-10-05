@@ -759,3 +759,89 @@ plus `s_gemv_split_async` (its shader was mis-attributed to the q8 one).  All 15
 reads **168 = 65 kernel + 15 shader + 61 host + 27 todo** (was 78/0/61/29).  Falsified by deleting a backend
 definition and requiring the checker to fail (done this batch: `s_gemv_q8_0_split` renamed → checker exit 1;
 restored → exit 0).  `make_port_map.py` regenerates byte-identically.
+
+# THE ORDERED DECODE-PATH LIST — WHICH OF THE 42 REMAINING kernels-NAMESPACE SYMBOLS A SINGLE-TOKEN DECODE ACTUALLY REACHES (2026-10-05, `vega`)
+
+This is the batch's central analysis, and it CHANGES THE QUESTION. The engine bar now reads **134 raw / 55
+distinct / 41 `strata::kernels::` / 0 cuda-runtime** (was `138/56/42/0`; `sample_tokens` is the one resolved —
+see below). The 41 remaining are what the whole-archive link still names; they are NOT the single-token decode's
+forward path. Traced from the engine's own code (`src/program/generate.cpp`'s token loop → `src/core/session.cpp`'s
+captured block → `src/core/layer.cpp`), **exactly TWO of them** are reached by a plain single-token decode under
+the shipped `--native` launch and this backend's capability answers.
+
+## The decode trip, in the order the engine reaches each symbol
+
+The single-token decode is: `generate.cpp`'s token loop → per layer `cudaGraphLaunch(pre)`,
+`cudaGraphLaunch(post)`, where the recorded block is `session_capture_token`'s body (`session.cpp:830-899`) →
+after the last layer, the sampler → the next token.
+
+| # | symbol | where the decode reaches it | flag / default chain | class | state |
+|---|---|---|---|---|---|
+| 1 | `copy_from_mapped` | `src/core/session.cpp:875`, INSIDE the captured per-layer block, after `doorbell_wait` and before `moe_hit_add`/`block_layer_post`. UNCONDITIONAL (not behind `hits`). | none — `session_capture_token` runs whenever the token graph is captured; the shipped launch does NOT pass `--no-capture`/`--no-token-graph` (`generate.cpp:4268`) | **A** | UNPORTED. PORT-MAP kinds it `host` ("a mapped-buffer copy"), but `elementwise.cu:226` launches `copy_from_mapped_kernel` — a float4 DEVICE kernel reading MAPPED host memory. Same mis-kind as `copy_i32_from_mapped` (`elementwise.hpp:104`). |
+| 2 | `sample_tokens` | `src/program/generate.cpp:7742` — the decode tail: `sample_tokens(d_logits, 1, n_vocab, nullptr, 0, sp, d_next, token_stream)`; the token it writes is the token produced. | `sp.greedy` default **false**, `sp.temperature` default **1.0** → the sampled path; `sp.penalty_last_n` default **0** → no penalty window; `sp.top_k` default **20** → `k = 20`; `n_vocab = 248320` → 61 blocks | **A** | **WIRED THIS BATCH** (`vulkan/src/kernels/sampler_vk.cpp` + `case_sample_tokens_entry`). |
+
+**That is the whole list.** No other kernels-namespace symbol is on the plain decode path. `embed_type_supported`
+(`native_head.cpp:119`) runs at MODEL LOAD, before any token; every other remaining symbol is on a configuration
+the shipped single-GPU launch does not select, or on the P6 verifier, or on a multi-GPU expert tier.
+
+## Why `copy_from_mapped` is the #1 next-batch item, and why it is not a wrapper
+
+On CUDA `copy_from_mapped` is a kernel that reads MAPPED, PINNED host memory LIVE and writes device — recordable,
+and re-read at every replay. **A Vulkan shader cannot dereference host memory** (vk_backend.hpp's mapped-memory
+note), so this port cannot render it as a recorded dispatch: `copy_i32_from_mapped` — its int32 twin, `layer.cpp:913`
+x2 (also inside the captured block) — was answered as a fenced HOST-STAGED copy (`elementwise_vk.cpp`, `stream_write`).
+That is the port's split-submission model (`sync.hpp`: "the host writes the answer, THEN submits the consumer"),
+and it is RIGHT for `doorbell_*`. But `copy_from_mapped`'s caller (`session.cpp:875`) sits INSIDE the capture and
+expects the graph to re-read the mapped region on every replay; a host-staged write happens ONCE, at capture.
+**So the port must decide where the host re-publishes `parts_dev` before each `cudaGraphLaunch`** — the narrow seam
+`sync.hpp` kept for exactly this swap — rather than wire a kernel that cannot exist. This is a design increment,
+not a wrapper; it is stated here so the next batch starts from the decision and not from a stub.
+
+## The prioritised list — everything else, by the class that keeps it off the decode trip
+
+**Class C — the speculative drafter (`src/core/mtp.cpp`), a configuration THIS PORT DOES NOT SELECT.** `setup.py`
+writes `--spec 4 --mtp`, but the draft loop needs `Verifier::init` to succeed and `layer_verify_compatible()`
+(`layer.cpp:476-491`) demands a conjunction the contract leaves false (`g_fused_gr` forced FALSE, `native_qsa_indexer_enabled()`
+answered FALSE, `native_bf16_projections` unpinned). The port's selected branch is a `--spec 0` run. Symbols, in
+`mtp.cpp` source order: `add_streams_broadcast` (497) · `fused_gr_read_multi` (510/571/620) · `window_ids` (551) ·
+`qsa_decode_attn_batch` (552) · `moe_group_resident` (579) · `moe_grouped_s2` (582) · `coupled_draft_sample` (635) ·
+`sample_tokens` (642, ALSO class A) · `row_top_prob` (643) · `map_ids` (644) · `coupled_draft_stage` (699) ·
+`kv_ring_restore` (748) · `mtp_select` (710/719/738) · `embedding_gather_dev` (485).
+
+**Class C — the A/B arm defaulting OFF.** `moe_hit_grouped_s2_cpu_order` (`expert_source.cpp:2329`): `d.hit_cpu_order
+= o.expert_cache_cpu_order` (`generate.cpp:3666`), default **false** (`generate.cpp:376`), set only by
+`--expert-cache-cpu-order` (`:1477`). The DEFAULT is the PORTED `moe_hit_grouped_s2` (`:2332`).
+
+**Class D — the P6 verifier (`src/core/verify.cpp`), which cannot init under the contract** (same conjunction).
+`broadcast_streams` · `copy_i32_from_mapped_unless` · `copy_indexed` · `copy_or_zero_from_mapped` ·
+`copy_rows_from_mapped` · `fetch_blobs` · `fused_gr_check` (311) · `gdn_ab_multi` · `gdn_conv_commit` ·
+`gdn_conv_l2_multi` · `gdn_step_norm_multi` · `gpu_stamp` · `native_moe_combine_multi` · `native_router_top10_multi` ·
+`native_expert_grouped` (+`native_expert_layout`/`native_expert_scratch_bytes`, 1025-1026) · `ple_block_projected` ·
+`rebase_ptrs` · `resident_plan` · `shared_expert_multi` (980) · `wait_flag_ge` · `wait_flag_ge_or` ·
+`qsa_decode_attn_batch` · `fused_gr_read_multi` · `moe_grouped_s2` · `copy_from_mapped`.
+
+**The multi-GPU REMOTE / PEER expert tiers (not selected on a single-device run):** `native_expert_grouped`,
+`native_expert_layout`, `native_expert_scratch_bytes` — `remote_experts.cpp:309-314`, `peer_experts.cpp:232-233`;
+`moe_grouped_s2` — `remote_experts.cpp:314`. Reached only with `--expert-cache-remote N`/`--remote-expert-opt`
+(`generate.cpp:3554-3664`) or `--peer-device` (`:3643`).
+
+**Model load (not decode):** `embed_type_supported` — `native_head.cpp:119`.
+
+**The `kernels_cpu` half, deliberately out of the Vulkan build:** the name-only pattern `strata::kernels::cpu`
+collapses TWO real symbols — `strata::kernels::cpu::bf16_rows_dot_multi` and its `_avx1` sibling (`kq_avx2.cpp` /
+`kq_avx1.cpp`, EXCLUDED from `strata_vulkan_kernels_cpu`: `vulkan/CMakeLists.txt:145`). Called at
+`expert_source.cpp:1228/1231` by `RouterLookahead::run` — the routing-aware PREFETCH, started only when the expert
+source warms (`expert_source.hpp:533`: `!role_ptr_.empty() && direct_.empty()` — the file tier) and
+`STRATA_LOOKAHEAD != 0` (`generate.cpp:3676`). On the packed-image launch it is off; on the file-tier config it is a
+background prefetch whose result is "an estimate only".
+
+## The prioritised wiring order for the batches after this one
+
+1. **`copy_from_mapped`** — on the decode trip (session.cpp:875); needs the host re-publish seam decided, not a
+   kernel (above). Until it lands, the captured token graph has no live parts copy.
+2. **The nine class-D verifier kernels and the eight drafter kernels** — only if the product must run the shipped
+   `--spec 4 --mtp` loop (which the port's contract currently refuses at `Verifier::init`). Not needed for a
+   `--spec 0` token.
+3. **The five remaining `shader`-row composites** (`coupled_draft_sample`, `moe_grouped_s2`,
+   `moe_hit_grouped_s2_cpu_order`, `native_expert_grouped`, `shared_expert_multi`) — each a class-C/D composite;
+   their shaders exist and are gated, the wrapper is missing for the same reason they are not on the decode trip.

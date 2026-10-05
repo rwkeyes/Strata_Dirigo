@@ -223,6 +223,7 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
     "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
     "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
     "$TREE/vulkan/src/kernels/rope_vk.cpp" \
+    "$TREE/vulkan/src/kernels/sampler_vk.cpp" \
     "$TREE/src/kernels/ngram.cpp" "$TREE/src/ngram/ple_reader.cpp" "$TREE/src/platform/direct_file.cpp" \
     -lpthread -lvulkan || exit 1
 

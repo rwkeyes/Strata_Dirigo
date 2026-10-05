@@ -1,5 +1,31 @@
 # Status — what is done, what is verified, what is not
 
+## `sample_tokens` WIRED and the ORDERED DECODE-PATH LIST (2026-10-05, `vega`)
+
+**THE MAP now reads 168 = 75 kernel + 5 shader + 61 host + 27 todo** (was 74/6/61/27): `sample_tokens` — the step
+that PRODUCES A TOKEN — moved `shader → kernel` and `vulkan/src/kernels/sampler_vk.cpp` defines it.  The other
+five `shader` rows are NOT on a single-token decode and were classified, not stubbed.
+
+**THE ENGINE BAR (`138 → 134` raw / `56 → 55` distinct / `42 → 41` `strata::kernels::` / CUDA stays `0`).**  The
+ONE-LAYER-BODY bar is UNCHANGED (`18` raw / `0` kernels-ns).
+
+**THE ORDERED DECODE-PATH LIST — TWO of the 41 remaining kernels-namespace symbols are reached by a single-token
+decode, in this order:** (1) **`copy_from_mapped`** (`session.cpp:875`, inside the captured per-layer block,
+UNCONDITIONAL; a DEVICE kernel reading MAPPED host memory, mis-kinded `host`; UNPORTED — the #1 next item, and a
+handshake seam rather than a wrapper, because a Vulkan shader cannot dereference host memory) and (2)
+**`sample_tokens`** (`generate.cpp:7742`, the decode tail; WIRED here).  Everything else is a non-selected
+configuration (drafter, verifier, remote/peer tiers, load) or the `kernels_cpu` half.  Full table + classes in
+`plan/DECODE-PATH-TRIAGE.md`.
+
+**`sample_tokens` PROVED** by `case_sample_tokens_entry`: three arms (sampled/split, greedy flag, temperature 0)
+each bitwise against the SHADER PATH and against the ENGINE'S OWN RULE, plus a CAPTURE ARM (records → replays
+bitwise).  Gate on `vega`: Arc **735/0/0** (exit 0), llvmpipe **723/0/3**, Ryzen iGPU **724/2/2 / 723/3/2 / 722/4/2**
+across three runs — the radeon failures are the documented platform-level non-deterministic wrong-value defect
+(`qsa_block_scores`, `bf16_gemv`, `bf16_gemv_fp32_mmvf{,_cols,_multi}`, `ple_block`, a DIFFERENT set each run),
+NOT this batch's cases; all six `sample_tokens entry` verdicts pass on all three arms.  `check_port_map.py` passes;
+`make_port_map.py` regenerates byte-identically.  The new `sample-tokens-entry-temp0-to-sampled` injection bites
+(and `inject-verify.sh`'s stale `rebuild_harness` TU list is fixed).  **`z820b` PENDING.**  Detail in `NEXT.md`.
+
 ## THE CUDA GRAPH API OVER THE PORT'S OWN RECORDED STEP — the recorder COMPILES and REPLAYS (2026-10-05, `vega`)
 
 **THE NEW BAR (the engine executable, not just the layer body): `154` undefined references / `64` distinct,

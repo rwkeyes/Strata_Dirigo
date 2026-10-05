@@ -139,6 +139,9 @@
 #                                       -> must FAIL  "sampler_kernel_f32: one survivor (top_p cut of one)"
 #   inject-verify.sh sample-tokens-choice-temp0-to-sampled  harness/vk_gate.cpp  temp 0 no longer routes to
 #                                       the argmax -> must FAIL  "sample_tokens: temperature 0"
+#   inject-verify.sh sample-tokens-entry-temp0-to-sampled  vulkan/src/kernels/sampler_vk.cpp  the ENGINE WRAPPER
+#                                       stops routing temp 0 to the argmax -> must FAIL  "sample_tokens entry
+#                                       (temperature 0)"
 #   inject-verify.sh coupled-draft-counter-off-by-one  coupled_sample.comp  drop the +1 of
 #                                       `coupled_draft_counter` -> must FAIL  "coupled_draft: the counter"
 #   inject-verify.sh coupled-draft-window-start  coupled_penalize.comp  drop the draft index j from the
@@ -171,9 +174,10 @@ rebuild_harness() {
       "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
       "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
       "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
+      "$TREE/vulkan/src/kernels/iq_vk.cpp" "$TREE/vulkan/src/kernels/moe_vk.cpp" \
       "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
       "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
-      "$TREE/vulkan/src/kernels/rope_vk.cpp" \
+      "$TREE/vulkan/src/kernels/rope_vk.cpp" "$TREE/vulkan/src/kernels/sampler_vk.cpp" \
       "$TREE/src/kernels/ngram.cpp" "$TREE/src/ngram/ple_reader.cpp" "$TREE/src/platform/direct_file.cpp" \
       -lpthread -lvulkan
 }
@@ -332,6 +336,18 @@ case "$name" in
     old=$'    if (greedy || temperature <= 0.0f) return P_GREEDY;'
     new=$'    if (greedy || temperature < 0.0f) return P_GREEDY;   // INJECTION: temp 0 no longer routes to the argmax'
     want="FAIL  sample_tokens: temperature 0" ;;
+  sample-tokens-entry-temp0-to-sampled)
+    # THE ENGINE WRAPPER's OWN routing rule (`vulkan/src/kernels/sampler_vk.cpp`): `sample_tokens` must send a
+    # temperature-0 request to the ARGMAX shader, not to the sampled path's uniform draw (sampler.cu:1006).  The
+    # harness injection above edits the CASE's own predicate, which the wrapper does not consult; THIS edits the
+    # WRAPPER, so it is the arm that proves the SHIPPED rule.  Dropping the temperature test makes the wrapper
+    # dispatch the sampled split for a temp-0 request - a different token for most seeds, which
+    # `case_sample_tokens_entry`'s temperature-0 arm must observe.  ENGINE-side backend source, so the script
+    # rebuilds the gate.
+    file="$TREE/vulkan/src/kernels/sampler_vk.cpp"; spv="sampler_vk"
+    old=$'    if (p.greedy || p.temperature <= 0.0f) {'
+    new=$'    if (p.greedy) {   // INJECTION: temperature 0 no longer routes to the argmax'
+    want="FAIL  sample_tokens entry (temperature 0)" ;;
   sampler-kernel-f32-top-p-boundary)
     # The portable f32 tail's top_p cut is `>=` (the SAMPLED chain's boundary, llama.cpp's).  Changing it to `>`
     # drops the boundary case: a cut of exactly top_p no longer closes the prefix, so a one-survivor shortlist
