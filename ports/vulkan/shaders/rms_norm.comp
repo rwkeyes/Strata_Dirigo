@@ -58,6 +58,10 @@ void main() {
     const float inv = inversesqrt(wg_sum(acc) / float(pc.cols) + pc.eps);
     for (uint c = lid; c < cols; c += lsize) {
         const uint i = base + c;
-        x.v[i] = (x.v[i] * w.v[i]) * inv;
+        // PER-COLUMN WEIGHT: `w[c]`, not `w[i]`.  The engine's CUDA (`elementwise.cu` `rms_norm_weighted_kernel`)
+        // computes `r[c] = (r[c] * w[c]) * inv` with `w` NOT advanced by the row - the weight is
+        // `w[n_cols]` broadcast over rows.  Indexing it by the element index reads the wrong weight for every
+        // row past the first (and out of bounds when the weight is cols-long, which is what the engine passes).
+        x.v[i] = (x.v[i] * w.v[c]) * inv;
     }
 }

@@ -1,0 +1,410 @@
+// vulkan/src/kernels/qsa_vk.cpp - the Vulkan backend's ATTENTION / QSA / rope entry points (the non-GDN half).
+//
+// ============================================================================================================
+// WHICH EIGHT, AND WHY THESE EIGHT (derived from the engine's own body, not from the plan's list)
+// ============================================================================================================
+//
+// `qsa_layer` (`src/core/layer.cpp:876`) is the NON-GDN layer body - the analogue of `gdn_layer` for the 12 QSA
+// layers (`qsa_interval = 4`, so layers 3,7,...,47), reached from `block_layer_pre` (`layer.cpp:1259`:
+// `if (qsa) qsa_layer(...) else gdn_layer(...)`).  This TU wires the first eight entry points `qsa_layer`'s own
+// body reaches that this tree can actually DISPATCH, in the order its call sites appear (the plan's §3 list
+// names the rows in prose and is NOT an order).  THE ORDER IS THE READING: within the two native/legacy stages
+// the branches are alternatives, so "the order the body reaches them" is the order the calls appear.
+//
+//   1. `native_qsa_rms_norm_weighted`  layer.cpp:879   `normalize_rotate`, the NATIVE norm (native_qsa_enabled)
+//   2. `native_rope_apply`             layer.cpp:881   `normalize_rotate`, the NATIVE rope (native_rope_enabled)
+//   3. `rope_neox_apply`               layer.cpp:882   `normalize_rotate`, the LEGACY rope (the else branch)
+//   4. `qsa_block_scores`              layer.cpp:970   the g_fast_select block scores (qsa_select.hpp)
+//   5. `qsa_block_topk`                layer.cpp:971   the g_fast_select weighted top-k
+//   6. `native_qsa_gate_apply`         layer.cpp:1010  the gate, NATIVE member (native_qsa_enabled)
+//   7. `qsa_gate_apply_f32`            layer.cpp:1011  the gate, LEGACY member (the else branch)
+//   8. `native_router_top10`           layer.cpp:370   moe_route's router (native_router_enabled; "the expert
+//                                                       routing"), the NEXT stage the non-GDN body reaches -
+//                                                       `block_layer_pre` run4 calls `moe_route` after run1's
+//                                                       `qsa_layer`.
+//
+// WHY THESE AND NOT THE WHOLE GROUP (the group is 36).  PLE and GR (`ple_block`, `ple_history_advance`,
+// `gr_read`, `gr_write`, `fused_gr_*`) sit in `block_layer_pre`'s shared stages and run for EVERY layer, GDN or
+// QSA - they are not the non-GDN body and are their own increment.  The stage-3 attention entry
+// `qsa_decode_attn_step` (layer.cpp:980) and its sibling `native_flash_attn_short_step` (:995) are REPORTED, not
+// wired: the map claims both are served by `attn_decode_short`, whose own header says it is
+// `native_flash_attn_short_step` (a gathered [capacity,2,256] f16 WINDOW), while `qsa_decode_attn_step`'s
+// contract (qsa_decode_attn.hpp) reads the KV POOLS through the page table with an int8/q4 option and takes a
+// scratch - a different kernel.  No shader in this tree matches that contract, so it is a SHADER-PORT job, not
+// a stub (see the header note there; it is the same class as I3's `s_gemv_q8_0_split`).  `qsa_index_step`,
+// `topk_512_step`, `qsa_attend_step` and `native_qsa_indexer_append` are PORT-MAP `todo` (no shader either).
+//
+// ============================================================================================================
+// THE WIRING PATTERN (the plan's §2, not an invention)
+// ============================================================================================================
+//
+// The engine's HEADERS ARE NOT EDITED.  Each symbol below is the thin wrapper already declared in
+// `include/strata/kernels/{native_qsa,native_rope,rope,qsa,qsa_select,native_router}.hpp`; this TU answers the
+// `strata::kernels::` symbol the wrapper calls.  On a CUDA/HIP build `src/kernels/cuda/*.cu` answer them; on
+// this build THIS file does.  Each body resolves the engine's raw device pointers to arena views
+// (`arena_resolve`), takes the pipeline the device layer caches for the shader's own signature, and dispatches -
+// the same shape as `gdn_vk.cpp` / `matvec_vk.cpp` - and the shader each drives is the one the port's numeric
+// gate has already gated:
+//
+//     native_qsa_rms_norm_weighted -> native_qsa_rms_norm_weighted.spv (case_native_qsa_rms_norm_weighted)
+//     native_rope_apply            -> native_rope_apply.spv            (case_native_rope_apply)
+//     rope_neox_apply              -> rope_neox.spv                    (case_rope)
+//     qsa_block_scores             -> qsa_block_scores.spv             (case_qsa_select)
+//     qsa_block_topk               -> qsa_block_topk.spv               (case_qsa_select)
+//     native_qsa_gate_apply        -> native_qsa_gate_apply.spv        (case_native_qsa_gate_apply)
+//     qsa_gate_apply_f32           -> qsa_gate_apply_f32.spv           (case_qsa_gate_apply_f32)
+//     native_router_top10          -> native_router_top10.spv          (case_native_router_top10)
+//
+// The gate's `case_*_entry` cases re-run each with the ENGINE WRAPPER and compare BITWISE to that same shader
+// path AND against the case's explicit oracle, so this file's claim is not "it compiles" but "the wrapper's
+// answer equals the ported shader's answer".
+//
+// `rope_scaling()` is a `host` row: the rope CONSTANTS.  `rope_scaling.hpp` declares the process config,
+// `rope_scaling_set` once at startup and `rope_scaling()` at every analytic rope launch; on a CUDA build
+// `src/kernels/cuda/rope_scaling.cu` owns the storage, and a Vulkan build compiles no such file.  The one host
+// row this batch answers is therefore the storage plus its setter, so `layer.cpp:881`'s `rope_scaling()` (and
+// the engine's startup `rope_scaling_set`) link against THIS backend's own config.
+#if !defined(STRATA_ENABLE_VULKAN)
+#error "qsa_vk.cpp is the Vulkan backend: compile it only in a -DSTRATA_ENABLE_VULKAN=1 build"
+#endif
+
+#include "strata/kernels/native_qsa.hpp"     // native_qsa_rms_norm_weighted / native_qsa_gate_apply
+#include "strata/kernels/native_rope.hpp"    // native_rope_apply
+#include "strata/kernels/rope.hpp"           // rope_neox_apply
+#include "strata/kernels/rope_scaling.hpp"   // RopeScaling / rope_scaling / rope_scaling_set
+#include "strata/kernels/qsa.hpp"            // QsaShapes / qsa_step_fill / kStepCount
+#include "strata/kernels/qsa_select.hpp"     // qsa_block_scores / qsa_block_topk
+#include "strata/kernels/native_router.hpp"  // native_router_top10
+#include "strata/vulkan/vk_backend.hpp"      // the backend's seam: Stream, stream_of
+#include "vk_arena.hpp"                      // the arena + pointer->buffer resolution
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+namespace strata::vulkan {
+
+// Every shader here is `local_size_x = 256` (checked against the host's constant by the gate's census).
+static constexpr uint32_t kLocalSize = 256;
+static uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocalSize - 1) / kLocalSize); }
+
+// The port's rule: refuse, never degrade.  A pointer outside the arena, or a shape the engine's own wrapper
+// contract rejects, is a loud exit rather than a silently wrong binding.
+[[noreturn]] static void refuse(const char* who, const char* what) {
+    std::fprintf(stderr, "strata::vulkan::%s: %s - refusing rather than dispatching a wrong view\n", who, what);
+    std::exit(2);
+}
+
+// A Vulkan descriptor cannot be null: the two rope shaders ALWAYS bind an mrope table (binding 3 / 5) even when
+// `mrope == 0` and its contents are never read.  A per-dispatch allocation would exhaust the arena (it never
+// decreases), so the sentinel lives with the stream - the `iq_grids`/`cvec_tables` precedent.  Sixteen ints is
+// more than the shader can index with mrope 0.
+static Buf& dummy_buf(Stream& s) {
+    if (s.dummy.buffer == VK_NULL_HANDLE) {
+        s.dummy = s.ctx->alloc(64);
+        const int32_t zero[16] = {0};
+        s.ctx->write(s.dummy, zero, sizeof(zero));
+    }
+    return s.dummy;
+}
+
+// ============================================================================================================
+// THE EIGHT (each a bind-and-dispatch over the shader its gate case already proved)
+// ============================================================================================================
+
+// ---- 1. `native_qsa_rms_norm_weighted` -> native_qsa_rms_norm_weighted.spv (IN ro, G ro, OUT rw; push {int
+//        rows; int cols; float eps}; one workgroup per row).  The engine wrapper's argument order is
+//        (n_cols, n_rows); the shader's push is (rows, cols) - kept straight here.  In-place (output == input) is
+//        the engine's own call shape and is exact: each thread reads and writes its own element (the source's
+//        comment).  No `cols == 128` restriction; the real artifact is 2560/256.
+void native_qsa_rms_norm_weighted(Stream& s, const float* input, const float* gamma, float* output, int n_cols,
+                                  int n_rows, float epsilon) {
+    if (n_cols <= 0 || n_rows <= 0) return;
+    const uint64_t n = (uint64_t) n_cols * (uint64_t) n_rows;
+    Buf iv{}, gv{}, ov{};
+    if (!arena_resolve(s, input, n * 4, iv) || !arena_resolve(s, gamma, (uint64_t) n_cols * 4, gv) ||
+        !arena_resolve(s, output, n * 4, ov))
+        refuse("native_qsa_rms_norm_weighted", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_qsa_rms_norm_weighted.spv", 3, 12);
+    struct Push {
+        int32_t rows;
+        int32_t cols;
+        float eps;
+    } pc{};
+    pc.rows = n_rows;
+    pc.cols = n_cols;
+    pc.eps = epsilon;
+    s.ctx->dispatch(pipe, {&iv, &gv, &ov}, &pc, sizeof(pc), (uint32_t) n_rows);
+}
+
+// ---- 2. `native_rope_apply` -> native_rope_apply.spv (X ro, OUT rw, POS ro, MROPETAB ro; push {int rows;
+//        head_dim; n_rot; mrope; float theta_scale; freq_scale; corr_low; corr_high; ext_factor; mscale}).
+//        The NATIVE body computes the angle ON DEVICE in f32; `theta_scale = powf(freq_base, -2/n_rot)` is the
+//        ONE value computed on the host (the source does the same), and the scaling constants come from
+//        `RopeScaling::kernel_args` - `mscale` is the RAW `attn_factor`, NOT `RopeScaling::mscale()` (ggml's
+//        kernels apply the log term inside the helper when `ext_factor != 0`, exactly as the shader does).
+//        Grid (ceil((head_dim/2)/256), rows): the pairs are x, the row is y (the source's mapping).
+void native_rope_apply(Stream& s, const float* x, float* out, int rows, int head_dim, int n_rot,
+                       const strata::kernels::RopeScaling& scaling, const int* positions) {
+    if (rows <= 0 || head_dim <= 0 || n_rot <= 0) return;
+    const uint64_t n = (uint64_t) rows * (uint64_t) head_dim;
+    Buf xv{}, ov{}, pv{}, mv{};
+    if (!arena_resolve(s, x, n * 4, xv) || !arena_resolve(s, out, n * 4, ov) ||
+        !arena_resolve(s, positions, (uint64_t) rows * 4, pv))
+        refuse("native_rope_apply", "a pointer is not inside this stream's arena");
+    mv = dummy_buf(s);
+    const strata::kernels::RopeKernelArgs ka = scaling.kernel_args(n_rot);
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_rope_apply.spv", 4, 40);
+    struct Push {
+        int32_t rows;
+        int32_t head_dim;
+        int32_t n_rot;
+        int32_t mrope;
+        float theta_scale;
+        float freq_scale;
+        float corr_low;
+        float corr_high;
+        float ext_factor;
+        float mscale;
+    } pc{};
+    pc.rows = rows;
+    pc.head_dim = head_dim;
+    pc.n_rot = n_rot;
+    pc.mrope = 0;   // text: the positions ARE rotary positions (the engine's decode call)
+    pc.theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    pc.freq_scale = ka.freq_scale;
+    pc.corr_low = ka.corr_low;
+    pc.corr_high = ka.corr_high;
+    pc.ext_factor = ka.ext_factor;
+    pc.mscale = ka.attn_factor;
+    const uint32_t gx = (uint32_t) ((head_dim / 2 + (int) kLocalSize - 1) / (int) kLocalSize);
+    s.ctx->dispatch(pipe, {&xv, &ov, &pv, &mv}, &pc, sizeof(pc), gx, (uint32_t) rows);
+}
+
+// ---- 3. `rope_neox_apply` -> rope_neox.spv (X ro, OUT rw, COS ro, SIN ro, POS ro, MROPETAB ro; push {int
+//        rows; head_dim; n_rot; mrope}).  One thread per ROW.  The cos/sin table is host-built and its LENGTH is
+//        not an argument - `arena_resolve` uses its `bytes` only as the in-arena range check (the descriptor
+//        binds VK_WHOLE_SIZE from the offset), so one pair row is the honest minimum to check against.  The
+//        engine's decode call passes no mrope table (mrope 0), so the sentinel is bound.
+void rope_neox_apply(Stream& s, const float* x, float* out, int64_t rows, int head_dim, int n_rot,
+                     const float* cos_tab, const float* sin_tab, const int* pos) {
+    if (rows <= 0 || head_dim <= 0 || n_rot <= 0) return;
+    const uint64_t n = (uint64_t) rows * (uint64_t) head_dim;
+    const uint64_t one_pair = (uint64_t) (n_rot / 2) * 4;   // the table's minimum: one row of pairs
+    Buf xv{}, ov{}, cv{}, sv{}, pv{}, mv{};
+    if (!arena_resolve(s, x, n * 4, xv) || !arena_resolve(s, out, n * 4, ov) ||
+        !arena_resolve(s, cos_tab, one_pair, cv) || !arena_resolve(s, sin_tab, one_pair, sv) ||
+        !arena_resolve(s, pos, (uint64_t) rows * 4, pv))
+        refuse("rope_neox_apply", "a pointer is not inside this stream's arena");
+    mv = dummy_buf(s);
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/rope_neox.spv", 6, 16);
+    struct Push {
+        int32_t rows;
+        int32_t head_dim;
+        int32_t n_rot;
+        int32_t mrope;
+    } pc{};
+    pc.rows = (int32_t) rows;
+    pc.head_dim = head_dim;
+    pc.n_rot = n_rot;
+    pc.mrope = 0;
+    s.ctx->dispatch(pipe, {&xv, &ov, &cv, &sv, &pv, &mv}, &pc, sizeof(pc), groups_for((uint64_t) rows));
+}
+
+// ---- 4. `qsa_block_scores` -> qsa_block_scores.spv (POOLED ro, DEAD ro, QIDX ro, STEPS ro, SCORES rw; push
+//        {int max_blocks}).  Grid (max_blocks, nq): one workgroup per (query, block).  `active_blocks > 0`
+//        launches only that many x-groups (the header's perf-review contract; -1 means the capacity).  The
+//        shader hardcodes R=4 / IDX_DIM=128 / IDX_HEADS=4, so a shape that disagrees is a loud refusal rather
+//        than a read past the pooled rows.
+void qsa_block_scores(Stream& s, const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                      int64_t nq, int64_t max_blocks, const strata::kernels::QsaShapes& sh, float* scores, int64_t active_blocks) {
+    if (nq <= 0 || max_blocks <= 0) return;
+    if (sh.idx_block != 4 || sh.idx_dim != 128 || sh.idx_n_head != 4)
+        refuse("qsa_block_scores", "the shader fixes idx_block=4, idx_dim=128, idx_n_head=4");
+    Buf pv{}, dv{}, qv{}, sv{}, ov{};
+    if (!arena_resolve(s, pooled, (uint64_t) max_blocks * 128 * 4, pv) ||
+        !arena_resolve(s, dead, 128 * 4, dv) ||
+        !arena_resolve(s, q_idx, (uint64_t) nq * 4 * 128 * 4, qv) ||
+        !arena_resolve(s, steps, (uint64_t) nq * 4 * 4, sv) ||
+        !arena_resolve(s, scores, (uint64_t) nq * (uint64_t) max_blocks * 4, ov))
+        refuse("qsa_block_scores", "a pointer is not inside this stream's arena");
+    const uint32_t gx = (active_blocks > 0) ? (uint32_t) active_blocks : (uint32_t) max_blocks;
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/qsa_block_scores.spv", 5, 4);
+    struct Push {
+        int32_t max_blocks;
+    } pc{};
+    pc.max_blocks = (int32_t) max_blocks;
+    s.ctx->dispatch(pipe, {&pv, &dv, &qv, &sv, &ov}, &pc, sizeof(pc), gx, (uint32_t) nq);
+}
+
+// ---- 5. `qsa_block_topk` -> qsa_block_topk.spv (SCORES ro, STEPS ro, IDS rw; push {int max_blocks; int cap}).
+//        One workgroup per query; the ids are emitted ASCENDING.  `active_blocks` is the header's bound on the
+//        largest n_bid+1 of the call; the port's shader is the reference kernel and sizes nothing by it, so it
+//        is accepted and ignored (its grid is sized by the query count, exactly as the case drives it).
+void qsa_block_topk(Stream& s, const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks,
+                    int64_t cap, const strata::kernels::QsaShapes& sh, int32_t* ids, int64_t active_blocks) {
+    (void) active_blocks;
+    if (nq <= 0 || max_blocks <= 0 || cap <= 0) return;
+    if (sh.idx_block != 4)
+        refuse("qsa_block_topk", "the shader fixes R = idx_block = 4");
+    Buf sv{}, tv{}, ov{};
+    if (!arena_resolve(s, scores, (uint64_t) nq * (uint64_t) max_blocks * 4, sv) ||
+        !arena_resolve(s, steps, (uint64_t) nq * 4 * 4, tv) ||
+        !arena_resolve(s, ids, (uint64_t) nq * (uint64_t) cap * 4, ov))
+        refuse("qsa_block_topk", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/qsa_block_topk.spv", 3, 8);
+    struct Push {
+        int32_t max_blocks;
+        int32_t cap;
+    } pc{};
+    pc.max_blocks = (int32_t) max_blocks;
+    pc.cap = (int32_t) cap;
+    s.ctx->dispatch(pipe, {&sv, &tv, &ov}, &pc, sizeof(pc), (uint32_t) nq);
+}
+
+// ---- 6. `native_qsa_gate_apply` -> native_qsa_gate_apply.spv (ATTN ro, QFULL ro, OUT rw; push {int n_head;
+//        head_dim}; one thread per (head, dim)).  `out = attn * sigmoid(second-half gate)`, all f32.  One
+//        surplus group is dispatched so a missing element guard is visible (the shader has none - the CUDA's
+//        256-thread grid is exact, and the case's fixture uses the same surplus).
+void native_qsa_gate_apply(Stream& s, const float* attn, const float* q_full, float* output, int n_head,
+                           int head_dim) {
+    if (n_head <= 0 || head_dim <= 0) return;
+    const uint64_t n = (uint64_t) n_head * (uint64_t) head_dim;
+    Buf av{}, qv{}, ov{};
+    if (!arena_resolve(s, attn, n * 4, av) || !arena_resolve(s, q_full, n * 2 * 4, qv) ||
+        !arena_resolve(s, output, n * 4, ov))
+        refuse("native_qsa_gate_apply", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_qsa_gate_apply.spv", 3, 8);
+    struct Push {
+        int32_t n_head;
+        int32_t head_dim;
+    } pc{};
+    pc.n_head = n_head;
+    pc.head_dim = head_dim;
+    s.ctx->dispatch(pipe, {&av, &qv, &ov}, &pc, sizeof(pc), groups_for(n) + 1u);
+}
+
+// ---- 7. `qsa_gate_apply_f32` -> qsa_gate_apply_f32.spv (same layout as #6).  The LEGACY sibling: the same RULE,
+//        the same f32 arithmetic on this target (no shaderFloat64).  `head_dim` comes from the QsaShapes the
+//        engine passes; the shader's push is the same {n_head, head_dim} pair.
+void qsa_gate_apply_f32(Stream& s, const float* attn, const float* q_full, const strata::kernels::QsaShapes& sh, float* output) {
+    const int n_head = (int) sh.n_head, head_dim = (int) sh.head_dim;
+    if (n_head <= 0 || head_dim <= 0) return;
+    const uint64_t n = (uint64_t) n_head * (uint64_t) head_dim;
+    Buf av{}, qv{}, ov{};
+    if (!arena_resolve(s, attn, n * 4, av) || !arena_resolve(s, q_full, n * 2 * 4, qv) ||
+        !arena_resolve(s, output, n * 4, ov))
+        refuse("qsa_gate_apply_f32", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/qsa_gate_apply_f32.spv", 3, 8);
+    struct Push {
+        int32_t n_head;
+        int32_t head_dim;
+    } pc{};
+    pc.n_head = n_head;
+    pc.head_dim = head_dim;
+    s.ctx->dispatch(pipe, {&av, &qv, &ov}, &pc, sizeof(pc), groups_for(n) + 1u);
+}
+
+// ---- 8. `native_router_top10` -> native_router_top10.spv (LOGITS ro, IDS rw, WEIGHTS rw; push {int n_tokens}).
+//        ONE token per call (the engine's moe_route calls it per token).  512 experts, top-10, softmax, ggml's
+//        2^-14 lower clamp - all fixed by the shader.  `n_tokens = 1` and one workgroup, exactly as the case's
+//        single-token arm drives it.
+void native_router_top10(Stream& s, const float* logits, int32_t* ids, float* weights) {
+    Buf lv{}, iv{}, wv{};
+    if (!arena_resolve(s, logits, 512ull * 4, lv) || !arena_resolve(s, ids, 10ull * 4, iv) ||
+        !arena_resolve(s, weights, 10ull * 4, wv))
+        refuse("native_router_top10", "a pointer is not inside this stream's arena");
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_router_top10.spv", 3, 4);
+    struct Push {
+        int32_t n_tokens;
+    } pc{};
+    pc.n_tokens = 1;
+    s.ctx->dispatch(pipe, {&lv, &iv, &wv}, &pc, sizeof(pc), 1);
+}
+
+}  // namespace strata::vulkan
+
+// ---- the engine's entry points: the symbols include/strata/kernels/*.hpp declare --------------------------
+namespace strata::kernels {
+
+// helper: every body refuses when the opaque stream is not a live Vulkan stream.
+static strata::vulkan::Stream* need_stream(const char* who, void* stream) {
+    strata::vulkan::Stream* s = strata::vulkan::stream_of(stream);
+    if (s == nullptr) {
+        std::fprintf(stderr, "%s: the stream handle is not a live Vulkan stream; refusing\n", who);
+        std::exit(2);
+    }
+    return s;
+}
+
+// native_qsa.hpp: `void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
+//     int n_cols, int n_rows, float epsilon, void* stream);`  (layer.cpp:879)
+void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output, int n_cols, int n_rows,
+                                  float epsilon, void* stream) {
+    strata::vulkan::native_qsa_rms_norm_weighted(*need_stream("native_qsa_rms_norm_weighted", stream), input, gamma,
+                                                 output, n_cols, n_rows, epsilon);
+}
+
+// native_rope.hpp: `void native_rope_apply(const float* x, float* out, int rows, int head_dim, int n_rot,
+//     const strata::kernels::RopeScaling& scaling, const int* positions, void* stream);`  (layer.cpp:881)
+void native_rope_apply(const float* x, float* out, int rows, int head_dim, int n_rot, const strata::kernels::RopeScaling& scaling,
+                       const int* positions, void* stream) {
+    strata::vulkan::native_rope_apply(*need_stream("native_rope_apply", stream), x, out, rows, head_dim, n_rot,
+                                      scaling, positions);
+}
+
+// rope.hpp: `void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot,
+//     const float* cos_tab, const float* sin_tab, const int* pos, void* stream);`  (layer.cpp:882)
+void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
+                     const float* sin_tab, const int* pos, void* stream) {
+    strata::vulkan::rope_neox_apply(*need_stream("rope_neox_apply", stream), x, out, rows, head_dim, n_rot, cos_tab,
+                                    sin_tab, pos);
+}
+
+// qsa_select.hpp: `void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx,
+//     const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
+//     int64_t active_blocks);`  (layer.cpp:970)
+void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                      int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+    strata::vulkan::qsa_block_scores(*need_stream("qsa_block_scores", stream), pooled, dead, q_idx, steps, nq,
+                                     max_blocks, s, scores, active_blocks);
+}
+
+// qsa_select.hpp: `void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks,
+//     int64_t cap, const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks);`  (layer.cpp:971)
+void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                    const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
+    strata::vulkan::qsa_block_topk(*need_stream("qsa_block_topk", stream), scores, steps, nq, max_blocks, cap, s,
+                                   ids, active_blocks);
+}
+
+// native_qsa.hpp: `void native_qsa_gate_apply(const float* attn, const float* q_full, float* output, int n_head,
+//     int head_dim, void* stream);`  (layer.cpp:1010)
+void native_qsa_gate_apply(const float* attn, const float* q_full, float* output, int n_head, int head_dim,
+                           void* stream) {
+    strata::vulkan::native_qsa_gate_apply(*need_stream("native_qsa_gate_apply", stream), attn, q_full, output,
+                                          n_head, head_dim);
+}
+
+// qsa.hpp: `void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out,
+//     void* stream);`  (layer.cpp:1011)
+void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
+    strata::vulkan::qsa_gate_apply_f32(*need_stream("qsa_gate_apply_f32", stream), attn, q_full, s, out);
+}
+
+// native_router.hpp: `void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);`
+//     (moe_route, layer.cpp - the expert routing)
+void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
+    strata::vulkan::native_router_top10(*need_stream("native_router_top10", stream), logits, ids, weights);
+}
+
+// ---- the `host` row: the rope CONSTANTS (rope_scaling.hpp) -------------------------------------------------
+// On a CUDA build `src/kernels/cuda/rope_scaling.cu` owns this storage; a Vulkan build compiles no such file.
+// Plain storage, one writer at startup (the header's contract), read at every analytic rope launch.  The
+// default-constructed value is the identity - exactly the engine's unscaled decode.
+static RopeScaling g_rope_scaling;
+void rope_scaling_set(const strata::kernels::RopeScaling& scaling) { g_rope_scaling = scaling; }
+const RopeScaling& rope_scaling() { return g_rope_scaling; }
+
+}  // namespace strata::kernels

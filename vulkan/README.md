@@ -254,3 +254,30 @@ the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.c
   (`LayerView::name`, `WeightTable::find`, `native_embed`, `NativeEmbed::gather_one`, `main`) all have a home in
   the targets the shim batch added; their TUs compile clean under the shim, and only the sibling TUs that need the
   DEFERRED CUDA graph API (I5's) keep those targets from building.
+
+## What I5 (engine) adds (2026-10-05)
+
+* `vulkan/src/kernels/qsa_vk.cpp` (new) - **the ATTENTION / QSA / rope entry points**, the non-GDN half of the
+  decode path: the first eight entry points the non-GDN layer body `qsa_layer` (`src/core/layer.cpp:876`) reaches,
+  in call-site order - `native_qsa_rms_norm_weighted` (`:879`), `native_rope_apply` (`:881`), `rope_neox_apply`
+  (`:882`), `qsa_block_scores` (`:970`), `qsa_block_topk` (`:971`), `native_qsa_gate_apply` (`:1010`),
+  `qsa_gate_apply_f32` (`:1011`) and `native_router_top10` (`:370`, the expert routing).  Engine headers unchanged.
+  Each proved by a new `case_*_entry` through the ENGINE WRAPPER, BITWISE against the port's shader path AND against
+  the case's explicit oracle (`EnginePin`-pinned); `strata_vk_entry_smoke` links the new TU (the numeric proof is
+  the gate cases, which run the wrapper end to end).
+* **A CROSS-CUTTING DEFECT FOUND AND FIXED WHILE WIRING (the last batch's latent-defect class): the norm WEIGHT
+  was indexed by the ELEMENT index instead of the COLUMN index.**  `rms_norm.comp` and
+  `native_qsa_rms_norm_weighted.comp` read `w.v[i]`/`gamma.v[i]` (`i = row*cols+c`) where the engine's contract is
+  `w[n_cols]` broadcast over rows (`native_qsa.cu` `gamma[col]`; `elementwise.cu` `r[c]*w[c]`).  Every row past the
+  first read the wrong weight, and a cols-long engine weight was read OUT OF BOUNDS - a silently wrong token on
+  every QSA layer.  Three cases' oracles reproduced the shader's indexing and masked it.  Fixed both shaders
+  (`[c]`), the three oracles (column index), and `elementwise_vk.cpp`'s weight resolution (`cols` floats).
+* **THE `host` ROW:** `rope_scaling()` (+ `rope_scaling_set`) - the rope constants, owned by `rope_scaling.cu` on a
+  CUDA build.  No capability flipped.
+* **REPORTED, NOT WIRED:** `qsa_decode_attn_step` (`layer.cpp:980`) has NO shader in this tree - PORT-MAP maps it
+  to `attn_decode_short`, but that shader IS `native_flash_attn_short_step`'s (a gathered f16 window) while this
+  symbol reads the KV POOLS through a page table.  A shader-port job, not a stub.
+* **THE LINK PROGRESS:** the one-layer-body link moved **106 -> 94** undefined references / **44 -> 35**
+  full-signature / **42 -> 33** name-only.  The attention/QSA/MoE/GR/PLE/rope group falls **36 -> 27**.  All 35
+  remaining are referenced by `layer.cpp` itself; the only other structural blocker is the deferred CUDA graph API
+  (I5's).

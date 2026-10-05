@@ -46,6 +46,8 @@
 #include "strata/kernels/s2_gemv_q8.hpp"     // I4: s2_gemv_q8
 #include "strata/kernels/kv_q8.hpp"          // I4: kv_append_q8_step / kv_gather_q8_step (kv_stream.hpp + qsa.hpp)
 #include "strata/kernels/qsa.hpp"            // I4: kv_append_step / kv_gather_step (the fp16 KV cache)
+#include "strata/kernels/qsa_select.hpp"     // QSA/attention batch: qsa_block_scores / qsa_block_topk
+#include "strata/kernels/rope.hpp"           // QSA/attention batch: rope_neox_apply
 
 #include <algorithm>
 #include <cmath>
@@ -4142,7 +4144,7 @@ void case_rms_norm(Ctx& ctx, const std::string& dir) {
             const double inv = 1.0 / std::sqrt(acc / (double) cols + 1e-6);
             for (int c = 0; c < cols; ++c) {
                 const uint64_t i = (uint64_t) r * cols + c;
-                ref[i] = (float) ((double) x[i] * (double) w[i] * inv);
+                ref[i] = (float) ((double) x[i] * (double) w[c] * inv);   // per-column weight: w[c], not w[i]
             }
         }
         Buf bx = ctx.alloc(padded * 4), bw = ctx.alloc(padded * 4);
@@ -12197,7 +12199,7 @@ void case_native_qsa_rms_norm_weighted(Ctx& ctx, const std::string& dir) {
             const double scale = 1.0 / std::sqrt(acc / (double) cols + (double) eps);
             for (int c = 0; c < cols; ++c) {
                 const uint64_t i = (uint64_t) r * cols + c;
-                ref[i] = (float) (scale * (double) x[i] * (double) g[i]);
+                ref[i] = (float) (scale * (double) x[i] * (double) g[c]);   // per-column gamma: g[c], not g[i]
             }
         }
         for (int inplace = 1; inplace >= 0; --inplace) {
@@ -14089,7 +14091,7 @@ void case_rms_norm_weighted_entry(Ctx& ctx, const std::string& dir) {
             const double inv = 1.0 / std::sqrt(acc / (double) cols + 1e-6);
             for (int c = 0; c < cols; ++c) {
                 const uint64_t i = (uint64_t) r * cols + c;
-                want[i] = (float) ((double) x[i] * (double) w[i] * inv);
+                want[i] = (float) ((double) x[i] * (double) w[c] * inv);   // per-column weight: w[c], not w[i]
             }
         }
 
@@ -17026,6 +17028,653 @@ void case_kv_gather_step_entry(Ctx& ctx, const std::string& dir) {
     ctx.free(bt); ctx.free(bi); ctx.free(bst);
 }
 
+// ============================================================================================================
+// THE ATTENTION / QSA / rope ENTRY POINTS (vulkan/src/kernels/qsa_vk.cpp).  Each case runs the port's EXISTING
+// shader fixture through (A) the shader path on the harness ctx and (B) the ENGINE WRAPPER
+// `strata::kernels::<symbol>` on its own engine stream (`EnginePin`-pinned), then asserts (C) the wrapper's
+// answer equals the shader path's BITWISE and (D) equals the case's explicit oracle.  APPENDED at the end of
+// main() for the shared-RNG reason every prior batch names.
+// ============================================================================================================
+
+// #1 `native_qsa_rms_norm_weighted` (layer.cpp:879) -> native_qsa_rms_norm_weighted.spv.  Fixture is
+// case_native_qsa_rms_norm_weighted's three shapes; the oracle is the rule's double transcription (tol 3e-3).
+void case_native_qsa_rms_norm_weighted_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_qsa_rms_norm_weighted.spv")) return;
+    struct Shape { int rows, cols; };
+    const Shape shapes[] = {{8, 2560}, {2, 256}, {3, 1024}};
+    const float eps = 1e-6f;
+    for (const Shape& sh : shapes) {
+        const int rows = sh.rows, cols = sh.cols;
+        const uint64_t n = (uint64_t) rows * cols;
+        const uint64_t padded = n + 2u * (uint64_t) cols + 8;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> x(padded, NaN), g(padded, NaN);
+        for (uint64_t i = 0; i < n; ++i) { x[i] = rndf(1.0f); g[i] = 0.5f + rndf(1.0f); }
+        std::vector<float> ref(padded, NaN);
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const double scale = 1.0 / std::sqrt(acc / (double) cols + (double) eps);
+            for (int c = 0; c < cols; ++c) {
+                const uint64_t i = (uint64_t) r * cols + c;
+                ref[i] = (float) (scale * (double) x[i] * (double) g[c]);   // per-column gamma: g[c], not g[i]
+            }
+        }
+        Buf bx = ctx.alloc(padded * 4), bg = ctx.alloc((size_t) cols * 4), bo = ctx.alloc(padded * 4);
+        ctx.write(bx, x.data(), padded * 4);
+        ctx.write(bg, g.data(), (size_t) cols * 4);
+        std::vector<float> init(padded, NaN);
+        ctx.write(bo, init.data(), padded * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/native_qsa_rms_norm_weighted.spv", 3, 12);
+            struct { int32_t rows, cols; float eps; } pc{rows, cols, eps};
+            ctx.dispatch(p, {&bx, &bg, &bo}, &pc, sizeof(pc), (uint32_t) rows + 2u);
+        }
+        std::vector<float> ref_y(padded);
+        ctx.read(bo, ref_y.data(), padded * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("native_qsa_rms_norm_weighted entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bx); ctx.free(bg); ctx.free(bo); return;
+        }
+        float* dx = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dg = strata::vulkan::arena_alloc<float>(*s, (size_t) cols);
+        float* dy = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+        strata::vulkan::stream_write(*s, dg, g.data(), (size_t) cols * 4);
+        strata::kernels::native_qsa_rms_norm_weighted(dx, dg, dy, cols, rows, eps, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dy, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (uint64_t i = 0; i < n; ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "native_qsa_rms_norm_weighted entry (r=%d c=%d): engine wrapper == shader path, bitwise", rows, cols);
+        verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+        int bad = 0; double worst = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 3e-3, 1e-6)) ++bad;
+            worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30));
+        }
+        std::snprintf(tag, sizeof tag, "native_qsa_rms_norm_weighted entry (r=%d c=%d): engine wrapper vs the rule (double)", rows, cols);
+        verdict(tag, bad == 0, bad, (int) n, worst, "relative vs the rule's double transcription (tol 3e-3)");
+        ctx.free(bx); ctx.free(bg); ctx.free(bo);
+    }
+}
+
+// #2 `native_rope_apply` (layer.cpp:881) -> native_rope_apply.spv.  Fixture: case_native_rope_apply's arms 0
+// (None) and 2 (YaRN factor 2, ext_factor 1).  Oracle: the host transcription of the SOURCE's analytic angle
+// (rope_ref mode 0), 3e-3 row-relative - the shader's trig is the driver's.
+void case_native_rope_apply_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_rope_apply.spv")) return;
+    struct Arm { int rows, head_dim; int type; };
+    const Arm arms[] = {{192, 256, 0}, {96, 256, 1}};
+    for (const Arm& ar : arms) {
+        const int rows = ar.rows, head_dim = ar.head_dim, n_rot = 64;
+        const float freq_base = 1.0e7f;
+        const float theta_scale = std::pow(freq_base, -2.0f / (float) n_rot);
+        float freq_scale = 1.0f, corr_low = 0.0f, corr_high = 0.0f, ext_factor = 0.0f, mscale = 1.0f;
+        strata::kernels::RopeScaling scaling;   // None; freq_base 1e7 (the artifact's default)
+        if (ar.type == 1) {
+            const double factor = 2.0, orig_ctx = 262144.0, beta_fast = 32.0, beta_slow = 1.0, base = 1.0e7;
+            auto corr_dim = [&](double n_rot_d) {
+                return 64.0 * std::log(orig_ctx / (n_rot_d * 2.0 * 3.14159265358979323846)) / (2.0 * std::log(base));
+            };
+            freq_scale = (float) (1.0 / factor);
+            corr_low = (float) std::floor(corr_dim(beta_fast));
+            corr_high = (float) std::ceil(corr_dim(beta_slow));
+            if (corr_low < 0) corr_low = 0;
+            if (corr_high > (float) (n_rot - 1)) corr_high = (float) (n_rot - 1);
+            ext_factor = 1.0f;
+            scaling.type = strata::kernels::RopeScalingType::YaRN;
+            scaling.factor = factor;
+            scaling.ext_factor = 1.0;
+        }
+        std::vector<float> x((size_t) rows * head_dim);
+        for (auto& v : x) v = rndf(1.0f);
+        std::vector<int> pos((size_t) rows);
+        for (int r = 0; r < rows; ++r) pos[(size_t) r] = (ar.type == 0) ? (r % 32) : ((r * 37) % 256);
+        std::vector<float> ref;
+        rope_ref(x, ref, rows, head_dim, n_rot, pos, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, 0);
+        Buf bx = ctx.alloc(x.size() * 4), bo = ctx.alloc(x.size() * 4), bp = ctx.alloc((size_t) rows * 4), bm = ctx.alloc(4);
+        ctx.write(bx, x.data(), x.size() * 4);
+        ctx.write(bp, pos.data(), (size_t) rows * 4);
+        const int32_t dummy = 0;
+        ctx.write(bm, &dummy, 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/native_rope_apply.spv", 4, 40);
+            struct { int32_t rows, head_dim, n_rot, mrope; float theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale; } pc;
+            pc.rows = rows; pc.head_dim = head_dim; pc.n_rot = n_rot; pc.mrope = 0;
+            pc.theta_scale = theta_scale; pc.freq_scale = freq_scale; pc.corr_low = corr_low; pc.corr_high = corr_high;
+            pc.ext_factor = ext_factor; pc.mscale = mscale;
+            const uint32_t gx = (uint32_t) ((head_dim / 2 + kLocalSize - 1) / kLocalSize);
+            ctx.dispatch(p, {&bx, &bo, &bp, &bm}, &pc, sizeof(pc), gx, (uint32_t) rows);
+        }
+        std::vector<float> ref_y(x.size());
+        ctx.read(bo, ref_y.data(), x.size() * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("native_rope_apply entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bx); ctx.free(bo); ctx.free(bp); ctx.free(bm); return;
+        }
+        float* dx = strata::vulkan::arena_alloc<float>(*s, x.size());
+        float* dout = strata::vulkan::arena_alloc<float>(*s, x.size());
+        int* dpos = strata::vulkan::arena_alloc<int>(*s, (size_t) rows);
+        strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 4);
+        strata::vulkan::stream_write(*s, dpos, pos.data(), (size_t) rows * 4);
+        strata::kernels::native_rope_apply(dx, dout, rows, head_dim, n_rot, scaling, dpos, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(x.size());
+        strata::vulkan::stream_read(*s, dout, got.data(), x.size() * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < x.size(); ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "native_rope_apply entry (hd=%d rows=%d %s): engine wrapper == shader path, bitwise", head_dim, rows, ar.type ? "yarn2" : "none");
+        verdict(tag, bad_bw == 0, bad_bw, (int) x.size(), 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+        int bad = 0; double worst = 0;
+        for (int r = 0; r < rows; ++r) {
+            const int base = r * head_dim;
+            double scale = 1e-30;
+            for (int d = 0; d < head_dim; ++d) scale = std::max(scale, (double) std::fabs(x[(size_t) base + d]));
+            for (int d = 0; d < head_dim; ++d) {
+                const double rel = std::fabs((double) got[base + d] - (double) ref[base + d]) / scale;
+                worst = std::max(worst, rel);
+                if (!(rel <= 3.0e-3)) ++bad;
+            }
+        }
+        std::snprintf(tag, sizeof tag, "native_rope_apply entry (hd=%d rows=%d %s): engine wrapper vs the analytic rule", head_dim, rows, ar.type ? "yarn2" : "none");
+        verdict(tag, bad == 0, bad, (int) x.size(), worst, "row-relative vs the host analytic rule (tol 3e-3)");
+        ctx.free(bx); ctx.free(bo); ctx.free(bp); ctx.free(bm);
+    }
+}
+
+// #3 `rope_neox_apply` (layer.cpp:882) -> rope_neox.spv.  Fixture: case_rope's text arms (NEOX pairing, the
+// partial-rotation tail copied).  Oracle: the host NEOX rule, with the tail asserted BIT-EXACT.
+void case_rope_neox_apply_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "rope_neox.spv")) return;
+    const int head_dim = 256, n_rot = 64, half = n_rot / 2;
+    const double theta = 10000.0;
+    const int max_pos = 64;
+    const float TAIL = 1234.5f;
+    std::vector<float> ct, st;
+    rope_table_host(n_rot, theta, max_pos, ct, st);
+    const int32_t mtab[6] = {0, 1, 2, 3, 4, 5};
+    struct RC { int rows; std::vector<int> pos; };
+    const std::vector<RC> arms = {{3, {0, 1, 7}}, {4, {5, 5, 5, 5}}};
+    for (const RC& c : arms) {
+        const int rows = c.rows;
+        const size_t n = (size_t) rows * head_dim;
+        const uint64_t slack = 64;
+        std::vector<float> x(n, 0.0f);
+        for (int r = 0; r < rows; ++r)
+            for (int d = 0; d < head_dim; ++d) x[(size_t) r * head_dim + d] = (d < n_rot) ? rndf(1.0f) : TAIL;
+        std::vector<float> ref(n, 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            const float* xr = &x[(size_t) r * head_dim];
+            float* rr = &ref[(size_t) r * head_dim];
+            for (int d = n_rot; d < head_dim; ++d) rr[d] = xr[d];
+            for (int i = 0; i < half; ++i) {
+                const int toff = c.pos[r] * half + i;
+                const double a = xr[i], b = xr[half + i], cc = ct[toff], ss = st[toff];
+                rr[i] = (float) (a * cc - b * ss);
+                rr[half + i] = (float) (a * ss + b * cc);
+            }
+        }
+        Buf bx = ctx.alloc(n * 4), bo = ctx.alloc((n + slack) * 4), bc = ctx.alloc(ct.size() * 4),
+            bs = ctx.alloc(st.size() * 4), bp = ctx.alloc((uint64_t) rows * 4), bm = ctx.alloc(sizeof(mtab));
+        ctx.write(bx, x.data(), n * 4);
+        std::vector<float> out(n + slack, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(bo, out.data(), out.size() * 4);
+        ctx.write(bc, ct.data(), ct.size() * 4);
+        ctx.write(bs, st.data(), st.size() * 4);
+        ctx.write(bp, c.pos.data(), (uint64_t) rows * 4);
+        ctx.write(bm, mtab, sizeof(mtab));
+        {
+            VkPipeline p = ctx.pipeline(dir + "/rope_neox.spv", 6, 16);
+            struct { int rows, head_dim, n_rot, mrope; } pc{rows, head_dim, n_rot, 0};
+            const uint32_t groups = (uint32_t) ((rows + kLocalSize - 1) / kLocalSize);
+            ctx.dispatch(p, {&bx, &bo, &bc, &bs, &bp, &bm}, &pc, sizeof(pc), groups);
+        }
+        std::vector<float> ref_y(n + slack);
+        ctx.read(bo, ref_y.data(), ref_y.size() * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("rope_neox_apply entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bx); ctx.free(bo); ctx.free(bc); ctx.free(bs); ctx.free(bp); ctx.free(bm); return;
+        }
+        float* dx = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dc = strata::vulkan::arena_alloc<float>(*s, ct.size());
+        float* ds = strata::vulkan::arena_alloc<float>(*s, st.size());
+        int* dpos = strata::vulkan::arena_alloc<int>(*s, (size_t) rows);
+        strata::vulkan::stream_write(*s, dx, x.data(), n * 4);
+        strata::vulkan::stream_write(*s, dc, ct.data(), ct.size() * 4);
+        strata::vulkan::stream_write(*s, ds, st.data(), st.size() * 4);
+        strata::vulkan::stream_write(*s, dpos, c.pos.data(), (size_t) rows * 4);
+        strata::kernels::rope_neox_apply(dx, dout, rows, head_dim, n_rot, dc, ds, dpos, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dout, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < n; ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "rope_neox_apply entry (rows=%d): engine wrapper == shader path, bitwise", rows);
+        verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+        int bad = 0, tail_bad = 0; double worst = 0;
+        for (int r = 0; r < rows; ++r) {
+            const float* xr = &x[(size_t) r * head_dim];
+            for (int i = 0; i < half; ++i) {
+                const double a = xr[i], b = xr[half + i];
+                for (int off : {i, half + i}) {
+                    const double want = ref[(size_t) r * head_dim + off];
+                    const double g = got[(size_t) r * head_dim + off];
+                    const double tol = std::max(std::fabs(want) * 9.5367e-7, (std::fabs(a) + std::fabs(b)) * 9.5367e-7);
+                    const double ratio = std::fabs(g - want) / (tol + 1e-30);
+                    worst = std::max(worst, ratio);
+                    if (!(ratio <= 1.0)) ++bad;
+                }
+            }
+            for (int d = n_rot; d < head_dim; ++d) if (got[(size_t) r * head_dim + d] != TAIL) ++tail_bad;
+        }
+        std::snprintf(tag, sizeof tag, "rope_neox_apply entry (rows=%d): engine wrapper vs the NEOX rule (bit-exact tail)", rows);
+        verdict(tag, bad == 0 && tail_bad == 0, bad + tail_bad, (int) n, worst, "rotation outside the err/tol bound or the tail was not copied");
+        ctx.free(bx); ctx.free(bo); ctx.free(bc); ctx.free(bs); ctx.free(bp); ctx.free(bm);
+    }
+}
+
+// #4 `qsa_block_scores` (layer.cpp:970) -> qsa_block_scores.spv.  Fixture: case_qsa_select's scores arm (the
+// tail block scored against `dead`, +1e9 when it has cells).  Oracle: the rule's independent transcription.
+void case_qsa_block_scores_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "qsa_block_scores.spv")) return;
+    const uint32_t max_blocks = 24, nq = 3;
+    std::vector<float> pooled((size_t) max_blocks * kQsaDim), dead(kQsaDim), qidx((size_t) nq * kQsaHeads * kQsaDim);
+    for (float& x : pooled) x = rndf(1.0f);
+    for (float& x : dead) x = rndf(1.0f) * 8.0f;
+    for (float& x : qidx) x = rndf(1.0f);
+    const uint32_t nkv[3] = {37, 64, 5};
+    std::vector<int32_t> steps((size_t) nq * 4, 0);
+    for (uint32_t i = 0; i < nq; ++i) {
+        steps[i * 4 + 0] = (int32_t) nkv[i] - 1;
+        steps[i * 4 + 1] = (int32_t) nkv[i];
+        steps[i * 4 + 2] = (int32_t) (nkv[i] / kQsaR);
+        steps[i * 4 + 3] = 16;
+    }
+    Buf bp = ctx.alloc(pooled.size() * 4), bd = ctx.alloc(dead.size() * 4), bq = ctx.alloc(qidx.size() * 4),
+        bst = ctx.alloc(steps.size() * 4), bsc = ctx.alloc((size_t) nq * max_blocks * 4);
+    ctx.write(bp, pooled.data(), pooled.size() * 4);
+    ctx.write(bd, dead.data(), dead.size() * 4);
+    ctx.write(bq, qidx.data(), qidx.size() * 4);
+    ctx.write(bst, steps.data(), steps.size() * 4);
+    std::vector<float> sentf((size_t) nq * max_blocks, -12345.0f);
+    ctx.write(bsc, sentf.data(), sentf.size() * 4);
+    {
+        VkPipeline ps = ctx.pipeline(dir + "/qsa_block_scores.spv", 5, 4);
+        struct { int max_blocks; } spc{(int) max_blocks};
+        ctx.dispatch(ps, {&bp, &bd, &bq, &bst, &bsc}, &spc, sizeof(spc), max_blocks, nq);
+    }
+    std::vector<float> ref_sc(sentf.size());
+    ctx.read(bsc, ref_sc.data(), ref_sc.size() * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("qsa_block_scores entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bp); ctx.free(bd); ctx.free(bq); ctx.free(bst); ctx.free(bsc); return;
+    }
+    strata::kernels::QsaShapes sh{};
+    sh.n_head = 24; sh.n_head_kv = 2; sh.head_dim = 256; sh.n_rot = 64;
+    sh.idx_n_head = kQsaHeads; sh.idx_dim = kQsaDim; sh.idx_block = kQsaR; sh.idx_top_k = 2048; sh.page_size = 4;
+    float* dp = strata::vulkan::arena_alloc<float>(*s, pooled.size());
+    float* dd = strata::vulkan::arena_alloc<float>(*s, dead.size());
+    float* dq = strata::vulkan::arena_alloc<float>(*s, qidx.size());
+    int32_t* dst = strata::vulkan::arena_alloc<int32_t>(*s, steps.size());
+    float* dsc = strata::vulkan::arena_alloc<float>(*s, sentf.size());
+    strata::vulkan::stream_write(*s, dp, pooled.data(), pooled.size() * 4);
+    strata::vulkan::stream_write(*s, dd, dead.data(), dead.size() * 4);
+    strata::vulkan::stream_write(*s, dq, qidx.data(), qidx.size() * 4);
+    strata::vulkan::stream_write(*s, dst, steps.data(), steps.size() * 4);
+    strata::vulkan::stream_write(*s, dsc, sentf.data(), sentf.size() * 4);
+    strata::kernels::qsa_block_scores(dp, dd, dq, dst, (int64_t) nq, (int64_t) max_blocks, sh, dsc, s, -1);   // WRAPPER
+    std::vector<float> got(sentf.size());
+    strata::vulkan::stream_read(*s, dsc, got.data(), got.size() * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < got.size(); ++i) { uint32_t a, b; std::memcpy(&a, &ref_sc[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "qsa_block_scores entry (nq=%u blocks=%u): engine wrapper == shader path, bitwise", nq, max_blocks);
+    verdict(tag, bad_bw == 0, bad_bw, (int) got.size(), 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+    int bad = 0; double worst = 0;
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+        const uint32_t n_kv = nkv[qi], n_bid = n_kv / kQsaR;
+        for (uint32_t b = 0; b <= n_bid; ++b) {
+            const bool tail = (b == n_bid);
+            double want = 0.0;
+            for (uint32_t h = 0; h < kQsaHeads; ++h) {
+                double dot = 0.0;
+                for (uint32_t d = 0; d < kQsaDim; ++d) {
+                    const double key = tail ? (double) dead[d] : (double) pooled[(size_t) b * kQsaDim + d];
+                    dot += key * (double) qidx[((size_t) qi * kQsaHeads + h) * kQsaDim + d];
+                }
+                want += std::max(dot, 0.0);
+            }
+            if (tail && (n_kv % kQsaR) != 0) want += 1e9;
+            const double g = (double) got[(size_t) qi * max_blocks + b];
+            const double rel = std::fabs(g - want) / (std::fabs(want) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 1e-5 || std::fabs(g - want) <= 1e-4)) ++bad;
+        }
+        for (uint32_t b = n_bid + 1; b < max_blocks; ++b)
+            if (got[(size_t) qi * max_blocks + b] != -12345.0f) ++bad;
+    }
+    std::snprintf(tag, sizeof tag, "qsa_block_scores entry: engine wrapper vs the relu/dead/+1e9 rule");
+    verdict(tag, bad == 0, bad, (int) got.size(), worst, "scores outside tolerance (or a block past n_bid was written)");
+    ctx.free(bp); ctx.free(bd); ctx.free(bq); ctx.free(bst); ctx.free(bsc);
+}
+
+// #5 `qsa_block_topk` (layer.cpp:971) -> qsa_block_topk.spv.  Fixture: case_qsa_select's selection arms.
+// Oracle: `qsa_select_want` (the documented rule, independent of the kernel's radix machinery).
+void case_qsa_block_topk_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "qsa_block_topk.spv")) return;
+    const uint32_t max_blocks = 24, cap = 128;
+    struct Arm { const char* what; uint32_t n_kv, width, n_bid; };
+    const Arm arms[] = {
+        {"a plain selection: the budget lands inside a block", 64, 6, 16},
+        {"ties at the budget boundary go to the LOWEST cells", 64, 6, 16},
+        {"a 1-cell tail IS selectable, and its weight is 1", 37, 3, 9},
+    };
+    for (const Arm& a : arms) {
+        std::vector<float> sc(max_blocks, -1000.0f);
+        for (uint32_t b = 0; b <= a.n_bid; ++b) sc[b] = 10.0f - 0.5f * (float) b;
+        if (a.n_kv == 37) {                                   // a 1-cell tail: its cells are selectable, weight 1
+            sc[2] = 100.0f; sc[9] = 1e9f;
+        } else if (std::string(a.what).find("ties") != std::string::npos) {
+            sc[5] = 50.0f; sc[9] = 50.0f; sc[13] = 50.0f;      // three equal keys, six cells wanted
+        } else {
+            sc[3] = 100.0f; sc[7] = 90.0f; sc[11] = 80.0f;     // a plain selection
+        }
+        std::vector<int32_t> st = {(int32_t) (a.n_kv - 1), (int32_t) a.n_kv, (int32_t) a.n_bid, (int32_t) a.width};
+        Buf b_sc = ctx.alloc(max_blocks * 4), b_st = ctx.alloc(16), b_ids = ctx.alloc((size_t) cap * 4);
+        ctx.write(b_sc, sc.data(), max_blocks * 4);
+        ctx.write(b_st, st.data(), 16);
+        std::vector<int32_t> sent((size_t) cap, -1);
+        ctx.write(b_ids, sent.data(), sent.size() * 4);
+        {
+            VkPipeline pt = ctx.pipeline(dir + "/qsa_block_topk.spv", 3, 8);
+            struct { int max_blocks, cap; } tpc{(int) max_blocks, (int) cap};
+            ctx.dispatch(pt, {&b_sc, &b_st, &b_ids}, &tpc, sizeof(tpc), 1);
+        }
+        std::vector<int32_t> ref_ids(cap);
+        ctx.read(b_ids, ref_ids.data(), ref_ids.size() * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("qsa_block_topk entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(b_sc); ctx.free(b_st); ctx.free(b_ids); return;
+        }
+        float* d_sc = strata::vulkan::arena_alloc<float>(*s, max_blocks);
+        int32_t* d_st = strata::vulkan::arena_alloc<int32_t>(*s, 4);
+        int32_t* d_ids = strata::vulkan::arena_alloc<int32_t>(*s, cap);
+        strata::vulkan::stream_write(*s, d_sc, sc.data(), max_blocks * 4);
+        strata::vulkan::stream_write(*s, d_st, st.data(), 16);
+        strata::vulkan::stream_write(*s, d_ids, sent.data(), sent.size() * 4);
+        strata::kernels::QsaShapes sh{};
+        sh.idx_block = kQsaR; sh.idx_dim = kQsaDim; sh.idx_n_head = kQsaHeads;
+        strata::kernels::qsa_block_topk(d_sc, d_st, 1, (int64_t) max_blocks, (int64_t) cap, sh, d_ids, s, -1);  // WRAPPER
+        std::vector<int32_t> got(cap);
+        strata::vulkan::stream_read(*s, d_ids, got.data(), got.size() * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (uint32_t i = 0; i < cap; ++i) if (got[i] != ref_ids[i]) ++bad_bw;
+        char tag[220];
+        std::snprintf(tag, sizeof tag, "qsa_block_topk entry: %s == shader path, bitwise", a.what);
+        verdict(tag, bad_bw == 0, bad_bw, (int) cap, 0.0, "ids differ from the ported shader's own path");
+        std::vector<int32_t> want;
+        qsa_select_want(want, sc, a.n_kv, a.n_bid, a.width);
+        int bad = 0;
+        for (uint32_t i = 0; i < a.width; ++i) {
+            const int32_t w = (i < want.size()) ? want[i] : -1;
+            if (got[i] != w) ++bad;
+        }
+        for (uint32_t i = a.width; i < cap; ++i) if (got[i] != -1) ++bad;
+        std::snprintf(tag, sizeof tag, "qsa_block_topk entry: %s vs the selection rule", a.what);
+        verdict(tag, bad == 0, bad, (int) cap, 0.0, "ids not equal to the selection rule's");
+        ctx.free(b_sc); ctx.free(b_st); ctx.free(b_ids);
+    }
+}
+
+// #6 `native_qsa_gate_apply` (layer.cpp:1010) -> native_qsa_gate_apply.spv.  Fixture: case_native_qsa_gate_apply's
+// shapes; oracle: the NATIVE rule (attn * sigmoid of the SECOND half), f32, tol 1e-5.
+void case_native_qsa_gate_apply_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_qsa_gate_apply.spv")) return;
+    struct Shape { int n_head, head_dim; };
+    const Shape shapes[] = {{24, 256}, {4, 12}};
+    for (const Shape& shp : shapes) {
+        const int nh = shp.n_head, hd = shp.head_dim;
+        const size_t n = (size_t) nh * hd;
+        const uint64_t padded = n + 8u;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> attn(n), qf((size_t) nh * 2 * hd), ref(n);
+        for (auto& x : attn) x = rndf(1.0f);
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                qf[(size_t) h * 2 * hd + d] = rndf(0.1f);
+                const int kk = d % 3;
+                qf[(size_t) h * 2 * hd + hd + d] = (kk == 0) ? -25.0f : (kk == 1) ? 25.0f : rndf(4.0f);
+            }
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                const double g = (double) qf[(size_t) h * 2 * hd + hd + d];
+                ref[(size_t) h * hd + d] = (float) ((double) attn[(size_t) h * hd + d] * (1.0 / (1.0 + std::exp(-g))));
+            }
+        Buf ba = ctx.alloc(n * 4), bq = ctx.alloc((size_t) nh * 2 * hd * 4), bo = ctx.alloc(padded * 4);
+        ctx.write(ba, attn.data(), n * 4);
+        ctx.write(bq, qf.data(), qf.size() * 4);
+        std::vector<float> init(padded, NaN);
+        ctx.write(bo, init.data(), padded * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/native_qsa_gate_apply.spv", 3, 8);
+            struct { int32_t n_head, head_dim; } pc{nh, hd};
+            ctx.dispatch(p, {&ba, &bq, &bo}, &pc, sizeof(pc), groups_for(n) + 1u);
+        }
+        std::vector<float> ref_y(padded);
+        ctx.read(bo, ref_y.data(), padded * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("native_qsa_gate_apply entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(ba); ctx.free(bq); ctx.free(bo); return;
+        }
+        float* da = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dq = strata::vulkan::arena_alloc<float>(*s, (size_t) nh * 2 * hd);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, da, attn.data(), n * 4);
+        strata::vulkan::stream_write(*s, dq, qf.data(), qf.size() * 4);
+        strata::kernels::native_qsa_gate_apply(da, dq, dout, nh, hd, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dout, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < n; ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "native_qsa_gate_apply entry (n_head=%d head_dim=%d): engine wrapper == shader path, bitwise", nh, hd);
+        verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+        int bad = 0; double worst = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 1e-5, 1e-7)) ++bad;
+            worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30));
+        }
+        std::snprintf(tag, sizeof tag, "native_qsa_gate_apply entry (n_head=%d head_dim=%d): engine wrapper vs the native rule", nh, hd);
+        verdict(tag, bad == 0, bad, (int) n, worst, "f32 vs the native rule's double transcription (tol 1e-5)");
+        ctx.free(ba); ctx.free(bq); ctx.free(bo);
+    }
+}
+
+// #7 `qsa_gate_apply_f32` (layer.cpp:1011) -> qsa_gate_apply_f32.spv.  Fixture: case_qsa_gate_apply_f32's shapes;
+// oracle: the same gate rule (attn * sigmoid of the SECOND half), tol 1e-5.
+void case_qsa_gate_apply_f32_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "qsa_gate_apply_f32.spv")) return;
+    struct Shape { int n_head, head_dim; };
+    const Shape shapes[] = {{24, 256}, {4, 12}};
+    for (const Shape& shp : shapes) {
+        const int nh = shp.n_head, hd = shp.head_dim;
+        const size_t n = (size_t) nh * hd;
+        const uint64_t padded = n + 8u;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> attn(n), qf((size_t) nh * 2 * hd), ref(n);
+        for (auto& x : attn) x = rndf(1.0f);
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                qf[(size_t) h * 2 * hd + d] = rndf(0.1f);
+                const int kk = d % 3;
+                qf[(size_t) h * 2 * hd + hd + d] = (kk == 0) ? -25.0f : (kk == 1) ? 25.0f : rndf(4.0f);
+            }
+        for (int h = 0; h < nh; ++h)
+            for (int d = 0; d < hd; ++d) {
+                const double g = (double) qf[(size_t) h * 2 * hd + hd + d];
+                ref[(size_t) h * hd + d] = (float) ((double) attn[(size_t) h * hd + d] * (1.0 / (1.0 + std::exp(-g))));
+            }
+        Buf ba = ctx.alloc(n * 4), bq = ctx.alloc((size_t) nh * 2 * hd * 4), bo = ctx.alloc(padded * 4);
+        ctx.write(ba, attn.data(), n * 4);
+        ctx.write(bq, qf.data(), qf.size() * 4);
+        std::vector<float> init(padded, NaN);
+        ctx.write(bo, init.data(), padded * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/qsa_gate_apply_f32.spv", 3, 8);
+            struct { int32_t n_head, head_dim; } pc{nh, hd};
+            ctx.dispatch(p, {&ba, &bq, &bo}, &pc, sizeof(pc), groups_for(n) + 1u);
+        }
+        std::vector<float> ref_y(padded);
+        ctx.read(bo, ref_y.data(), padded * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("qsa_gate_apply_f32 entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(ba); ctx.free(bq); ctx.free(bo); return;
+        }
+        strata::kernels::QsaShapes qsh{};
+        qsh.n_head = nh; qsh.head_dim = hd;
+        float* da = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dq = strata::vulkan::arena_alloc<float>(*s, (size_t) nh * 2 * hd);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, n);
+        strata::vulkan::stream_write(*s, da, attn.data(), n * 4);
+        strata::vulkan::stream_write(*s, dq, qf.data(), qf.size() * 4);
+        strata::kernels::qsa_gate_apply_f32(da, dq, qsh, dout, s);   // THE ENGINE WRAPPER
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dout, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < n; ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "qsa_gate_apply_f32 entry (n_head=%d head_dim=%d): engine wrapper == shader path, bitwise", nh, hd);
+        verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+        int bad = 0; double worst = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 1e-5, 1e-7)) ++bad;
+            worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30));
+        }
+        std::snprintf(tag, sizeof tag, "qsa_gate_apply_f32 entry (n_head=%d head_dim=%d): engine wrapper vs the gate rule", nh, hd);
+        verdict(tag, bad == 0, bad, (int) n, worst, "f32 vs the gate rule's double transcription (tol 1e-5)");
+        ctx.free(ba); ctx.free(bq); ctx.free(bo);
+    }
+}
+
+// #8 `native_router_top10` (the expert routing) -> native_router_top10.spv.  The engine wrapper is the SINGLE
+// token form, so a multi-token fixture drives the shader path in one launch and the wrapper once per token.
+// Oracle: `router_host_row` (the rule's independent double transcription); ids exact, weights rel 1e-5.
+void case_native_router_top10_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_router_top10.spv")) return;
+    const int NE = 512, K = 10;
+    struct Arm { const char* name; int n_tok; int kind; };
+    const Arm arms[] = {{"random", 1, 0}, {"12-way exact tie", 4, 2}};
+    std::mt19937 rng(9099);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (const Arm& ar : arms) {
+        const int NT = ar.n_tok;
+        std::vector<float> logits((size_t) NT * NE);
+        for (int t = 0; t < NT; ++t)
+            for (int e = 0; e < NE; ++e) {
+                float v = gauss(rng);
+                if (ar.kind == 2) v = (e < 12) ? 2.0f : gauss(rng);
+                logits[(size_t) t * NE + e] = v;
+            }
+        std::vector<int> r_ids((size_t) NT * K);
+        std::vector<float> r_w((size_t) NT * K);
+        for (int t = 0; t < NT; ++t)
+            router_host_row(std::vector<float>(logits.begin() + (size_t) t * NE, logits.begin() + (size_t) (t + 1) * NE),
+                            NE, K, r_ids, r_w, t);
+        Buf bl = ctx.alloc(logits.size() * 4), bi = ctx.alloc((size_t) NT * K * 4), bw = ctx.alloc((size_t) NT * K * 4);
+        ctx.write(bl, logits.data(), logits.size() * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 4);
+            struct { int32_t n_tokens; } pc{NT};
+            ctx.dispatch(p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT);
+        }
+        std::vector<int32_t> ref_ids((size_t) NT * K);
+        std::vector<float> ref_w((size_t) NT * K);
+        ctx.read(bi, ref_ids.data(), ref_ids.size() * 4);
+        ctx.read(bw, ref_w.data(), ref_w.size() * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("native_router_top10 entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bl); ctx.free(bi); ctx.free(bw); return;
+        }
+        float* dl = strata::vulkan::arena_alloc<float>(*s, logits.size());
+        strata::vulkan::stream_write(*s, dl, logits.data(), logits.size() * 4);
+        std::vector<int32_t> got_i((size_t) NT * K);
+        std::vector<float> got_w((size_t) NT * K);
+        // The wrapper is the SINGLE-token form, so a multi-token fixture calls it once per row.  Each row's
+        // logits sub-buffer is `NE * 4 = 2048` bytes in (a multiple of llvmpipe's 16-byte descriptor-offset
+        // limit), and the ids/weights go to their OWN arena allocations rather than to `di + t*K` - a
+        // `10 * 4 = 40`-byte offset is NOT 16-aligned on llvmpipe and the bind would be refused there (the Arc's
+        // limit is 4, which is exactly why an unaligned test offset can pass on one device and not another).
+        for (int t = 0; t < NT; ++t) {
+            int32_t* di_t = strata::vulkan::arena_alloc<int32_t>(*s, K);
+            float* dw_t = strata::vulkan::arena_alloc<float>(*s, K);
+            strata::kernels::native_router_top10(dl + (size_t) t * NE, di_t, dw_t, s);
+            strata::vulkan::stream_read(*s, di_t, &got_i[(size_t) t * K], K * 4);
+            strata::vulkan::stream_read(*s, dw_t, &got_w[(size_t) t * K], K * 4);
+        }
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < got_i.size(); ++i) {
+            if (got_i[i] != ref_ids[i]) ++bad_bw;
+            uint32_t a, b; std::memcpy(&a, &ref_w[i], 4); std::memcpy(&b, &got_w[i], 4); if (a != b) ++bad_bw;
+        }
+        char tag[200];
+        std::snprintf(tag, sizeof tag, "native_router_top10 entry (%s): engine wrapper == shader path, bitwise", ar.name);
+        verdict(tag, bad_bw == 0, bad_bw, (int) (2 * got_i.size()), 0.0, "ids/weights differ from the ported shader's own path");
+        int bad = 0; double worst = 0;
+        for (size_t i = 0; i < got_i.size(); ++i) {
+            if (got_i[i] != r_ids[i]) ++bad;
+            const double rel = std::fabs((double) got_w[i] - (double) r_w[i]) / (std::fabs((double) r_w[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 1e-5)) ++bad;
+        }
+        std::snprintf(tag, sizeof tag, "native_router_top10 entry (%s): engine wrapper vs the rule (double)", ar.name);
+        verdict(tag, bad == 0, bad, (int) (2 * got_i.size()), worst, "ids exact; weights relative vs the rule (tol 1e-5)");
+        ctx.free(bl); ctx.free(bi); ctx.free(bw);
+    }
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -17287,6 +17936,17 @@ int main(int argc, char** argv) {
     case_kv_append_step_entry(ctx, dir);         // kv_append_step       -> kv_f16_append.spv      (layer.cpp:943)
     case_kv_gather_q8_entry(ctx, dir);           // kv_gather_q8_step    -> kv_q8_gather.spv       (layer.cpp:983)
     case_kv_gather_step_entry(ctx, dir);         // kv_gather_step       -> kv_f16_gather.spv      (layer.cpp:989)
+    // THE ATTENTION / QSA / rope ENTRY POINTS (vulkan/src/kernels/qsa_vk.cpp), in the order the non-GDN body
+    // `qsa_layer` reaches them (layer.cpp:879/881/882/970/971/1010/1011) plus the router (:370).  APPENDED last
+    // for the same shared-RNG reason as every batch above.
+    case_native_qsa_rms_norm_weighted_entry(ctx, dir); // native_qsa_rms_norm_weighted -> native_qsa_rms_norm_weighted.spv (layer.cpp:879)
+    case_native_rope_apply_entry(ctx, dir);            // native_rope_apply            -> native_rope_apply.spv            (layer.cpp:881)
+    case_rope_neox_apply_entry(ctx, dir);              // rope_neox_apply              -> rope_neox.spv                    (layer.cpp:882)
+    case_qsa_block_scores_entry(ctx, dir);             // qsa_block_scores             -> qsa_block_scores.spv             (layer.cpp:970)
+    case_qsa_block_topk_entry(ctx, dir);               // qsa_block_topk               -> qsa_block_topk.spv               (layer.cpp:971)
+    case_native_qsa_gate_apply_entry(ctx, dir);        // native_qsa_gate_apply        -> native_qsa_gate_apply.spv        (layer.cpp:1010)
+    case_qsa_gate_apply_f32_entry(ctx, dir);           // qsa_gate_apply_f32           -> qsa_gate_apply_f32.spv           (layer.cpp:1011)
+    case_native_router_top10_entry(ctx, dir);          // native_router_top10          -> native_router_top10.spv          (layer.cpp:370)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

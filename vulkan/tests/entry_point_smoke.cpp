@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
                 const double inv = 1.0 / std::sqrt(acc / (double) cols + 1e-6);
                 for (int c = 0; c < cols; ++c) {
                     const uint64_t i = (uint64_t) r * cols + c;
-                    const float want = (float) ((double) x[i] * (double) w[i] * inv);
+                    const float want = (float) ((double) x[i] * (double) w[c] * inv);   // per-column weight: w[c]
                     const double rel = std::fabs((double) got[i] - want) / (std::fabs((double) want) + 1e-30);
                     if (!(rel <= 3e-3)) ++bad;
                 }

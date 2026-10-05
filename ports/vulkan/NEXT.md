@@ -100,6 +100,147 @@ claimed anywhere in this section or the ones below it**. Every measured number a
 sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
 
 
+## INCREMENT I5 (ENGINE) — THE ATTENTION / QSA / rope ENTRY POINTS: THE NON-GDN BODY'S NEXT EIGHT, AND A CROSS-CUTTING WEIGHT-INDEXING DEFECT FOUND AND FIXED (2026-10-05, `vega`)
+
+**THE BAR (the running line): `106 → 94` undefined references / `44 → 35` distinct full-signature
+`strata::kernels::` symbols / `42 → 33` under the parent's name-only pattern.**  The
+attention / QSA / MoE / GR / PLE / rope group falls **36 → 27**; every other group is unchanged.  MEASURED with the
+CURRENT STANDARD recipe (`$HOME/vkbuild-vulkan` is a **Makefiles** build dir, so **never pass `-G Ninja`**;
+reconfigured + rebuilt from the current tree first):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 94   (was 106)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 35   (was 44)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 33   (was 42)
+
+**THE EIGHT, IN THE ORDER THE ENGINE'S OWN NON-GDN BODY REACHES THEM.**  The non-GDN layer body is `qsa_layer`
+(`src/core/layer.cpp:876`) - the analogue of `gdn_layer` for the 12 QSA layers (`qsa_interval = 4`), reached from
+`block_layer_pre` (`layer.cpp:1259`).  The plan's §3 list is NOT an order; the order is the source order of the call
+sites (within a stage the native/legacy branches are alternatives, so the order is the order the calls appear):
+
+| # | symbol | call site | stage | shader |
+|---|---|---|---|---|
+| 1 | `native_qsa_rms_norm_weighted` | layer.cpp:879 | `normalize_rotate`, the NATIVE norm | native_qsa_rms_norm_weighted.spv |
+| 2 | `native_rope_apply` | layer.cpp:881 | `normalize_rotate`, the NATIVE rope | native_rope_apply.spv |
+| 3 | `rope_neox_apply` | layer.cpp:882 | `normalize_rotate`, the LEGACY rope | rope_neox.spv |
+| 4 | `qsa_block_scores` | layer.cpp:970 | the `g_fast_select` block scores | qsa_block_scores.spv |
+| 5 | `qsa_block_topk` | layer.cpp:971 | the `g_fast_select` weighted top-k | qsa_block_topk.spv |
+| 6 | `native_qsa_gate_apply` | layer.cpp:1010 | the gate, NATIVE member | native_qsa_gate_apply.spv |
+| 7 | `qsa_gate_apply_f32` | layer.cpp:1011 | the gate, LEGACY member | qsa_gate_apply_f32.spv |
+| 8 | `native_router_top10` | layer.cpp:370 (`moe_route`) | the expert routing | native_router_top10.spv |
+
+All eight live in the new `vulkan/src/kernels/qsa_vk.cpp` (attention + rope ride with the QSA body; the router is the
+next stage `block_layer_pre` run4 reaches after run1's `qsa_layer`).  Engine headers unchanged.  Each is a THIN
+bind-and-dispatch over the shader its gate case already proved; `native_rope_apply` derives `theta_scale` and the
+`RopeScaling::kernel_args` constants (exactly as the source does), and `native_qsa_rms_norm_weighted` carries the
+`(n_cols, n_rows)` argument order the header declares.  A per-dispatch mrope sentinel (a Vulkan binding cannot be
+null) is cached in `Stream::dummy` (`vulkan/src/device/vk_arena.hpp`), lazily, because `arena_alloc` never
+decreases.
+
+**EACH PROVED BY ITS CASE THROUGH THE ENGINE WRAPPER - BITWISE vs THE SHADER PATH AND vs THE EXPLICIT ORACLE.**
+A new `case_*_entry` in the port's gate runs the port's EXISTING case's fixture through (A) the shader path and (B)
+the ENGINE WRAPPER `strata::kernels::<symbol>` on its own engine stream (`EnginePin`-pinned), then asserts (C)
+wrapper == shader path **BITWISE** and (D) == the case's explicit oracle.  Raw lines (vega, `intel_icd`/Arc B70;
+the same cases pass on llvmpipe and the Ryzen iGPU):
+
+| # | symbol | wrapper == shader path (bitwise), worst | wrapper vs oracle, worst |
+|---|---|---|---|
+| 1 | `native_qsa_rms_norm_weighted` | **20480/20480 + 512/512 + 3072/3072, w 0** | **w 2.2e-07 / 1.69e-07 / 2.38e-07** (the norm rule, double, tol 3e-3) |
+| 2 | `native_rope_apply` | **49152/49152 + 24576/24576, w 0** | **w 1.6e-05 / 1.9e-05** (row-relative analytic rule, tol 3e-3; None + YaRN2) |
+| 3 | `rope_neox_apply` | **768/768 + 1024/1024, w 0** | **w 0.106 / 0.088** (the NEOX rule, bit-exact tail) |
+| 4 | `qsa_block_scores` | **72/72, w 0** | **72/72 w 5.56e-07** (relu per head + the dead key + 1e9) |
+| 5 | `qsa_block_topk` | **128/128 x 3 arms, w 0** | **128/128 x 3 w 0** (the selection rule, ids exact) |
+| 6 | `native_qsa_gate_apply` | **6144/6144 + 48/48, w 0** | **w 7.87e-07 / 7.3e-07** (the native gate rule, tol 1e-5) |
+| 7 | `qsa_gate_apply_f32` | **6144/6144 + 48/48, w 0** | **w 7.75e-07 / 7.78e-07** (the gate rule, tol 1e-5) |
+| 8 | `native_router_top10` | **20/20 + 80/80, w 0** | **w 1.86e-07 / 2.27e-07** (ids exact, weights tol 1e-5) |
+
+**THE LATENT DEFECT - THE CLASS THE LAST BATCH NAMED (A PARAMETER USED AS SOMETHING IT DOES NOT MEAN), FOUND HERE
+AND FIXED: the RoPE/norm WEIGHT was indexed by the ELEMENT index instead of the COLUMN index.**  The engine's
+contract (and its CUDA) is per-column: `include/strata/kernels/native_qsa.hpp` says "gamma[n_cols] broadcast over
+rows", and `native_qsa.cu`'s `norm` computes `output[col] = scale * input[col] * gamma[col]` with `input`/`output`
+advanced by the row offset and gamma NOT advanced; the legacy `elementwise.cu` `rms_norm_weighted_kernel` is
+`r[c] = (r[c] * w[c]) * inv`.  But BOTH port shaders read `gamma.v[i]` / `w.v[i]` with `i = row*cols + c` - the
+ELEMENT index.  For row 0 the two coincide; for every later row it reads the wrong weight, and with a cols-long
+weight (which is what the engine passes) it reads OUT OF BOUNDS.  **The defect was invisible because THREE cases'
+oracles were written to reproduce the shader's element-wise indexing instead of the rule** - the "oracle built from
+the thing under test" trap: `case_rms_norm`, `case_rms_norm_weighted_entry` and
+`case_native_qsa_rms_norm_weighted` all fed an n-long weight and an element-wise oracle.  FIXED: `rms_norm.comp`
+and `native_qsa_rms_norm_weighted.comp` now read `w.v[c]` / `gamma.v[c]`; the three oracles now use the column
+index (the RNG draws are unchanged, so no later case's fixture moves); and `elementwise_vk.cpp`'s
+`rms_norm_weighted` now range-checks `cols` floats (not `rows*cols`) and supplies `cols` ones - so a cols-long
+engine weight is accepted rather than refused.  This defect would have produced a SILENTLY WRONG token on every
+QSA layer (and every legacy `rms_norm_weighted` call) the moment the engine ran; the integration case caught it
+because it compares against the ENGINE'S contract rather than the shader's habit.
+
+**THE FIXTURE DEFECTS FOUND WHILE PROVING (both were the CASE's, both fixed, neither weakened):** (1) the entry
+case's gamma view was one `cols` long, which exposed the out-of-bounds read above; (2) the router case's multi-token
+arm formed a `weights + t*10` device pointer - a **40-byte** offset, which is NOT a multiple of llvmpipe's 16-byte
+`minStorageBufferOffsetAlignment` (the Arc's is 4), so the lvp arm DIED on the bind.  The arm now uses per-token
+arena buffers; the engine's own `logits + t*512` (2048 B) is aligned.  NOTE ON THE lvp ARM: it had been EXITING
+(no totals) in the first two runs of this batch - that was this case's misaligned test offset, not a device
+problem; it now completes.
+
+**THE `host` ROW: `rope_scaling()`** - the rope CONSTANTS (`rope_scaling.hpp`).  On a CUDA build
+`src/kernels/cuda/rope_scaling.cu` owns the storage; a Vulkan build compiles no such file, and `layer.cpp:881`
+calls `rope_scaling()` at every analytic rope launch.  `qsa_vk.cpp` answers `rope_scaling()` and its setter
+(`rope_scaling_set`), default-constructed to the identity (the engine's unscaled decode).  No capability flag was
+turned on: `native_qsa_enabled()` and `native_rope_enabled()` were already TRUE (both symbols each gates already
+had a shader), so `case_native_capabilities` needed no new arm and still passes.
+
+**REPORTED, NOT WIRED - A SHADER-PORT JOB, NOT A STUB.**  `qsa_decode_attn_step` (`layer.cpp:980`, the DEFAULT
+decode attention) sits at #6 in the derived order but has NO shader in this tree: PORT-MAP maps it to
+`attn_decode_short`, whose own header says it IS `native_flash_attn_short_step` - a GATHERED `[capacity,2,256]` f16
+WINDOW - while `qsa_decode_attn_step`'s contract (`qsa_decode_attn.hpp`) reads the KV POOLS through the page table
+with an int8/q4 option and takes a scratch.  That is a different kernel, so `qsa_decode_attn_step` is a
+SHADER-PORT job (the `s_gemv_q8_0_split` class), reported rather than stubbed; its sibling
+`native_flash_attn_short_step` (:995) and the `todo` rows `qsa_attend_step` (:1002), `qsa_index_step` /
+`topk_512_step` (:973) and `native_qsa_indexer_append` (:945) are the same class.  Also NOT in this increment: the
+PLE and GR stages of `block_layer_pre` (`ple_block`, `ple_history_advance`, `gr_read`, `gr_write`, `fused_gr_*`) -
+they run for EVERY layer, GDN or QSA, so they are not "the non-GDN body".
+
+**THE REMAINING 35 `strata::kernels::` SYMBOLS, GROUPED.**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue (the I2 elementwise set)** | **0** | all answered |
+| **matvec / GEMV / KV** | **6** | `bf16_gemv_fp32_mmvf_cols`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve` |
+| **attention / QSA / MoE / GR / PLE / rope** | **27** | `build_rope_table`, `rope_table_set`, `gr_read`, `gr_write`, `gr_workspace_init`, `fused_gr_read`, `fused_gr_supported`, `moe_combine`, `native_moe_combine`, `shared_expert(+_scratch_bytes)`, `ple_block(+_scratch_bytes)`, `ple_history_advance`, `ngram_rows`, `PleTable::{collect,is_open,issue}`, `qsa_attend_step`, `qsa_decode_attn_step`, `qsa_decode_attn_scratch_floats`, `qsa_index_step`, `qsa_step_fill`, `topk_512_step`, `native_qsa_indexer_append`, `native_flash_attn_short_step`, `router_top10` |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+(`rope_scaling` is ANSWERED by this batch (the one `host` row), so it is not among the 27.)
+
+**THE REMAINING DISTANCE TO A LAYER THAT LINKS.**  The one-layer-body link (`src/core/layer.cpp` vs the backend +
+the shim) carries **35 undefined `strata::kernels::` symbols**, ALL of them referenced by `layer.cpp` itself (the
+link compiles only `layer.cpp`, so every one it names is on this link) - that is the integration's remaining work.
+It also carries the FIVE engine cross-TU symbols (`main`, `strata::core::LayerView::name`,
+`WeightTable::find`, `native_embed`, `NativeEmbed::gather_one`), which have homes in the targets the shim batch
+added.  Beyond the symbols, the ONLY other structural blocker is the DEFERRED CUDA GRAPH API that I5 owns:
+`include/strata/core/graph.hpp:81` needs `cudaGraph_t`/`cudaGraphExec_t` (which the shim, per the user's I5
+deferral, does not declare), so `src/core/graph.cpp`, `src/core/session.cpp` and `src/program/generate.cpp` cannot
+compile - which is what keeps `strata_vulkan_core` / `strata_vulkan_engine` / `strata_vulkan` from building.  The
+one-layer body needs the 35 kernels ANDed; a whole PROGRAM additionally needs I5's graph declarations.  The graph
+API was NOT ported.
+
+**RESULTS (vega).**  Engine CONFIGURE + BUILD under `-DSTRATA_ENABLE_VULKAN=ON` clean.  Gate on `vega`:
+**Arc (intel_icd) 603/0/0 (exit 0), llvmpipe 591/0/3, Ryzen iGPU (radeon_icd) 593/1/2** - **+34 verdicts on every
+arm** (8 new cases: 3+2+2+2+3+2+2+2 arms = 17 arms x 2 verdicts = 34), 0 failed on the Arc.  ON THE RECORD: the
+radeon arm's first run carried the documented intermittent `budget: independent requery agrees` flake and the
+second carried the open RADV-only `bf16_gemv_split n_in=2560 n_out=512` defect; a third read **594/0/2**.  The lvp
+arm had been EXITING without totals in the first two runs of this batch - the misaligned router-case offset above
+- and now completes 591/0/3.  `check_port_map.py` passes (`168 - 78 kernel, 61 host, 29 todo; 111 shaders built,
+92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (the eight were already `kernel`
+rows and `rope_scaling` a `host` row, so the map does not move).  **`z820b` is PENDING** (no XTX/K620 number).  The
+CUDA graph API was NOT ported and the plan was NOT re-scoped.
+
 ## INCREMENT I4 — THE NEXT EIGHT MATVEC / GEMV / KV ENTRY POINTS (THE BF16 GEMVs, THE S2 GEMV, THE FP16/INT8 KV CACHE) AND THE STANDARDISED LINK PROGRESS BAR (2026-10-05, `vega`)
 
 **THE BAR (the running line): `118 → 106` undefined references / `53 → 44` distinct full-signature

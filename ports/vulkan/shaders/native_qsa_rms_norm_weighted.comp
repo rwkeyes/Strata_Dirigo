@@ -56,6 +56,11 @@ void main() {
     const float scale = inversesqrt(wg_sum(acc) / float(pc.cols) + pc.eps);
     for (uint c = lid; c < cols; c += lsize) {
         const uint i = base + c;
-        out_.v[i] = scale * in_.v[i] * gamma.v[i];   // the NATIVE order: scale * input * gamma
+        // THE WEIGHT IS PER-COLUMN, broadcast over rows: `gamma[c]`, NOT `gamma[i]`.  The engine's CUDA
+        // (native_qsa.cu `norm`) reads `gamma[col]` with `input`/`output` advanced by the row offset and gamma
+        // NOT advanced; the header says "gamma[n_cols] broadcast over rows".  Indexing it by the ELEMENT index
+        // is a well-formed wrong weight for every row past the first (and, with a cols-long weight as the engine
+        // passes, an out-of-bounds read) - a defect the case's element-wise oracle used to mask.
+        out_.v[i] = scale * in_.v[i] * gamma.v[c];   // the NATIVE order: scale * input * gamma[col]
     }
 }

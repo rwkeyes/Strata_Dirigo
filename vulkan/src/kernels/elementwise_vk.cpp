@@ -190,15 +190,18 @@ void rms_norm_weighted(Stream& s, float* x, const float* w, int64_t rows, int64_
     Buf wv{};
     bool own_ones = false;
     if (w != nullptr) {
-        if (!arena_resolve(s, w, n * 4, wv)) {
+        // The weight is PER-COLUMN (`w[n_cols]`, broadcast over rows) - the same contract the engine's CUDA
+        // kernel reads (`w[col]`, not advanced by the row).  Range-check only `cols` floats, so a cols-long
+        // engine weight is accepted instead of being refused as an n-long one would be.
+        if (!arena_resolve(s, w, (uint64_t) cols * 4, wv)) {
             std::fprintf(stderr, "strata::vulkan::rms_norm_weighted: w is not inside this stream's arena\n");
             std::exit(2);
         }
     } else {
         // The engine's unweighted form.  A weight buffer is required here, so allocate ones for this call.
-        wv = s.ctx->alloc(n * 4);
-        std::vector<float> ones((size_t) n, 1.0f);
-        s.ctx->write(wv, ones.data(), n * 4);
+        wv = s.ctx->alloc((uint64_t) cols * 4);
+        std::vector<float> ones((size_t) cols, 1.0f);
+        s.ctx->write(wv, ones.data(), (uint64_t) cols * 4);
         own_ones = true;
     }
     VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/rms_norm.spv", 2, 12);

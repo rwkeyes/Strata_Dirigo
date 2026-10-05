@@ -66,6 +66,12 @@ struct Stream {
         bool valid = false;
     } iq_grids;
 
+    // A NON-NULL SENTINEL for the descriptors a Vulkan bind cannot leave empty: the two rope shaders ALWAYS
+    // bind an mrope table even when `mrope == 0` and its contents are never read (a null descriptor is illegal
+    // here).  It lives with the stream for the same reason the tables above do - `arena_alloc` never decreases,
+    // so a per-dispatch sentinel would exhaust the arena.  Placed lazily by qsa_vk.cpp.
+    Buf dummy{};
+
     // The synthetic device-address base and the alignment every carving starts on.  The alignment is the
     // device's OWN storage-buffer-offset limit raised to 256, so a view computed from an allocation is
     // bindable on every implementation the port runs on (the Arc measures 4 bytes; the limit is still a
