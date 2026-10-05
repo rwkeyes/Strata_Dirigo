@@ -10,13 +10,14 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
 short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
-Walsh-Hadamard rotation) and the hybrid K8V4 mode landed, the box's GPU run was **238 passed / 0 failed / 0 skipped**
-on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 226 / 0 / 3
-on llvmpipe and 228 / 1 / 2 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone (both
+Walsh-Hadamard rotation), the hybrid K8V4 mode and descriptor OFFSETS landed, the box's GPU run was **242 passed /
+0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup
+size 32) - 230 / 0 / 3 on llvmpipe and 233 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the
+discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 228/1/2 is the flaky case below (in a good run, 229/0/2)
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 233/0/2 becomes 232/1/2 when the flaky budget-requery case fires
 when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
 compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
 (`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
@@ -147,6 +148,21 @@ twice, and omitted) fail exactly the arms they should, and both needed fixing fi
 the same input again (a no-op), and the "omitted" version left a push constant unused so `-Werror` failed the build
 and the run printed the STALE binary's numbers.  Arc 238/0/0.  See `RUN-ON-B70.md` for where this sits on the path to
 a running engine.
+
+**Descriptor OFFSETS landed: the recorded blocker between the port and the engine is retired (2026-10-04).**
+The engine reaches a row slice by pointer arithmetic (`Y + t0 * ldy`, `X + t0 * K`) while the port bound every
+descriptor at byte 0 - which forced the GEMM case into a workaround of one buffer per half.  `Buf::offset` (a copy of
+the handle with the offset set, default 0 so every existing call site is unchanged) is now honoured at the single
+descriptor-write site, with four gate arms: a view reads from its offset, the offset-0 binding still reads from zero,
+neither dispatch writes past its count, and - the one that matters - **the L(i)=B(i) lookalike control**, because an
+IGNORED offset returns the offset-0 data and looks like a plausible answer rather than an error.  The device's
+`minStorageBufferOffsetAlignment` is now recorded per device and printed by the case: **the Arc reports 4 bytes**
+(the port's earlier comment guessed 64), which is what makes the engine's slices bindable as they stand - on a device
+with a 64-byte limit that arithmetic would need padding.  An unaligned offset is refused by name before it reaches
+the driver.  Arc 242/0/0.  **Honest limit:** the aligned path is gated on three implementations, but the refusal path
+was NOT reproduced out of tree - the probe's device contract differs from the gate's (it reads the LEDGER budget
+instead of the driver's and refuses the allocation first), and chasing it was not worth the time; what is verified is
+that the refusal machinery fires and names its cause.
 
 | Case | Verdict | Method |
 |---|---|---|

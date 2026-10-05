@@ -47,7 +47,25 @@ struct Buf {
     bool device_local = false;       // DEVICE_LOCAL (real VRAM on a discrete card)
     bool host_visible = false;       // ...and mappable, so no staging is needed
     bool vram_account = false;       // which account alloc() charged it to (see the account rule below)
+    // A VIEW OFFSET, in bytes, honoured when this handle is bound as a descriptor.  The engine does not pass whole
+    // buffers around: it reaches a row slice by pointer arithmetic (`Y + t0 * ldy`, `X + t0 * K`), so the device
+    // layer has to be able to bind "this buffer, from here".  A copy of the handle with `offset` set is that view,
+    // and zero (the default) keeps every existing call site binding exactly what it bound before.
+    //
+    // THE DEVICE'S ALIGNMENT RULE APPLIES: a storage-buffer descriptor offset must be a multiple of
+    // `minStorageBufferOffsetAlignment`, or the bind is invalid and the read is undefined.  MEASURED on this box:
+    // the Arc reports **4 bytes** (llvmpipe and radeon print their own from `case_descriptor_offset`), which is
+    // what makes the engine's `X + t0 * K` slices bindable as they stand - on a device with a 64-byte limit that
+    // arithmetic would need padding, and the case prints both numbers rather than assuming either.
+    uint64_t offset = 0;
 };
+
+// A view of `b` starting `off` bytes in: the engine's row-slice pattern, made explicit.
+inline Buf view(const Buf& b, uint64_t off) {
+    Buf v = b;
+    v.offset = off;
+    return v;
+}
 
 // What the device OFFERS, printed rather than assumed, because the three implementations in the gate differ
 // completely: the Arc has three non-visible DEVICE_LOCAL types plus a separate system heap (so staging is
@@ -153,6 +171,10 @@ struct DeviceInfo {
     bool storage_buffer_8bit = false;
     bool shader_float64 = false;
     uint32_t subgroup_size = 0;
+    // The alignment a storage-buffer descriptor offset must have.  It is what decides whether the engine's row-slice
+    // pointer arithmetic is portable at all: `X + t0 * K` is bindable only if `K * sizeof(elem)` is a multiple of
+    // this, so the port checks it instead of discovering it as a wrong number on one driver.
+    uint32_t min_storage_offset_align = 0;
     // The DEVICE_LOCAL heap total.  **NOT a model-size budget, and on Intel Arc it is misleading**: Arc
     // reports its dedicated VRAM or the resizable-BAR window here, while the GPU allocates from shared system
     // memory.  Sizing comes from MemoryBudget above; this is here to be printed and to clamp the reserve.
@@ -328,6 +350,8 @@ private:
     // RADV hit it after four new cases took the gate past 64 sets, while the same binary passed on the Arc.
     VkDescriptorSet set_alloc(VkDescriptorSetLayout layout);
     VkDescriptorPool new_desc_pool();
+    // Refuses an unaligned descriptor offset with a message naming the device's limit (see the definition).
+    void check_offsets(const std::vector<const Buf*>& bufs) const;
 
     // ---- staging transfers: a one-shot command buffer and a fence, per transfer -------------------------
     // A backend pools these (stage 5's problem, not a correctness one) - the same call the descriptor sets and

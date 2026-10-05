@@ -205,6 +205,9 @@ static void fill_info(DeviceInfo& di, VkPhysicalDevice pd) {
     p2.pNext = &sg;
     vkGetPhysicalDeviceProperties2(pd, &p2);
     di.subgroup_size = sg.subgroupSize;
+    // A descriptor offset must be a multiple of this.  Recorded here because it is the limit that decides whether
+    // the engine's `X + t0 * K` row slices can be bound directly (see Buf::offset).
+    di.min_storage_offset_align = p2.properties.limits.minStorageBufferOffsetAlignment;
 
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
@@ -695,6 +698,24 @@ void Ctx::free(Buf& b) {
 
 // One descriptor pool.  64 sets is plenty for a case, and set_alloc() creates another when it is not - see the
 // ceiling note in the header.
+// A descriptor offset must be a multiple of the device's `minStorageBufferOffsetAlignment`.  An unaligned one is
+// not "slightly wrong": the bind is invalid and what the shader reads is undefined - on one driver and not another,
+// which is the worst kind.  The engine reaches rows by pointer arithmetic, so this check is what says whether that
+// arithmetic is portable for a given row stride.
+void Ctx::check_offsets(const std::vector<const Buf*>& bufs) const {
+    if (info_.min_storage_offset_align == 0) return;
+    for (const Buf* b : bufs) {
+        if (b == nullptr || b->offset == 0) continue;
+        if (b->offset % info_.min_storage_offset_align != 0) {
+            std::fprintf(stderr,
+                         "dispatch: descriptor offset %llu is not a multiple of the device's %u-byte alignment "
+                         "(minStorageBufferOffsetAlignment) - the bind would be invalid and the read undefined\n",
+                         (unsigned long long) b->offset, info_.min_storage_offset_align);
+            std::exit(2);
+        }
+    }
+}
+
 VkDescriptorPool Ctx::new_desc_pool() {
     VkDescriptorPoolSize ps{};
     ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -939,12 +960,14 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     // which the device destroys with the pool, so a re-recording leaks a handful of sets and nothing else.
     if (fresh_set) set = set_alloc(set_layout);
 
+    check_offsets(bufs);
+
     std::vector<VkDescriptorBufferInfo> info(bufs.size());
     std::vector<VkWriteDescriptorSet> writes(bufs.size());
     for (size_t i = 0; i < bufs.size(); ++i) {
         info[i] = {};
         info[i].buffer = bufs[i]->buffer;
-        info[i].offset = 0;
+        info[i].offset = bufs[i]->offset;          // a view binds from here; the default is 0
         info[i].range = VK_WHOLE_SIZE;
         writes[i] = {};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

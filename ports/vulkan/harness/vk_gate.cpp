@@ -2501,6 +2501,68 @@ void case_kv_hybrid(Ctx& ctx, const std::string& dir) {
     ctx.free(b_k); ctx.free(b_v); ctx.free(b_rot_in); ctx.free(b_rot_out);
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// A DESCRIPTOR OFFSET: binding a row slice rather than a whole buffer
+// ----------------------------------------------------------------------------------------------------------
+
+// The engine does not pass whole buffers around - it reaches a row slice by pointer arithmetic (`Y + t0 * ldy`,
+// `X + t0 * K`).  A device layer that can only bind from byte 0 forces every such call into a copy or a second
+// buffer, which is why this is the recorded blocker between the port and the engine.  `Buf::offset` closes it, and
+// this case proves the binding reads from the offset rather than from zero - the negative control is the whole
+// point, because an ignored offset produces a plausible wrong answer rather than an error.
+void case_descriptor_offset(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "copy.spv")) return;
+    const uint32_t N = 256;                                  // one row of floats
+    const uint32_t align = ctx.info().min_storage_offset_align;
+    std::vector<float> src(2 * N);
+    for (uint32_t i = 0; i < N; ++i) {
+        src[i] = 0.5f * (float) i;                           // half A
+        src[N + i] = -3.0f - (float) i;                       // half B: nothing like A
+    }
+    Buf b_src = ctx.alloc(src.size() * 4), b_dst1 = ctx.alloc(src.size() * 4), b_dst2 = ctx.alloc(src.size() * 4);
+    ctx.write(b_src, src.data(), src.size() * 4);
+    std::vector<float> sent(src.size(), -12345.0f);
+    ctx.write(b_dst1, sent.data(), sent.size() * 4);
+    ctx.write(b_dst2, sent.data(), sent.size() * 4);
+    VkPipeline pc = ctx.pipeline(dir + "/copy.spv", 2, 4);
+    struct { int32_t n; } push{(int32_t) N};
+    const uint32_t groups = (N + kLocalSize - 1) / kLocalSize;
+    // (1) the whole buffer, from byte 0
+    ctx.dispatch(pc, {&b_src, &b_dst1}, &push, sizeof(push), groups);
+    // (2) the SAME buffer, bound as a view starting at the second row
+    const uint64_t off = (uint64_t) N * 4;
+    Buf v_src = view(b_src, off);
+    ctx.dispatch(pc, {&v_src, &b_dst2}, &push, sizeof(push), groups);
+    std::vector<float> d1(src.size()), d2(src.size());
+    ctx.read(b_dst1, d1.data(), d1.size() * 4);
+    ctx.read(b_dst2, d2.data(), d2.size() * 4);
+
+    int bad_a = 0, bad_b = 0, lookalike = 0, tail = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (d1[i] != src[i]) ++bad_a;                        // the offset-0 view is half A
+        if (d2[i] != src[N + i]) ++bad_b;                    // the offset view is half B
+        if (d2[i] == src[i]) ++lookalike;                    // ... and is NOT half A: the offset was honoured
+    }
+    for (uint32_t i = N; i < 2 * N; ++i) {                   // both dispatches wrote N elements and no more
+        if (d1[i] != -12345.0f) ++tail;
+        if (d2[i] != -12345.0f) ++tail;
+    }
+    std::printf("      %u-byte row, device alignment %u B: offset-0 view = half A (%d wrong), offset view = half B "
+                "(%d wrong), %d of %u elements look like half A, %d stray writes\n",
+                N * 4, align, bad_a, bad_b, lookalike, N, tail);
+    std::printf("      the engine's strides: `X + t0*K` is bindable only when K*4 is a multiple of %u (K = 2560 "
+                "gives %u B, %s)\n", align, 2560u * 4u, (2560u * 4u) % align == 0 ? "fine" : "NOT aligned");
+    verdict("descriptor offset: a view reads from its offset", bad_b == 0, bad_b, (int) N, 0.0,
+            "the view did not read the second row");
+    verdict("descriptor offset: the offset-0 binding still reads from zero", bad_a == 0, bad_a, (int) N, 0.0,
+            "the plain binding changed meaning");
+    verdict("descriptor offset: the offset is honoured, not ignored (the L(i)=B(i) lookalike control)", lookalike == 0,
+            lookalike, (int) N, 0.0, "the view returned the offset-0 data - the offset was ignored");
+    verdict("descriptor offset: neither dispatch writes past its N elements", tail == 0, tail, (int) (2 * N), 0.0,
+            "a stray write past the requested count");
+    ctx.free(b_src); ctx.free(b_dst1); ctx.free(b_dst2);
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -8092,6 +8154,7 @@ int main(int argc, char** argv) {
     case_kv_f16_append(ctx, dir);          // the KV append: the cache's write half, chained into the gather
     case_kv_q4_rot(ctx, dir);              // the Q4_0 KV path: the FWHT rotation, the group rule, the design claim
     case_kv_hybrid(ctx, dir);              // the hybrid mode: INT8 K, rotated Q4_0 V, the asymmetry
+    case_descriptor_offset(ctx, dir);      // binding a row slice (the engine's pointer arithmetic, made bindable)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);
