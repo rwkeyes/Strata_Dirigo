@@ -1,0 +1,56 @@
+#version 450
+// ports/vulkan/shaders/native_gdn_conv_silu.comp - the PERFORMANCE tier's native GDN four-tap convolution,
+// ported from src/kernels/cuda/native_gdn_preprocess.cu's `conv_silu` kernel (its host wrapper is
+// `native_gdn_conv_silu`, native_gdn_preprocess.hpp:14-16), replacing the legacy `gdn_conv_step`
+// (shaders/gdn_conv_step.comp, src/kernels/cuda/gdn.cu:99-111).
+//
+// THE RULE (native_gdn_preprocess.cu:53-68), which is the SAME four-tap causal convolution as the legacy
+// kernel PLUS the SiLU, in ONE kernel, with TWO outputs:
+//
+//     values = { history[c*3], history[c*3+1], history[c*3+2], input[c] }   // oldest first, then the new column
+//     sum    = sum_{tap<4} values[tap] * weights[c*4 + tap]
+//     sum    = sum + 0.0f            // the native SSM kernel adds its zero bias even with no bias input
+//     raw_output[c]  = sum
+//     silu_output[c] = sum / (1 + expf(-sum))          // FP32 fast-math SiLU
+//     slide:  history[c*3 + tap] = values[tap + 1]  for tap < 3
+//
+// WHAT THE NATIVE BODY DOES DIFFERENTLY FROM THE LEGACY, stated rather than assumed:
+//
+//   * it FUSES the SiLU.  The legacy branch is `gdn_conv_step` -> a D2D copy -> `silu_inplace`/`silu_f32`
+//     (src/core/layer.cpp:255-257): THREE launches where this is ONE.  The SiLU expression here is exactly
+//     `silu_f32.comp`'s (`v / (1.0f + exp(-v))`), so the fused kernel computes the same value the separate one
+//     would - and it writes BOTH outputs (raw and SiLU), because the caller may want either.
+//   * it adds the zero bias explicitly (`sum = __fadd_rn(sum, 0.0f)`); in IEEE that is `sum + 0.0f` (it only
+//     differs from `sum` for -0.0), and it is transcribed literally so the arithmetic is the source's.
+//
+// THE ORACLE is this same rule transcribed in double by the gate case (`case_native_gdn_conv_silu`), not the
+// legacy kernel's - and the case compares the SLID history BIT FOR BIT, because the kernel only MOVES values
+// and does no arithmetic on the carried state.
+//
+// One thread per channel, as the CUDA; the grid is sized to `channels` (a grid sized to the work writes the
+// same bytes).  No barrier, no subgroup op, no atomic - the whole computation per channel is independent, which
+// `gates/run_gate.sh`'s op census checks.  The native host wrapper validates `d_conv == 4`; this shader takes
+// `d_conv` for interface parity and mirrors the CUDA body, which uses four taps and three carried rows.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer H { float v[]; } hist;          // (channels, 3), oldest first
+layout(set = 0, binding = 1, std430) readonly buffer XI { float v[]; } xin; // (channels,)
+layout(set = 0, binding = 2, std430) readonly buffer W { float v[]; } w;    // (channels, 4), tap fastest
+layout(set = 0, binding = 3, std430) buffer RAW { float v[]; } raw;         // (channels,)
+layout(set = 0, binding = 4, std430) buffer SILU { float v[]; } silu;       // (channels,)
+layout(push_constant, std430) uniform PC { int channels; int d_conv; } pc;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= uint(pc.channels)) return;
+    float values[4];
+    values[0] = hist.v[c * 3u + 0u];
+    values[1] = hist.v[c * 3u + 1u];
+    values[2] = hist.v[c * 3u + 2u];
+    values[3] = xin.v[c];                                  // the new column is the LAST tap
+    float sum = 0.0f;
+    for (uint tap = 0u; tap < 4u; ++tap) sum += values[tap] * w.v[c * 4u + tap];
+    sum = sum + 0.0f;                                      // the native body's zero-bias fold
+    raw.v[c] = sum;
+    silu.v[c] = sum / (1.0f + exp(-sum));                  // FP32 fast-math SiLU
+    for (uint tap = 0u; tap < 3u; ++tap) hist.v[c * 3u + tap] = values[tap + 1u];   // slide: drop the oldest
+}

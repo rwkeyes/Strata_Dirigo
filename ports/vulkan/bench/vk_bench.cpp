@@ -92,6 +92,39 @@ Timing time_kernel(Ctx& ctx, VkPipeline p, const std::vector<const Buf*>& bufs, 
     return t;
 }
 
+// Time a TWO-KERNEL chain: per batch iteration, record kernel A then kernel B into the same command buffer
+// (`record_dispatch` inserts the compute->compute barrier between them).  This exists for ONE pair: the GDN
+// conv, where the legacy branch runs `gdn_conv_step` and then a SEPARATE `silu_f32` (src/core/layer.cpp:255-257)
+// while the native kernel fuses them into one dispatch.  The reported figure is the median per-ITERATION time
+// (both dispatches) / batch, so it is directly comparable to a single-dispatch `time_kernel` row.
+Timing time_two(Ctx& ctx, VkPipeline pa, const std::vector<const Buf*>& ba, const void* pca, uint32_t pca_bytes,
+                uint32_t ga, uint32_t gay, VkPipeline pb, const std::vector<const Buf*>& bb, const void* pcb,
+                uint32_t pcb_bytes, uint32_t gb, uint32_t gby, int batch, int reps, int warmups) {
+    ctx.record_begin();
+    for (int i = 0; i < batch; ++i) {
+        ctx.record_dispatch(pa, ba, pca, pca_bytes, ga, gay);
+        ctx.record_dispatch(pb, bb, pcb, pcb_bytes, gb, gby);
+    }
+    ctx.record_end_and_submit();
+    for (int w = 0; w < warmups; ++w) ctx.replay_recorded();
+    std::vector<double> ms;
+    ms.reserve((size_t) reps);
+    for (int r = 0; r < reps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ctx.replay_recorded();
+        const auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / (double) batch);
+    }
+    std::sort(ms.begin(), ms.end());
+    Timing t;
+    t.reps = reps;
+    t.batch = batch;
+    t.med = ms[ms.size() / 2];
+    t.lo = ms.front();
+    t.hi = ms.back();
+    return t;
+}
+
 // The one row format.  `elems` is the number of logical output elements the dispatch produces; `macs` is the
 // multiply-accumulate count it performs (0 where the kernel does no reduction, and then the unit is elems/s).
 void report(const char* kernel, const std::string& shape, const Timing& t, double elems, double macs) {
@@ -511,6 +544,110 @@ void bench_rms_norm_pair(Ctx& ctx, const std::string& dir, int reps, int warmups
     ctx.free(bx); ctx.free(bg); ctx.free(bo);
 }
 
+// =========================================================================================================
+// THE PERFORMANCE TIER, class B, batch 2: the native GDN / DeltaNet MIXER kernels, each against the legacy
+// kernel it replaces at the same shape on the same device.  Same XPAIR convention (native/legacy, < 1.0 faster).
+// =========================================================================================================
+
+void bench_gdn_conv_silu_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int C = 2560, dc = 4;                         // n_embd channels, d_conv
+    const size_t hist = (size_t) C * 3;
+    std::vector<float> cs = floats(hist), x = floats((size_t) C), kw = floats((size_t) C * dc);
+    Buf bcs = alloc(ctx, hist * 4), bx = alloc(ctx, (size_t) C * 4), bkw = alloc(ctx, (size_t) C * dc * 4),
+        braw = alloc(ctx, (size_t) C * 4), bsilu = alloc(ctx, (size_t) C * 4), bo = alloc(ctx, (size_t) C * 4);
+    ctx.write(bcs, cs.data(), hist * 4);
+    ctx.write(bx, x.data(), (size_t) C * 4);
+    ctx.write(bkw, kw.data(), (size_t) C * dc * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "C=%d d_conv=4", C);
+    struct { int32_t channels; int32_t d_conv; } pcc{C, dc};
+    // legacy: gdn_conv_step, one thread per channel, one output.
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_conv_step.spv", 4, 8);
+        tl = time_kernel(ctx, p, {&bcs, &bx, &bkw, &bo}, &pcc, sizeof(pcc), (uint32_t) ((C + 255) / 256), 1, 64,
+                         reps, warmups);
+        report("gdn_conv_step (legacy)", shape, tl, (double) C, 0.0);
+    }
+    // native: native_gdn_conv_silu, one thread per channel, TWO outputs (raw + fused SiLU).
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_conv_silu.spv", 5, 8);
+        tn = time_kernel(ctx, p, {&bcs, &bx, &bkw, &braw, &bsilu}, &pcc, sizeof(pcc), (uint32_t) ((C + 255) / 256),
+                         1, 64, reps, warmups);
+        report("native_gdn_conv_silu", shape, tn, (double) C, 0.0);
+    }
+    std::printf("XPAIR gdn_conv %s | legacy gdn_conv_step | native native_gdn_conv_silu | native/legacy %.3f\n",
+                shape, tn.med / tl.med);
+    // THE FUSION, MEASURED.  Per DISPATCH the native writes one extra output and computes the SiLU, so the row
+    // above can read slower - but the legacy branch is conv_step -> a D2D copy -> silu_inplace (layer.cpp:255-257),
+    // i.e. it runs a SECOND dispatch the native removes.  The copy cannot be timed as a kernel; the two KERNELS
+    // can, so this row times conv_step + silu_f32 in one recorded batch and reports native over that chain.
+    {
+        VkPipeline pc_ = ctx.pipeline(dir + "/gdn_conv_step.spv", 4, 8);
+        VkPipeline ps_ = ctx.pipeline(dir + "/silu_f32.spv", 1, 4);
+        struct { int32_t n; } pcs{C};
+        Timing tc = time_two(ctx, pc_, {&bcs, &bx, &bkw, &bo}, &pcc, sizeof(pcc), (uint32_t) ((C + 255) / 256), 1,
+                             ps_, {&bo}, &pcs, sizeof(pcs), (uint32_t) ((C + 255) / 256), 1, 64, reps, warmups);
+        report("gdn_conv_step+silu_f32 (legacy chain)", shape, tc, (double) C, 0.0);
+        std::printf("XPAIR gdn_conv_fused %s | legacy conv_step+silu_f32 (2 dispatches) | native "
+                    "native_gdn_conv_silu (1) | native/chain %.3f\n", shape, tn.med / tc.med);
+    }
+    ctx.free(bcs); ctx.free(bx); ctx.free(bkw); ctx.free(braw); ctx.free(bsilu); ctx.free(bo);
+}
+
+void bench_gdn_l2_norm_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int rows = 48, cols = 128;                    // h_v heads, S
+    const uint64_t n = (uint64_t) rows * cols;
+    std::vector<float> x = floats(n);
+    Buf bx = alloc(ctx, n * 4);
+    ctx.write(bx, x.data(), n * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "rows=48 cols=128");
+    Timing tl;
+    {
+        struct { int32_t rows, cols; float eps; } pcl{rows, cols, 1e-6f};
+        VkPipeline p = ctx.pipeline(dir + "/gdn_l2_norm.spv", 1, 12);
+        tl = time_kernel(ctx, p, {&bx}, &pcl, sizeof(pcl), (uint32_t) rows, 1, 64, reps, warmups);
+        report("gdn_l2_norm (legacy)", shape, tl, (double) n, 0.0);
+    }
+    Timing tn;
+    {
+        const float inv_sqrt_cols = 1.0f / std::sqrt((float) cols);
+        struct { int32_t rows, cols; float eps; float inv_sqrt_cols; } pcn{rows, cols, 1e-6f, inv_sqrt_cols};
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_l2_norm.spv", 1, 16);
+        tn = time_kernel(ctx, p, {&bx}, &pcn, sizeof(pcn), (uint32_t) rows, 1, 64, reps, warmups);
+        report("native_gdn_l2_norm", shape, tn, (double) n, 0.0);
+    }
+    std::printf("XPAIR gdn_l2_norm %s | legacy gdn_l2_norm | native native_gdn_l2_norm | native/legacy %.3f\n",
+                shape, tn.med / tl.med);
+    ctx.free(bx);
+}
+
+void bench_gdn_beta_gate_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int h_v = 48;
+    std::vector<float> b = floats((size_t) h_v);
+    Buf bb = alloc(ctx, (size_t) h_v * 4);
+    ctx.write(bb, b.data(), (size_t) h_v * 4);
+    struct { int32_t n; } pc{h_v};
+    const uint32_t groups = (uint32_t) ((h_v + 255) / 256);
+    Timing tl;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/gdn_beta_gate.spv", 1, 4);
+        tl = time_kernel(ctx, p, {&bb}, &pc, sizeof(pc), groups, 1, 128, reps, warmups);
+        report("gdn_beta_gate (legacy)", "h_v=48", tl, (double) h_v, 0.0);
+    }
+    Timing tn;
+    {
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_beta_gate.spv", 1, 4);
+        tn = time_kernel(ctx, p, {&bb}, &pc, sizeof(pc), groups, 1, 128, reps, warmups);
+        report("native_gdn_beta_gate", "h_v=48", tn, (double) h_v, 0.0);
+    }
+    std::printf("XPAIR gdn_beta_gate h_v=48 | legacy gdn_beta_gate | native native_gdn_beta_gate | native/legacy %.3f\n",
+                tn.med / tl.med);
+    ctx.free(bb);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -593,6 +730,10 @@ int main(int argc, char** argv) {
     bench_router_pair(ctx, dir, reps, warmups);
     bench_moe_combine_pair(ctx, dir, reps, warmups);
     bench_rms_norm_pair(ctx, dir, reps, warmups);
+    // batch 2: the native GDN / DeltaNet mixer kernels (conv+SiLU, l2_norm, beta_gate).
+    bench_gdn_conv_silu_pair(ctx, dir, reps, warmups);
+    bench_gdn_l2_norm_pair(ctx, dir, reps, warmups);
+    bench_gdn_beta_gate_pair(ctx, dir, reps, warmups);
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a

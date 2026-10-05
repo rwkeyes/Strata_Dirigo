@@ -1,5 +1,43 @@
 # Status — what is done, what is verified, what is not
 
+## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, first three native kernels — class B batch 2 (2026-10-05)
+
+The first three native **GDN / DeltaNet mixer** kernels — the mixer is **36 of the model's 48 layers** — each
+replacing a legacy kernel already ported and gated, each oracled against the engine's OWN native body
+(`src/kernels/cuda/native_gdn_preprocess.cu`), each MEASURED against that legacy kernel at the same shape on the
+same device, with **`native_gdn_enabled()` left answering FALSE** (the flag gates six more unported symbols) and
+`case_native_capabilities` extended to enforce it.
+
+| case | rule (the engine's OWN native body = the oracle) | measured (vega Arc / box XTX) | falsified by |
+|---|---|---|---|
+| `native_gdn_conv_silu` (3 arms C=2560/24/300) | `native_gdn_preprocess.cu` `conv_silu`: the four-tap conv **PLUS the SiLU in ONE kernel**, BOTH outputs (raw + SiLU), the zero-bias fold, the slide | **12800/12800 w 1.87e-06** (Arc), 12800/12800 w **3.39e-05** (XTX), 120/120, 1500/1500; slid state **BIT-EXACT**; terms-derived bound | `native-gdn-conv-silu-drop-silu` → FAIL 11509/12800 |
+| `native_gdn_l2_norm` (3 arms cols=128) | `native_gdn_preprocess.cu` `l2_norm`: f32 sums, `rsqrtf(partial/S + eps/S)` (eps on the MEAN), folded `scale_after=1/sqrt(S)` | **392/392 w 1.54e-07**, 2312/2312 w 2.16e-07, 648/648 w 1.17e-07 (Arc); XTX 1.17e-07/1.49e-07/1.74e-07; NaN row-guard | `native-gdn-l2-norm-drop-folded-scale` → FAIL 264/392 w 10.3 |
+| `native_gdn_beta_gate` (48 heads) | `native_gdn_preprocess.cu` `beta_sigmoid`: `1/(1+expf(-x))` — the SAME expression as the legacy `sigmoid_f` | **48/48 w 1.42e-06** (both boxes); raw identity checked host-side to move | `native-gdn-beta-gate-sign-flip` → FAIL 0/48 w 7.2e+10 |
+| `native capabilities: gdn flag` | `native_gdn_enabled()` == "every gated symbol has a built shader"; the 3 ported shaders exist | **4/4** — flag **FALSE** (6 unported gated shaders absent) | `native-caps-gdn-true` → FAIL 3/4 |
+
+**THE MEASUREMENT (native/legacy, same shape, same device — < 1.0 is faster; full table in `bench/README.md`).**
+`native_gdn_conv_silu` **0.938** Arc / **0.909** iGPU / **0.694** XTX / 0.936 K620 (a win per dispatch even
+though it does the SiLU and a second output too); against the legacy **chain** (`gdn_conv_step`+`silu_f32`, the
+two dispatches the layer actually runs) **0.574 / 0.764 / 0.544 / 0.720** — a 1.3–2.1x win.
+`native_gdn_l2_norm` **0.997 / 1.013 / 0.938 / 0.942** and `native_gdn_beta_gate` **1.011 / 1.045 / 1.068 /
+0.865** are **WASHES: the same work per element as the legacy kernel, no algorithmic difference to win, and
+reported as findings rather than tuned away.**  A native kernel is not required to be faster.
+
+**CAPABILITY CONTRACT.**  `native_gdn_enabled()` gates NINE symbols: the three ported here + `native_gdn_gate`
+/ `native_gdn_step` / `native_gdn_out_norm` and the three `fused_gdn_*` paths (the latter also gated on
+`g_fused_gdn` + `native_bf16_projections`) — six with no shader.  The backend
+(`vulkan/src/kernels/native_caps_vk.cpp`) answers **false**, and `case_native_capabilities` gains a gdn arm
+asserting the flag equals "every gated symbol has a built shader" AND that the three ported shaders exist —
+an invariant, not a hard-coded boolean.
+
+**THE MAP MOVES BY THREE ROWS:** `168 — 66 kernel, 61 host, 41 todo` → **`168 — 69 kernel, 61 host, 38 todo`**;
+`check_port_map.py` passes and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **Gate, after
+the commit: vega Arc 415/0/0, lvp 403/0/3, radeon-iGPU 406/0/2 (exit 0); box `z820b` RADV XTX 411/0/1,
+lvp 403/0/3, nvidia K620 406/0/2 — 0 failed on every arm on both boxes** (+8 verdicts on each).  One finding
+the case produced: the first run read 12798/12800 on the iGPU at worst 1.09e-05 because two four-tap sums
+CANCEL — fixed in the FIXTURE's bound (`gemv_bound`, the port's "bound a reduction by its TERMS" rule), not by
+loosening a tolerance.  Full detail in `NEXT.md`'s top section.
+
 ## THE PERFORMANCE TIER'S FIRST FOUR KERNELS — class B, the NATIVE fast paths (2026-10-05)
 
 The first increment of the PERFORMANCE tier: the **four class-B capability-gated native fast paths** are

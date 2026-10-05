@@ -1,0 +1,29 @@
+#version 450
+// ports/vulkan/shaders/native_gdn_beta_gate.comp - the PERFORMANCE tier's native GDN beta gate, ported from
+// src/kernels/cuda/native_gdn_preprocess.cu's `beta_sigmoid` kernel (host wrapper `native_gdn_beta_gate`,
+// native_gdn_preprocess.hpp:23-24), replacing the legacy `gdn_beta_gate` (shaders/gdn_beta_gate.comp,
+// src/kernels/cuda/gdn.cu:217-233).
+//
+// THE RULE (native_gdn_preprocess.cu:86-89): `beta[i] = sigmoid(beta[i]) = 1/(1 + expf(-beta[i]))`, in place
+// over the per-head scalars - the fraction `gdn_step`'s contract (`d = (v - sk)*beta`) demands.  The native
+// body's `sigmoid` is `1.0f / (1.0f + expf(-value))`, and `gdn.cu`'s `sigmoid_f` is the same expression; so
+// here the native and legacy RULES ARE THE SAME, which the bench pair measures as a wash rather than a win
+// (only the launch shape differs: 256 threads/block here, 128 there, both one group at h_v=48).  It is ported
+// anyway because this kernel is one of the three the SAME `native_gdn_enabled()` flag gates: flipping that
+// flag without it would leave the mixer's beta half on a different arithmetic path from its conv/norm halves.
+//
+// THE ORACLE is the engine's own sigmoid, evaluated in double by the gate case (`case_native_gdn_beta_gate`);
+// the measured `worst` is the f32 `exp`'s gap against it, reported rather than claimed exact.  The fixture
+// spans the sigmoid's whole range (large negative -> ~0, large positive -> ~1, mid-range) and the case checks
+// host-side that the raw (identity) reading differs, so the falsification (a flipped sign) must bite.
+//
+// One thread per head, as the CUDA; the grid is sized to `n`.  No barrier, no subgroup op, no atomic.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer B { float v[]; } b;
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    b.v[i] = 1.0f / (1.0f + exp(-b.v[i]));
+}

@@ -43,19 +43,36 @@
 //                                   gated (case_native_qsa_rms_norm_weighted) so the symbol is READY - the flag
 //                                   turns on with `native_qsa_gate_apply`'s shader, not before.
 //
+//   native_gdn_enabled()         -> SIX native GDN kernels (`native_gdn_conv_silu`, `native_gdn_l2_norm`,
+//                                   `native_gdn_beta_gate` at layer.cpp:253/266-267/296; `native_gdn_gate`,
+//                                   `native_gdn_step`, `native_gdn_out_norm` at layer.cpp:297/308/324) AND the
+//                                   THREE fused paths `fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm`
+//                                   (layer.cpp:250/287/322, additionally gated on `g_fused_gdn` and
+//                                   `native_bf16_projections`).  This backend has ported the first three
+//                                   (`gdn_conv_silu`, `gdn_l2_norm`, `beta_gate` shaders); the other THREE GDN
+//                                   kernels and ALL THREE fused paths have no shader.  Answering true would
+//                                   dispatch them.  ANSWER: false - and the answer is not "nothing is
+//                                   implemented": the three ported shaders exist and are gated.  The flag stays
+//                                   false until EVERY symbol it selects has a shader, which is what
+//                                   `case_native_capabilities`'s gdn arm enforces (it requires the flag to equal
+//                                   "every gated symbol has a built shader").
+//
 // THE SETTERS are the engine's option plumbing (`generate.cpp` calls `native_X_set_enabled(o.native_X)`).  On this
 // backend they do NOT decide the answer: the backend reports its own implementation, so a `--native` launch
 // cannot talk it into selecting a symbol it has not ported.  They are no-ops that exist so the engine's option
 // resolution links once it is compiled under STRATA_ENABLE_VULKAN (a later increment), and so the single writer
 // of these answers is this file.
 //
-// HOW TO CHECK IT: the numeric gate's `case_native_capabilities` includes these same headers, calls the four
+// HOW TO CHECK IT: the numeric gate's `case_native_capabilities` includes these same headers, calls the five
 // getters, requires the exact answers above, and requires each ported symbol's .spv to be present - so a
-// capability cannot answer true for a symbol whose shader was deleted.
+// capability cannot answer true for a symbol whose shader was deleted.  Its GDN arm is the invariant rather
+// than a hard-coded boolean: `native_gdn_enabled()` must equal "every symbol this flag gates has a built
+// shader" (currently false, because the six unported GDN symbols and the three fused paths have none).
 #if !defined(STRATA_ENABLE_VULKAN)
 #error "native_caps_vk.cpp is the Vulkan backend: compile it only in a -DSTRATA_ENABLE_VULKAN=1 build"
 #endif
 
+#include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -78,5 +95,13 @@ bool native_moe_combine_enabled() { return true; } // native_moe_combine.comp, g
 // ---- native QSA: the flag also gates the UNPORTED native_qsa_gate_apply (layer.cpp:1010) ---------------------
 void native_qsa_set_enabled(bool) { /* see the header note */ }
 bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported
+
+// ---- native GDN: the flag also gates the UNPORTED three GDN kernels + three fused paths -----------------------
+// `native_gdn_conv_silu` / `native_gdn_l2_norm` / `native_gdn_beta_gate` ARE ported and gated, but the SAME flag
+// also selects `native_gdn_gate` / `native_gdn_step` / `native_gdn_out_norm` and the three `fused_gdn_*` paths,
+// none of which has a shader - so the answer is false and must stay false while any of them is missing.  This is
+// the "symbol-at-a-time truth" rule; `case_native_capabilities`'s gdn arm asserts the invariant directly.
+void native_gdn_set_enabled(bool) { /* see the header note */ }
+bool native_gdn_enabled() { return false; }        // see the header note: six gated symbols unported
 
 }  // namespace strata::kernels

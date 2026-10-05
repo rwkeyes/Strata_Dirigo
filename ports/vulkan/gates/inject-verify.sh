@@ -70,6 +70,17 @@
 #   inject-verify.sh native-caps-qsa-true  vulkan/src/kernels/native_caps_vk.cpp  answer qsa true
 #                                       -> must FAIL  "native capabilities"
 #
+#   (performance tier, class B, batch 2 - the native GDN / DeltaNet mixer)
+#   inject-verify.sh native-caps-gdn-true  vulkan/src/kernels/native_caps_vk.cpp  answer the GDN flag true while
+#                                       six of its gated symbols are unported
+#                                       -> must FAIL  "native capabilities: gdn flag"
+#   inject-verify.sh native-gdn-conv-silu-drop-silu  native_gdn_conv_silu.comp  drop the fused SiLU
+#                                       -> must FAIL  "native_gdn_conv_silu"
+#   inject-verify.sh native-gdn-l2-norm-drop-folded-scale  native_gdn_l2_norm.comp  drop the folded 1/sqrt(S)
+#                                       -> must FAIL  "native_gdn_l2_norm"
+#   inject-verify.sh native-gdn-beta-gate-sign-flip  native_gdn_beta_gate.comp  flip the sigmoid's exponent sign
+#                                       -> must FAIL  "native_gdn_beta_gate"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -358,6 +369,38 @@ case "$name" in
     old=$'bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported'
     new=$'bool native_qsa_enabled() { return true; }        // INJECTION: a capability answered true for a symbol that is NOT implemented'
     want="FAIL  native capabilities" ;;
+  native-caps-gdn-true)
+    # THE GDN FLAG'S own falsification, and it is the batch's capability point: `native_gdn_enabled()` gates the
+    # three kernels this batch ports AND six it does not, so it must stay FALSE.  The case's gdn arm asserts
+    # `flag == (every gated symbol has a built shader)`; answering true while the six unported gated shaders are
+    # absent is exactly the lie the arm exists to catch.
+    file="$TREE/vulkan/src/kernels/native_caps_vk.cpp"
+    old=$'bool native_gdn_enabled() { return false; }        // see the header note: six gated symbols unported'
+    new=$'bool native_gdn_enabled() { return true; }        // INJECTION: the GDN flag answered true while six gated symbols are unported'
+    want="FAIL  native capabilities: gdn flag" ;;
+  native-gdn-conv-silu-drop-silu)
+    # The native body's new content vs `gdn_conv_step` is the FUSED SiLU and the second output.  Writing the raw
+    # sum into the SiLU output drops it; the case compares BOTH outputs against the native rule, so this bites on
+    # every channel whose sum is not its own SiLU (which the case's margin check proves is most of them).
+    file="$SH/native_gdn_conv_silu.comp"; spv="native_gdn_conv_silu"
+    old=$'    silu.v[c] = sum / (1.0f + exp(-sum));                  // FP32 fast-math SiLU'
+    new=$'    silu.v[c] = sum;   // INJECTION: the fused SiLU dropped - the raw sum written to the SiLU output'
+    want="FAIL  native_gdn_conv_silu" ;;
+  native-gdn-l2-norm-drop-folded-scale)
+    # The native body applies TWO factors - `scale = rsqrtf(partial/S + eps/S)` and the folded
+    # `scale_after = 1/sqrt(S)` - where the legacy kernel applies one and the layer adds the other in a separate
+    # `scale_inplace`.  Dropping the second factor scales every output by sqrt(S) = 11.3.
+    file="$SH/native_gdn_l2_norm.comp"; spv="native_gdn_l2_norm"
+    old=$'        x.v[i] = (scale * x.v[i]) * pc.inv_sqrt_cols;    // the native body\'s two-factor scale'
+    new=$'        x.v[i] = scale * x.v[i];   // INJECTION: the native body\'s folded 1/sqrt(S) dropped'
+    want="FAIL  native_gdn_l2_norm" ;;
+  native-gdn-beta-gate-sign-flip)
+    # The rule is `sigmoid(x) = 1/(1+exp(-x))`.  Flipping the exponent's sign is the plausible slip and is a
+    # different function; the fixture spans the sigmoid's whole range so every value moves.
+    file="$SH/native_gdn_beta_gate.comp"; spv="native_gdn_beta_gate"
+    old=$'    b.v[i] = 1.0f / (1.0f + exp(-b.v[i]));'
+    new=$'    b.v[i] = 1.0f / (1.0f + exp(b.v[i]));   // INJECTION: the sigmoid exponent\'s sign flipped'
+    want="FAIL  native_gdn_beta_gate" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

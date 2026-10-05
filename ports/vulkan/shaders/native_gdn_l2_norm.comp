@@ -1,0 +1,65 @@
+#version 450
+// ports/vulkan/shaders/native_gdn_l2_norm.comp - the PERFORMANCE tier's native GDN L2 normalisation, ported
+// from src/kernels/cuda/native_gdn_preprocess.cu's `l2_norm` kernel (host wrapper `native_gdn_l2_norm`,
+// native_gdn_preprocess.hpp:18-21), replacing the legacy `gdn_l2_norm` (shaders/gdn_l2_norm.comp,
+// src/kernels/cuda/gdn.cu:118-130).
+//
+// THE RULE (native_gdn_preprocess.cu:70-84), in place, one block per row, over a 128-wide row:
+//
+//     partial = sum_{col<128} x[col]^2
+//     scale   = rsqrtf(partial / S + epsilon)          // the host passes epsilon = eps/S, scale_after = 1/sqrt(S)
+//     x[col]  = (scale * x[col]) * scale_after
+//
+// WHAT THE NATIVE BODY DOES DIFFERENTLY FROM THE LEGACY, stated rather than assumed.  The two rules are
+// MATHEMATICALLY THE SAME - `scale` carries a sqrt(S) from `partial/S` and `scale_after` divides it back out, so
+// the result is `x / sqrt(sum(x^2) + eps)`, which is exactly what the legacy kernel computes.  What differs is
+// the ARITHMETIC PATH:
+//
+//   * the reduction is the native kernel's own (a `__shfl_xor_sync` warp tree over 32 lanes, warp partials in
+//     shared memory, the first warp combines them - 256 threads for S=128, half of them idle), where the legacy
+//     CUDA is one warp per row over a DOUBLE accumulator.  This port reduces with the workgroup barrier tree in
+//     common/wg_reduce.glsl (no subgroup op, the port's vendor-compatibility rule), a THIRD association again.
+//   * it sums in FLOAT, where the legacy kernel sums in DOUBLE (and `ref/gdn.py` does `l2_norm(q.astype(f64))`).
+//   * it forms `rsqrtf(mean + eps/S)` (the eps on the MEAN), where the legacy forms `1/sqrt(sum + eps)` (the eps
+//     on the SQUARED NORM - gdn.hpp:75-80's convention).  Over a full row the two agree; they diverge only where
+//     the sum is ~0 and the eps is the whole answer, and that regime is what the gate's near-zero row probes.
+//   * it applies a SECOND factor, `scale_after = 1/sqrt(S)`.  Under the branch policy the legacy path adds that
+//     factor in a separate `scale_inplace` launch (src/core/layer.cpp:276) and its `gdn_step` does not scale the
+//     readout; the native `gdn_step` DOES (`native_gdn.cu`'s `scale = 1/sqrt(S)`), so the native pre-processing
+//     kernel carries its own - which is why the layer only runs `scale_inplace` on the legacy branch.
+//
+// THE ORACLE is the native body's rule transcribed in double by the gate case (`case_native_gdn_l2_norm`); the
+// measured `worst` is the f32 arithmetic's gap against it, REPORTED rather than claimed to be bit-exact.  The
+// case's falsification drops the `scale_after` factor, which moves every element by sqrt(S) = 11.3.
+//
+// ONE WORKGROUP PER ROW (the port's rule, so the driver's per-kernel subgroup width cannot size a grid wrongly);
+// the dispatch is exactly `rows` groups and the row guard makes an over-dispatch harmless.  In-place is exact:
+// every read of `x` for the reduction precedes the barrier inside `wg_sum`, and the write loop touches only its
+// own element.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer X { float v[]; } x;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int rows; int cols; float eps; float inv_sqrt_cols; } pc;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.rows)) return;   // workgroup-uniform, so every barrier below is reached by everyone
+    const uint cols = uint(pc.cols);
+    const uint base = row * cols;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float partial = 0.0f;
+    for (uint c = lid; c < cols; c += gl_WorkGroupSize.x) {
+        const float t = x.v[base + c];
+        partial += t * t;
+    }
+    // The native body's `rsqrtf(partial/S + epsilon)` with the host's epsilon = eps/S, then the folded
+    // `scale_after = 1/sqrt(S)`.  wg_sum is the workgroup barrier-tree sum (see common/wg_reduce.glsl).
+    const float scale = inversesqrt(wg_sum(partial) / float(pc.cols) + pc.eps / float(pc.cols));
+    for (uint c = lid; c < cols; c += gl_WorkGroupSize.x) {
+        const uint i = base + c;
+        x.v[i] = (scale * x.v[i]) * pc.inv_sqrt_cols;    // the native body's two-factor scale
+    }
+}

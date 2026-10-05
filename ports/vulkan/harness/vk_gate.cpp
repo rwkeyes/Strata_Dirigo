@@ -27,6 +27,7 @@
 // never edited (see ports/vulkan/plan/BACKEND-INTEGRATION.md).
 #include "strata/vulkan/vk_backend.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -12234,6 +12235,279 @@ void case_native_capabilities(Ctx&, const std::string& dir) {
     if (!set_ok) ++bad;
     verdict("native capabilities (vulkan backend)", bad == 0, bad, 4, (double) bad,
             "answers + built shaders: rope/router/moe true (ported), qsa false (its flag also gates an unported symbol)");
+
+    // THE GDN FLAG, and the same discipline as the QSA row above - but stated as an INVARIANT rather than a
+    // hard-coded boolean, because `native_gdn_enabled()` is the case this batch is the middle of.
+    //
+    // This ONE flag gates NINE symbols: the three this batch ports (`native_gdn_conv_silu`, `native_gdn_l2_norm`,
+    // `native_gdn_beta_gate` - layer.cpp:253/266-267/296) AND six it does not (the remaining native GDN kernels
+    // `native_gdn_gate` / `native_gdn_step` / `native_gdn_out_norm` at :297/308/324, and the three fused paths
+    // `fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm` at :250/287/322, the latter additionally
+    // gated on `g_fused_gdn` and `native_bf16_projections`).  So the flag must answer TRUE only once EVERY
+    // gated symbol has a shader, and FALSE otherwise - the answer describes what is IMPLEMENTED, never what one
+    // batch happens to have finished.  Two assertions, both needed:
+    //   (1) this batch's three ported shaders EXIST - so a `false` answer cannot hide a deleted shader; and
+    //   (2) the flag EQUALS "every gated symbol has a built shader" - so when the remaining six land, the flag
+    //       must be revisited, and until then it must stay false.
+    struct GdnSym { const char* sym; const char* spv; bool ported; };
+    const GdnSym gdn_gated[] = {
+        {"native_gdn_conv_silu",  "native_gdn_conv_silu.spv",  true},    // this batch
+        {"native_gdn_l2_norm",    "native_gdn_l2_norm.spv",    true},    // this batch
+        {"native_gdn_beta_gate",  "native_gdn_beta_gate.spv",  true},    // this batch
+        {"native_gdn_gate",       "native_gdn_gate.spv",       false},   // unported
+        {"native_gdn_step",       "native_gdn_step.spv",       false},   // unported
+        {"native_gdn_out_norm",   "native_gdn_out_norm.spv",   false},   // unported
+        {"fused_gdn_conv_l2",     "fused_gdn_conv_l2.spv",     false},   // unported (also gated on g_fused_gdn)
+        {"fused_gdn_ab",          "fused_gdn_ab.spv",          false},   // unported
+        {"fused_gdn_step_norm",   "fused_gdn_step_norm.spv",   false},   // unported
+    };
+    const int n_gdn = (int) (sizeof(gdn_gated) / sizeof(gdn_gated[0]));
+    int gdn_bad = 0;
+    bool all_gdn_built = true;
+    for (int i = 0; i < n_gdn; ++i) {
+        const bool built = std::filesystem::exists(dir + "/" + gdn_gated[i].spv);
+        if (!built) all_gdn_built = false;
+        if (gdn_gated[i].ported && !built) {
+            ++gdn_bad;
+            std::printf("      capability: %s is ported but has no built shader\n", gdn_gated[i].sym);
+        }
+    }
+    const bool gdn_answer = strata::kernels::native_gdn_enabled();
+    if (gdn_answer != all_gdn_built) {
+        ++gdn_bad;
+        std::printf("      capability: native_gdn_enabled answered %d while %s gated shader(s) are built\n",
+                    (int) gdn_answer, all_gdn_built ? "ALL" : "NOT all");
+    }
+    verdict("native capabilities: gdn flag", gdn_bad == 0, gdn_bad, 4, (double) gdn_bad,
+            "flag == (every gated symbol built); the 3 ported shaders exist, the 6 unported siblings do not");
+}
+
+// PERFORMANCE TIER, class B (batch 2): the first three native GDN / DeltaNet MIXER kernels, each replacing the
+// legacy kernel already ported and gated above.  The oracle for every one is the engine's OWN native body
+// (src/kernels/cuda/native_gdn_preprocess.cu), not the legacy kernel's rule - and where the native arithmetic
+// differs from the legacy's, the case MEASURES and states that difference rather than asserting equality.
+// `native_gdn_enabled()` stays FALSE (the same flag gates six more unported symbols; see
+// vulkan/src/kernels/native_caps_vk.cpp and this file's `case_native_capabilities`).
+
+// `native_gdn_conv_silu` (native_gdn_preprocess.cu's `conv_silu`, wrapper native_gdn_preprocess.hpp:14),
+// replacing `gdn_conv_step`.  The native body is the SAME four-tap conv PLUS the SiLU in ONE kernel, writing
+// BOTH the raw output and the SiLU output (the legacy branch runs `gdn_conv_step` -> a D2D copy ->
+// `silu_inplace`/`silu_f32`: src/core/layer.cpp:253-258).  The oracle is this native rule transcribed in
+// double, and the SLID history is compared BIT FOR BIT because the kernel only MOVES values.  Arms: C = 2560
+// (the artifact, 10 workgroups), 24 (one) and 300 (two); all use d_conv = 4, which the native wrapper requires
+// and which makes the two outputs and the three-row slide well-defined.
+void case_native_gdn_conv_silu(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_conv_silu.spv")) return;
+    const int arms[] = {2560, 24, 300};
+    for (int C : arms) {
+        const int dc = 4;
+        const size_t hist = (size_t) C * 3;
+        std::vector<float> cs(hist), x((size_t) C), kw((size_t) C * dc);
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < 3; ++i) cs[(size_t) c * 3 + i] = (float) (10 * (i + 1) + (c % 90));  // labelled rows
+        for (int c = 0; c < C; ++c) x[(size_t) c] = 100.0f + (float) c;
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc; ++i)
+                kw[(size_t) c * dc + i] = ((i & 1) ? -1.0f : 1.0f) * (float) (i + 1) * rndf(1.5f);
+
+        // ORACLE: the native body (conv_silu) in double - both outputs, the zero-bias fold and the slide.  The
+        // raw sum's TERMS are accumulated too, because a four-tap dot can CANCEL and a bound by the result alone
+        // then fails on exactly the channels that are right (see the comparison below).
+        std::vector<float> want_raw((size_t) C), want_silu((size_t) C), want_cs = cs;
+        std::vector<double> term_sum((size_t) C, 0.0);
+        for (int c = 0; c < C; ++c) {
+            const double values[4] = {(double) want_cs[(size_t) c * 3 + 0], (double) want_cs[(size_t) c * 3 + 1],
+                                      (double) want_cs[(size_t) c * 3 + 2], (double) x[(size_t) c]};
+            double sum = 0.0, terms = 0.0;
+            for (int t = 0; t < 4; ++t) {
+                sum += values[t] * (double) kw[(size_t) c * dc + t];
+                terms += std::fabs(values[t] * (double) kw[(size_t) c * dc + t]);
+            }
+            term_sum[(size_t) c] = terms;
+            sum = sum + 0.0;                                         // the native body's zero-bias fold
+            want_raw[(size_t) c] = (float) sum;
+            want_silu[(size_t) c] = (float) (sum / (1.0 + std::exp(-sum)));
+            for (int t = 0; t < 3; ++t) want_cs[(size_t) c * 3 + t] = (float) values[t + 1];
+        }
+        // the fixture margin: the SiLU must MOVE the output, or a kernel that wrote `raw` twice would pass.
+        double silu_d = 0, silu_m = 0;
+        for (int c = 0; c < C; ++c) {
+            silu_d += std::fabs((double) want_raw[(size_t) c] - (double) want_silu[(size_t) c]);
+            silu_m += std::fabs((double) want_silu[(size_t) c]);
+        }
+        const bool silu_moves = silu_m > 0 && silu_d / silu_m > 0.05;
+
+        Buf bcs = ctx.alloc(hist * 4), bx = ctx.alloc((size_t) C * 4), bkw = ctx.alloc((size_t) C * dc * 4),
+            braw = ctx.alloc((size_t) C * 4), bsilu = ctx.alloc((size_t) C * 4);
+        ctx.write(bcs, cs.data(), hist * 4);
+        ctx.write(bx, x.data(), (size_t) C * 4);
+        ctx.write(bkw, kw.data(), (size_t) C * dc * 4);
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_conv_silu.spv", 5, 8);
+        struct { int32_t channels; int32_t d_conv; } pc{C, dc};
+        ctx.dispatch(p, {&bcs, &bx, &bkw, &braw, &bsilu}, &pc, sizeof(pc), groups_for((uint64_t) C));
+        std::vector<float> got_raw((size_t) C), got_silu((size_t) C), got_cs(hist);
+        ctx.read(braw, got_raw.data(), (size_t) C * 4);
+        ctx.read(bsilu, got_silu.data(), (size_t) C * 4);
+        ctx.read(bcs, got_cs.data(), hist * 4);
+
+        int bad_raw = 0, bad_silu = 0, bad_state = 0;
+        double worst = 0;
+        for (int c = 0; c < C; ++c) {
+            // BOUND BY THE SUM'S TERMS, not by its result (the port's MMVF rule, `gemv_bound`): a four-tap dot
+            // can cancel, and a purely relative bound then fails on exactly the channels that are right.
+            // MEASURED before this bound was used: 2 of 12800 on the Ryzen iGPU at ratio 1.09e-05 (two channels
+            // whose sums partially cancel), while every channel's ABSOLUTE deviation sat at the f32 ulp of its
+            // terms - i.e. the kernel was right and the assertion was wrong.  The SiLU is a Lipschitz function of
+            // that same sum (|d silu/d sum| <= ~1.1), so the same terms bound it, loosened by its own rtol.
+            const double bound_raw = gemv_bound((double) want_raw[(size_t) c], term_sum[(size_t) c], 4e-6);
+            const double bound_silu = gemv_bound((double) want_silu[(size_t) c], term_sum[(size_t) c], 2e-5);
+            if (!(std::fabs((double) got_raw[(size_t) c] - (double) want_raw[(size_t) c]) <= bound_raw)) ++bad_raw;
+            if (!(std::fabs((double) got_silu[(size_t) c] - (double) want_silu[(size_t) c]) <= bound_silu)) ++bad_silu;
+            const double r = std::fabs((double) got_raw[(size_t) c] - (double) want_raw[(size_t) c]) /
+                             (std::fabs((double) want_raw[(size_t) c]) + 1e-30);
+            worst = std::max(worst, r);
+        }
+        for (size_t i = 0; i < hist; ++i) if (got_cs[i] != want_cs[i]) ++bad_state;
+
+        char tag[80];
+        std::snprintf(tag, sizeof tag, "native_gdn_conv_silu C=%d d_conv=%d", C, dc);
+        const bool ok = bad_raw == 0 && bad_silu == 0 && bad_state == 0 && silu_moves;
+        verdict(tag, ok, bad_raw + bad_silu + bad_state + (silu_moves ? 0 : 1), 2 * C + (int) hist, worst,
+                "raw+SiLU vs the native rule (double) + state bit-exact (fixture margin checked)");
+        if (!ok)
+            std::printf("      (bad_raw %d bad_silu %d bad_state %d silu_moves %d)\n", bad_raw, bad_silu, bad_state,
+                        (int) silu_moves);
+        ctx.free(bcs); ctx.free(bx); ctx.free(bkw); ctx.free(braw); ctx.free(bsilu);
+    }
+}
+
+// `native_gdn_l2_norm` (native_gdn_preprocess.cu's `l2_norm`, wrapper native_gdn_preprocess.hpp:18), replacing
+// `gdn_l2_norm`.  The native RULE is `x / sqrt(sum(x^2) + eps)` - mathematically the SAME as the legacy's - but
+// its ARITHMETIC differs: it sums in FLOAT (the legacy CUDA sums in double), forms `rsqrtf(partial/S + eps/S)`
+// (eps on the MEAN; the legacy forms `1/sqrt(sum + eps)`), and applies a SECOND factor `scale_after = 1/sqrt(S)`
+// that the legacy path adds in a separate `scale_inplace` launch (layer.cpp:276).  The oracle is that native
+// rule transcribed in double, so the printed `worst` IS the f32 arithmetic gap - reported, not claimed
+// bit-exact.  The fixture's row 0 is NEAR ZERO (where the eps is most of the answer and the mean-vs-sum eps
+// reading diverges by ~1.5x rather than 11.3x), and the case checks host-side that dropping the folded
+// `scale_after` moves the output - which is the falsification's target.
+void case_native_gdn_l2_norm(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_l2_norm.spv")) return;
+    struct Shape { int rows, cols; };
+    const Shape shapes[] = {{1, 128}, {16, 128}, {3, 128}};
+    const float eps = 1e-6f;
+    for (const Shape& sh : shapes) {
+        const int rows = sh.rows, cols = sh.cols;
+        const uint64_t n = (uint64_t) rows * cols;
+        const uint64_t padded = n + 2u * (uint64_t) cols + 8;         // slack so an over-dispatch is DETECTED
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> x(padded, NaN), ref(padded, NaN);
+        for (uint64_t i = 0; i < n; ++i) x[i] = rndf(3.0f);
+        for (int c = 0; c < cols; ++c) x[(uint64_t) c] = 1e-4f * rndf(1.0f);   // row 0 near zero
+        const float inv_sqrt_cols = 1.0f / std::sqrt((float) cols);
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const double scale = 1.0 / std::sqrt(acc / (double) cols + (double) eps / (double) cols);
+            for (int c = 0; c < cols; ++c) {
+                const uint64_t i = (uint64_t) r * cols + c;
+                ref[i] = (float) (scale * (double) x[i] * (double) inv_sqrt_cols);
+            }
+        }
+        // the fixture margin: dropping the folded `scale_after` must move the output by sqrt(cols) = 11.3.
+        double rival_d = 0, rival_m = 0;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int c = 0; c < cols; ++c) { const double t = x[(uint64_t) r * cols + c]; acc += t * t; }
+            const double scale = 1.0 / std::sqrt(acc / (double) cols + (double) eps / (double) cols);
+            for (int c = 0; c < cols; ++c) {
+                const uint64_t i = (uint64_t) r * cols + c;
+                const double a = scale * (double) x[i];
+                rival_d += std::fabs(a - (double) ref[i]);
+                rival_m += std::fabs((double) ref[i]);
+            }
+        }
+        const bool scaled_moves = rival_m > 0 && rival_d / rival_m > 0.05;
+
+        Buf bx = ctx.alloc(padded * 4);
+        ctx.write(bx, x.data(), padded * 4);
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_l2_norm.spv", 1, 16);
+        struct { int32_t rows, cols; float eps; float inv_sqrt_cols; } pc{rows, cols, eps, inv_sqrt_cols};
+        ctx.dispatch(p, {&bx}, &pc, sizeof(pc), (uint32_t) rows);
+        std::vector<float> got(padded);
+        ctx.read(bx, got.data(), padded * 4);
+
+        int bad = 0, guard_bad = 0;
+        double worst = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (!close_enough(got[i], ref[i], 1e-4, 1e-6)) ++bad;
+            const double r = std::fabs((double) got[i] - (double) ref[i]) / (std::fabs((double) ref[i]) + 1e-30);
+            worst = std::max(worst, r);
+        }
+        for (uint64_t i = n; i < padded; ++i) if (!(std::isnan(got[i]) || got[i] == 0.0f)) ++guard_bad;
+
+        char tag[80];
+        std::snprintf(tag, sizeof tag, "native_gdn_l2_norm r=%d c=%d (f32 vs double)", rows, cols);
+        const bool ok = bad == 0 && guard_bad == 0 && scaled_moves;
+        verdict(tag, ok, bad + guard_bad + (scaled_moves ? 0 : 1), (int) (n + (padded - n)), worst,
+                "relative vs the native rule's double transcription (tol 1e-4) + row-guard NaN");
+        if (!ok) {
+            int printed = 0;
+            for (uint64_t i = 0; i < n && printed < 4; ++i)
+                if (!close_enough(got[i], ref[i], 1e-4, 1e-6)) {
+                    std::printf("      offender i=%llu want=%.9g got=%.9g\n",
+                                (unsigned long long) i, (double) ref[i], (double) got[i]);
+                    ++printed;
+                }
+            if (!scaled_moves) std::printf("      FIXTURE: dropping the folded scale_after does not move the output\n");
+        }
+        ctx.free(bx);
+    }
+}
+
+// `native_gdn_beta_gate` (native_gdn_preprocess.cu's `beta_sigmoid`, wrapper native_gdn_preprocess.hpp:23),
+// replacing `gdn_beta_gate`.  Rule: `beta[i] = sigmoid(beta[i])`, in place - the fraction `gdn_step`'s contract
+// demands.  The native body's sigmoid is `1/(1+expf(-v))`, the SAME expression as the legacy `sigmoid_f`, so
+// this is the one GDN pair whose RULES ARE THE SAME (the bench pair is expected to be a wash, and a wash is
+// reported as a finding); it is ported because one flag gates all three, so the mixer's beta half is covered on
+// the native branch too.  Oracle: the engine's own sigmoid in double; the fixture spans the whole range and the
+// case checks host-side that the raw (identity) reading moves the output.
+void case_native_gdn_beta_gate(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_beta_gate.spv")) return;
+    const int h_v = 48;                                          // the artifact's ssm_v_heads
+    std::vector<float> b((size_t) h_v), want((size_t) h_v);
+    for (int h = 0; h < h_v; ++h) {
+        if (h % 3 == 0) b[(size_t) h] = -25.0f + (float) (h % 7);          // -> ~0
+        else if (h % 3 == 1) b[(size_t) h] = 25.0f - (float) (h % 7);      // -> ~1
+        else b[(size_t) h] = rndf(4.0f);                                   // mid-range
+    }
+    for (int h = 0; h < h_v; ++h) want[(size_t) h] = (float) (1.0 / (1.0 + std::exp(-(double) b[(size_t) h])));
+    double raw_d = 0, mag = 0;
+    for (int h = 0; h < h_v; ++h) {
+        raw_d += std::fabs((double) b[(size_t) h] - (double) want[(size_t) h]);
+        mag += std::fabs((double) want[(size_t) h]);
+    }
+    const bool raw_moves = mag > 0 && (raw_d / mag) > 0.05;
+
+    Buf bb = ctx.alloc((size_t) h_v * 4);
+    ctx.write(bb, b.data(), (size_t) h_v * 4);
+    VkPipeline p = ctx.pipeline(dir + "/native_gdn_beta_gate.spv", 1, 4);
+    struct { int32_t n; } pc{h_v};
+    ctx.dispatch(p, {&bb}, &pc, sizeof(pc), groups_for((uint64_t) h_v));
+    std::vector<float> got((size_t) h_v);
+    ctx.read(bb, got.data(), (size_t) h_v * 4);
+
+    int bad = 0;
+    double worst = 0;
+    for (int h = 0; h < h_v; ++h) {
+        if (!close_enough(got[(size_t) h], want[(size_t) h], 2e-6, 1e-7)) ++bad;
+        worst = std::max(worst, std::fabs((double) got[(size_t) h] - (double) want[(size_t) h]) /
+                                    (std::fabs((double) want[(size_t) h]) + 1e-30));
+    }
+    const bool ok = bad == 0 && raw_moves;
+    verdict("native_gdn_beta_gate (sigmoid)", ok, bad + (raw_moves ? 0 : 1), h_v, worst,
+            "relative vs engine double sigmoid (tol 2e-6) + fixture margin");
+    if (!ok && !raw_moves) std::printf("      FIXTURE: the raw (identity) reading does not move the output\n");
+    ctx.free(bb);
 }
 
 int main(int argc, char** argv) {
@@ -12411,6 +12685,11 @@ int main(int argc, char** argv) {
     case_native_moe_combine(ctx, dir);           // native_moe_combine <- moe_combine
     case_native_qsa_rms_norm_weighted(ctx, dir); // native_qsa_rms_norm_weighted <- rms_norm_weighted
     case_native_capabilities(ctx, dir);          // the Vulkan backend's capability answers (the branch the engine takes)
+    // PERFORMANCE TIER, batch 2: the first three native GDN / DeltaNet MIXER kernels, each replacing a legacy
+    // kernel already ported above.  APPENDED at the end for the same shared-RNG reason as the class-B four.
+    case_native_gdn_conv_silu(ctx, dir);         // native_gdn_conv_silu <- gdn_conv_step (fused + SiLU)
+    case_native_gdn_l2_norm(ctx, dir);           // native_gdn_l2_norm   <- gdn_l2_norm
+    case_native_gdn_beta_gate(ctx, dir);         // native_gdn_beta_gate <- gdn_beta_gate
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

@@ -81,6 +81,14 @@ TABLE = {
     # `native_qsa_gate_apply` (layer.cpp:1010), so the backend still answers that check false - see
     # native_caps_vk.cpp.  The shader exists; the row is `kernel` because the GPU work is done.
     'native_qsa_rms_norm_weighted':   ('kernel', 'native_qsa_rms_norm_weighted'),   # replaces rms_norm_weighted
+    # THE PERFORMANCE TIER, class B, batch 2: the first three native GDN / DeltaNet MIXER kernels (the mixer is
+    # 36 of the model's 48 layers).  Each replaces a legacy kernel already ported (`gdn_conv_step` / `gdn_l2_norm`
+    # / `gdn_beta_gate`), and all three are gated by the SAME `native_gdn_enabled()` flag - which stays FALSE
+    # because the flag ALSO gates six unported symbols (`native_gdn_gate`/`_step`/`_out_norm` and the three
+    # `fused_gdn_*` paths).  See vulkan/src/kernels/native_caps_vk.cpp and case_native_capabilities.
+    'native_gdn_conv_silu':           ('kernel', 'native_gdn_conv_silu'),      # replaces gdn_conv_step (fused + SiLU)
+    'native_gdn_l2_norm':             ('kernel', 'native_gdn_l2_norm'),        # replaces gdn_l2_norm
+    'native_gdn_beta_gate':           ('kernel', 'native_gdn_beta_gate'),      # replaces gdn_beta_gate
     'native_quantize_q8_1':           ('kernel', 'quantize_q8_1'),
     'ple_block':                      ('kernel', 'ple_bcast ple_conv ple_gate ple_gnorm'),
     'ple_history_advance':            ('kernel', 'ple_history_advance'),
@@ -186,10 +194,7 @@ TABLE = {
     'map_ids':                        ('todo', 'no shader in this tree yet'),
     'moe_group_resident':             ('todo', 'no shader in this tree yet'),
     'mtp_select':                     ('todo', 'no shader in this tree yet'),
-    'native_gdn_beta_gate':           ('todo', 'no shader in this tree yet'),
-    'native_gdn_conv_silu':           ('todo', 'no shader in this tree yet'),
     'native_gdn_gate':                ('todo', 'no shader in this tree yet'),
-    'native_gdn_l2_norm':             ('todo', 'no shader in this tree yet'),
     'native_gdn_out_norm':            ('todo', 'no shader in this tree yet'),
     'native_gdn_step':                ('todo', 'no shader in this tree yet'),
     'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),

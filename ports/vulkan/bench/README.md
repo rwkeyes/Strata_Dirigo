@@ -97,6 +97,10 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `router_top10_f32` vs `native_router_top10` | n_tokens=16, n_expert=512, k=10 | elements/s |
 | `moe_combine_f32` vs `native_moe_combine` | n_embd=2560 k=10 shared=1 | elements/s |
 | `rms_norm` vs `native_qsa_rms_norm_weighted` | rows=128 cols=2560 | elements/s |
+| `gdn_conv_step` vs `native_gdn_conv_silu` | C=2560 d_conv=4 | elements/s (outputs) |
+| `gdn_conv_step`+`silu_f32` vs `native_gdn_conv_silu` | C=2560 d_conv=4 (the 2-dispatch legacy chain) | elements/s |
+| `gdn_l2_norm` vs `native_gdn_l2_norm` | rows=48 cols=128 | elements/s |
+| `gdn_beta_gate` vs `native_gdn_beta_gate` | h_v=48 | elements/s |
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
@@ -205,6 +209,38 @@ the iGPU the kernel batch is above the ~5-15 µs floor; on llvmpipe the `native_
 floor for the native row (0.2036 ms for 16 tokens) and reads slightly slower than legacy there - a
 toolchain/execution-model artifact of a CPU driver, not a device result.  Both rows are printed so the reader
 sees it.
+
+### The class-B NATIVE vs LEGACY pairs, batch 2 — the GDN / DeltaNet MIXER — measured 2026-10-05
+
+The mixer runs on **36 of the model's 48 layers**.  These are the first three native mixer kernels, each timed
+against the legacy kernel it replaces at the same shape on the same device, plus (for the conv) against the
+**two-dispatch legacy chain** the layer actually issues.  Same `XPAIR` convention: `native/legacy`, **< 1.0
+means the native kernel is faster**; `reps=9`.
+
+| pair (native ← legacy) | Arc B70 (ms) native/legacy | ratio | Ryzen iGPU | ratio | XTX (box) | ratio | K620 (box) | ratio | llvmpipe (vega/box) | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `native_gdn_conv_silu` ← `gdn_conv_step` | 0.0047 / 0.0050 | **0.938** | 0.0067 / 0.0074 | **0.909** | 0.0018 / 0.0026 | **0.694** | 0.0073 / 0.0078 | **0.936** | 0.0189 / 0.0214 | 0.881 |
+| `native_gdn_conv_silu` ← `gdn_conv_step`+`silu_f32` (2 dispatches) | 0.0047 / 0.0082 | **0.574** | 0.0067 / 0.0088 | **0.764** | 0.0018 / 0.0033 | **0.544** | 0.0073 / 0.0101 | **0.720** | 0.0189 / 0.0377 | 0.501 |
+| `native_gdn_l2_norm` ← `gdn_l2_norm` | 0.0050 / 0.0050 | 0.997 | 0.0059 / 0.0059 | 1.013 | 0.0024 / 0.0026 | 0.938 | 0.0116 / 0.0123 | 0.942 | 0.0679 / 0.0692 | 0.981 |
+| `native_gdn_beta_gate` ← `gdn_beta_gate` | 0.0037 / 0.0037 | 1.011 | 0.0010 / 0.0010 | 1.045 | 0.0012 / 0.0011 | 1.068 | 0.0025 / 0.0029 | 0.865 | 0.0118 / 0.0116 | 1.016 |
+
+**The honest reading, including the two pairs that are NOT wins.**
+
+* **`native_gdn_conv_silu` is a win everywhere, and a bigger win against what the branch runs.**  Per DISPATCH
+  it writes a second output and computes the SiLU, yet it beats the `gdn_conv_step` it replaces by 6-31%
+  (0.694-0.938 across the four GPUs).  The legacy branch is `gdn_conv_step` -> a D2D copy -> `silu_f32`
+  (`layer.cpp:255-257`); the copy cannot be timed as a kernel, but the two KERNELS can, and the native one
+  dispatch is **1.3-2.1x faster than that chain** (0.481-0.764).  Both rows are printed.
+* **`native_gdn_l2_norm` is a WASH (0.938-1.039).**  The native rule is numerically the SAME as the legacy's
+  (`x / sqrt(sum(x^2)+eps)`; the `1/S` and `1/sqrt(S)` factors cancel), and both kernels are one workgroup per
+  128-wide row - the arithmetic change (f32 sums, a `rsqrtf` of the mean form, a folded `scale_after`) buys no
+  throughput.  Recorded as measured.
+* **`native_gdn_beta_gate` is a WASH (0.865-1.068).**  Its rule is `1/(1+expf(-x))`, the SAME expression as the
+  legacy `sigmoid_f`, one thread per head either way - nothing to win.  On the Arc/iGPU/XTX it reads 1-7%
+  SLOWER, which is run-to-run noise at a dispatch of 48 elements, but it is reported rather than hidden.
+* **A native kernel is not required to be faster.**  The batch's value for these two is that the ONE
+  `native_gdn_enabled()` flag now has all three of its simple mixer stages on the native arithmetic path; the
+  flag stays false until the six remaining gated symbols land (see `NEXT.md`).
 
 ## The one number that is a problem, not a baseline
 

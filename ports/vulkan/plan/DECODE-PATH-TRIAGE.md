@@ -1,9 +1,10 @@
 # Decode-path triage — the 52 `todo` rows, from the engine's own sources
 #
-# CURRENT 2026-10-05 (after the class-A closure batch): the map reads **168 = 62 kernel + 61 host + 45 todo**,
-# the class-A set is CLOSED, and M-A is RE-DEFINED over the class-A set at the end of this file ("THE RE-DEFINED
-# MILESTONE M-A").  The numbers quoted immediately below are the state at `7c317c4`, kept as the record the
-# triage was written against.
+# CURRENT 2026-10-05 (after the class-B batch 2): the map reads **168 = 69 kernel + 61 host + 38 todo** (the
+# class-A set is CLOSED and the performance tier is in progress: 7 of the scoreboard's class-B native fast paths
+# are ported - the four of batch 1 plus the three native GDN mixer kernels of batch 2).  M-A is RE-DEFINED over
+# the class-A set at the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted immediately below
+# are the state at `7c317c4`, kept as the record the triage was written against.
 
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads
@@ -187,6 +188,21 @@ same shape: `native_rope_apply` **0.301×** of `rope_neox` on the Arc (0.118× o
 `native_router_top10` **0.078×** of `router_top10_f32` (0.082× on the XTX), `native_moe_combine` **0.998×**
 (a wash), `native_qsa_rms_norm_weighted` **1.007×** (neutral; 1.117× on the iGPU and 1.795× on the K620 — a
 FINDING, not a win).  The full table is in `bench/README.md`.
+
+### Class B, batch 2: the GDN / DeltaNet MIXER's first three native fast paths (2026-10-05)
+
+The same symbol-at-a-time discipline applies to the second batch, and it is the case the discipline was written
+for.  Three native GDN kernels are now ported and gated - `native_gdn_conv_silu` (replaces `gdn_conv_step`),
+`native_gdn_l2_norm` (replaces `gdn_l2_norm`) and `native_gdn_beta_gate` (replaces `gdn_beta_gate`) - each
+oracled against the engine's OWN native body (`src/kernels/cuda/native_gdn_preprocess.cu`), not the legacy rule.
+**`native_gdn_enabled()` still answers FALSE**, because that ONE flag also gates SIX symbols this tree has no
+shader for: the remaining native GDN kernels `native_gdn_gate` / `native_gdn_step` / `native_gdn_out_norm`
+(layer.cpp:297/308/324) and the three fused paths `fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm`
+(:250/287/322, the latter also gated on `g_fused_gdn` + `native_bf16_projections`).  `case_native_capabilities`
+gains a **gdn arm** asserting the flag EQUALS "every gated symbol has a built shader" - currently false - and
+that the three ported shaders exist.  Measured (`bench/README.md`): `native_gdn_conv_silu` is a win (0.694-0.938
+per dispatch; 0.481-0.764 against the 2-dispatch legacy chain), while `native_gdn_l2_norm` (0.938-1.039) and
+`native_gdn_beta_gate` (0.865-1.068) are WASHES - the same work per element, no algorithmic difference to win.
 
 ## Class C — the non-selected configuration (7)
 

@@ -1,5 +1,82 @@
 # Start here next session
 
+## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, first three native kernels — class B batch 2 — **DONE 2026-10-05**
+
+The mixer runs on **36 of the model's 48 layers** (`gdn_layer`, `src/core/layer.cpp:223`), so it is where the
+decode step spends most of its layers.  This increment ports the **first three of its native fast paths** —
+`native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate` — each replacing a legacy kernel already
+ported and gated, each **oracled against the engine's OWN native body** (`src/kernels/cuda/native_gdn_preprocess.cu`,
+not the legacy rule), each **MEASURED against that legacy kernel at the same shape on the same device**
+(`ports/vulkan/bench/`), and **`native_gdn_enabled()` is deliberately left answering FALSE** with
+`case_native_capabilities` extended to enforce that the answer keeps describing what is actually implemented.
+
+**THE THREE SYMBOLS, and the oracle each was transcribed from:**
+
+| symbol (shader) | replaces | the native body's rule (oracle) | case |
+|---|---|---|---|
+| `native_gdn_conv_silu` | `gdn_conv_step` | `native_gdn_preprocess.cu`'s `conv_silu` (`:53-68`): the SAME four-tap conv **PLUS the SiLU in ONE kernel**, writing BOTH the raw and the SiLU output, with the zero-bias fold `sum = __fadd_rn(sum, 0.0f)`; the legacy branch is `gdn_conv_step` -> a D2D copy -> `silu_f32` (layer.cpp:255-257), three launches | 3 arms (C=2560/24/300, d_conv=4); raw+SiLU vs a double transcription of the native rule, slid state **BIT-EXACT**; a terms-derived bound (see the finding below) |
+| `native_gdn_l2_norm` | `gdn_l2_norm` | `native_gdn_preprocess.cu`'s `l2_norm` (`:70-84`): sums in **FLOAT**, `rsqrtf(partial/S + eps/S)` (eps on the **MEAN**), then a folded `scale_after = 1/sqrt(S)` — numerically the SAME rule as the legacy, a different arithmetic path | 3 arms (rows 1/16/3, cols=128); vs the native rule's double transcription; near-zero row 0 + NaN-padded tail; **HONEST: the two RULES are the same, so the printed `worst` IS the arithmetic gap** |
+| `native_gdn_beta_gate` | `gdn_beta_gate` | `native_gdn_preprocess.cu`'s `beta_sigmoid` (`:86-89`): `beta[i] = 1/(1+expf(-beta[i]))` — the **SAME expression** as the legacy `sigmoid_f` | 48 heads spanning ~0/mid/~1; vs the engine's double sigmoid; the raw identity reading is checked host-side to move |
+
+**THE MEASUREMENT — native vs legacy, same shape, same device (`XPAIR` lines; ratio is native/legacy, so < 1.0
+means the native kernel is faster).**  This includes the pair that is NOT a win:
+
+| pair (native ← legacy) | Arc B70 | Ryzen iGPU | XTX (box) | K620 (box) | llvmpipe (both) |
+|---|---:|---:|---:|---:|---:|
+| `native_gdn_conv_silu` ← `gdn_conv_step` | **0.938** | **0.909** | **0.694** | **0.936** | 0.881 / 0.949 |
+| `native_gdn_conv_silu` ← `gdn_conv_step`+`silu_f32` (the 2-dispatch chain it replaces) | **0.574** | **0.764** | **0.544** | **0.720** | 0.501 / 0.481 |
+| `native_gdn_l2_norm` ← `gdn_l2_norm` | 0.997 | 1.013 | 0.938 | 0.942 | 0.981 / 1.039 |
+| `native_gdn_beta_gate` ← `gdn_beta_gate` | 1.011 | 1.045 | 1.068 | 0.865 | 1.016 / 1.002 |
+
+**The conv+SiLU kernel is the batch's real win, and it is larger against what the branch actually runs.**
+Per DISPATCH the native writes one extra output and computes the SiLU, yet it is still 6-31% faster than the
+plain `gdn_conv_step` (0.694-0.938).  Measured against the legacy **chain** the layer really issues
+(`gdn_conv_step` then `silu_f32`, two dispatches — a D2D copy cannot be timed as a kernel), the native one
+dispatch is **1.3-2.1x faster** (0.481-0.764).  The legacy conv is one thread per channel with a serial 4-tap
+dot; the native keeps that shape but fuses the second kernel's work into the same thread.
+
+**`native_gdn_l2_norm` and `native_gdn_beta_gate` are WASHES, and that is the honest measurement.**
+`l2_norm` sits at 0.938-1.039 and `beta_gate` at 0.865-1.068 across six devices — both are the same
+work per element as the legacy kernel (one workgroup per 128-wide row; one thread per head), with no
+algorithmic difference to win, so the arithmetic change (f32 sums / a folded scale / the same sigmoid) buys
+no throughput.  **A native kernel is not required to be faster; recorded as measured, not tuned**
+(`bench/README.md` has the full tables and the reading).
+
+**A FINDING THE CASE ITSELF PRODUCED, fixed in the FIXTURE's bound rather than by loosening a tolerance.**  The
+first run of `case_native_gdn_conv_silu` read **12798/12800 on the Ryzen iGPU (worst 1.09e-05)** while every
+channel's ABSOLUTE deviation sat at the f32 ulp of its terms — two channels whose four-tap sums partially
+CANCEL, which is exactly the case a purely relative bound fails on.  The comparison is now the port's
+terms-derived bound (`gemv_bound`: `rtol·|want| + 16·2⁻²⁴·Σ|terms|`), and the same run then reads green with
+the worst relative deviation unchanged — the kernel was right and the assertion was wrong (the port's own
+"bound a reduction by its TERMS" rule, `vulkan-compute-shader-porting`).
+
+**THE CAPABILITY DISCIPLINE — `native_gdn_enabled()` answers FALSE, and the case enforces WHY.**  This ONE flag
+gates NINE symbols: the three ported here (`native_gdn_conv_silu`/`_l2_norm`/`_beta_gate` at
+layer.cpp:253/266-267/296) AND six unported ones (the remaining native GDN kernels `native_gdn_gate`,
+`native_gdn_step`, `native_gdn_out_norm` at :297/308/324, and the three fused paths `fused_gdn_conv_l2`,
+`fused_gdn_ab`, `fused_gdn_step_norm` at :250/287/322 — the latter additionally gated on `g_fused_gdn` and
+`native_bf16_projections`).  Answering true would make the engine dispatch a symbol with no shader, so the
+backend (`vulkan/src/kernels/native_caps_vk.cpp`, new GDN block) answers **false**.  `case_native_capabilities`
+gains a **gdn arm** that asserts the flag EQUALS *"every gated symbol has a built shader"* — currently false,
+because the six unported gated shaders are absent — AND that this batch's three ported shaders exist (so a
+`false` cannot hide a deleted shader).  It is an invariant, not a hard-coded boolean: when the remaining six
+land, the flag has to be revisited.  Falsified by `native-caps-gdn-true` → `FAIL native capabilities: gdn flag
+3/4`.
+
+**THE MAP DROPS BY THREE.**  `PORT-MAP.tsv` moved `168 — 66 kernel, 61 host, 41 todo` -> **`168 — 69 kernel,
+61 host, 38 todo`** (the three symbols are now `kernel` rows naming their shaders); `check_port_map.py` passes
+(`103 shaders built, 84 claimed`) and `make_port_map.py` regenerates the file **byte-identically** (`diff -q`).
+
+**GATE, after the change.  vega:** intel_icd (Arc B70) **415 / 0 / 0** (`run_gate.sh` exit **0**), llvmpipe
+**403 / 0 / 3**, radeon_icd (Ryzen iGPU) **406 / 0 / 2** — **+8 verdicts** on every arm (3 conv + 3 l2_norm +
+1 beta_gate + 1 gdn-flag), 0 failed.  Box (`z820b`): radeon_icd (RX 7900 XTX) **411 / 0 / 1**, llvmpipe
+**403 / 0 / 3**, nvidia_icd (Quadro K620) **406 / 0 / 2** — **0 failed on every arm**; `run_gate.sh` exits **1**
+there only for the pre-existing M8 `prefill split` skip.  Every one of the four new falsification injections
+was run and BIT: `native-gdn-conv-silu-drop-silu` -> `FAIL native_gdn_conv_silu C=2560 d_conv=4 11509/12800`;
+`native-gdn-l2-norm-drop-folded-scale` -> `FAIL native_gdn_l2_norm r=1 c=128 264/392 worst 10.3`;
+`native-gdn-beta-gate-sign-flip` -> `FAIL native_gdn_beta_gate (sigmoid) 0/48 worst 7.2e+10`;
+`native-caps-gdn-true` -> `FAIL native capabilities: gdn flag 3/4`.
+
 ## THE PERFORMANCE TIER'S FIRST FOUR KERNELS — class B, the NATIVE fast paths — **DONE 2026-10-05**
 
 The port is correct-but-slow **by construction**, and the throughput harness (`ports/vulkan/bench/`) landed
