@@ -17,16 +17,13 @@ iGPU because the discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 263/0/2 becomes 262/1/2 when the flaky budget-requery case fires
-when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
-compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
-(`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
-binary fails it identically, 2 runs of 2**, and the usage delta is 0 - it is the budget figure drifting on an iGPU
-that shares system memory with everything else.  Verified by building the previous commit in a worktree and running
-the same ICD.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
-stale seven times in two days; read the last line of your own run.** All three available implementations are exercised
-again by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 69 kernels, 19 shared includes, one generated table file (`harness/iq_grids.hpp`,
+matrix path RUNS on XMX, including the prefill GEMM.  The count now stands at **314 / 0 / 0 on the Intel ICD**
+(302 / 0 / 3 on llvmpipe, 305 / 0 / 2 on the radeon iGPU) after the M-A 4/10 + 5/10 batch.  All three available
+implementations are exercised by `run_gate.sh` (it once stopped at the Intel skip, so the cross-implementation arm
+never ran on this box after the swap - `NEXT.md`), and the radeon iGPU's `budget: independent requery agrees` is
+INTERMITTENT rather than deterministic: the driver's free figure drifts ~2.8 MB against the 1.7 MB tolerance (1
+failure in 3 consecutive runs of one binary on one device; an older commit reproduces it).  Re-run it and record it;
+do not chase it.  **75 kernels, 20 shared includes**, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -54,9 +51,22 @@ POSITION and `rows[r]` is the DESTINATION, an unnamed destination row must survi
 `width % 4 == 0` + 16-byte-alignment precondition is its `float4` cast rather than the rule - the case GATES that
 by running `width = 6`, where the CUDA would refuse.  Falsified by `gates/inject-verify.sh scatter-rows-identity`
 -> `FAIL  scatter_rows_f32: permutation ... 511/3072`.  **Arc 284/0/0** (272 + the batch's twelve verdicts, and
-`run_gate.sh` **exit 0**); box `radeon_icd 280/0/1`, lvp 272/0/3, nvidia 275/0/2.  Seven of the ten `todo` symbols
-remain: `iq_dequant_f32`, `iq_embed_rows`, `native_q5_k_f32`, `moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`,
-`moe_hit_grouped_s2`.
+`run_gate.sh` **exit 0**); box `radeon_icd 280/0/1`, lvp 272/0/3, nvidia 275/0/2.  **M-A 4/10 and 5/10 landed the
+STANDALONE IQ/BF16 dequantiser and the token-embedding gather on it** (`iq_dequant_f32`, `iq_embed_rows`;
+`shaders/common/iq_dequant.glsl`, `shaders/iq_dequant_f32.comp`, `shaders/iq_embed_rows.comp`).  The decoder is the
+engine's own `dq_dispatch<float>` - the port keeps its `tid` 0..31 thread mapping rather than re-deriving a block
+layout - and the case reproduces each `dq_*` body on the host as the oracle, ONE ARM PER FORMAT over the **14
+formats** the port's generated grids cover (BF16, IQ4_NL, IQ4_XS, Q8_0, Q5_0, Q5_1, Q2_0, Q4_K, Q5_K, Q3_K,
+IQ3_XXS, IQ3_S, IQ2_S, IQ1_M); **IQ2_XXS (16) and IQ2_XS (17) stay `todo`** - their grids are not in
+`harness/iq_grids.hpp` and neither shader claims them.  `iq_embed_rows` gates the row stride and a DERANGEMENT
+token list, so an identity gather fails every token.  Falsified by `gates/inject-verify.sh
+iq-dequant-iq1m-grid-high` -> `FAIL  iq_dequant_f32: IQ1_M  310/768  worst 2.34e+05` and `iq-embed-rows-identity`
+-> `FAIL  iq_embed_rows: BF16 ... 0/3072  worst 6.58e+04`; the first targets a shared INCLUDE, so the script now
+compiles the shader that INCLUDES a changed `common/` file rather than reporting `DID NOT COMPILE` on a file with
+no `#version`.  **+30 green verdicts on every implementation, bit-exact against the oracle**: vega **Arc 314/0/0**
+(`run_gate.sh` exit 0), llvmpipe 302/0/3, radeon-iGPU 305/0/2; box `radeon_icd` (7900 XTX) **310/0/1**, lvp
+302/0/3, nvidia 305/0/2.  **M-A is 5 of the ten**; the five `todo` symbols are `native_q5_k_f32`, `moe_grouped_s2`,
+`moe_hit_add`, `moe_hit_select`, `moe_hit_grouped_s2`.
 
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)

@@ -168,6 +168,60 @@ is the **`iq_dequant_f32` -> `iq_embed_rows` pair**: the standalone IQ/BF16 dequ
 (15 `is_iq` types plus BF16 - the port has only the FUSED dot form today), a format at a time with one codebook's
 values per arm, then the row gather built on it.
 
+## M-A 4/10 and 5/10: `iq_dequant_f32` + `iq_embed_rows` - the STANDALONE IQ/BF16 dequantiser, and the row gather on it
+
+**The pair the decode path needs first, and why it is a pair.** `iq_dequant_f32` is the engine's standalone
+I-quant / BF16 decoder - `dq_dispatch<float>` through `dequant_flat_kernel` (`src/kernels/cuda/iq_kernels.cu:1643`,
+`:1848`) - and `iq_embed_rows` (`embed_rows_kernel`, `:1830`) is the token-embedding gather built on it: rows
+`tokens[t]` of a GGUF table, `row_bytes` apart, dequantised to fp32. The port had only the FUSED `iq*_mmvq` dots;
+this is the standalone form, and `iq_embed_rows` needs no decode of its own.
+
+**THE ENGINE'S DECODER IS THE ORACLE, and the port keeps its thread mapping rather than re-deriving a layout.**
+Every offset, shift and scale comes from the CUDA body that `iq_dequant_f32` and `iq_embed_rows` actually launch,
+and the GLSL keeps the engine's own `tid` 0..31 mapping (`il = tid/8`, `ib = tid%8`, the inner `j` loop, and the
+output position each case writes) - the port's worst bug class is a re-derived element->byte map that agrees with
+itself. `shaders/common/iq_dequant.glsl` holds that decode ONCE, shared by both shaders; each launches with 32
+active lanes inside a 256-lane workgroup so `run_gate.sh`'s single workgroup-size rule still holds.
+
+**Coverage, stated exactly.** Every `is_iq` type whose grid the port's generated table carries, plus BF16 - **14
+formats**: BF16, IQ4_NL, IQ4_XS, Q8_0, Q5_0, Q5_1, Q2_0, Q4_K, Q5_K, Q3_K, IQ3_XXS, IQ3_S, IQ2_S, IQ1_M. **IQ2_XXS
+(ggml 16) and IQ2_XS (17) are NOT ported**: their grids (`iq2xxs_grid`, `iq2xs_grid`) are not in
+`harness/iq_grids.hpp`, and neither shader claims them - an unproven format is recorded, not approximated.
+
+**One arm per format; the oracle is a transcription of the RULE.** The case reproduces each `dq_*` body on the
+host, element by element, and compares the device's 256 values against it. The fixture puts a KNOWN, FINITE fp16
+scale in every place the format stores one - a random byte pattern would assemble an inf/NaN scale and the case
+would measure that instead of the decode - and the scale AND the pattern vary with the superblock and with the row
+seed, so a decode that read the wrong superblock or the wrong row lands on a DIFFERENT value, not an equal one.
+`iq_embed_rows` uses a DERANGEMENT token list (`tokens[t] != t`), so an identity gather fails on every token, and
+gates the row STRIDE the caller passes with two wide-row arms (`n_embd = 512`, two superblocks per row).
+
+**Measured.** vega, this commit: **Intel Arc (BMG G31, default) 314 passed / 0 failed / 0 skipped**, intel_icd
+314/0/0, llvmpipe **302/0/3**, radeon-iGPU 305/0/2 - `run_gate.sh` **exit 0**. z820b: radeon_icd (7900 XTX)
+**310/0/1** (its 1 skip is the pre-existing M8 `prefill split`), lvp 302/0/3, nvidia (K620) 305/0/2; the box's
+script exits 1 on that pre-existing skip, exactly as it does at HEAD. That is **+30 verdicts on every
+implementation** (14 dequant + 16 embed arms), all green, and the device's values are **bit-exact** against the
+host oracle on all 30 (worst dev/tol 0).
+
+**Falsified, and one change the falsification forced.** `gates/inject-verify.sh iq-dequant-iq1m-grid-high`
+(misplace the IQ1_M grid high bit, `<< 8` -> `<< 7`) -> `FAIL  iq_dequant_f32: IQ1_M  310/768  worst 2.34e+05`.
+`iq-embed-rows-identity` (gather the row at the POSITION instead of the token) -> `FAIL  iq_embed_rows: BF16 ...
+0/3072  worst 6.58e+04`. The first targets a shared INCLUDE, which has no `#version` and cannot be compiled alone,
+so `inject-verify.sh` now compiles the shader that INCLUDES a changed `common/` file (and says so) instead of
+reporting `DID NOT COMPILE` - the same rule the port learned when three injections silently tested nothing.
+
+**Honest limit.** The row base is computed in 64-bit and truncated to the 32-bit byte index the storage buffers
+take, so a table larger than 4 GiB is outside this arm; the engine's `size_t` row arithmetic would still be
+correct, and the port's embedding tables are far below that. `iq_dequant_f32` also stops at the 14 formats above -
+IQ2_XXS and IQ2_XS stay `todo` in `PORT-MAP.tsv` for the grid reason stated.
+
+**M-A is now 5 of the ten.** Still `todo`: `native_q5_k_f32`, `moe_grouped_s2`, `moe_hit_add`, `moe_hit_select`,
+`moe_hit_grouped_s2`. The next increment in the derived order is **`native_q5_k_f32`** (= `quantize_q8_1` +
+`native_q5_k_mmvq`, the head's Q5_K matvec - `q5_q8_dot` in `src/kernels/cuda/native_mmvq.cu`, a pinned
+integer-dot order the `iq*_mmvq` family does not contain).
+
+
+
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
 
 **Closed the same day the API was written.**  `case_recorded_step` (`harness/vk_gate.cpp`, six verdicts, one

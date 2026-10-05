@@ -16,6 +16,10 @@
 #                                       -> must FAIL  "gather_rows: 16-byte-aligned rows ..."
 #   inject-verify.sh scatter-rows-identity  scatter_rows_f32.comp  write dst row r instead of rows[r]
 #                                       -> must FAIL  "scatter_rows_f32: permutation ..."
+#   inject-verify.sh iq-dequant-iq1m-grid-high  common/iq_dequant.glsl  misplace the IQ1_M grid high bit
+#                                       -> must FAIL  "iq_dequant_f32: IQ1_M"
+#   inject-verify.sh iq-embed-rows-identity     iq_embed_rows.comp  gather the row at the POSITION
+#                                       -> must FAIL  "iq_embed_rows: ..."
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -52,8 +56,20 @@ case "$name" in
     old=$'    const uint dbase = uint(ROWS.v[r]) * pc.width;'
     new=$'    const uint dbase = r * pc.width;   // INJECTION: the destination row indirection dropped'
     want="FAIL  scatter_rows_f32: permutation" ;;
+  iq-dequant-iq1m-grid-high)
+    # The rule lives in a shared INCLUDE, so the compile target is the shader that includes it (below).
+    file="$SH/common/iq_dequant.glsl"; spv="iq_dequant_f32"; comp="$SH/iq_dequant_f32.comp"
+    old=$'        const uint gidx = iq_b(bb + 4u * ib + il) | (((qh >> (4u * (il % 2u))) & 7u) << 8u);'
+    new=$'        const uint gidx = iq_b(bb + 4u * ib + il) | (((qh >> (4u * (il % 2u))) & 7u) << 7u);   // INJECTION: IQ1_M grid high bit misplaced'
+    want="FAIL  iq_dequant_f32: IQ1_M" ;;
+  iq-embed-rows-identity)
+    file="$SH/iq_embed_rows.comp"; spv="iq_embed_rows"
+    old=$'    const uint row = uint(uint64_t(tok) * uint64_t(pc.row_bytes));'
+    new=$'    const uint row = uint(uint64_t(gl_WorkGroupID.y) * uint64_t(pc.row_bytes));   // INJECTION: row index = position, not the token'
+    want="FAIL  iq_embed_rows: " ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
+COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target
 
 # 1. the anchor must be there, or we would be "injecting" into a file that no longer says what we think.
 if ! grep -qF -- "$old" "$file"; then
@@ -65,8 +81,11 @@ bak="$(mktemp)"
 cp "$file" "$bak"
 restore() {
   cp "$bak" "$file"; rm -f "$bak"
-  glslc --target-env=vulkan1.3 -fshader-stage=compute "$file" -o "$SH/$spv.spv" 2>/dev/null
-  # if the changed file is a shared INCLUDE, every shader that includes it must be recompiled too
+  if [ "${file#"$SH/common/"}" = "$file" ]; then
+    glslc --target-env=vulkan1.3 -fshader-stage=compute "$file" -o "$SH/$spv.spv" 2>/dev/null
+  fi
+  # if the changed file is a shared INCLUDE, every shader that includes it must be recompiled (the include itself
+  # cannot be compiled: it has no #version)
   if [ "${file#"$SH/common/"}" != "$file" ]; then
     for c in "$SH"/*.comp; do
       grep -qF "$(basename "$file")" "$c" || continue
@@ -89,7 +108,9 @@ PY
 [ $? -eq 0 ] || { echo "ANCHOR MISSED: $name - anchor not unique"; exit 2; }
 
 # 3. it must COMPILE - an injection that does not build is a stale binary wearing a new timestamp.
-if ! glslc --target-env=vulkan1.3 -fshader-stage=compute "$file" -o "$SH/$spv.spv" 2>"$BUILD/$spv.glslerr"; then
+#    `$COMPILE_TARGET` is the shader that INCLUDES the changed file when the change is in common/ (an include has
+#    no #version and cannot be compiled alone), and the changed file itself otherwise.
+if ! glslc --target-env=vulkan1.3 -fshader-stage=compute "$COMPILE_TARGET" -o "$SH/$spv.spv" 2>"$BUILD/$spv.glslerr"; then
   echo "DID NOT COMPILE: $name"; sed -n '1,12p' "$BUILD/$spv.glslerr"; exit 3
 fi
 if [ "${file#"$SH/common/"}" != "$file" ]; then

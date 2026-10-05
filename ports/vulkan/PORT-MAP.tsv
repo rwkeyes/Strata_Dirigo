@@ -27,8 +27,8 @@ gather_rows	kernel	gather_rows
 gr_read	host	a workspace read
 gr_workspace_bytes	host	a size
 gr_workspace_init	host	a workspace hand-out
-iq_dequant_f32	todo	a standalone IQ dequantiser (this port has the FUSED iq*_mmvq)
-iq_embed_rows	todo	the IQ/BF16 token-embedding dequant, not ported - iq_kernels.hpp declares it
+iq_dequant_f32	kernel	iq_dequant_f32
+iq_embed_rows	kernel	iq_embed_rows
 iq_row_bytes	host	a size
 k	host	a constant
 kv_append_q4_step	kernel	kv_q4_append

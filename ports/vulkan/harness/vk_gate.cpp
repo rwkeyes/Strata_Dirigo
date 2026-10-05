@@ -8916,6 +8916,384 @@ void case_scatter_rows_f32(Ctx& ctx, const std::string& dir) {
             0.0, "the fixture is a derangement with at least one unnamed destination row");
 }
 
+// ===================================================================================== M-A: the IQ / BF16 dequant
+// THE STANDALONE I-quant / BF16 DEQUANTISER, and the token-embedding row gather built on it.
+//
+// `dq_dispatch<float>` (src/kernels/cuda/iq_kernels.cu) is the engine's own decoder for BOTH `iq_dequant_f32`
+// (the flat form, n a multiple of 256) and `iq_embed_rows` (its row gather).  This case reproduces the CUDA's
+// per-format body on the host - element by element, with the ENGINE'S OWN thread mapping (tid 0..31, il=tid/8,
+// ib=tid%8, the inner j loop, and the output position each case writes) - and compares the device's 256 values
+// against it.  ONE ARM PER FORMAT.  The oracle is a transcription of the rule, NOT a re-derived layout: the
+// port's worst bug class is a re-derived block layout that agrees with itself.
+//
+// The formats are every `is_iq` type whose grid the port's generated table carries (harness/iq_grids.hpp), plus
+// BF16.  IQ2_XXS (ggml type 16) and IQ2_XS (17) are NOT here: their grids (iq2xxs_grid, iq2xs_grid) are not in
+// the generated table, and shaders/iq_dequant_f32.comp does not claim them - an unproven format is recorded,
+// not approximated.
+
+static const uint8_t kIqSigns[128] = {
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+static const int kIqMask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+static uint32_t iq_u16h(const uint8_t* p) { return (uint32_t) p[0] | ((uint32_t) p[1] << 8); }
+static float iq_h2fh(const uint8_t* p) { return strata::kernels::f32_from_f16((uint16_t) iq_u16h(p)); }
+static float iq_u16f(uint32_t u) { return strata::kernels::f32_from_f16((uint16_t) u); }
+static float iq_u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+static int iq_g64h(uint32_t lo, uint32_t hi, int j) {
+    return (j < 4) ? (int) ((lo >> (8 * j)) & 0xFFu) : (int) ((hi >> (8 * (j - 4))) & 0xFFu);
+}
+static int iq_g32h(uint32_t w, int j) { return (int) ((w >> (8 * j)) & 0xFFu); }
+
+static void iq_scmin_h(uint32_t j, const uint8_t* sc, uint32_t& d, uint32_t& m) {
+    if (j < 4) { d = sc[j] & 63; m = sc[j + 4] & 63; }
+    else { d = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j - 4] >> 6) << 4); }
+}
+
+// The engine's dq_iq* / dq_q* for ONE thread `tid` of the 32 that decode a 256-value superblock.
+static void iq_dq_host(int ty, const uint8_t* w, size_t wbase, uint32_t ibs, uint32_t tid, float* y) {
+    const uint32_t il = tid / 8, ib = tid % 8;
+    const uint8_t* b0 = w + wbase;
+    if (ty == 30) {                                       // dq_bf16
+        const uint8_t* x = b0 + (size_t) ibs * 512 + (size_t) tid * 16;
+        for (int j = 0; j < 8; ++j) y[tid * 8 + j] = iq_u2f((uint32_t) iq_u16h(x + j * 2) << 16);
+    } else if (ty == 20) {                                // dq_iq4_nl
+        const uint8_t* b = b0 + (size_t) ibs * 144 + (size_t) ib * 18;
+        const float d = iq_h2fh(b);
+        float* o = y + 32 * ib + 4 * il;
+        for (int j = 0; j < 4; ++j) {
+            o[j]      = d * (float) kIq4nlHost[b[2 + 4 * il + j] & 0xF];
+            o[j + 16] = d * (float) kIq4nlHost[b[2 + 4 * il + j] >> 4];
+        }
+    } else if (ty == 23) {                                // dq_iq4_xs
+        const uint8_t* b = b0 + (size_t) ibs * 136;
+        const uint32_t sh = iq_u16h(b + 2);
+        const int ls = (int) ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (int) ((sh >> (2 * ib)) & 3u) << 4;
+        const float d = iq_h2fh(b) * (float) (ls - 32);
+        const uint8_t* q4 = b + 8 + 16 * ib + 4 * il;
+        float* o = y + 32 * ib + 4 * il;
+        for (int j = 0; j < 4; ++j) { o[j] = d * (float) kIq4nlHost[q4[j] & 0xF]; o[j + 16] = d * (float) kIq4nlHost[q4[j] >> 4]; }
+    } else if (ty == 8) {                                 // dq_q8_0
+        const uint8_t* b = b0 + (size_t) ibs * 272 + (size_t) ib * 34;
+        const float d = iq_h2fh(b);
+        for (int j = 0; j < 8; ++j) y[32 * ib + 8 * il + j] = (float) (int8_t) b[2 + 8 * il + j] * d;
+    } else if (ty == 6) {                                 // dq_q5_0
+        const uint8_t* b = b0 + (size_t) ibs * 176 + (size_t) ib * 22;
+        const float d = iq_h2fh(b);
+        const uint32_t qh = (uint32_t) b[2] | ((uint32_t) b[3] << 8) | ((uint32_t) b[4] << 16) | ((uint32_t) b[5] << 24);
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t iqs = 4 * il + j;
+            const uint32_t xh0 = ((qh >> iqs) << 4) & 0x10u;
+            const uint32_t xh1 = (qh >> (iqs + 12)) & 0x10u;
+            y[32 * ib + iqs]      = ((float) ((b[6 + iqs] & 0xF) | xh0) - 16.0f) * d;
+            y[32 * ib + iqs + 16] = ((float) ((b[6 + iqs] >> 4) | xh1) - 16.0f) * d;
+        }
+    } else if (ty == 7) {                                 // dq_q5_1
+        const uint8_t* b = b0 + (size_t) ibs * 192 + (size_t) ib * 24;
+        const float dmx = iq_h2fh(b), dmy = iq_h2fh(b + 2);
+        const uint32_t qh = (uint32_t) b[4] | ((uint32_t) b[5] << 8) | ((uint32_t) b[6] << 16) | ((uint32_t) b[7] << 24);
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t iqs = 4 * il + j;
+            const uint32_t xh0 = ((qh >> iqs) << 4) & 0x10u;
+            const uint32_t xh1 = (qh >> (iqs + 12)) & 0x10u;
+            y[32 * ib + iqs]      = (float) ((b[8 + iqs] & 0xF) | xh0) * dmx + dmy;
+            y[32 * ib + iqs + 16] = (float) ((b[8 + iqs] >> 4) | xh1) * dmx + dmy;
+        }
+    } else if (ty == 42) {                                // dq_q2_0
+        const uint32_t b8 = tid / 8, part = tid % 8;
+        const uint8_t* b = b0 + (size_t) ibs * 72 + (size_t) b8 * 18;
+        const float d = iq_h2fh(b);
+        for (int j = 0; j < 8; ++j) {
+            const int i = (int) part * 8 + j;
+            const int code = (b[2 + i / 4] >> ((i % 4) * 2)) & 3;
+            y[b8 * 64 + (uint32_t) i] = d * (float) (code - 1);
+        }
+    } else if (ty == 12) {                                // dq_q4_K
+        const uint8_t* b = b0 + (size_t) ibs * 144;
+        const float dall = iq_h2fh(b), dmin = iq_h2fh(b + 2);
+        uint32_t sc, m;
+        iq_scmin_h(2 * il, b + 4, sc, m);     const float d1 = dall * (float) sc, m1v = dmin * (float) m;
+        iq_scmin_h(2 * il + 1, b + 4, sc, m); const float d2 = dall * (float) sc, m2v = dmin * (float) m;
+        const uint8_t* q = b + 16 + 32 * il + 4 * ib;
+        float* o = y + 64 * il + 4 * ib;
+        for (int l = 0; l < 4; ++l) { o[l] = d1 * (float) (q[l] & 0xF) - m1v; o[l + 32] = d2 * (float) (q[l] >> 4) - m2v; }
+    } else if (ty == 13) {                                // dq_q5_K (64 threads folded onto 32)
+        const uint8_t* b = b0 + (size_t) ibs * 176;
+        const float dall = iq_h2fh(b), dmin = iq_h2fh(b + 2);
+        for (int tt = (int) tid; tt < 64; tt += 32) {
+            const int qil = tt / 16, iir = tt % 16;
+            uint32_t sc, m;
+            iq_scmin_h(2 * qil, b + 4, sc, m);     const float d1 = dall * (float) sc, m1v = dmin * (float) m;
+            iq_scmin_h(2 * qil + 1, b + 4, sc, m); const float d2 = dall * (float) sc, m2v = dmin * (float) m;
+            const uint8_t* ql = b + 48 + 32 * qil + 2 * iir;
+            const uint8_t* qh = b + 16 + 2 * iir;
+            uint8_t hm = (uint8_t) (1u << (2 * qil));
+            float* o = y + 64 * qil + 2 * iir;
+            o[0]  = d1 * ((float) (ql[0] & 0xF) + ((qh[0] & hm) ? 16.0f : 0.0f)) - m1v;
+            o[1]  = d1 * ((float) (ql[1] & 0xF) + ((qh[1] & hm) ? 16.0f : 0.0f)) - m1v;
+            hm <<= 1;
+            o[32] = d2 * ((float) (ql[0] >> 4) + ((qh[0] & hm) ? 16.0f : 0.0f)) - m2v;
+            o[33] = d2 * ((float) (ql[1] >> 4) + ((qh[1] & hm) ? 16.0f : 0.0f)) - m2v;
+        }
+    } else if (ty == 11) {                                // dq_q3_K (64 threads folded onto 32)
+        const uint8_t* b = b0 + (size_t) ibs * 110;
+        const float d_all = iq_h2fh(b + 108);
+        for (int tt = (int) tid; tt < 64; tt += 32) {
+            const int r = tt / 4, t2 = r / 2, is0 = r % 2;
+            const int l0 = 16 * is0 + 4 * (tt % 4);
+            const int n = t2 / 4, j = t2 - 4 * n;
+            const uint8_t m = (uint8_t) (1u << (4 * n + j));
+            const int is = 8 * n + 2 * j + is0;
+            const int shift = 2 * j;
+            const int8_t us = is < 4  ? (int8_t) ((b[96 + is] & 0xF) | (((b[96 + is + 8] >> 0) & 3) << 4))
+                            : is < 8  ? (int8_t) ((b[96 + is] & 0xF) | (((b[96 + is + 4] >> 2) & 3) << 4))
+                            : is < 12 ? (int8_t) ((b[96 + is - 8] >> 4) | (((b[96 + is] >> 4) & 3) << 4))
+                                      : (int8_t) ((b[96 + is - 8] >> 4) | (((b[96 + is - 4] >> 6) & 3) << 4));
+            const float dl = d_all * (float) (us - 32);
+            const uint8_t* q = b + 32 * n;
+            float* o = y + 128 * n + 32 * j;
+            for (int l = l0; l < l0 + 4; ++l)
+                o[l] = dl * (float) ((int8_t) ((q[l] >> shift) & 3) - ((b[l] & m) ? 0 : 4));
+        }
+    } else if (ty == 18) {                                // dq_iq3_xxs
+        const uint8_t* b = b0 + (size_t) ibs * 98;
+        const uint32_t g1 = strata::vkport::kIq3xxsGrid[b[2 + 8 * ib + 2 * il + 0]];
+        const uint32_t g2 = strata::vkport::kIq3xxsGrid[b[2 + 8 * ib + 2 * il + 1]];
+        const uint32_t aux32 = iq_u16h(b + 66 + 4 * ib) | (iq_u16h(b + 66 + 4 * ib + 2) << 16);
+        const float d = iq_h2fh(b) * (0.5f + (float) (aux32 >> 28)) * 0.5f;
+        const uint8_t signs = kIqSigns[(aux32 >> (7 * il)) & 127u];
+        for (int j = 0; j < 4; ++j) {
+            y[32 * ib + 8 * il + j]     = d * (float) iq_g32h(g1, j) * ((signs & kIqMask[j]) ? -1.0f : 1.0f);
+            y[32 * ib + 8 * il + j + 4] = d * (float) iq_g32h(g2, j) * ((signs & kIqMask[j + 4]) ? -1.0f : 1.0f);
+        }
+    } else if (ty == 21) {                                // dq_iq3_s
+        const uint8_t* b = b0 + (size_t) ibs * 110;
+        const uint32_t qh = b[66 + ib];
+        const uint32_t g1 = b[2 + 8 * ib + 2 * il + 0] | ((qh << (8 - 2 * il)) & 256u);
+        const uint32_t g2 = b[2 + 8 * ib + 2 * il + 1] | ((qh << (7 - 2 * il)) & 256u);
+        const uint32_t w1 = strata::vkport::kIq3sGrid[g1], w2 = strata::vkport::kIq3sGrid[g2];
+        const float d = iq_h2fh(b) * (1.0f + 2.0f * (float) ((b[106 + ib / 2] >> (4 * (ib % 2))) & 0xF));
+        const uint8_t signs = b[74 + 4 * ib + il];
+        for (int j = 0; j < 4; ++j) {
+            y[32 * ib + 8 * il + j]     = d * (float) iq_g32h(w1, j) * ((signs & kIqMask[j]) ? -1.0f : 1.0f);
+            y[32 * ib + 8 * il + j + 4] = d * (float) iq_g32h(w2, j) * ((signs & kIqMask[j + 4]) ? -1.0f : 1.0f);
+        }
+    } else if (ty == 22) {                                // dq_iq2_s
+        const uint8_t* b = b0 + (size_t) ibs * 82;
+        const uint32_t qh = b[66 + ib];
+        const uint32_t gidx = b[2 + 4 * ib + il] | ((qh << (8 - 2 * il)) & 0x300u);
+        const uint32_t g0 = strata::vkport::kIq2sGrid[2 * gidx], g1 = strata::vkport::kIq2sGrid[2 * gidx + 1];
+        const uint8_t signs = b[2 + 32 + 4 * ib + il];
+        const float d = iq_h2fh(b) * (0.5f + (float) ((b[74 + ib] >> (4 * (il / 2))) & 0xF)) * 0.25f;
+        for (int j = 0; j < 8; ++j)
+            y[32 * ib + 8 * il + j] = d * (float) iq_g64h(g0, g1, j) * ((signs & kIqMask[j]) ? -1.0f : 1.0f);
+    } else if (ty == 29) {                                // dq_iq1_m
+        const uint8_t* b = b0 + (size_t) ibs * 56;
+        const uint32_t sc0 = iq_u16h(b + 48), sc1 = iq_u16h(b + 50), sc2 = iq_u16h(b + 52), sc3 = iq_u16h(b + 54);
+        const uint32_t scale_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+        const uint32_t ib16 = 2 * ib + il / 2;
+        const float d = iq_u16f(scale_u16) *
+                        (2.0f * (float) ((iq_u16h(b + 48 + 2 * (ib16 / 4)) >> (3 * (ib16 % 4))) & 7u) + 1.0f);
+        const uint32_t qh = b[32 + 2 * ib + il / 2];
+        const float delta = (qh & (0x08u << (4 * (il % 2)))) ? (-1.0f - 0.125f) : (-1.0f + 0.125f);
+        const uint32_t g = strata::vkport::kIq1sGrid[b[4 * ib + il] | (((qh >> (4 * (il % 2))) & 7u) << 8)];
+        const uint32_t q0 = g & 0x0F0F0F0Fu;
+        const uint32_t q1 = (g >> 4) & 0x0F0F0F0Fu;
+        for (int j = 0; j < 4; ++j) {
+            y[32 * ib + 8 * il + j]     = d * ((float) ((q0 >> (8 * j)) & 0xFu) + delta);
+            y[32 * ib + 8 * il + j + 4] = d * ((float) ((q1 >> (8 * j)) & 0xFu) + delta);
+        }
+    }
+    // any other type is refused by the host entry point before a dispatch (see the shader's header)
+}
+
+struct IqFmt { int ty; const char* name; uint32_t sb; };   // sb = bytes of one 256-value superblock
+static const IqFmt kIqFmts[] = {
+    {30, "BF16",    512}, {20, "IQ4_NL", 144}, {23, "IQ4_XS", 136}, {8, "Q8_0",   272},
+    {6,  "Q5_0",    176}, {7,  "Q5_1",   192}, {42, "Q2_0",    72}, {12, "Q4_K",  144},
+    {13, "Q5_K",    176}, {11, "Q3_K",   110}, {18, "IQ3_XXS", 98}, {21, "IQ3_S", 110},
+    {22, "IQ2_S",    82}, {29, "IQ1_M",   56},
+};
+
+static void iq_wf16(std::vector<uint8_t>& v, size_t off, float f) {
+    const uint16_t h = strata::kernels::f16_from_f32(f);
+    v[off] = (uint8_t) (h & 0xFF); v[off + 1] = (uint8_t) (h >> 8);
+}
+
+// A fixture with a KNOWN, FINITE scale in every place the format stores one: a random byte pattern would assemble
+// an inf or NaN fp16 scale and the case would measure that instead of the decode.  The pattern (and the scale)
+// vary with the superblock AND with `seed`, so a decode that read the wrong superblock or the wrong row lands on
+// a different value rather than on an equal one.
+static std::vector<uint8_t> iq_fixture(int ty, uint32_t n_sb, uint32_t sb, uint32_t seed) {
+    std::vector<uint8_t> v((size_t) n_sb * sb);
+    for (size_t k = 0; k < v.size(); ++k) v[k] = (uint8_t) ((k * 37 + seed * 101 + 13) & 0xFF);
+    for (uint32_t s = 0; s < n_sb; ++s) {
+        const size_t base = (size_t) s * sb;
+        const float sc = 0.02f + 0.003f * (float) seed + 0.001f * (float) s;
+        if (ty == 30) {                                    // BF16: force finite ~[0.5,1) (exp 0x7E), no inf/NaN
+            for (uint32_t k = 0; k + 1 < sb; k += 2) {
+                const uint16_t u = (uint16_t) (0x3F00u | ((iq_u16h(v.data() + base + k)) & 0x7Fu));
+                v[base + k] = (uint8_t) (u & 0xFF); v[base + k + 1] = (uint8_t) (u >> 8);
+            }
+        } else if (ty == 20) { for (int i = 0; i < 8; ++i) iq_wf16(v, base + (size_t) i * 18, sc * (1.0f + (float) i)); }
+        else if (ty == 6)    { for (int i = 0; i < 8; ++i) iq_wf16(v, base + (size_t) i * 22, sc * (1.0f + (float) i)); }
+        else if (ty == 8)    { for (int i = 0; i < 8; ++i) iq_wf16(v, base + (size_t) i * 34, sc * (1.0f + (float) i)); }
+        else if (ty == 42)   { for (int i = 0; i < 4; ++i) iq_wf16(v, base + (size_t) i * 18, sc * (1.0f + (float) i)); }
+        else if (ty == 7)    { for (int i = 0; i < 8; ++i) { iq_wf16(v, base + (size_t) i * 24, sc * (1.0f + (float) i)); iq_wf16(v, base + (size_t) i * 24 + 2, sc * 0.25f * (1.0f + (float) i)); } }
+        else if (ty == 12 || ty == 13) { iq_wf16(v, base, sc); iq_wf16(v, base + 2, sc * 0.25f); }
+        else if (ty == 11)   { iq_wf16(v, base + 108, sc); }
+        else if (ty == 18 || ty == 21 || ty == 22 || ty == 23) { iq_wf16(v, base, sc); }
+        else if (ty == 29) {                               // IQ1_M: the fp16 scale is the HIGH NIBBLE of bytes 49/51/53/55
+            const uint16_t V = strata::kernels::f16_from_f32(sc);
+            uint8_t* p = v.data() + base + 48;
+            p[1] = (uint8_t) ((p[1] & 0x0F) | ((V & 0xFu) << 4));
+            p[3] = (uint8_t) ((p[3] & 0x0F) | (((V >> 4) & 0xFu) << 4));
+            p[5] = (uint8_t) ((p[5] & 0x0F) | (((V >> 8) & 0xFu) << 4));
+            p[7] = (uint8_t) ((p[7] & 0x0F) | (((V >> 12) & 0xFu) << 4));
+        }
+    }
+    return v;
+}
+
+// One format arm of `iq_dequant_f32`.  Returns the number of elements outside tolerance (also counted into the
+// verdict), and prints the oracle's element 0 against the device's, its mass, and the bit-exact count.
+static void iq_dequant_arm(Ctx& ctx, const std::string& dir, const IqFmt& f, uint32_t n_sb,
+                           Buf& b_w, Buf& b_y, Buf& b_g1, Buf& b_g2, Buf& b_g3, Buf& b_g4) {
+    const std::vector<uint8_t> w = iq_fixture(f.ty, n_sb, f.sb, 0);
+    ctx.write(b_w, w.data(), w.size());
+    const size_t n = (size_t) n_sb * 256;
+    std::vector<float> want(n);
+    for (uint32_t s = 0; s < n_sb; ++s)
+        for (uint32_t tid = 0; tid < 32; ++tid) iq_dq_host(f.ty, w.data(), 0, s, tid, want.data() + (size_t) s * 256);
+    std::vector<uint8_t> sink(n * 4, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int ty; } pc{f.ty};
+    VkPipeline p = ctx.pipeline(dir + "/iq_dequant_f32.spv", 6, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_y}, &pc, sizeof(pc), n_sb);
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0, bits = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double wv = (double) want[i], gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        if (got[i] == want[i]) ++bits;
+        const double tol = 1e-5 * std::fabs(wv) + 1e-6;    // f32 vs a double oracle: ~1 ulp, plus an abs floor
+        const double ratio = std::fabs(gv - wv) / tol;
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(wv);
+    }
+    for (size_t i = n * 4; i < img.size(); ++i) if (img[i] != 0xC3) ++bad;   // nothing past the output count
+    char label[96];
+    std::snprintf(label, sizeof label, "iq_dequant_f32: %s", f.name);
+    std::printf("      %-8s sb=%u want[0]=%.6g got[0]=%.6g | bit-exact %d/%d | non-finite %d | oracle mass %.6g\n",
+                f.name, n_sb, (double) want[0], (double) got[0], bits, (int) n, nonfinite, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live && nonfinite == 0, bad, (int) n, worst, "elements outside tolerance (worst dev/tol)");
+}
+
+void case_iq_dequant_f32(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq_dequant_f32.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("iq_dequant_f32", "device lacks storageBuffer8BitAccess"); return; }
+    Buf b_w = ctx.alloc(2u << 20), b_y = ctx.alloc(2u << 20);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq1sGrid));
+    Buf b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
+    Buf b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    for (const IqFmt& f : kIqFmts) iq_dequant_arm(ctx, dir, f, 3, b_w, b_y, b_g1, b_g2, b_g3, b_g4);
+    ctx.free(b_w); ctx.free(b_y); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4);
+}
+
+// One arm of `iq_embed_rows`: a table of DISTINCT rows and a token list that is a DERANGEMENT, so a kernel that
+// gathered row `t` (the position) instead of row `tokens[t]` (the index) fails on every token.  The row STRIDE
+// (`row_bytes`) is what the engine passes, and the whole point of the gather: the oracle reads the same stride.
+static void iq_embed_arm(Ctx& ctx, const std::string& dir, const IqFmt& f, uint32_t n_embd, uint32_t n_tok,
+                         const std::vector<int32_t>& tokens, Buf& b_t, Buf& b_w, Buf& b_y,
+                         Buf& b_g1, Buf& b_g2, Buf& b_g3, Buf& b_g4) {
+    const uint32_t n_rows = 6;
+    const uint32_t n_sb_row = n_embd / 256;
+    const uint32_t row_bytes = n_sb_row * f.sb;
+    std::vector<uint8_t> table((size_t) n_rows * row_bytes);
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        const std::vector<uint8_t> row = iq_fixture(f.ty, n_sb_row, f.sb, 1 + r);
+        std::memcpy(table.data() + (size_t) r * row_bytes, row.data(), row.size());
+    }
+    ctx.write(b_w, table.data(), table.size());
+    ctx.write(b_t, tokens.data(), tokens.size() * 4);
+    const size_t n = (size_t) n_tok * n_embd;
+    std::vector<float> want(n);
+    for (uint32_t t = 0; t < n_tok; ++t)
+        for (uint32_t b = 0; b < n_sb_row; ++b)
+            for (uint32_t tid = 0; tid < 32; ++tid)
+                iq_dq_host(f.ty, table.data(), (size_t) tokens[t] * row_bytes, b, tid,
+                           want.data() + (size_t) t * n_embd + (size_t) b * 256);
+    std::vector<uint8_t> sink(n * 4, 0xC3);
+    ctx.write(b_y, sink.data(), sink.size());
+    struct { int ty; int n_embd; uint32_t row_bytes; } pc{f.ty, (int) n_embd, row_bytes};
+    VkPipeline p = ctx.pipeline(dir + "/iq_embed_rows.spv", 7, (int) sizeof(pc));
+    ctx.dispatch(p, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_t, &b_y}, &pc, sizeof(pc), n_sb_row, n_tok);
+    std::vector<uint8_t> img(sink.size(), 0);
+    ctx.read(b_y, img.data(), img.size());
+    const float* got = reinterpret_cast<const float*>(img.data());
+    int bad = 0, nonfinite = 0, bits = 0;
+    double worst = 0, mass = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double wv = (double) want[i], gv = (double) got[i];
+        if (!std::isfinite(gv)) ++nonfinite;
+        if (got[i] == want[i]) ++bits;
+        const double tol = 1e-5 * std::fabs(wv) + 1e-6;
+        const double ratio = std::fabs(gv - wv) / tol;
+        worst = std::max(worst, ratio);
+        if (!(ratio <= 1.0)) ++bad;
+        mass += std::fabs(wv);
+    }
+    char label[128];
+    std::snprintf(label, sizeof label, "iq_embed_rows: %s rows=%u tok=%u", f.name, n_rows, n_tok);
+    std::printf("      %-8s n_embd=%u row_bytes=%u tokens[0]=%d | bit-exact %d/%d | non-finite %d | mass %.6g\n",
+                f.name, n_embd, row_bytes, tokens[0], bits, (int) n, nonfinite, mass);
+    const bool live = mass > 1e-3;
+    if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
+    verdict(label, bad == 0 && live && nonfinite == 0, bad, (int) n, worst, "elements outside tolerance (worst dev/tol)");
+}
+
+void case_iq_embed_rows(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq_embed_rows.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("iq_embed_rows", "device lacks storageBuffer8BitAccess"); return; }
+    // token -> row: a DERANGEMENT (tokens[t] != t for every t) plus a repeat, so identity fails everywhere
+    const std::vector<int32_t> toks = {5, 0, 4, 1, 3, 2};
+    Buf b_w = ctx.alloc(4u << 20), b_y = ctx.alloc(1u << 20), b_t = ctx.alloc(64);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq1sGrid));
+    Buf b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
+    Buf b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    // one arm per covered format at one superblock per row, PLUS two wide-row arms (n_embd 512 = two superblocks)
+    // so the row STRIDE the caller passes is exercised, not assumed equal to the block bytes.
+    const int wide[] = {30, 22};
+    for (int ty : wide)
+        for (const IqFmt& f : kIqFmts)
+            if (f.ty == ty) { iq_embed_arm(ctx, dir, f, 512, 6, toks, b_t, b_w, b_y, b_g1, b_g2, b_g3, b_g4); break; }
+    for (const IqFmt& f : kIqFmts) iq_embed_arm(ctx, dir, f, 256, 6, toks, b_t, b_w, b_y, b_g1, b_g2, b_g3, b_g4);
+    ctx.free(b_w); ctx.free(b_y); ctx.free(b_t); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -9053,6 +9431,8 @@ int main(int argc, char** argv) {
     case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)
     case_gather_rows(ctx, dir);            // M-A: the MTP draft head's opaque-byte row gather
     case_scatter_rows_f32(ctx, dir);       // M-A: the peer experts' row write-back
+    case_iq_dequant_f32(ctx, dir);        // M-A: the standalone IQ/BF16 dequantiser (dq_dispatch)
+    case_iq_embed_rows(ctx, dir);         // M-A: the token-embedding row gather built on it
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

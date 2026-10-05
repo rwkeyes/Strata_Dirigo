@@ -1,0 +1,40 @@
+// ports/vulkan/shaders/iq_embed_rows.comp - the token-embedding gather: rows tokens[t] of a GGUF table,
+// dequantised to fp32.
+//
+// `iq_embed_rows` (src/kernels/cuda/iq_kernels.cu's `embed_rows_kernel`): a (n_embd/256) x n_tok grid of 32-lane
+// blocks; block (b, t) dequantises superblock b of row `tokens[t]` into out[t*n_embd + b*256 .. +255].  The table
+// row starts at `tokens[t] * row_bytes` - a STRIDE the caller passes, not n_embd's block bytes - which is the
+// whole reason the gather is its own kernel rather than a strided dequant.
+//
+// The decode is common/iq_dequant.glsl, the same one `iq_dequant_f32` uses; the ONLY difference here is where the
+// superblock's bytes start and where its 256 outputs go.
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer W    { uint8_t b[]; } w_b;   // the GGUF table bytes
+layout(set = 0, binding = 1, std430) readonly  buffer G1   { uint v[]; } iq1s_g;
+layout(set = 0, binding = 2, std430) readonly  buffer G2   { uint v[]; } iq2s_g;
+layout(set = 0, binding = 3, std430) readonly  buffer G3   { uint v[]; } iq3xxs_g;
+layout(set = 0, binding = 4, std430) readonly  buffer G4   { uint v[]; } iq3s_g;
+layout(set = 0, binding = 5, std430) readonly  buffer TOK  { int t[]; } TO_;
+layout(set = 0, binding = 6, std430) writeonly buffer OUT  { float y[]; } OU_;
+
+layout(push_constant) uniform Pc { int ty; int n_embd; uint row_bytes; } pc;
+
+#include "common/iq_dequant.glsl"
+
+void main() {
+    // 32-lane decode inside a 256-lane workgroup: the engine's embed_rows_kernel launches 32-thread blocks, and
+    // lanes 32..255 are idle so that thread mapping is preserved rather than re-derived.
+    if (gl_LocalInvocationID.x >= 32u) return;
+    const uint b = gl_WorkGroupID.x;                      // which 256-value superblock of the row
+    const uint tok = uint(TO_.t[gl_WorkGroupID.y]);       // the token whose row this block reads
+    // 64-bit row arithmetic, 32-bit index - the engine's `table + (size_t)tokens[t]*row_bytes`.
+    const uint row = uint(uint64_t(tok) * uint64_t(pc.row_bytes));
+    iq_dq_256(pc.ty, row, b, gl_LocalInvocationID.x,
+              uint(gl_WorkGroupID.y) * uint(pc.n_embd) + b * 256u);
+}

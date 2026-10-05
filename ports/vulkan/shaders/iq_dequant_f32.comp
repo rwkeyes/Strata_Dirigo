@@ -1,0 +1,32 @@
+// ports/vulkan/shaders/iq_dequant_f32.comp - the STANDALONE I-quant / BF16 dequantiser, flat.
+//
+// `dq_dispatch<float>` through `dequant_flat_kernel<float>` (src/kernels/cuda/iq_kernels.cu): one 32-lane block
+// per 256-value superblock, superblock i -> dst[i*256 .. i*256+255].  That is the engine's `iq_dequant_f32`
+// (n a multiple of 256) - the primitive `iq_embed_rows` is built on, and the dequantiser the prompt path's
+// `Gemm::native` needs.
+//
+// The decode itself is in common/iq_dequant.glsl, where the object model is the engine's own thread mapping.
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer W   { uint8_t b[]; } w_b;   // the raw blocks
+layout(set = 0, binding = 1, std430) readonly  buffer G1  { uint v[]; } iq1s_g;   // IQ1_S grid (IQ1_M)
+layout(set = 0, binding = 2, std430) readonly  buffer G2  { uint v[]; } iq2s_g;   // IQ2_S grid
+layout(set = 0, binding = 3, std430) readonly  buffer G3  { uint v[]; } iq3xxs_g; // IQ3_XXS grid
+layout(set = 0, binding = 4, std430) readonly  buffer G4  { uint v[]; } iq3s_g;   // IQ3_S grid
+layout(set = 0, binding = 5, std430) writeonly buffer OUT { float y[]; } OU_;
+
+layout(push_constant) uniform Pc { int ty; } pc;
+
+#include "common/iq_dequant.glsl"
+
+void main() {
+    // The engine decodes a 256-value superblock with 32 threads (dq_dispatch's `tid`); lanes 32..255 are idle so
+    // the decoder's own thread mapping is preserved verbatim rather than re-derived element by element.
+    if (gl_LocalInvocationID.x >= 32u) return;
+    const uint i = gl_WorkGroupID.x;
+    iq_dq_256(pc.ty, 0u, i, gl_LocalInvocationID.x, i * 256u);
+}
