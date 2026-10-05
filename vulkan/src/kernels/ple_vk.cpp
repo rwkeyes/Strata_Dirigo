@@ -23,6 +23,20 @@
 // `native_router_top10` (the router's native member) is already wired in qsa_vk.cpp; `native_moe_combine` is
 // the DEFAULT combine because `native_moe_combine_enabled()` answers true (native_caps_vk.cpp).
 //
+// THE FOUR MORE (this batch) - the MoE / GR / PLE tail that still had no definition, in call-site order:
+//
+//   7. `shared_expert_scratch_bytes`  layer.cpp:347   `host`  the MoE workspace size (moe_buffers_init)
+//   8. `fused_gr_supported`           layer.cpp:1189  `host`  the GR geometry predicate (short-circuited off,
+//                                                             but layer.cpp references it, so it must LINK)
+//   9. `moe_combine`                  layer.cpp:464   kernel  -> moe_combine_f32.spv (the LEGACY combine)
+//  10. `ngram_rows`                   layer.cpp:1293  `host`  the PLE hash (src/kernels/ngram.cpp on CUDA)
+//
+// `shared_expert` ITSELF IS NOT WIRED AND CANNOT BE, and that is a FINDING rather than an omission: its
+// CANONICAL (non-native) path (`shared_expert.cu:242-361`) dispatches `s_gemv_q8_0_split` / `s_gemv_q8k_split`
+// for the K-quant gate/up and the legacy Q8_0-activation down projection, and NEITHER has a shader in this
+// tree.  Wiring it would need those two shaders PORTED - a shader job, not a wrapper job.  Only its
+// free workspace SIZE is answerable here, so that is what this TU answers.
+//
 // ============================================================================================================
 // THE WIRING PATTERN (the plan's §2, not an invention)
 // ============================================================================================================
@@ -57,6 +71,8 @@
 #include "strata/kernels/ngram.hpp"          // NG_N_EMBD / NG_HC / NG_HC_DIM / NG_HIST / PLE_CONV_KERNEL / NGRAM_SIZE
 #include "strata/kernels/router_top10.hpp"   // router_top10
 #include "strata/kernels/native_moe.hpp"     // native_moe_combine
+#include "strata/kernels/shared_expert.hpp"  // shared_expert_scratch_bytes / moe_combine (the MoE block)
+#include "strata/kernels/fused_gr.hpp"       // fused_gr_supported (the GR geometry predicate)
 #include "strata/kernels/quantize_act.hpp"   // quantize_q8_0 (the PLE key's activation image)
 #include "strata/kernels/bf16_gemv.hpp"      // bf16_gemv / bf16_gemv_fp32_mmvf (the PLE projections)
 #include "strata/kernels/s2_gemv_q8.hpp"     // s2_gemv_q8 (the PLE key projection)
@@ -368,6 +384,32 @@ static void native_moe_combine_impl(Stream& s, const float* parts, const float* 
     s.ctx->dispatch(p, {&pv, &wv, &sv, &ov}, &pc, sizeof(pc), groups_for((uint64_t) n_embd));
 }
 
+// `moe_combine` -> moe_combine_f32.spv (PARTS ro, W ro, S ro, Y rw; push {n_embd, k, has_shared}).  THE
+// LEGACY combine - the `native_moe_combine_enabled() == false` branch of `moe_combine_parts`
+// (`layer.cpp:464`).  The port answers that flag TRUE, so this member is OFF the selected path, but the
+// symbol is reached by the layer body's own source and must LINK.  f32, Kahan/fma accumulation
+// (`moe_combine_f32.comp`), one thread per output element; `shared == nullptr` binds the sentinel with
+// has_shared=0 (a Vulkan descriptor cannot be null).  The shared row is ADDED PLAIN - the port's rule.
+static void moe_combine_impl(Stream& s, const float* parts, const float* weights, const float* shared,
+                             float* y, int64_t n_embd, int64_t k) {
+    if (n_embd <= 0 || k <= 0) return;
+    if (!parts || !weights || !y) refuse("moe_combine", "a required pointer is null");
+    if (k > 64) refuse("moe_combine", "k > 64 (the engine refuses rather than truncating)");
+    Buf pv{}, wv{}, sv{}, yv{};
+    if (!arena_resolve(s, parts, (uint64_t) k * (uint64_t) n_embd * 4, pv) ||
+        !arena_resolve(s, weights, (uint64_t) k * 4, wv) || !arena_resolve(s, y, (uint64_t) n_embd * 4, yv))
+        refuse("moe_combine", "a pointer is not inside this stream's arena");
+    if (shared != nullptr) {
+        if (!arena_resolve(s, shared, (uint64_t) n_embd * 4, sv))
+            refuse("moe_combine", "the shared pointer is not inside this stream's arena");
+    } else {
+        sv = dummy_buf(s);
+    }
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/moe_combine_f32.spv", 4, 12);
+    struct { int32_t n_embd, k, has_shared; } pc{(int32_t) n_embd, (int32_t) k, shared ? 1 : 0};
+    s.ctx->dispatch(p, {&pv, &wv, &sv, &yv}, &pc, sizeof(pc), groups_for((uint64_t) n_embd));
+}
+
 }  // namespace strata::vulkan
 
 // ---- the engine's entry points: the symbols include/strata/kernels/*.hpp declare --------------------------
@@ -486,6 +528,72 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
                         int64_t n_embd, int64_t k, void* stream) {
     strata::vulkan::native_moe_combine_impl(*need_stream("native_moe_combine", stream), parts, weights, shared,
                                             output, n_embd, k);
+}
+
+// shared_expert.hpp: `uint64_t shared_expert_scratch_bytes(int64_t n_ff);`  (a `host` row: `moe_buffers_init`,
+//     `layer.cpp:347`).  Transcribed from `shared_expert.cu:234`: gate(n_ff f32) | up(n_ff f32) |
+//     q8_0(n_ff/32*34) | q8k(n_ff/256*292) | g(1 f32), each 16-byte aligned, plus 32 bytes of tail.
+//     **THE `qk` REGION IS SIZED ON `n_ff/256*292` AND IS ZERO FOR THE ARTIFACT'S DOWN WIDTH (640 < 256*2),
+//     WHICH IS NOT A BUG** - the header argues Q8_K is structurally impossible for 640; the CUDA sizes it
+//     the same way.  The rival reading (size it on Q8_0 for every projection) changes the answer for the
+//     gate/up widths, which the case pins.
+uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
+    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~(uint64_t) 15;
+    const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~(uint64_t) 15;
+    const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~(uint64_t) 15;
+    return a * 2 + q0 + qk + 32;
+}
+
+// shared_expert.hpp: `void moe_combine(const float* parts, const float* weights, const float* shared,
+//     float* y, int64_t n_embd, int64_t k, void* stream);`  (layer.cpp:464, the LEGACY combine; the port's
+//     `native_moe_combine_enabled()` answers true so the engine takes the native member, but the source row
+//     still has to link).
+void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
+                 int64_t k, void* stream) {
+    strata::vulkan::moe_combine_impl(*need_stream("moe_combine", stream), parts, weights, shared, y, n_embd, k);
+}
+
+// fused_gr.hpp: `bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);`  (a `host` row:
+//     `block_layer_pre`/`block_layer_post`, `layer.cpp:1189`/`:1328`).  Transcribed from `fused_gr.cu:1164`:
+//     a pure GEOMETRY predicate (N=2560, HC=4, LR=320), NOT a capability answer - a backend cannot return
+//     false without lying about the geometry.  It is SHORT-CIRCUITED off on this port (`g_fused_gr` is
+//     forced false by the GR contract, and `&&` evaluates left to right), so it is never CALLED at runtime;
+//     it must still LINK, and the case pins the predicate itself.
+bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
+    return n_embd == 2560 && hc == 4 && hc_lr == 320;
+}
+
+// ngram.hpp: `void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c,
+//     uint32_t* out);`  (a `host` row: `ple_issue_token`, `layer.cpp:1293`).  THE PLE HASH - pure host, no
+//     shader; on a CUDA build `src/kernels/ngram.cpp` (a HOST TU) defines it, and a Vulkan build compiles no
+//     `src/` TU, so it is transcribed here verbatim.  The four silent-plausible rivals are named in
+//     `ngram.hpp`: XOR not sum, `% vocab` not `& (vocab-1)`, the EOS cut FORWARD, and `prev` read NEWEST
+//     first.  `ngram_rows_entry` gives each its own observable.
+static uint64_t ngram_mixed_local(const int64_t* ctx, const uint64_t* mult, int n) {
+    uint64_t mixed = (uint64_t) ctx[0] * mult[0];
+    for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * mult[j];
+    return mixed;
+}
+void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c, uint32_t* out) {
+    const int n_prev = NGRAM_SIZE - 1;
+    for (int i = 0; i < n_tokens; ++i) {
+        int64_t ctx[NGRAM_SIZE];
+        ctx[0] = tokens[i];
+        bool cut = false;
+        for (int s = 1; s < NGRAM_SIZE; ++s) {
+            const int32_t t = cut ? TOKEN_NULL : prev[i * n_prev + (n_prev - s)];
+            cut = cut || t < 0 || t == PLE_EOS_TOKEN_ID;
+            ctx[s] = cut ? PLE_EOS_TOKEN_ID : t;
+        }
+        for (int n = 2; n <= NGRAM_SIZE; ++n) {
+            const uint64_t mixed = ngram_mixed_local(ctx, c.mult, n);
+            const int base = (n - 2) * HEADS_PER_NGRAM;
+            for (int g = 0; g < HEADS_PER_NGRAM; ++g) {
+                const int h = base + g;
+                out[i * PLE_N_HEADS + h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
+            }
+        }
+    }
 }
 
 }  // namespace strata::kernels

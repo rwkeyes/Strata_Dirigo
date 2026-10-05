@@ -1,5 +1,105 @@
 # Start here next session
 
+## THE MoE / QSA / GR / PLE TAIL — six more entry points, TWO CLASSIFICATION FINDINGS, and how far M-B is from a LINK (2026-10-05, `vega`)
+
+**THE BAR (the running line): `75 → 64` undefined references / `25 → 19` distinct full-signature
+`strata::kernels::` symbols / `23 → 17` under the parent's name-only pattern.**  The attention / QSA / MoE / GR /
+PLE / rope group falls **17 → 12**; matvec/GEMV/KV is unchanged at 6 and `other` falls **2 → 1** (glue 0, GDN
+mixer 0).  Measured with the CURRENT STANDARD recipe (`$HOME/vkbuild-vulkan` is a **Makefiles** build dir, so
+**never pass `-G Ninja`**; reconfigured + rebuilt from the current tree first):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 64   (was 75)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 19   (was 25)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 17   (was 23)
+
+**THE GROUP TABLE (the remaining 19 distinct full-signature symbols).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue** | **0** | all answered |
+| **matvec / GEMV / KV** | **6** | `bf16_gemv_fp32_mmvf_cols`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve` |
+| **attention / QSA / MoE / GR / PLE / rope** | **12** | `build_rope_table`, `rope_table_set`, `fused_gr_read`, `shared_expert`, `native_flash_attn_short_step`, `native_qsa_indexer_append`, `qsa_attend_step`, `qsa_index_step`, `topk_512_step`, `PleTable::{collect,is_open,issue}` |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **1** | `copy_i32_from_mapped` |
+
+**HOW FAR M-B IS FROM A LINK — THE NUMBER THE BRIEF ASKS FOR.**  **19 symbols remain; 8 are WRAPPABLE and 11
+have NO SHADER in this tree.**  Exhausting the wrappable set lands on 11 symbols whose only remaining work is
+**SHADERS PORTED, not wrappers written** — a different work shape.  The 8 wrappable: `bf16_gemv_fp32_mmvf_cols`
+(shader exists — verifier-only), `build_rope_table`, `rope_table_set`, `copy_i32_from_mapped`,
+`PleTable::{collect,is_open,issue}` (pure host) and **`shared_expert` — PARTIALLY**: its canonical path needs
+`s_gemv_q8_0_split`/`s_gemv_q8k_split`, two of the no-shader eleven.  The 11 no-shader: `qsa_attend_step`,
+`qsa_index_step`, `topk_512_step`, `native_qsa_indexer_append`, `native_flash_attn_short_step`,
+`s_gemv_q8_0_split`, `s_gemv_q8k_split`, `fused_gr_read`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve`.
+
+**THE SIX, IN THE ORDER THE ENGINE'S OWN BODY REACHES THEM** (SOURCE order of the call sites; within a
+native/legacy pair the branches are alternatives):
+
+| # | symbol | call site | kind | shader(s) | TU |
+|---|---|---|---|---|---|
+| 1 | `qsa_step_fill` | layer.cpp:908 | PURE HOST | — (writes HOST memory) | qsa_vk.cpp |
+| 2 | `indexer_key_append` | layer.cpp:948 | kernel | indexer_key_append.spv | qsa_vk.cpp |
+| 3 | `fused_gr_supported` | layer.cpp:1189/:1328 | PURE HOST | — (a geometry predicate) | ple_vk.cpp |
+| 4 | `shared_expert_scratch_bytes` | layer.cpp:347 | PURE HOST | — (a size) | ple_vk.cpp |
+| 5 | `moe_combine` | layer.cpp:464 | kernel | moe_combine_f32.spv | ple_vk.cpp |
+| 6 | `ngram_rows` | layer.cpp:1293 | PURE HOST | — (the PLE hash) | ple_vk.cpp |
+
+Engine headers unchanged.  Each proved by a new `case_*_entry`, `EnginePin`-pinned where it opens its own
+stream.  Raw lines (vega, `intel_icd`/Arc B70):
+
+| # | symbol | wrapper == shader path (bitwise) | wrapper vs the oracle |
+|---|---|---|---|
+| 1 | `qsa_step_fill` | — (no shader) | 32/32 int32 + three rivals MOVE (ceil `n_bid` / unclamped `width` / `n_bid` on `pos`) |
+| 2 | `indexer_key_append` | **640/640 + spare, w 0** | 256/256, worst 0.0655 (terms/mean bound); margins 0.530 / 0.082 |
+| 3 | `fused_gr_supported` | — | 6/6 geometries (5 false arms falsify "always true") |
+| 4 | `shared_expert_scratch_bytes` | — | 7/7 widths + two rivals MOVE (Q8_K sized as Q8_0 / no alignment) |
+| 5 | `moe_combine` | **2560 + 2560 + 37, w 0** | w 0.078 / 0 / 0.0588 (terms bound); shared-router-weighted rival MOVE |
+| 6 | `ngram_rows` | — | 304/304 **vs the EXTERNAL `ref/ngram.py` vectors**; 4 rivals MOVE on 5–6 of 6 cases |
+
+**FINDING 1 — `qsa_step_fill` IS NOT A NO-SHADER ROW.**  The brief listed it with the shader-port work; its
+signature is `void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes&)` and `qsa.cu:699` writes
+HOST memory.  It needs no shader and never did.  (PORT-MAP has always kinded it `host`.)  Wired and proved.
+
+**FINDING 2 — `indexer_key_append` WAS RECORDED "LANDED" WITHOUT A DEFINITION.**  `plan/DECODE-PATH-TRIAGE.md`
+carries it as "LANDED 2026-10-05" in the class-A table; the shader (`indexer_key_append.spv`) and a SHADER case
+exist, but no `strata::kernels::indexer_key_append` wrapper did — so the layer link showed it undefined.  The
+same defect shape as the QSA norm-weight-indexing bug: **an assertion of "ported" that checked a shader existed
+and not that a definition did.**  Written here, proved by `case_indexer_key_append_entry`.
+
+**A MAP MIS-KIND FOUND (reported, map left byte-identical).**  PORT-MAP kinds `kv_ring_table`,
+`kv_stream_reset` and `kv_stream_resolve` as `host`, but `src/kernels/cuda/kv_stream.cu` LAUNCHES kernels
+(`reset_kernel<<<128,256>>>` :199, `ring_kernel<<<64,256>>>` :226, `resolve_kernel` + `copy_kernel` :204-222).
+They are DEVICE ops with no shader here — the same family as the `gr_read`/`fused_gr_read` mis-kind the triage
+settled.  They are therefore counted in the 11 no-shader, not the 8 wrappable.
+
+**THE DISCIPLINES.**  Every oracle is the engine's OWN rule (a `.cu` body), except `ngram_rows`' which is the
+EXTERNAL generated vector file — so a shader/oracle SHARED mistake cannot pass, and each rival reading gets its
+own observable and a host-side margin proving it MOVES (or, where genuinely indistinguishable, is stated: the
+`moe_combine` k=1 "first term as a sum" rival is `0.0f + x == x` and is stated, not asserted — carried over from
+the native member's case).  The latent-defect class (a parameter used as something it does not mean; an
+in-place kernel where the CUDA writes a separate destination; an element-size mismatch between the engine's
+layout and the port's shader) was checked against all six; none of the three shapes occurs in them (the two
+kernels' regions are f32 in both the engine and the shader).
+
+**RESULTS (vega).**  Gate: Arc (`intel_icd`) **655/0/0**, llvmpipe **643/0/3** — **+28 verdicts per arm**, 0
+failed.  Ryzen iGPU (`radeon_icd`): **645/1/2, 644/2/2, 645/1/2** across three runs — the documented
+intermittent `budget` flake and the open non-deterministic wrong-value defect, this session seen in
+**`bf16_gemv entry n_in=2560 n_out=128` (1 of 512)** and **`fused_gdn_ab h_v=48 n=2560` (1 of 96)** — neither
+is one of this batch's cases.  **New datum on the record:** the intermittent defect has now appeared in a THIRD
+kernel (`fused_gdn_ab`), as well as `bf16_gemv`/`bf16_gemv_split` and `ple_block (key)` — the device/driver
+characterisation stands.  `check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo; 112 shaders built, 93
+claimed`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  `strata_vk_entry_smoke` builds +
+runs PASS.  **`z820b` is PENDING** (suspended, no WoL — no XTX/K620 number is claimed).  The CUDA graph API was
+NOT touched.
+
 ## THE PLE / GR SHARED STAGES + THE MoE ROUTING ROWS — the next six entry points, and a WORKSPACE-LAYOUT DEFECT FOUND AND FIXED (2026-10-05, `vega`)
 
 **THE BAR (the running line): `91 → 75` undefined references / `33 → 25` distinct full-signature `strata::kernels::`

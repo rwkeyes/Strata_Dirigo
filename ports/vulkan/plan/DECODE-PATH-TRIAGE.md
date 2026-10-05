@@ -671,3 +671,27 @@ CONTRACT**, and the wrong PORT-MAP pairing (`attn_decode_short`) is what made th
 `kernel` row's named shader must be the kernel the symbol's own header describes, not merely a shader whose file
 name is `*attn*`.
 
+
+# THREE MORE CORRECTIONS — the MoE/QSA/GR/PLE tail batch (2026-10-05)
+
+Recorded here, in the same spirit as the `qsa_decode_attn_step` correction above: each is a label that was
+true of a SHADER or a PLAN and false of the CODE.
+
+1. **`indexer_key_append` was "LANDED" without a definition.**  The class-A implementations table above lists it
+   "LANDED 2026-10-05".  The shader (`ports/vulkan/shaders/indexer_key_append.comp`) and the shader case
+   (`case_indexer_key_append`) did land; no `strata::kernels::indexer_key_append` wrapper existed in this tree,
+   so `layer.cpp:948` was still an undefined reference.  Written in `vulkan/src/kernels/qsa_vk.cpp` and proved by
+   `case_indexer_key_append_entry` this batch.  **The lesson is the same one the `qsa_decode_attn_step`
+   correction states: "ported" is a claim about the SYMBOL the layer links against, not about a shader or a
+   plan row.**
+
+2. **`qsa_step_fill` is a `host` row, not a no-shader device op.**  It is in the batch brief's "NO SHADER"
+   list, but its own signature is `void qsa_step_fill(int32_t* host_step, ...)` (`qsa.hpp:173`) and `qsa.cu:699`
+   writes host memory — it never needed a shader.  PORT-MAP has always kinded it `host`.  Now defined.
+
+3. **`kv_ring_table` / `kv_stream_reset` / `kv_stream_resolve` are DEVICE ops mis-kinded `host`.**  PORT-MAP
+   calls them "ring bookkeeping" / "the expert file tier: bookkeeping / whether a row is resident", but
+   `src/kernels/cuda/kv_stream.cu` LAUNCHES `reset_kernel<<<128,256>>>` (:199), `ring_kernel<<<64,256>>>`
+   (:226), and `resolve_kernel` + `copy_kernel` (:204-222).  They have no shader in this tree.  The map row is
+   left byte-identical (a kind-table change, like the `gr_read`/`fused_gr_read` one, is a separate fix), but
+   they are counted with the NO-SHADER set in `NEXT.md`'s bar, not with the wrappable host rows.

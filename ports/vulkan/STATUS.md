@@ -1,5 +1,66 @@
 # Status — what is done, what is verified, what is not
 
+## THE MoE / QSA / GR / PLE TAIL — six more entry points, and TWO CLASSIFICATION FINDINGS (2026-10-05, `vega`)
+
+**THE BAR MOVED `75 → 64` raw / `25 → 19` full-signature / `23 → 17` name-only.**  The six, in the order the
+engine's own body reaches them, wired across `vulkan/src/kernels/qsa_vk.cpp` (two) and `ple_vk.cpp` (four),
+engine headers unchanged, each proved by a new `case_*_entry` (raw lines below):
+
+| # | symbol | call site | kind | proof: wrapper == shader path (bitwise) | wrapper vs the oracle |
+|---|---|---|---|---|---|
+| 1 | `qsa_step_fill` | layer.cpp:908 | PURE HOST | — (no shader) | 32/32 int32 vs the `qsa.cu:699` rule; 3 rivals MOVE |
+| 2 | `indexer_key_append` | layer.cpp:948 | kernel | 640/640 + spare key, w 0 | 256/256, worst 0.0655 of the terms/mean bound |
+| 3 | `fused_gr_supported` | layer.cpp:1189/:1328 | PURE HOST | — | 6/6 geometries vs `fused_gr.cu:1164` |
+| 4 | `shared_expert_scratch_bytes` | layer.cpp:347 | PURE HOST | — | 7/7 widths vs `shared_expert.cu:234`; 2 rivals MOVE |
+| 5 | `moe_combine` | layer.cpp:464 | kernel | 2560+2560+37, w 0 | w 0.078 / 0 / 0.0588 (terms bound) |
+| 6 | `ngram_rows` | layer.cpp:1293 | PURE HOST | — | 304/304 **vs the EXTERNAL `ref/ngram.py` vectors** |
+
+**FINDING 1 — the parent's no-shader list is wrong for one symbol.**  `qsa_step_fill` takes an
+`int32_t* host_step` and writes HOST memory (`qsa.cu:699`); it has no shader because it needs none.  Wiring it
+is a wrapper job, and it was still undefined in this tree.  (PORT-MAP has always called it `host`.)
+
+**FINDING 2 — `indexer_key_append` was recorded "LANDED" but had NO DEFINITION here.**  The class-A triage
+table (`plan/DECODE-PATH-TRIAGE.md`) says "LANDED 2026-10-05"; the shader and a shader case exist, but the
+`strata::kernels::indexer_key_append` wrapper did not — so the layer link still showed it undefined.  This is
+the same shape as the norm-weight-indexing defect: **a symbol asserted ported without checking that a
+definition existed for its CONTRACT.**  Now written and proved.
+
+**THE DISCIPLINES.**  (a) *A shader/oracle shared mistake must not pass.*  `ngram_rows`' oracle is
+`ple_oracle_vectors.inc`, GENERATED from `ref/ngram.py` — not from this engine — so a mistake shared between
+the transcription and a transcription-built oracle cannot pass; the four named rivals (XOR→sum, `%vocab`→mask,
+`prev` reversed, the EOS cut applied AFTER the store) each MOVE on 5–6 of the 6 external cases.  Every other
+oracle is the engine's OWN rule (the `.cu` body), and each rival has a host-side margin proving it MOVES:
+`indexer_key_append` norm-before-pool **5.30e-01** / rotate-at-last **8.22e-02**; `moe_combine`'s shared
+ROUTER-WEIGHTED rival; `qsa_step_fill`'s ceil-`n_bid` / unclamped-width / `n_bid`-on-`pos`.
+(b) *The latent-defect class.*  Checked the six against the three named shapes: no parameter used as something
+it does not mean (each wrapper carries the CUDA's own argument contract); no in-place kernel called where the
+CUDA writes a separate destination (`moe_combine`/`indexer_key_append` are both correct as written); no
+element-size mismatch (the two kernels' regions are f32, matching their shaders).  ONE mis-kind was found in
+the map, reported below.
+
+**REPORTED, NOT STUBBED — the remaining 19, and the point M-B is stuck at.**
+**`N = 19` symbols remain; **`8` are WRAPPABLE** and **`11` have NO SHADER in this tree** (a shader-port job,
+not a wrapper job).**  The 8: `bf16_gemv_fp32_mmvf_cols` (shader exists, verifier-only), `build_rope_table`,
+`rope_table_set`, `copy_i32_from_mapped`, `PleTable::{collect,is_open,issue}` (all pure host) and **`shared_expert`
+— PARTIALLY**: its CANONICAL path dispatches `s_gemv_q8_0_split` / `s_gemv_q8k_split` for the K-quant gate/up
+and the legacy Q8_0-activation down projection, and NEITHER has a shader, so those two no-shader symbols block
+it.  The 11 no-shader: `qsa_attend_step`, `qsa_index_step`, `topk_512_step`, `native_qsa_indexer_append`,
+`native_flash_attn_short_step` (all PORT-MAP `todo`), `s_gemv_q8_0_split` / `s_gemv_q8k_split` (todo),
+`fused_gr_read` (contract-removed) and **`kv_ring_table` / `kv_stream_reset` / `kv_stream_resolve` — which
+PORT-MAP kinds `host` but `kv_stream.cu` LAUNCHES (`reset_kernel<<<128,256>>>`, `ring_kernel<<<64,256>>>`,
+`resolve_kernel`/`copy_kernel`)**: a mis-kind of the same family as `gr_read`/`fused_gr_read`, left in the map
+(byte-identical) and reported here.
+
+**RESULTS (vega).**  Gate: Arc (`intel_icd`) **655/0/0**, llvmpipe **643/0/3** (+28 verdicts per arm, 0 failed).
+Ryzen iGPU (`radeon_icd`): 645/1/2, 644/2/2, 645/1/2 across three runs — the documented intermittent
+`budget` flake and the open wrong-value defect, now seen in **`bf16_gemv entry n_in=2560 n_out=128` (1 of 512
+elements) and `fused_gdn_ab h_v=48 n=2560` (1 of 96)** — **neither is one of this batch's cases.**  On the
+record as the brief asked: the intermittent defect has now appeared in a THIRD kernel (`fused_gdn_ab`) as well
+as `bf16_gemv`/`bf16_gemv_split` and `ple_block`, so it is device/driver-level, not one kernel's bug.
+`check_port_map.py` passes (`168 — 78 kernel, 61 host, 29 todo; 112 shaders built, 93 claimed`);
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  `strata_vk_entry_smoke` builds + runs PASS.
+**`z820b` PENDING** (suspended, no WoL — no XTX/K620 number is claimed).  The CUDA graph API was NOT touched.
+
 ## THE PLE / GR SHARED STAGES + THE MoE ROUTING ROWS — the next six entry points, and a WORKSPACE-LAYOUT DEFECT FIXED (2026-10-05, `vega`)
 
 **The GR pair is the SHARED stage (every layer, 48 of 48); the PLE stage is layer-1; the two MoE rows complete the

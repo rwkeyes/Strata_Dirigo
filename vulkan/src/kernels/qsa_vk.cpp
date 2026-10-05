@@ -34,6 +34,12 @@
 // default false); `qsa_index_step`, `topk_512_step`, `qsa_attend_step` and `native_qsa_indexer_append` are
 // PORT-MAP `todo` (no shader either).
 //
+// THE TENTH AND ELEVENTH (this batch): `qsa_step_fill` (:908, PURE HOST - the four derived per-token counts)
+// and `indexer_key_append` (:948, the LEGACY indexer member, `indexer_key_append.spv`).  Both are reached by
+// `qsa_layer`'s own body, in that order; both were STILL UNDEFINED in this tree before this batch (the
+// class-A triage recorded `indexer_key_append` "LANDED" against a shader THIS tree had but a wrapper it did
+// not).  Neither is a no-shader row: one needs no shader (host), one has had one.
+//
 // ============================================================================================================
 // THE WIRING PATTERN (the plan's §2, not an invention)
 // ============================================================================================================
@@ -388,6 +394,43 @@ void qsa_decode_attn(Stream& s, const float* q, const strata::kernels::QsaAttnPo
                     (uint32_t) nh);
 }
 
+// `indexer_key_append` -> indexer_key_append.spv (RAW ro, POS ro, WK ro, TAIL rw, DEAD rw, POOLED rw,
+// BPOS rw, COS ro, SIN ro; push {idx_dim, r, n_rot, pos_base, eps}).  ONE CELL per dispatch: the tail is a
+// ring and the spare pooled row MOVES (`n_bid = pos/r`), so a caller drives one call per token exactly as
+// `qsa_layer` does (`layer.cpp:948`).  The engine's own `pos_dev` is a DEVICE pointer, so the wrapper reads
+// nothing back - the shader derives the slot from device memory, which is what keeps this capturable.
+//
+// THE POOLED/COS/SIN EXTENTS ARE THE CALLER'S, NOT THE WRAPPER'S.  The row the shader writes is `pos/r`, a
+// DEVICE quantity the host cannot see, and the cos/sin table is `st.cos_tab` over `st.max_cells` - so the
+// live-range check here names the smallest extent that is certainly inside the region (`idx_dim` for the
+// pooled row, `n_rot/2` for one rotation row).  That is the same contract the CUDA has: the caller sized
+// the state for `max_cells` and the arena is one buffer, so the check is a pointer-in-arena test, not a
+// size assertion.  A wrap or a missing completion rotation would be an out-of-range write the caller sized
+// for; the gate's `case_indexer_key_append_entry` pins the values and the completion rule instead.
+static void indexer_key_append_impl(Stream& s, const float* raw, const int32_t* pos_dev, int32_t pos_base,
+                                    const float* w_k_norm, float eps, const strata::kernels::QsaIndexerBuffers& b,
+                                    const strata::kernels::QsaShapes& sh, const float* cos_tab, const float* sin_tab) {
+    const int64_t idx_dim = sh.idx_dim, r = sh.idx_block, n_rot = sh.n_rot;
+    if (idx_dim <= 0 || r <= 0 || n_rot <= 0) return;
+    if (!raw || !pos_dev || !w_k_norm || !b.tail || !b.dead || !b.pooled || !b.block_pos || !cos_tab || !sin_tab)
+        refuse("indexer_key_append", "a required pointer is null");
+    Buf rawv{}, posv{}, wv{}, tailv{}, deadv{}, poolv{}, bpv{}, ctv{}, stv{};
+    if (!arena_resolve(s, raw, (uint64_t) idx_dim * 4, rawv) ||
+        !arena_resolve(s, pos_dev, 4, posv) ||
+        !arena_resolve(s, w_k_norm, (uint64_t) idx_dim * 4, wv) ||
+        !arena_resolve(s, b.tail, (uint64_t) (r - 1) * idx_dim * 4, tailv) ||
+        !arena_resolve(s, b.dead, (uint64_t) idx_dim * 4, deadv) ||
+        !arena_resolve(s, b.pooled, (uint64_t) idx_dim * 4, poolv) ||
+        !arena_resolve(s, b.block_pos, 4, bpv) ||
+        !arena_resolve(s, cos_tab, (uint64_t) (n_rot / 2) * 4, ctv) ||
+        !arena_resolve(s, sin_tab, (uint64_t) (n_rot / 2) * 4, stv))
+        refuse("indexer_key_append", "a pointer is not inside this stream's arena");
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/indexer_key_append.spv", 9, 20);
+    struct { int32_t idx_dim, r, n_rot, pos_base; float eps; } pc{(int32_t) idx_dim, (int32_t) r,
+                                                                 (int32_t) n_rot, pos_base, eps};
+    s.ctx->dispatch(p, {&rawv, &posv, &wv, &tailv, &deadv, &poolv, &bpv, &ctv, &stv}, &pc, sizeof(pc), 1u);
+}
+
 }  // namespace strata::vulkan
 
 // ---- the engine's entry points: the symbols include/strata/kernels/*.hpp declare --------------------------
@@ -479,6 +522,40 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
     const int64_t chunks = (cap + 63) / 64;
     return (uint64_t) chunks * (uint64_t) s.n_head * (uint64_t) (256 + 2) + 64;
+}
+
+// qsa.hpp: `void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s);`  (layer.cpp:908).  IT IS
+// A PURE HOST ROW, NOT A DEVICE OP - `host_step` is host memory and there is no shader for it in this tree,
+// and none is needed: it writes the four DERIVED per-token counts from one position, which is the point of
+// the buffer (`n_kv`, `n_bid` and `width` must not be computed twice, differently).  Transcribed from
+// `qsa.cu:699`.  The parent tier's no-shader list named this symbol; that list is WRONG for it and this is
+// the correction - the one thing it shares with a no-shader row is that it used to be undefined here.
+void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s) {
+    if (host_step == nullptr) return;
+    if (pos < 0) {
+        std::fprintf(stderr, "qsa_step_fill: pos < 0 - refusing\n");
+        std::exit(2);
+    }
+    const int64_t n_kv = pos + 1;
+    host_step[kStepPos] = (int32_t) pos;
+    host_step[kStepNKv] = (int32_t) n_kv;
+    host_step[kStepNBid] = (int32_t) (n_kv / s.idx_block);
+    host_step[kStepWidth] = (int32_t) qsa_selection_width(n_kv, s);
+}
+
+// qsa.hpp: `void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base,
+//     const float* w_k_norm, float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
+//     const float* sin_tab, void* stream);`  (layer.cpp:948).  THE LEGACY INDEXER MEMBER the
+//     `native_qsa_indexer_enabled() == false` contract selects; the indexer runs on the MAIN forward path of
+//     all 12 QSA layers every token (the append precedes the selection).  PORT-MAP was `kernel` already but
+//     the wrapper had never been written - the class-A triage TABLE recorded it "LANDED" while THIS tree had
+//     no definition for it at all, so the link still showed it undefined.  That is the batch's second
+//     classification finding (the first: `qsa_step_fill` is host, not no-shader).
+void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
+                        float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
+                        const float* sin_tab, void* stream) {
+    strata::vulkan::indexer_key_append_impl(*need_stream("indexer_key_append", stream), raw, pos_dev, pos_base,
+                                            w_k_norm, eps, b, s, cos_tab, sin_tab);
 }
 
 // ---- the `host` row: the rope CONSTANTS (rope_scaling.hpp) -------------------------------------------------
