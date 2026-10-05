@@ -369,6 +369,11 @@ void bench_iq2s(Ctx& ctx, const std::string& dir, int n_out, int reps, int warmu
 // =========================================================================================================
 
 void bench_sampler(Ctx& ctx, const std::string& dir, int n_vocab, int reps, int warmups) {
+    // THE PARAMETERS THE ENGINE ACTUALLY USES, read off `SamplerParams` (include/strata/kernels/sampler.hpp)
+    // and generate.cpp's defaults: `top_k = 20` (and `sampled_k` keeps 1..63 as given, so k = 20) and
+    // `penalty_last_n = 0` (the penalty window is DISABLED by default).  The rows below therefore come in
+    // pairs: the parameters this harness used before (top_k 64, window 64) and the engine's DEFAULT
+    // (top_k 20, window 0), so the two are never confused again.
     const int history_len = 64;                         // the artifact's window
     const int max_tokens = 64;                          // the engine's kSplitMaxRows (its split bound)
     std::vector<float> row((size_t) n_vocab * max_tokens);
@@ -408,15 +413,27 @@ void bench_sampler(Ctx& ctx, const std::string& dir, int n_vocab, int reps, int 
     if (!ctx.info().shader_float64) {
         std::printf("SKIP sampler_split              | device has no shaderFloat64 (its tail accumulates in double)\n");
     } else {
-        double split1 = 0.0;
         VkPipeline p_split = ctx.pipeline(dir + "/sampler_split.spv", 3, (uint32_t) sizeof(Pc));
-        for (int nt : {1, max_tokens}) {
-            pc.n_tokens = nt;
-            Timing ts = time_kernel(ctx, p_split, {&b_l, &b_h, &b_o}, &pc, (uint32_t) sizeof(pc), (uint32_t) nt, 1, 1,
-                                    sreps, swarm);
-            std::snprintf(shape, sizeof shape, "vocab=%d n_tokens=%d", n_vocab, nt);
-            report(nt == 1 ? "sampler_split" : "sampler_split_64", shape, ts, (double) n_vocab * nt, 0.0);
-            if (nt == 1) split1 = ts.med;
+        // (top_k, penalty_last_n, row count, row name).  `top_k = 20, penalty_last_n = 0` IS the engine's
+        // default (`SamplerParams`); `top_k = 64, penalty_last_n = 64` is what this harness measured before.
+        struct Cfg { int k, win, nt; const char* name; };
+        const Cfg cfgs[] = {
+            {64, 64, 1, "sampler_split"},          // kept: the row the release note/README quote
+            {64, 64, 64, "sampler_split_64"},      // kept: the engine's row bound at the old parameters
+            {20, 0, 1, "sampler_split_def"},       // THE ENGINE'S DEFAULT: top_k 20, no penalty window
+            {20, 64, 1, "sampler_split_k20w64"},   // the penalty scan's share at the DEFAULT k
+            {64, 0, 1, "sampler_split_k64w0"},     // the k-round scan's share with the window OFF
+        };
+        double split1 = 0.0;
+        for (const Cfg& c : cfgs) {
+            pc.n_tokens = c.nt;
+            pc.top_k = c.k;
+            pc.penalty_last_n = c.win;
+            Timing ts = time_kernel(ctx, p_split, {&b_l, &b_h, &b_o}, &pc, (uint32_t) sizeof(pc), (uint32_t) c.nt, 1,
+                                    1, sreps, swarm);
+            std::snprintf(shape, sizeof shape, "vocab=%d n_tokens=%d k=%d win=%d", n_vocab, c.nt, c.k, c.win);
+            report(c.name, shape, ts, (double) n_vocab * c.nt, 0.0);
+            if (c.nt == 1 && c.k == 64 && c.win == 64) split1 = ts.med;
         }
         std::printf("XPAIR sampler_split/sampler_kernel_f32 vocab=%d  %.4f / %.4f  = %.3f  (the DEFAULT over the fallback)\n",
                     n_vocab, split1, tf.med, tf.med > 0 ? split1 / tf.med : 0.0);

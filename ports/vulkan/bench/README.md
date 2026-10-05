@@ -450,6 +450,36 @@ the default measured 348.95 ms pre-fix, so the headline was 1.6× the default's 
 above it (546.81 vs 13.50).  The XTX's default cost is **NOT MEASURED** (the box is suspended): **202.0 ms stands
 as the XTX ONE-BLOCK FALLBACK figure, and the XTX SPLIT row is PENDING.**
 
+**THE PARAMETERS THE ENGINE ACTUALLY USES, AND THE DECOMPOSITION AT THEM (added 2026-10-05).** The row above
+was measured at the HARNESS's parameters — `top_k 64` and `penalty_last_n 64`. The engine's own defaults
+(`include/strata/kernels/sampler.hpp`) are **`top_k = 20`** (`sampled_k` keeps 1..63 as given, so k = 20) and
+**`penalty_last_n = 0`, i.e. the penalty window is DISABLED** (generate.cpp:250/:6250 set the same). A
+performance number quoted at parameters the engine does not use is a number about the probe, so the bench now
+measures the engine's DEFAULT beside the old row (`reps=5`, one dispatch per batch; the penalty-cost and
+k-round-cost rows are the same instrument with ONE parameter changed, so the differences are the components).
+
+| Row (Arc B70 / intel_icd, med ms) | k | window | Arc | Ryzen iGPU | llvmpipe |
+|---|---:|---:|---:|---:|---:|
+| `sampler_split` (the row the tables above quote) | 64 | 64 | 13.4965 | 9.1644 | 67.6972 |
+| `sampler_split_k64w0` | 64 | 0 | 8.2954 | 6.6868 | 59.0819 |
+| `sampler_split_k20w64` | 20 | 64 | 8.0522 | 4.7237 | 29.7570 |
+| **`sampler_split_def` (THE ENGINE'S DEFAULT)** | **20** | **0** | **2.8448** | **2.3532** | **20.0418** |
+| `sampler_kernel_f32` (one-block fallback) | 64 | 64 | 546.73 | 300.02 | 1172.42 |
+
+**The reading, on the Arc:** the engine's REAL default is **2.84 ms**, not 13.50 — 4.7× lower, because the
+default disables the penalty window AND keeps only 20 candidates. The component split, same instrument:
+the k-round scan is `k64w0 - k20w0` = 5.45 ms for 44 extra rounds ≈ **0.124 ms per round** (so k=20 ≈ 2.5 ms),
+and the penalty-window scan at k=20 is `k20w64 - k20w0` = **5.21 ms** — i.e. **whenever the window is ON it
+costs more than the rounds it wraps**; at the default (window off) the rounds are the whole 2.84 ms. The 61
+partition merges and the 993 KB row load are the remainder. **Nothing was changed in the shader for this** —
+the row is a measurement of what ships, at the parameters the engine uses.
+
+**THE NEXT-LARGEST COMPONENT IS THEREFORE PARAMETER-DEPENDENT, and it is stated as such:** with the shipped
+default (`penalty_last_n = 0`) it is the k-round scan over the 61 partitions; with a penalty window enabled it
+is the window scan, which the port does per element (`O(hits × hlen)`) where the engine builds a 4,096-bit
+block bitmap. Attacking either is a post-integration question — it was descoped here by re-prioritisation (see
+`NEXT.md`).
+
 ## Evidence the harness measures something real
 
 1. **Cross-ICD (the same binary, the same kernel, different device).**  `run_bench.sh` runs every ICD, and

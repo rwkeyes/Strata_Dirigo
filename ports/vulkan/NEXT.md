@@ -1,5 +1,105 @@
 # Start here next session
 
+## AN INTERMITTENT, NON-DETERMINISTIC FAILURE ON THE Ryzen iGPU — CHARACTERISED, NOT FIXED (2026-10-05)
+
+**This is an OPEN DEFECT and it outranks the performance work below.** A green `run_gate.sh` on `vega` does
+**not** currently prove determinism: the same commit, the same binary, the same fixture seed (`std::mt19937
+g_rng(11)`) fails on the radeon ICD in ~11% of runs and passes in the rest. The failure was found by the
+parent tier's own verification run (radeon `434 passed, 2 failed, 2 skipped`; the other failure is the
+documented `budget: independent requery agrees` flake) and was reported as
+`FAIL bf16_gemv n_in=2560 n_out=128 130/131 worst 36.7`, against `131/131 worst 0.00573` for the SAME case in
+the SAME run on the Arc — a ~6000× gap, so it is not a tolerance question.
+
+**THE RATE AND THE ARMS (radeon only, `vega`; same binary, ICD pinned with `VK_ICD_FILENAMES`).**
+
+| measurement | runs | runs with a bad case | arms seen |
+|---|---:|---:|---|
+| gate, radeon (`--spv-dir shaders`) | 59 | 10 | `bf16_gemv_split n=2560 n_out=512` ×5, `bf16_gemv n=2560 n_out=512` ×3, `bf16_gemv_split n=2560 n_out=48` ×1, `fused_gdn_ab h_v=48 n=2560` ×1 |
+| gate, radeon (diagnostic build, +23 lines) | 102 | 11 | `bf16_gemv_split n_out=512` ×10, `bf16_gemv n_out=512` ×1 |
+| gate, **intel** (Arc, ANV) | 84 | **0** | — |
+| gate, **lvp** (llvmpipe) | 47 | **0** | — |
+
+Every bad case is ONE row out of 512 (occasionally 2–5); the reported `worst` spans 1.23 to 664 × the
+terms-derived bound. Deviation of the device's output from a hand-written f32 emulation of the shader's own
+summation (256-lane strided accumulation, pairwise tree): **3e-6 to 6e-4 absolute, i.e. a few ULP of the
+result**, on one row.
+
+**WHAT IT IS NOT — each ruled out by measurement, not by argument.**
+
+* **Not the kernel's arithmetic, and not a stale or partial input read.** A focused probe
+  (`/tmp/repro3.cpp`, built against the port's own `harness/vk_compute.*` and the shipping `bf16_gemv.spv`)
+  alternates TWO complete fixtures A/B so every element differs between consecutive dispatches, and on a bad
+  dispatch searches EVERY single-element mutation of the failing row against the device's value bit for bit
+  (previous-fixture value, zero, low byte zeroed, high byte zeroed). It matches on a few, and in most failures
+  **no single-element mutation of any of those forms reproduces the value** — and the deviation is a few ULP,
+  orders of magnitude below one element's contribution. A stale or partially-written word would move the sum
+  by that word's contribution (~0.6) and would PERSIST on re-dispatch, because the bytes stay stale.
+* **Not write/dispatch ordering.** Re-dispatching the IDENTICAL buffers with no host rewrite returns the
+  correct value: 10 of the 11 gate hits, and 100% of the probe's hits (one needed a second re-dispatch).
+  A host-write-visibility race would survive the re-dispatch.
+* **Not descriptor-pool growth.** `(descriptor pool 2 created: the previous one was full)` appears at the same
+  point (line ~460) in EVERY run, including the ~89% that pass; and the standalone probe reproduces with no
+  pool growth at all (one pipeline, one descriptor set).
+* **Not an aliasing/binding bug.** Only one row (one workgroup) is ever wrong; a wrong descriptor slice or an
+  overlapping binding corrupts many rows.
+* **Not the fixture or the RNG.** With the fixture fixed, passing runs reproduce their `worst` EXACTLY
+  (e.g. `0.00699` / `0.00722` for the two `n_in=2560` arms, run after run). An earlier independent build also
+  saw `fused_gdn_ab`, so the failing set is not one shader.
+* **Not a GPU reset.** No `amdgpu` ring timeout or reset in `dmesg` during any of these runs (the device HAS
+  two historical resets and one page fault on record, both hours earlier and on other binaries).
+
+**ITS SHAPE, MEASURED.** The probe reproduces only with a FRESHLY ALLOCATED buffer per dispatch (mode C:
+2 bad dispatches in 24,000 under 4 concurrent probe processes) and never with a reused buffer
+(modes A/B: **0 in 48,000**). The rate tracks DEVICE/HOST LOAD, not process count: 4 concurrent probe
+processes on the radeon gave 2–5 bad dispatches per 20,000, while one radeon probe run alongside four Arc
+probe processes and two gate loops gave **73 in 20,000** (`/tmp/repro3-single-radeon.log` — so it is NOT a
+clean single-process baseline; the quiet single-process figure is 1 in 8,000). **The same probe on the Arc
+(ANV) gave 0 bad dispatches in 80,000** — same binary, same shaders, same fixtures, same host code.
+
+**THE HONEST VERDICT.** The evidence rules out the port's own arithmetic: the shader's f32 result matches a
+hand emulation of its own summation order bit-for-bit on the vast majority of rows on BOTH devices, re-dispatch
+of the identical buffers is always correct, and the Arc — which has none of the iGPU's shared-memory /
+coherency path — never shows it in 80,000 dispatches. **Two hypotheses are still standing, and neither is
+closed:**
+
+1. **A stale/partial read, ordered by the write/dispatch or the dispatch/dispatch boundary.** Favoured by the
+   shape of the evidence (fresh buffers only, rate scaling with load, self-correcting on re-dispatch) and
+   disfavoured by the magnitude (a few ULP, where a stale word would move the sum by ~0.6). Not reproduced by
+   the single-element mutation search; the ordering could still be at a coarser granularity than one element.
+2. **A subgroup-width-dependent shared-memory read on the 64-wide RADV implementation.** Favoured by the
+   device split (64-wide RADV only; 32-wide ANV and 8-wide llvmpipe clean over 131 gate runs) and by the
+   affected shaders all using the workgroup `wg_sum` barrier tree; disfavoured by the fact that the tree has
+   no width to be wrong about by construction.
+
+**Until one of them is closed, treat a green `run_gate.sh` on `vega` as "no failure was observed", NOT as
+"the suite is deterministic", and read the radeon arm's FAILURE LIST, not just its total.** Nothing was
+suppressed for this: the case is NOT skipped on radeon, the bound is NOT widened, and the failure is NOT
+deleted from the README.
+
+Evidence kept: `/tmp/rgdiag-hit-*.log` (11 radeon gate hits with re-dispatch diagnostics),
+`/tmp/rg200-fail-*.log` (10 pre-diagnostic hits), `/tmp/repro2-*.log` (the fma vs mul+add emulation split),
+`/tmp/repro3-*.log`, `/tmp/repro3-intel-*.log`, `/tmp/repro3-single-radeon.log`,
+`/tmp/evidence-bf16gemv-radeon-FAIL.log`. The two probes are `/tmp/repro2.cpp` and `/tmp/repro3.cpp` (not
+committed - they are diagnostic scratch, built against `harness/vk_compute.*` and the shipping `bf16_gemv.spv`).
+
+**DESCOPED BY RE-PRIORITISATION (2026-10-05).** The performance tier's two remaining items — the sampler's
+next-cost attack and the PER-TOKEN BUDGET table — are NOT done. The user re-ranked engine integration
+(tokens produced on the B70) above further performance work, so this increment stops at the correctness
+finding. What IS on the record, because it was measured before the re-ranking: the bench now measures the
+split sampler at the ENGINE'S REAL parameters (top_k 20, the penalty window DISABLED) beside the old
+(k 64 / window 64) row this harness used to quote (see `bench/README.md`), and the engine's real sampler
+parameters are `k = sampled_k(top_k, n_vocab)` = **20** at the default `top_k = 20`, `hlen =
+min(penalty_last_n, history_len)` = **0** at the default `penalty_last_n = 0`, `kSplitMaxBlocks =
+kSplitMaxRows = 64`, stage 1 = 128 threads over `kSplitBlockSpan` 4096, stage 2 = one 32-thread warp per row.
+The port renders both stages as ONE 256-thread workgroup per row (`SC_PER_LANE = 16`), which is the port's
+shape, NOT the engine's `kSplitPerLane = 32`.
+
+**BOX `z820b`: PENDING.** The box is suspended (`100% packet loss`, `No route to host`, no Wake-on-LAN), so
+the whole-tree sync and `run_gate.sh` / `run_bench.sh` there are PENDING and **no XTX or K620 number is
+claimed anywhere in this section or the ones below it**. Every measured number above is from `vega`; the
+sampler rows are from `vega`'s Arc (intel_icd), Ryzen iGPU (radeon_icd) and llvmpipe (lvp_icd).
+
+
 ## THE SAMPLER, MEASURED PROPERLY — the DEFAULT is the SPLIT, its real cost, and the PENALTY-HOIST fix — **DONE 2026-10-05**
 
 The performance tier's named first target, and the only number in the port above 100 ms.  The baseline carried

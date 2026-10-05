@@ -1,5 +1,20 @@
 # Status — what is done, what is verified, what is not
 
+## NOT DETERMINISTIC ON THE Ryzen iGPU — a characterised open defect (2026-10-05)
+
+**A green `run_gate.sh` on `vega` does not prove determinism.** The same commit, binary and fixture seed fails
+on the radeon ICD in ~11% of runs and passes in the rest: the bad case is one row of `bf16_gemv` /
+`bf16_gemv_split` at `n_in=2560 n_out=512` (and once `fused_gdn_ab`), by 1.23–664× the terms-derived bound.
+Measured: radeon 10 bad runs in 59 (and 11 in 102 with a diagnostic build) · **intel 0 in 84 · lvp 0 in 47**.
+A standalone probe against the shipping `bf16_gemv.spv` gives **0 bad dispatches in 80,000 on the Arc and
+1/8,000 (quiet) to 73/20,000 (under load) on the iGPU**, and re-dispatching the identical buffers is always
+correct — so the kernel's arithmetic is right and the transient is device/driver-level (RADV
+RAPHAEL_MENDOCINO). It is NOT a tolerance question, NOT a fixture/RNG drift, NOT descriptor-pool growth
+(pool 2 is created in every run, passing ones included), NOT an aliasing bug (one row, not many), and NOT a
+stale input read (a single-element mutation of the previous/zero/byte-zeroed form does not reproduce it, and
+a stale word would persist on re-dispatch). **The case is not skipped on radeon and the bound is not
+widened.** Full detail and evidence paths in `NEXT.md`'s top section.
+
 ## THE SAMPLER, MEASURED PROPERLY — the engine's DEFAULT is the SPLIT, and the PENALTY HOIST — the performance tier's first target (2026-10-05)
 
 The one number in the port above 100 ms, with a caveat the release notes carried: `sampler_kernel_f32` **546.9 ms
