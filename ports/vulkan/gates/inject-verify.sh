@@ -161,17 +161,21 @@ rebuild_harness() {
   # (strata::kernels::fwht256_cuda) through vulkan/src/device/, so a change to any of those sources must rebuild
   # the gate (a device-layer injection that skipped this would run a stale binary and report a clean result).
   g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
-      -I"$TREE/vulkan/include" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 -o "$GATE" \
+      -I"$TREE/vulkan/include" -I"$TREE/vulkan/include/cuda_compat" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 -o "$GATE" \
       "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" "$ROOT/harness/vk_stack.cpp" \
       "$ROOT/harness/vk_gate.cpp" \
       "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
       "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
       "$TREE/vulkan/src/device/sync.cpp" \
+      "$TREE/vulkan/src/compat/cuda_runtime.cpp" \
       "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
       "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
       "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
       "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
-      "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" -lvulkan
+      "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
+      "$TREE/vulkan/src/kernels/rope_vk.cpp" \
+      "$TREE/src/kernels/ngram.cpp" "$TREE/src/ngram/ple_reader.cpp" "$TREE/src/platform/direct_file.cpp" \
+      -lpthread -lvulkan
 }
 # A source that must be rebuilt into the GATE (the harness proper, or the engine-side backend the harness links).
 is_harness_src() {
@@ -602,6 +606,30 @@ case "$name" in
     old=$'    return false;   // no fused_gr shader in this tree: the backend reports what it implements'
     new=$'    return n_embd == 2560 && hc == 4 && hc_lr == 320;   // INJECTION: the fused read claimed supported (a HOLE)'
     want="FAIL  fused_gr_supported entry" ;;
+  graph-drop-last-node)
+    # THE CUDA GRAPH API (this batch).  A capture RECORDS the dispatches a body issues; dropping the LAST one is
+    # the plausible "off by one node" a hand-rolled recorder ships with.  The recorded step then replays 5 of 6
+    # silu passes, so the replay cannot equal direct execution - and the node count moves too.
+    file="$TREE/vulkan/src/device/vk_compute.cpp"
+    old=$'    encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,\n                    /*fresh_set=*/true);\n    ++recorded_;'
+    new=$'    if (capture_ && recorded_ == 5) return;   // INJECTION: the capture drops its last node\n    encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,\n                    /*fresh_set=*/true);\n    ++recorded_;'
+    want="FAIL  cuda graph: replay == direct execution" ;;
+  graph-replay-stale)
+    # A replay that does NOT re-submit the recording hands back a STALE answer: the buffer keeps whatever the
+    # host last wrote (here the new input), instead of the recorded dispatches' output.  That is the "graph
+    # replays stale arguments" hazard, and it must move the live-input arm.
+    file="$TREE/vulkan/src/compat/cuda_runtime.cpp"
+    old=$'    exec->owner->submit_owned(exec->cb, exec->fence);   // the port\'s own submit + fence, the same path a replay uses'
+    new=$'    static bool injected_first = false;   // INJECTION: only the first launch submits; later replays are stale\n    if (injected_first) { g_last = cudaSuccess; return cudaSuccess; }\n    injected_first = true;\n    exec->owner->submit_owned(exec->cb, exec->fence);'
+    want="FAIL  cuda graph: host mutations between replays are SEEN" ;;
+  graph-exec-destroy-leak)
+    # A leaked instantiation: `cudaGraphExecDestroy` drops the recording instead of destroying it.  The arena is
+    # untouched (the leak is command buffers + fences), so the leak is observed by the backend's own live-recording
+    # counter, which must return to zero.
+    file="$TREE/vulkan/src/compat/cuda_runtime.cpp"
+    old=$'    if (exec->cb != VK_NULL_HANDLE && exec->owner != nullptr)\n        exec->owner->destroy_owned(exec->cb, exec->fence);\n    delete exec;'
+    new=$'    // INJECTION: the instantiation is leaked (its recording is never destroyed)\n    delete exec;'
+    want="FAIL  cuda graph: no instantiation left live" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

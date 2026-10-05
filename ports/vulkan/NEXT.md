@@ -1,5 +1,105 @@
 # Start here next session
 
+## THE CUDA GRAPH API OVER THE PORT'S OWN RECORDED STEP — the recorder COMPILES and REPLAYS (2026-10-05, `vega`)
+
+**THE NEW BAR (the engine executable, not just the layer body): `154` undefined references / `64` distinct =
+`51` `strata::kernels::` full-signature + `13` `strata::core::` + others, and `0` CUDA-runtime symbols.**  The
+`0` is the point: the shim now answers the ENTIRE CUDA-runtime surface the engine library references, **the graph
+API included** (`grep -oP "undefined reference to \`\K[^']+" ... | grep -c '^cuda'` → 0).  Measured by
+whole-archiving the four engine libraries against the backend (`strata_vk_engine/core/kernels/kernels_cpu` vs
+`cudart/device`); the four recorder TUs `src/core/{graph,session,mtp,verify}.cpp` now **COMPILE** against the shim
+(`g++ -std=c++20 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device -DSTRATA_ENABLE_VULKAN=1 -c`
+→ exit 0 each).  The one-layer-body link is UNCHANGED (`18` raw / `0` kernels-namespace).  The remaining 51
+kernels-namespace symbols are the port's unported forward-path work (the MoE grouping, the drafter, the
+sampler multi-forms, …), NOT the graph API.
+
+## DELIVERABLE A — how the engine USES capture (read from its own code), and what "replay-only" would break
+
+**The recorder is `src/core/session.cpp`** (the same shape in `mtp.cpp` / `verify.cpp`); the `GraphRegistry` in
+`include/strata/core/graph.hpp` is **referenced by NO engine host code** (only `graph.cpp` and the `sycl/` copy
+name it).  Per layer, in order (`session.cpp:221-258`):
+
+    cudaStreamCreate(&cs) -> cudaStreamBeginCapture(cs, ThreadLocal) -> block_layer_pre/post(..., (void*) cs)
+      -> cudaStreamEndCapture(cs, &graph) -> cudaStreamDestroy(cs) -> cudaGraphInstantiate(out, graph, 0)
+      -> cudaGraphDestroy(graph)
+    // per token, per layer (session.cpp:282-289):
+    stage_token(...) ; cudaGraphLaunch(gr.execs[l], cs)
+
+`mtp.cpp` adds `cudaGraphUpload(exec, cs)` + `cudaStreamSynchronize(cs)`; `verify.cpp` adds the diagnostic
+`cudaGraphGetNodes`/`cudaGraphNodeGetType`/`cudaGraphKernelNodeGetParams` (under `STRATA_VERIFY_NODES`); the
+destructors call `cudaGraphExecDestroy`.
+
+**It is RECORDING, not graph-level semantics.**  No hand-added nodes, no cross-stream capture, no event/wait
+nodes inside a capture (events are recorded only BETWEEN two launches — `session.hpp`), no
+`cudaGraphExecUpdate`, no memory-node aliasing.  The graph-level facts it DOES rely on are `graph.hpp`'s two
+measurements: **(1) a replay re-reads its input BUFFERS but not its kernel ARGUMENTS** ("a kernel argument is
+copied into the node at capture and is never re-read … a position, a page-table base, a token id must be DATA in
+a device buffer"), and **(2) fixed addresses are the caller's obligation.**  A block is ~43 nodes
+(`session.hpp`: "the 43-node block graph measured 1.585 ms against 2.393 ms for direct launches"), two graphs
+(`pre`/`post`) per layer.  Between replays `stage_token` (`session.cpp:177`) rewrites the PINNED staging buffers
+`host_step`/`host_pos`; the body reads them through the `copy_i32_from_mapped` KERNEL into `st.step`/`st.pos_dev`
+(`layer.cpp:911-914`, `g_publish_kernel` default **true**) — no pointer changes.
+
+**What a naive replay-only implementation breaks.**  (a) A capture must RECORD, not RUN: this backend's
+`dispatch` submits AND waits, so letting it execute would advance every GDN recurrent state and the residual
+once before the first token.  (b) A HOST↔DEVICE copy or a memset inside a capture cannot be recorded (this
+shim stages both through host memory); CUDA records a memcpy node, the port must REFUSE.  Both are handled and
+stated in the shim header.
+
+## DELIVERABLE B — the mapping: a graph IS the port's recorded step (no second mechanism)
+
+`ports/vulkan/plan/CUDA-GRAPH-MAPPING.md` (new) has the full table.  In one line: **a `cudaGraph_t`/`cudaGraphExec_t`
+is one of the port's recorded steps** — the SAME `Ctx::encode_dispatch` (chain barrier between dispatches, a fresh
+descriptor set per dispatch) and the SAME `vkQueueSubmit` + fence wait — made `capture_begin` divert `Ctx::dispatch`
+to `record_dispatch`, so a capture RECORDS.  `EndCapture` closes the recording (no submit) and the shim owns it;
+`Instantiate` takes ownership; `Launch` = `Ctx::submit_owned`; `Destroy` frees.  D2D copies record as
+`vkCmdCopyBuffer`; `Upload` is a no-op; `GetNodes`/`NodeGetType` report counts; `KernelNodeGetParams` is
+`cudaErrorNotSupported`.  **Preserved:** record-once/replay-many, live-buffer re-read, capture-does-not-run,
+bitwise replay==direct.  **NOT preserved (stated in the header):** one queue (no multi-stream), and H2D/D2H
+copies + memsets inside a capture are `cudaErrorStreamCaptureUnsupported`.
+
+## DELIVERABLE C — the proof (Arc, `intel_icd`), and the three injections
+
+`case_cuda_graph_entry` (`vk_gate.cpp`, appended) opens the ENGINE stream, records 6 `silu_inplace` dispatches
+through the shim, and compares to direct execution.  Raw lines:
+
+    PASS  cuda graph: capture records, does not run  1024/ 1024   worst 0   captured elements moved
+    PASS  cuda graph: the graph holds N dispatch nodes     6/    6   worst 6   nodes
+    PASS  cuda graph: replay == direct execution (bitwise)  1024/ 1024   worst 0   elements differ
+    PASS  cuda graph: host mutations between replays are SEEN  1024/ 1024   worst 0   elements differ
+    PASS  cuda graph: replay twice, no cross-replay contamination  1024/ 1024   worst 0   elements differ
+    PASS  cuda graph: 6 instantiate/destroy cycles replay correctly     6/    6   worst 0   cycles failed
+    PASS  cuda graph: instantiate/destroy leaks no arena bytes     1/    1   worst 0   arena bytes grown
+    PASS  cuda graph: no instantiation left live (recordings return to 0)     1/    1   worst 0   recordings still owned
+    PASS  cuda graph: a H2D copy inside a capture is REFUSED     1/    1   worst 0   refused loudly
+    PASS  cuda graph: a memset inside a capture is REFUSED     1/    1   worst 0   refused loudly
+    PASS  cuda graph: a D2D copy records and replays  1024/ 1024   worst 0   elements differ
+
+**The three injections BIT** (`gates/inject-verify.sh graph-…`; the script's `rebuild_harness` was also fixed —
+it had gone stale, missing `rope_vk.cpp` + the engine host sources + `-lpthread`):
+
+    FALSIFIED (graph-drop-last-node):     FAIL  cuda graph: replay == direct execution (bitwise)     0/ 1024   elements differ
+    FALSIFIED (graph-replay-stale):       FAIL  cuda graph: host mutations between replays are SEEN     0/ 1024   elements differ
+    FALSIFIED (graph-exec-destroy-leak):  FAIL  cuda graph: no instantiation left live (recordings return to 0)     0/  1   worst 7
+
+The leak injection is observed by a NEW instrument, `Ctx::owned_recordings()` (++ when a recording is taken, --
+when destroyed; the arena never moves for a command-buffer leak).  A NEW latent-defect guard was added with it:
+the case asserts the counter returns to 0, so a leaked/double-owned instantiation cannot pass.
+
+## DELIVERABLE D/E/F — results (vega)
+
+`run_gate.sh` (background, exit 0 on the cleaned run): **Arc `intel_icd` 693/0/0**, llvmpipe `680/0/3` (the
+documented coopmat/vram skips), radeon iGPU `683/0/2` — **+11 verdicts per arm**, 0 failed; every `cuda graph:`
+arm green on the Arc.  **ON THE RECORD:** a later full run's radeon cross-arm carried the documented intermittent
+`budget: independent requery agrees` flake AND the open RADV-only wrong-value defect (`bf16_gemv entry n_in=2560
+n_out=128`, 510/512) — NEITHER is one of this batch's cases; the Arc arm read 693/0/0 both times.
+`check_port_map.py` passes (`168 — 66 kernel, 14 shader, 61 host, 27 todo`); `make_port_map.py` regenerates
+`PORT-MAP.tsv` **byte-identically** (no new symbol — the shim's `cuda*` names are not `strata::kernels::`).
+`strata_vk_cudart_smoke` and `strata_vk_entry_smoke` build + RUN PASS.  **`z820b` PENDING** (suspended, no WoL).
+The full `strata_vulkan` PROGRAM (`generate.cpp`) is NOT yet linkable — it needs a wider CUDA surface the RECORDER
+does not (`cudaDeviceProp`/`cudaGetDeviceProperties`, `cudaDeviceGetAttribute`, typed-pointer `cudaMalloc`,
+`cudaMallocHost`); that is a separate increment, reported, not the graph API.
+
 ## THE LAST FIVE NAMES, THE LINK's kernels PART AT ZERO, and M-B RUNS (2026-10-05, `vega`)
 
 **THE BAR (the running line): `41 → 18` raw / `7 → 0` distinct full-signature `strata::kernels::` symbols /

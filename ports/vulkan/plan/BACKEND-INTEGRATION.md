@@ -174,6 +174,13 @@ kernel proof, and a new integration case exercises the *engine entry point* thro
 * **Covers (2 kernel rows):** `sample_tokens` (`sampler_greedy` + `sampler_kernel`); wiring the recorded decode
   step into the engine so `src/program/generate.cpp` drives it.
 * **Files:** `vulkan/src/kernels/sampler_vk.cpp`, the engine's step/session wiring.
+* **Landed (2026-10-05, the CUDA graph API — the structural half of I5):** the CUDA STREAM-CAPTURE + GRAPH API is
+  now declared and implemented in `vulkan/include/cuda_compat/cuda_runtime.h` +
+  `vulkan/src/compat/cuda_runtime.cpp`, over the port's own recorded step (`vulkan/src/device/vk_compute.*`), so
+  the engine's recorder (`src/core/graph.cpp`, `session.cpp`, `mtp.cpp`, `verify.cpp`) COMPILES.  The design and
+  the semantics that could not be honoured exactly are in `plan/CUDA-GRAPH-MAPPING.md`; the proof is
+  `case_cuda_graph_entry` (10 verdicts + 3 injections).  The remaining PROGRAM half (the sampler kernel + a
+  `generate.cpp`-drivable binary) is unsettled and is NOT claimed here — see `NEXT.md`.
 * **Proves:** **M-B** — a Vulkan-backed single-layer forward pass with random weights (needs no model at all)
   as a gate case; then the decode step replays and equals the single-shot path, byte for byte.
 * **Risk (cannot predict):** the *program* — the composed step, the pass ordering, the host/device handoff

@@ -1,5 +1,40 @@
 # Status — what is done, what is verified, what is not
 
+## THE CUDA GRAPH API OVER THE PORT'S OWN RECORDED STEP — the recorder COMPILES and REPLAYS (2026-10-05, `vega`)
+
+**THE NEW BAR (the engine executable, not just the layer body): `154` undefined references / `64` distinct,
+and `0` CUDA-runtime symbols** — the shim now answers the whole CUDA-runtime surface the engine library
+references, the graph API included.  The four recorder TUs `src/core/{graph,session,mtp,verify}.cpp` COMPILE
+against the shim; the one-layer-body link is unchanged (`18` / `0` kernels-namespace); the remaining 51
+kernels-namespace symbols are the port's unported forward-path work, not the graph API.
+
+**A graph IS the port's recorded step** (no second mechanism): the SAME `Ctx::encode_dispatch` / `vkQueueSubmit`
++ fence wait, with `capture_begin` diverting `Ctx::dispatch` to `record_dispatch` so a capture RECORDS.
+`EndCapture` closes it; `Instantiate` takes ownership; `Launch` = `Ctx::submit_owned`; D2D copies record as
+`vkCmdCopyBuffer`.  Preserved: record-once/replay-many, live-buffer re-read, capture-does-not-run, bitwise
+replay==direct.  NOT preserved (stated in the shim header): the multi-stream model, and H2D/D2H copies + memsets
+inside a capture, which are `cudaErrorStreamCaptureUnsupported`.  Full analysis + mapping:
+`plan/CUDA-GRAPH-MAPPING.md`.
+
+**The record of the engine's usage** (`src/core/session.cpp`, NOT the unused `GraphRegistry`): per layer
+`cudaStreamCreate` → `cudaStreamBeginCapture(ThreadLocal)` → run the layer body → `cudaStreamEndCapture` →
+`cudaGraphInstantiate` → `cudaGraphDestroy`; per token `cudaGraphLaunch` per layer.  It is recording, not
+graph-level semantics; between replays only the pinned staging CONTENTS change (graph.hpp NOTE 2).
+
+**Proved on the Arc** by `case_cuda_graph_entry` (11 new verdicts): capture records and does not run; the graph
+holds N dispatch nodes; replay == direct execution BITWISE; host mutations between replays are SEEN; replay
+twice with no contamination; 6 instantiate/destroy cycles replay correctly, leak no arena bytes, and leave no
+recordings owned; a H2D copy and a memset inside a capture are each REFUSED loudly; a D2D copy records and
+replays.  **Three injections bite**: `graph-drop-last-node`, `graph-replay-stale`, `graph-exec-destroy-leak`
+(the last observed by the new `Ctx::owned_recordings()` instrument).
+
+**Verified on `vega`:** gate Arc **693/0/0** (exit 0), llvmpipe 680/0/3, Ryzen iGPU 683/0/2; a LATER run's radeon
+cross-arm carried the documented `budget` flake + the open `bf16_gemv` wrong-value defect (neither is this
+batch's cases); `check_port_map.py` passes (`168 — 66 kernel, 14 shader, 61 host, 27 todo`); `make_port_map.py`
+byte-identical; `strata_vk_cudart_smoke` and `strata_vk_entry_smoke` RUN PASS.  **`z820b` PENDING.**  The full
+`strata_vulkan` PROGRAM is not yet linkable (it needs a wider CUDA surface the recorder does not); reported, not
+the graph API.  Full detail in `NEXT.md`.
+
 ## THE LAST FIVE NAMES, THE LINK's kernels PART AT ZERO, and M-B RUNS (2026-10-05, `vega`)
 
 **THE BAR MOVED `41 → 18` raw / `7 → 0` distinct full-signature `strata::kernels::` symbols / `5 → 0`

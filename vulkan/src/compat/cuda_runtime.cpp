@@ -8,10 +8,13 @@
 #include "cuda_runtime.h"                 // this shim's own declarations (found via -Ivulkan/include/cuda_compat)
 
 #include "vk_arena.hpp"                   // Stream, arena_alloc, arena_resolve, stream_write/stream_read
+#include "strata/vulkan/vk_backend.hpp"   // stream_of: the stream-handle registry check
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -65,6 +68,22 @@ cudaError_t transfer(Stream* s, void* dst, const void* src, uint64_t count) {
     Buf dv{}, sv{};
     const bool d_arena = strata::vulkan::arena_resolve(*s, dst, count, dv);
     const bool s_arena = strata::vulkan::arena_resolve(*s, src, count, sv);
+
+    // ---- CAPTURE: record what is recordable, refuse what is not (see the header note) ------------------------
+    // A device->device copy IS a pure device command, so a capture RECORDS it (vkCmdCopyBuffer) instead of
+    // executing it.  A host end makes it a host<->device transfer, which this shim stages through host memory
+    // and therefore cannot record as a device command: rather than replay stale bytes, INVALIDATE the capture
+    // so cudaStreamEndCapture refuses loudly.
+    if (s->ctx != nullptr && s->ctx->capturing()) {
+        if (d_arena && s_arena) {
+            s->ctx->capture_copy(dv, sv, count);
+            g_last = cudaSuccess;
+            return cudaSuccess;
+        }
+        s->ctx->capture_invalidate();
+        return fail(cudaErrorStreamCaptureUnsupported);
+    }
+
     HostRegion* d_host = d_arena ? nullptr : host_region_of(dst);
     HostRegion* s_host = s_arena ? nullptr : host_region_of(src);
 
@@ -94,6 +113,58 @@ cudaError_t transfer_2d(Stream* s, void* dst, size_t dpitch, const void* src, si
                                        static_cast<const uint8_t*>(src) + row * spitch, width);
         if (e != cudaSuccess) return e;
     }
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+}  // namespace
+
+// ---- the graph objects: a recorded step the shim owns (see the header's capture/graph note) ----------------
+// A `cudaGraph_t` is a finished recording; `cudaGraphExec_t` is the same recording made launchable.  Both hold
+// the port's own recording handles (one persistent command buffer + one fence, submitted and waited by the
+// device layer's `submit_owned`) and the `Ctx` that owns them.
+// A recorded node handle.  The opaque handles the header forward-declares must be at GLOBAL scope (their names
+// are what `cudaGraph_t`/`cudaGraphNode_t` point at), so these three are not in a namespace.
+struct cudaGraphNode_st {
+    cudaGraphNodeType type = cudaGraphNodeTypeKernel;
+};
+
+struct cudaGraph_st {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    strata::vulkan::Ctx* owner = nullptr;
+    uint32_t dispatches = 0;
+    uint32_t copies = 0;
+    bool taken = false;                     // instantiate moved the recording to the exec
+    std::vector<cudaGraphNode_st> node_store;
+};
+
+struct cudaGraphExec_st {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    strata::vulkan::Ctx* owner = nullptr;
+    uint32_t dispatches = 0;
+    uint32_t copies = 0;
+};
+
+namespace {
+
+// The portable `cudaGraphInstantiate` body, shared by the two signatures.
+cudaError_t instantiate_impl(cudaGraphExec_t* exec, cudaGraph_t graph) {
+    if (exec == nullptr) return fail(cudaErrorInvalidValue);
+    *exec = nullptr;
+    if (graph == nullptr || graph->cb == VK_NULL_HANDLE || graph->taken)
+        return fail(cudaErrorInvalidValue);
+    cudaGraphExec_st* e = new cudaGraphExec_st();
+    e->cb = graph->cb;
+    e->fence = graph->fence;
+    e->owner = graph->owner;
+    e->dispatches = graph->dispatches;
+    e->copies = graph->copies;
+    graph->cb = VK_NULL_HANDLE;
+    graph->fence = VK_NULL_HANDLE;
+    graph->taken = true;
+    *exec = e;
     g_last = cudaSuccess;
     return cudaSuccess;
 }
@@ -216,6 +287,12 @@ cudaError_t cudaMemsetAsync(void* devPtr, int value, size_t count, cudaStream_t 
     Stream* s = current_or(reinterpret_cast<Stream*>(stream));
     if (s == nullptr) return fail(cudaErrorInvalidValue);
     if (count == 0) { g_last = cudaSuccess; return cudaSuccess; }
+    // Inside a capture there is no pure device memset command (this layer has no memset shader; the fill below
+    // stages through the host), so the capture is invalidated and the caller refuses - see the header note.
+    if (s->ctx != nullptr && s->ctx->capturing()) {
+        s->ctx->capture_invalidate();
+        return fail(cudaErrorStreamCaptureUnsupported);
+    }
     // A STAGED FILL: this device layer has no memset shader, so the byte is replicated in a host buffer and
     // uploaded through the same staging path every other host->device transfer uses.
     std::vector<uint8_t> fill((size_t) count, (uint8_t) (value & 0xff));
@@ -281,6 +358,241 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
     return cudaSuccess;
 }
 
+cudaError_t cudaEventQuery(cudaEvent_t event) {
+    if (event == nullptr) return fail(cudaErrorInvalidValue);
+    // Every submit in this backend already fenced and waited, so a recorded event is complete by the time this
+    // returns.  A never-recorded event is not ready, as CUDA's is.
+    if (!event->recorded) return fail(cudaErrorNotReady);
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
+    (void) flags;
+    if (stream != nullptr) {
+        Stream* s = strata::vulkan::stream_of(reinterpret_cast<void*>(stream));
+        if (s == nullptr) return fail(cudaErrorInvalidValue);
+        g_current = s;
+    }
+    if (event == nullptr) return fail(cudaErrorInvalidValue);
+    g_last = cudaSuccess;      // one synchronous queue: there is no pending work for a wait to order against
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDevice(int* device) {
+    if (device == nullptr) return fail(cudaErrorInvalidValue);
+    *device = 0;               // the one device
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaSetDevice(int device) {
+    if (device != 0) return fail(cudaErrorInvalidDevice);   // one device: refuse to pretend to switch
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaLaunchHostFunc(cudaStream_t stream, void (*fn)(void*), void* userData) {
+    Stream* s = (stream != nullptr) ? strata::vulkan::stream_of(reinterpret_cast<void*>(stream)) : g_current;
+    if (s == nullptr) return fail(cudaErrorInvalidValue);
+    g_current = s;
+    if (s->ctx != nullptr && s->ctx->capturing()) {   // not recordable as a device command
+        s->ctx->capture_invalidate();
+        return fail(cudaErrorStreamCaptureUnsupported);
+    }
+    if (fn != nullptr) fn(userData);    // prior work is complete: inline IS "after the queued work"
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+// ---- the multi-GPU / pinned-host / CUDA-driver surface (see the header note; each is a LOUD REFUSAL) -------
+cudaError_t cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
+    (void) ptr; (void) size; (void) flags;
+    // A host pointer is not shader-addressable on this backend (the arena is DEVICE_LOCAL and, on a discrete
+    // card, unmappable), so "pinning" it for device access would be a lie.  Refuse; the caller falls back.
+    return fail(cudaErrorNotSupported);
+}
+
+cudaError_t cudaHostUnregister(void* ptr) {
+    (void) ptr;                 // nothing was ever registered: succeed so cleanup paths do not report an error
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDeviceCount(int* count) {
+    if (count == nullptr) return fail(cudaErrorInvalidValue);
+    *count = 1;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceCanAccessPeer(int* canAccessPeer, int device, int peerDevice) {
+    if (canAccessPeer == nullptr) return fail(cudaErrorInvalidValue);
+    if (device != 0 || peerDevice != 0) return fail(cudaErrorInvalidDevice);
+    *canAccessPeer = 0;         // one device: nothing to have peer access to
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags) {
+    (void) peerDevice; (void) flags;
+    return fail(cudaErrorNotSupported);
+}
+
+cudaError_t cudaInitDevice(int device, unsigned int flags, unsigned int flags2) {
+    (void) flags; (void) flags2;
+    if (device != 0) return fail(cudaErrorInvalidDevice);
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDriverEntryPoint(const char* symbol, void** funcPtr, unsigned long long flags,
+                                    enum cudaDriverEntryPointQueryResult* driverStatus) {
+    (void) symbol; (void) flags;
+    if (funcPtr != nullptr) *funcPtr = nullptr;
+    if (driverStatus != nullptr) *driverStatus = cudaDriverEntryPointSymbolNotFound;
+    return fail(cudaErrorNotSupported);   // there is no CUDA driver API on a Vulkan device
+}
+
+// ---- streams, capture and graphs (see the header's closure note) -------------------------------------------
+cudaError_t cudaStreamCreate(cudaStream_t* stream) { return cudaStreamCreateWithFlags(stream, 0); }
+
+cudaError_t cudaStreamCreateWithFlags(cudaStream_t* stream, unsigned int flags) {
+    (void) flags;      // one queue: cudaStreamNonBlocking has nothing to change
+    if (stream == nullptr) return fail(cudaErrorInvalidValue);
+    Stream* s = g_current;
+    if (s == nullptr) {
+        // No device is up yet: open one the way the port's own smokes do, from STRATA_VK_SPV_DIR (the engine's
+        // program sets it) or the default shaders directory.  Refuse rather than hand back a stream with no
+        // arena, which would fail later at a confusing call site.
+        const char* dir = std::getenv("STRATA_VK_SPV_DIR");
+        const std::string spv = (dir != nullptr && *dir != '\0') ? dir : "ports/vulkan/shaders";
+        s = strata::vulkan::stream_open(64ull << 20, spv);
+        if (s == nullptr) return fail(cudaErrorInitializationError);
+        g_current = s;
+    }
+    *stream = reinterpret_cast<cudaStream_t>(s);
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamDestroy(cudaStream_t stream) {
+    // The stream IS the one device + arena; it is not ours to tear down here (the program closes it), so this
+    // releases only the handle the caller held.  Stated in the header rather than silent.
+    (void) stream;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamQuery(cudaStream_t stream) {
+    if (stream != nullptr) {
+        Stream* s = strata::vulkan::stream_of(reinterpret_cast<void*>(stream));
+        if (s == nullptr) return fail(cudaErrorInvalidValue);
+        g_current = s;
+    }
+    g_last = cudaSuccess;      // every submit already fenced and waited: work is complete
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode) {
+    (void) mode;      // one queue, so the thread-local/global distinction has nothing to distinguish
+    Stream* s = strata::vulkan::stream_of(reinterpret_cast<void*>(stream));
+    if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
+    if (s->ctx->capturing()) return fail(cudaErrorStreamCaptureUnsupported);   // nested capture
+    g_current = s;
+    s->ctx->capture_begin();
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* graph) {
+    if (graph == nullptr) return fail(cudaErrorInvalidValue);
+    *graph = nullptr;
+    Stream* s = strata::vulkan::stream_of(reinterpret_cast<void*>(stream));
+    if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
+    if (!s->ctx->capturing()) return fail(cudaErrorStreamCaptureUnsupported);
+    // A capture that hit an unrecordable op, or recorded nothing, is refused: an empty graph replays nothing
+    // and produces no error - the silent kind of failure this port keeps paying for.
+    if (!s->ctx->capture_end()) {
+        s->ctx->discard_recording();
+        return fail(cudaErrorStreamCaptureUnsupported);
+    }
+    cudaGraph_st* g = new cudaGraph_st();
+    s->ctx->take_recording(g->cb, g->fence, g->dispatches, g->copies);
+    g->owner = s->ctx;
+    *graph = g;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
+    if (exec == nullptr) return fail(cudaErrorInvalidValue);
+    Stream* s = (stream != nullptr) ? strata::vulkan::stream_of(reinterpret_cast<void*>(stream)) : g_current;
+    if (s == nullptr) s = g_current;
+    if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
+    g_current = s;
+    if (exec->owner == nullptr) return fail(cudaErrorInvalidValue);
+    if (exec->owner->capturing()) return fail(cudaErrorStreamCaptureUnsupported);   // a launch inside a capture
+    exec->owner->submit_owned(exec->cb, exec->fence);   // the port's own submit + fence, the same path a replay uses
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
+    if (graph == nullptr) return fail(cudaErrorInvalidValue);
+    if (!graph->taken && graph->cb != VK_NULL_HANDLE && graph->owner != nullptr)
+        graph->owner->destroy_owned(graph->cb, graph->fence);
+    delete graph;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
+    if (exec == nullptr) return fail(cudaErrorInvalidValue);
+    if (exec->cb != VK_NULL_HANDLE && exec->owner != nullptr)
+        exec->owner->destroy_owned(exec->cb, exec->fence);
+    delete exec;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphUpload(cudaGraphExec_t exec, cudaStream_t stream) {
+    (void) exec;
+    (void) stream;
+    g_last = cudaSuccess;   // the recording is host-side command buffers: there is nothing to upload
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, size_t* numNodes) {
+    if (graph == nullptr || numNodes == nullptr) return fail(cudaErrorInvalidValue);
+    const size_t total = (size_t) graph->dispatches + (size_t) graph->copies;
+    if (nodes == nullptr) { *numNodes = total; g_last = cudaSuccess; return cudaSuccess; }
+    const size_t cap = *numNodes;
+    graph->node_store.resize(total);
+    for (size_t i = 0; i < total; ++i)
+        graph->node_store[i].type = (i < (size_t) graph->dispatches) ? cudaGraphNodeTypeKernel : cudaGraphNodeTypeMemcpy;
+    for (size_t i = 0; i < total && i < cap; ++i) nodes[i] = &graph->node_store[i];
+    *numNodes = total;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphNodeGetType(cudaGraphNode_t node, enum cudaGraphNodeType* type) {
+    if (node == nullptr || type == nullptr) return fail(cudaErrorInvalidValue);
+    *type = node->type;
+    g_last = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node, struct cudaKernelNodeParams* params) {
+    (void) node;
+    (void) params;
+    // This shim keeps no CUDA kernel parameters (the recording holds Vulkan bindings), so there is nothing to
+    // report.  `cudaErrorNotSupported` rather than a plausible-looking zero - the engine reads this only under
+    // STRATA_VERIFY_NODES, where it names node kinds, not kernel params.
+    return fail(cudaErrorNotSupported);
+}
+
 // ---- errors ------------------------------------------------------------------------------------------------
 cudaError_t cudaPeekAtLastError(void) { return g_last; }
 
@@ -306,3 +618,16 @@ const char* cudaGetErrorString(cudaError_t error) {
 }
 
 }  // extern "C"
+
+// ---- cudaGraphInstantiate: the two toolkit signatures (C++ linkage; the engine calls both) ------------------
+cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long flags) {
+    (void) flags;      // the port has no instantiate flags to honour; the recording is already launchable
+    return instantiate_impl(exec, graph);
+}
+
+cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, cudaGraphNode_t* errorNode,
+                                 char* logBuffer, size_t bufferSize) {
+    if (errorNode != nullptr) *errorNode = nullptr;
+    if (logBuffer != nullptr && bufferSize != 0) logBuffer[0] = '\0';
+    return instantiate_impl(exec, graph);
+}

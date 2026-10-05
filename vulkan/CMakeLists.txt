@@ -136,12 +136,14 @@ find_package(Threads REQUIRED)
 
 strata_vulkan_resolve(_vspec src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
 add_library(strata_vulkan_spec STATIC EXCLUDE_FROM_ALL ${_vspec})
+target_compile_features(strata_vulkan_spec PRIVATE cxx_std_20)
 target_include_directories(strata_vulkan_spec PUBLIC ${STRATA_ROOT}/include)
 target_link_libraries(strata_vulkan_spec PUBLIC strata_vulkan_cudart)
 
 strata_vulkan_resolve(_vcpu src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
                       src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
 add_library(strata_vulkan_kernels_cpu STATIC EXCLUDE_FROM_ALL ${_vcpu})
+target_compile_features(strata_vulkan_kernels_cpu PRIVATE cxx_std_20)
 target_include_directories(strata_vulkan_kernels_cpu PUBLIC ${STRATA_ROOT}/include)
 target_link_libraries(strata_vulkan_kernels_cpu PUBLIC strata_vulkan_cudart Threads::Threads)
 # The AVX-512 / AVX2 source flags, mirrored from the top-level `strata_kernels_cpu`: without them
@@ -157,6 +159,7 @@ endif()
 
 strata_vulkan_resolve(_vcore src/core/graph.cpp src/core/weights.cpp src/core/layout.cpp src/platform/memory.cpp)
 add_library(strata_vulkan_core STATIC EXCLUDE_FROM_ALL ${_vcore})
+target_compile_features(strata_vulkan_core PRIVATE cxx_std_20)   # the engine's headers use C++20 (ends_with, defaulted operator==)
 target_include_directories(strata_vulkan_core PUBLIC ${STRATA_ROOT}/include)
 target_link_libraries(strata_vulkan_core PUBLIC strata_vulkan_cudart strata_vulkan_kernels)
 
@@ -166,10 +169,12 @@ strata_vulkan_resolve(_vengine
   src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
   src/core/conversation_memory.cpp src/core/peer_experts.cpp)
 add_library(strata_vulkan_engine STATIC EXCLUDE_FROM_ALL ${_vengine})
+target_compile_features(strata_vulkan_engine PRIVATE cxx_std_20)
 target_link_libraries(strata_vulkan_engine PUBLIC strata_vulkan_core strata_vulkan_kernels_cpu)
 
 strata_vulkan_resolve(_vmain src/program/generate.cpp)
 add_executable(strata_vulkan EXCLUDE_FROM_ALL ${_vmain})
+target_compile_features(strata_vulkan PRIVATE cxx_std_20)
 target_link_libraries(strata_vulkan PRIVATE strata_vulkan_engine strata_vulkan_spec)
 
 message(STATUS "Strata: Vulkan engine targets (deliverable B) - strata_vulkan_core / strata_vulkan_engine / "

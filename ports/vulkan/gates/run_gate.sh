@@ -208,13 +208,14 @@ echo "== building the harness (-Werror: hygiene is part of the gate)"
 # engine's own entry point (strata::kernels::fwht256_cuda) through it - see case_fwht256_entry.  Its device layer
 # is a separate copy with its own namespace (strata::vulkan), so it does not clash with this harness's portvk.
 g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
-    -I"$TREE/vulkan/include" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 \
+    -I"$TREE/vulkan/include" -I"$TREE/vulkan/include/cuda_compat" -I"$TREE/vulkan/src/device" -DSTRATA_ENABLE_VULKAN=1 \
     -o "$BUILD/vk_gate" "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" \
     "$ROOT/harness/vk_stack.cpp" \
     "$ROOT/harness/vk_gate.cpp" \
     "$TREE/vulkan/src/device/vk_compat.cpp" "$TREE/vulkan/src/device/vk_stack.cpp" \
     "$TREE/vulkan/src/device/vk_compute.cpp" "$TREE/vulkan/src/device/vk_arena.cpp" \
     "$TREE/vulkan/src/device/sync.cpp" \
+    "$TREE/vulkan/src/compat/cuda_runtime.cpp" \
     "$TREE/vulkan/src/kernels/fwht_vk.cpp" "$TREE/vulkan/src/kernels/native_caps_vk.cpp" \
     "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
     "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \

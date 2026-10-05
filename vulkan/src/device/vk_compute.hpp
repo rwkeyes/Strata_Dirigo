@@ -288,10 +288,46 @@ public:
     void record_begin();
     void record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                          uint32_t groups, uint32_t groups_y = 1);
+    void record_end();               // close the recording (the same closing host-read barrier); NO submit
     void record_end_and_submit();
     void replay_recorded();
     uint32_t recorded_dispatches() const { return recorded_; }
     bool has_recording() const { return have_recording_; }
+
+    // ---- STREAM CAPTURE: the CUDA-graph API's recording, built ON the recorded step above ------------------
+    // A "graph" on this backend IS a recorded step: one persistent command buffer holding the dispatches a
+    // capture body issued, re-submitted by every launch and never re-recorded.  Capture adds NO second
+    // recording mechanism - it reuses `encode_dispatch` (a chain barrier between dispatches, a fresh descriptor
+    // set per dispatch) and the same submit path as `record_dispatch`/`submit_recorded`.  What is new is only
+    // the DIVERSION: while a capture is active, `dispatch()` RECORDS instead of submitting and waiting, which
+    // is exactly what CUDA's stream capture does to a kernel launch.
+    //
+    // A command buffer can only hold pure device commands, so a capture can record the two this layer has:
+    // dispatches and device->device buffer copies (vkCmdCopyBuffer).  An op the port CANNOT record as a device
+    // command - a host<->device transfer (this layer's copies STAGE through host memory) or a memset (it has no
+    // memset shader) - makes the capture INVALID rather than silently executing inside a capture; the caller
+    // must then refuse (cudaErrorStreamCaptureUnsupported).  See `cuda_compat/cuda_runtime.h`.
+    void capture_begin();
+    void capture_invalidate() { capture_valid_ = false; }
+    bool capturing() const { return capture_; }
+    bool capture_valid() const { return capture_valid_; }
+    // Record a device->device byte copy into the active capture: one vkCmdCopyBuffer region + a transfer->compute
+    // barrier, so the next dispatch reads what it wrote.
+    void capture_copy(const Buf& dst, const Buf& src, uint64_t bytes);
+    // Close the capture WITHOUT submitting.  False when the capture was invalidated or recorded nothing.
+    bool capture_end();
+    // Hand the closed recording to the caller (the shim's cudaGraph_t): nulls this Ctx's recording handles so a
+    // later capture allocates fresh ones.  Only valid after capture_end() returned true.
+    void take_recording(VkCommandBuffer& cb, VkFence& fence, uint32_t& dispatches, uint32_t& copies);
+    // Abandon an in-progress/closed recording (an invalidated capture).  Frees its command buffer and fence.
+    void discard_recording();
+    // Submit + wait an owned recording (the SAME submission path `submit_recorded` uses), and destroy one.
+    void submit_owned(VkCommandBuffer cb, VkFence fence);
+    void destroy_owned(VkCommandBuffer cb, VkFence fence);
+    // How many recordings the caller (the shim's graphs) currently owns: incremented when a recording is taken,
+    // decremented when one is destroyed.  The instrument a leak test needs - a leaked instantiation shows up
+    // here even though it never touches the arena.
+    uint32_t owned_recordings() const { return owned_recordings_; }
 
 private:
     // One pipeline and everything that must be created and destroyed with it.  A key list parallel to a value
@@ -377,8 +413,12 @@ private:
     VkCommandBuffer rec_cb_ = VK_NULL_HANDLE;
     VkFence rec_fence_ = VK_NULL_HANDLE;
     uint32_t recorded_ = 0;         // dispatches in the current/last recording
+    uint32_t recorded_copies_ = 0;  // device->device copies in the current/last recording
     bool recording_ = false;        // between record_begin() and record_end_and_submit()
     bool have_recording_ = false;   // a finished recording exists and may be replayed
+    bool capture_ = false;          // a stream capture is active: dispatch() records instead of submitting
+    bool capture_valid_ = false;    // ...and nothing has invalidated it (see capture_invalidate)
+    uint32_t owned_recordings_ = 0; // recordings handed to the caller that have not been destroyed
 
     void query_budget();   // called after device creation, so the extension can be enabled
 };

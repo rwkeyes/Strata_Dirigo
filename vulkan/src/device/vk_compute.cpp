@@ -997,6 +997,13 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
 
 void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                    uint32_t groups, uint32_t groups_y) {
+    // A CAPTURE RECORDS, IT DOES NOT RUN.  CUDA's stream capture makes a kernel launch a node in a graph instead
+    // of a queued execution; here the same diversion routes the launch into the recorded-step encoder.  This is
+    // the ONE place the graph API joins the port's recorded step - there is no second recording path.
+    if (capture_) {
+        record_dispatch(pipe, bufs, push, push_bytes, groups, groups_y);
+        return;
+    }
     VkCommandBuffer cb = begin_oneshot();
     encode_dispatch(cb, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/false,
                     /*fresh_set=*/false);
@@ -1031,6 +1038,7 @@ void Ctx::record_begin() {
     VK_CHECK(vkBeginCommandBuffer(rec_cb_, &bi));
     recording_ = true;
     recorded_ = 0;
+    recorded_copies_ = 0;
 }
 
 void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
@@ -1044,9 +1052,9 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
     ++recorded_;
 }
 
-void Ctx::record_end_and_submit() {
+void Ctx::record_end() {
     if (!recording_) {
-        std::fprintf(stderr, "record_end_and_submit: not recording\n");
+        std::fprintf(stderr, "record_end: not recording\n");
         std::exit(1);
     }
     VkMemoryBarrier mb{};
@@ -1058,7 +1066,91 @@ void Ctx::record_end_and_submit() {
     VK_CHECK(vkEndCommandBuffer(rec_cb_));
     recording_ = false;
     have_recording_ = true;
+}
+
+void Ctx::record_end_and_submit() {
+    record_end();
     submit_recorded();
+}
+
+// ---- stream capture: the CUDA-graph API's recording, over the recorded step above --------------------------
+void Ctx::capture_begin() {
+    record_begin();                 // allocates a fresh command buffer + fence (the previous one was taken)
+    capture_ = true;
+    capture_valid_ = true;
+}
+
+void Ctx::capture_copy(const Buf& dst, const Buf& src, uint64_t bytes) {
+    if (!capture_) {
+        std::fprintf(stderr, "capture_copy: no capture is active\n");
+        std::exit(1);
+    }
+    if (bytes == 0) return;
+    VkBufferCopy r{};
+    r.srcOffset = src.offset;
+    r.dstOffset = dst.offset;
+    r.size = bytes;
+    vkCmdCopyBuffer(rec_cb_, src.buffer, dst.buffer, 1, &r);
+    // transfer -> compute (and -> any later transfer): the copy's writes are visible to the next dispatch.
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(rec_cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                         nullptr, 0, nullptr);
+    ++recorded_copies_;
+}
+
+bool Ctx::capture_end() {
+    if (!capture_) return false;
+    capture_ = false;
+    const bool ok = capture_valid_ && (recorded_ + recorded_copies_) > 0;
+    if (!ok) {
+        // Abandon: end the (unfinished) command buffer so it can be freed; the caller discards it and refuses.
+        if (recording_) { vkEndCommandBuffer(rec_cb_); recording_ = false; }
+        return false;
+    }
+    record_end();
+    return true;
+}
+
+void Ctx::take_recording(VkCommandBuffer& cb, VkFence& fence, uint32_t& dispatches, uint32_t& copies) {
+    cb = rec_cb_;
+    fence = rec_fence_;
+    dispatches = recorded_;
+    copies = recorded_copies_;
+    rec_cb_ = VK_NULL_HANDLE;
+    rec_fence_ = VK_NULL_HANDLE;
+    recorded_ = 0;
+    recorded_copies_ = 0;
+    recording_ = false;
+    have_recording_ = false;
+    ++owned_recordings_;
+}
+
+void Ctx::discard_recording() {
+    if (rec_cb_ != VK_NULL_HANDLE) { vkFreeCommandBuffers(dev_, cmd_pool_, 1, &rec_cb_); rec_cb_ = VK_NULL_HANDLE; }
+    if (rec_fence_ != VK_NULL_HANDLE) { vkDestroyFence(dev_, rec_fence_, nullptr); rec_fence_ = VK_NULL_HANDLE; }
+    recording_ = false;
+    have_recording_ = false;
+    recorded_ = 0;
+    recorded_copies_ = 0;
+}
+
+void Ctx::submit_owned(VkCommandBuffer cb, VkFence fence) {
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    VK_CHECK(vkResetFences(dev_, 1, &fence));   // the fence was signalled by the previous submission
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence));
+    VK_CHECK(vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX));
+}
+
+void Ctx::destroy_owned(VkCommandBuffer cb, VkFence fence) {
+    if (cb != VK_NULL_HANDLE) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
+    if (fence != VK_NULL_HANDLE) vkDestroyFence(dev_, fence, nullptr);
+    if (owned_recordings_ > 0) --owned_recordings_;
 }
 
 void Ctx::submit_recorded() {
