@@ -2206,6 +2206,301 @@ void case_kv_q4_rot(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// THE HYBRID MODE: K in INT8, V in rotated Q4_0 (src/kernels/kv_hybrid_parity.cpp)
+// ----------------------------------------------------------------------------------------------------------
+
+// The q8 rule, transcribed (kv_q8.hpp's: the scale is rounded to fp16 FIRST and the codes are computed against
+// that STORED value, so a reader dequantising with the stored scale agrees with the writer).
+static uint16_t q8_sbits(float amax) { return f16_from_f32(amax / 127.0f); }
+
+static int8_t q8_code(float x, float sf) {
+    if (!(sf > 0.0f)) return 0;                       // the source's guard: a zero scale means every code is 0
+    const float q = std::rint(x / sf);                // rint: nearest, ties to EVEN, as __float2int_rn does
+    return (int8_t) (q < -127.0f ? -127 : (q > 127.0f ? 127 : q));
+}
+
+void case_kv_hybrid(Ctx& ctx, const std::string& dir) {
+    // The engine's hybrid path (layer.cpp / prefill.cpp, `KV_MODE 3`): INT8 K, rotated Q4_0 V, the attention run
+    // in the MIXED basis, and the output de-rotated once.  What matters here is the ASYMMETRY: K is NOT rotated
+    // (q8 has the bits to keep outliers) and neither is the query - only V is, because V is the side that gets
+    // four bits.  Rotating K as well would change every score unless the query moved with it, and rotating V
+    // without de-rotating the output returns a correctly-scored but wrong-basis answer.  Both are gate material.
+    if (!have(dir, "kv_q8_append.spv") || !have(dir, "kv_q8_gather.spv") || !have(dir, "fwht256.spv") ||
+        !have(dir, "kv_q4_append.spv") || !have(dir, "kv_q4_gather.spv") || !have(dir, "attn_decode_short.spv")) {
+        return;
+    }
+    if (!ctx.info().storage_buffer_8bit || !ctx.info().storage_buffer_16bit) {
+        skip("kv_hybrid", "device lacks 8-bit or 16-bit storage - the two pools are int8+fp16 scales and packed q4");
+        return;
+    }
+    const uint32_t kv_heads = 2, head_dim = 256, page_size = 16, pages = 4, rows = pages * kv_heads * page_size;
+    const uint32_t cells = 6, first = 31;
+    const uint16_t SENT = 0xDEADu;
+    const uint32_t groups64 = head_dim / 64;                       // the q8 scale groups
+    const uint32_t groups32 = head_dim / 32;                       // the q4 blocks
+    const uint32_t q4_bytes_per_head = groups32 * 18;
+    std::vector<int32_t> table(pages);
+    for (uint32_t i = 0; i < pages; ++i) table[i] = (int32_t) (pages - 1 - i);   // REVERSED, as everywhere here
+    std::vector<int32_t> ids(cells);
+    for (uint32_t i = 0; i < cells; ++i) ids[i] = first + (int32_t) i;
+
+    // ---- the fixture: a raw K/V row per cell, and the RAW rotation of each V row (from the device, so the host
+    // rule is applied to the same f32 values the append saw rather than to a second rounding of the transform) ----
+    std::vector<std::vector<float>> kraw(cells), vraw(cells), vrot_dev(cells);
+    std::vector<float> rot_in((size_t) kv_heads * head_dim), rot_out((size_t) kv_heads * head_dim);
+    for (uint32_t i = 0; i < cells; ++i) {
+        kraw[i].resize((size_t) kv_heads * head_dim);
+        vraw[i].resize((size_t) kv_heads * head_dim);
+        vrot_dev[i].assign((size_t) kv_heads * head_dim, 0.0f);
+        f16_cur_at(kraw[i].data(), vraw[i].data(), ids[i], kv_heads, head_dim);
+        for (uint32_t h = 0; h < kv_heads; ++h)          // one outlier channel: what the V rotation exists for
+            vraw[i][h * head_dim + (3 + h)] += 9.0f;
+    }
+    Buf b_rot_in = ctx.alloc(rot_in.size() * 4), b_rot_out = ctx.alloc(rot_out.size() * 4);
+    VkPipeline pw = ctx.pipeline(dir + "/fwht256.spv", 2, 4);
+    struct { int n_rows; } wpc{(int) kv_heads};
+    for (uint32_t i = 0; i < cells; ++i) {
+        ctx.write(b_rot_in, vraw[i].data(), vraw[i].size() * 4);
+        ctx.dispatch(pw, {&b_rot_in, &b_rot_out}, &wpc, sizeof(wpc), kv_heads);
+        ctx.read(b_rot_out, vrot_dev[i].data(), vrot_dev[i].size() * 4);
+    }
+
+    // ---- the pools: q8 (K) and q4 (V) over the SAME page table, written by their own appends ----
+    const uint32_t q8_rows = rows;                                  // rows already carries the head
+    const uint32_t q8_code_bytes = q8_rows * head_dim;
+    const uint32_t q8_scale_elems = q8_rows * groups64;
+    const uint32_t q4_pool_bytes = rows * q4_bytes_per_head;
+    Buf b_kq = ctx.alloc(q8_code_bytes), b_ks = ctx.alloc(q8_scale_elems * 2);
+    Buf b_vq4 = ctx.alloc(q4_pool_bytes), b_dummy_code = ctx.alloc(q8_code_bytes), b_dummy_scale = ctx.alloc(q8_scale_elems * 2);
+    Buf b_q4_dummy = ctx.alloc(q4_pool_bytes);          // the q4 append's unused K half
+    Buf b_tab = ctx.alloc(table.size() * 4), b_step = ctx.alloc(20);
+    Buf b_kc = ctx.alloc((size_t) kv_heads * head_dim * 4), b_vc = ctx.alloc((size_t) kv_heads * head_dim * 4);
+    std::vector<uint8_t> sent_c(q8_code_bytes, 0x7F), sent_q4(q4_pool_bytes, 0xAB);
+    std::vector<uint16_t> sent_s(q8_scale_elems, 0xDEADu);
+    ctx.write(b_kq, sent_c.data(), sent_c.size());
+    ctx.write(b_ks, sent_s.data(), sent_s.size() * 2);
+    ctx.write(b_vq4, sent_q4.data(), sent_q4.size());
+    ctx.write(b_tab, table.data(), table.size() * 4);
+
+    VkPipeline paq8 = ctx.pipeline(dir + "/kv_q8_append.spv", 8, 16);
+    VkPipeline paq4 = ctx.pipeline(dir + "/kv_q4_append.spv", 6, 16);
+    const uint32_t g_q8_append = (uint32_t) ((2 * kv_heads * groups64 + kLocalSize - 1) / kLocalSize);
+    const uint32_t g_q4_append = (uint32_t) ((2 * kv_heads * groups32 + kLocalSize - 1) / kLocalSize);
+    struct { int kv_heads, head_dim, page_size, host_layout; } apc{(int) kv_heads, (int) head_dim, (int) page_size, 0};
+    for (uint32_t i = 0; i < cells; ++i) {
+        const std::vector<int32_t> step = {ids[i], ids[i] + 1, ids[i] / 4, 8, 0};
+        ctx.write(b_step, step.data(), step.size() * 4);
+        // K: the RAW row, through the q8 append.  THE UNUSED V HALF WRITES INTO A THROWAWAY POOL: the engine folds
+        // that pointer onto the used pool because its CUDA grid has a z dimension it can shrink to 1, while this
+        // port's decomposition puts both halves in ONE grid - folding here would be a data race on the same bytes.
+        ctx.write(b_kc, kraw[i].data(), kraw[i].size() * 4);
+        ctx.write(b_vc, vraw[i].data(), vraw[i].size() * 4);
+        ctx.dispatch(paq8, {&b_kq, &b_dummy_code, &b_ks, &b_dummy_scale, &b_tab, &b_step, &b_kc, &b_vc}, &apc,
+                     sizeof(apc), g_q8_append);
+        // V: the ROTATED row, through the q4 append.  ITS UNUSED K HALF GETS A THROWAWAY POOL for the same reason
+        // the q8 append's unused V half does: the grid covers both halves, so binding the used pool to both slots
+        // makes two writers race on the same bytes - harmless on one driver, 3071 of 3072 wrong on another.
+        ctx.write(b_vc, vrot_dev[i].data(), vrot_dev[i].size() * 4);   // the V HALF reads VC_
+        ctx.dispatch(paq4, {&b_q4_dummy, &b_vq4, &b_tab, &b_step, &b_kc, &b_vc}, &apc, sizeof(apc), g_q4_append);
+    }
+
+    // ---- the gathers: the q8 reader for K, the q4 reader for V (both into f16 scratch) ----
+    Buf b_ids = ctx.alloc(cells * 4);
+    ctx.write(b_ids, ids.data(), ids.size() * 4);
+    std::vector<int32_t> st16(16, 0);
+    st16[1] = (int32_t) (first + cells);
+    st16[3] = (int32_t) cells;
+    Buf b_st16 = ctx.alloc(st16.size() * 4);
+    ctx.write(b_st16, st16.data(), st16.size() * 4);
+    const uint32_t win = rows * kv_heads * head_dim;
+    Buf b_k = ctx.alloc((size_t) win * 2), b_v = ctx.alloc((size_t) win * 2);
+    std::vector<uint16_t> sent_win(win, SENT);
+    ctx.write(b_k, sent_win.data(), sent_win.size() * 2);
+    ctx.write(b_v, sent_win.data(), sent_win.size() * 2);
+    struct { int kv_heads, head_dim, page_size; } gpc{(int) kv_heads, (int) head_dim, (int) page_size};
+    VkPipeline pgq8 = ctx.pipeline(dir + "/kv_q8_gather.spv", 6, 12);
+    const uint32_t per4 = head_dim / 4;
+    const uint32_t g_q8_gather = (uint32_t) (((size_t) rows * kv_heads * per4 + kLocalSize - 1) / kLocalSize);
+    ctx.dispatch(pgq8, {&b_kq, &b_ks, &b_tab, &b_ids, &b_st16, &b_k}, &gpc, sizeof(gpc), g_q8_gather);
+    // THE Q4 GATHER HAS TWO SCRATCH OUTPUTS AND WRITES BOTH.  Sending its unused K scratch to the K window would
+    // overwrite the INT8 window with q4-dequantised V - and because the attention and the oracle would then both
+    // read that garbage, the composed arm would still LOOK nearly right (measured: 6143 of 6144).  An unused
+    // binding needs somewhere harmless, exactly like the unused pool in the append above.
+    Buf b_k_scratch_dummy = ctx.alloc((size_t) win * 2);
+    ctx.write(b_k_scratch_dummy, sent_win.data(), sent_win.size() * 2);
+    VkPipeline pgq4 = ctx.pipeline(dir + "/kv_q4_gather.spv", 7, 12);
+    const uint32_t g_q4_gather = (uint32_t) ((cells * kv_heads * groups32 + kLocalSize - 1) / kLocalSize);
+    ctx.dispatch(pgq4, {&b_vq4, &b_vq4, &b_tab, &b_ids, &b_st16, &b_k_scratch_dummy, &b_v}, &gpc, sizeof(gpc),
+                 g_q4_gather);
+    std::vector<uint16_t> wink(win), winv(win);
+    ctx.read(b_k, wink.data(), wink.size() * 2);
+    ctx.read(b_v, winv.data(), winv.size() * 2);
+
+    // ---- ARM 1: K is the q8 rule on the RAW rows - i.e. K WAS NOT ROTATED ----
+    {
+        int bad = 0, checked = 0;
+        for (uint32_t i = 0; i < cells; ++i) {
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                for (uint32_t g = 0; g < groups64; ++g) {
+                    const float* src = &kraw[i][h * head_dim + g * 64];
+                    float amax = 0.0f;
+                    for (uint32_t t = 0; t < 64; ++t) amax = std::max(amax, std::fabs(src[t]));
+                    const float sf = strata::kernels::f32_from_f16(q8_sbits(amax));
+                    for (uint32_t t = 0; t < 64; ++t) {
+                        const uint16_t want = f16_from_f32((float) q8_code(src[t], sf) * sf);
+                        const size_t j = ((size_t) i * kv_heads + h) * head_dim + g * 64 + t;
+                        if (wink[j] != want) ++bad;
+                        ++checked;
+                    }
+                }
+            }
+        }
+        std::printf("      hybrid K window vs the INT8 rule on the RAW rows (K is not rotated): %d of %d differ\n", bad,
+                    checked);
+        verdict("kv_hybrid: K is INT8 over the UNROTATED rows (the asymmetry)", bad == 0, bad, checked, 0.0,
+                "the K window is not the int8 rule applied to the raw rows - was K rotated?");
+    }
+
+    // ---- ARM 2: V is the q4 rule applied to the ROTATED rows ----
+    {
+        int bad = 0, checked = 0;
+        for (uint32_t i = 0; i < cells; ++i) {
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                for (uint32_t b = 0; b < groups32; ++b) {
+                    uint16_t d_bits = 0;
+                    uint8_t codes[16];
+                    q4_group_ref(d_bits, codes, &vrot_dev[i][h * head_dim + b * 32]);
+                    const float d = strata::kernels::f32_from_f16(d_bits);
+                    for (uint32_t j = 0; j < 32; ++j) {
+                        const uint8_t byte = codes[j & 15];
+                        const int code = (j < 16) ? int(byte & 0x0Fu) : int(byte >> 4);
+                        const uint16_t want = f16_from_f32((float) (code - 8) * d);
+                        const size_t k = ((size_t) i * kv_heads + h) * head_dim + b * 32 + j;
+                        if (winv[k] != want) ++bad;
+                        ++checked;
+                    }
+                }
+            }
+        }
+        std::printf("      hybrid V window vs the Q4_0 rule on the ROTATED rows: %d of %d differ\n", bad, checked);
+        verdict("kv_hybrid: V is Q4_0 over the ROTATED rows (apart from the f16 output of the rotation itself)",
+                bad == 0, bad, checked, 0.0, "the V window is not the q4 rule applied to the rotated rows");
+    }
+
+    // ---- ARMS 3 and 4: the composed attention, in the engine's own two steps ----
+    // The engine's parity file checks both: a TIGHT comparison against a host attention over the SAME dequantized
+    // window (which is what catches a wiring error - a missing or doubled de-rotation), and a BOUNDED comparison
+    // against the fp32-true attention from the unquantized K/V (which is the mode's accuracy claim).  One arm
+    // cannot do both jobs: the tight one cannot see what the quantisation cost, and the bounded one cannot see a
+    // basis error inside its own slack.
+    {
+        std::vector<float> q((size_t) 24 * 256);
+        for (float& v : q) v = rndf(1.0f);
+        std::vector<uint16_t> mb(256);
+        for (uint32_t c = 0; c < 256; ++c) mb[c] = f16_from_f32(rndf(0.6f));
+        Buf b_q = ctx.alloc(q.size() * 4), b_m = ctx.alloc(512), b_o = ctx.alloc((size_t) 24 * 256 * 4);
+        ctx.write(b_q, q.data(), q.size() * 4);
+        ctx.write(b_m, mb.data(), 512);
+        VkPipeline pattn = ctx.pipeline(dir + "/attn_decode_short.spv", 5, 8);
+        struct { uint32_t width, use_mask; } attpc{cells, 1u};
+        std::vector<float> nanp((size_t) 24 * 256, std::numeric_limits<float>::quiet_NaN());
+        ctx.write(b_o, nanp.data(), nanp.size() * 4);
+        ctx.dispatch(pattn, {&b_q, &b_k, &b_v, &b_m, &b_o}, &attpc, sizeof(attpc), 24);
+        std::vector<float> out_rot((size_t) 24 * 256);
+        ctx.read(b_o, out_rot.data(), out_rot.size() * 4);
+        // the output's inverse Hadamard: the same kernel, once
+        Buf b_or = ctx.alloc(out_rot.size() * 4), b_ob = ctx.alloc(out_rot.size() * 4);
+        ctx.write(b_or, out_rot.data(), out_rot.size() * 4);
+        struct { int n_rows; } opc{24};
+        ctx.dispatch(pw, {&b_or, &b_ob}, &opc, sizeof(opc), 24);
+        std::vector<float> out((size_t) 24 * 256);
+        ctx.read(b_ob, out.data(), out.size() * 4);
+
+        // ARM 3a: THE MIXED-BASIS ATTENTION, compared in the basis the attention actually ran in.  The oracle
+        // takes the SAME two f16 windows the device used (INT8 K, rotated Q4_0 V), so nothing re-rounds a window
+        // here: this arm isolates the attention arithmetic and the bindings, and it is tight.
+        std::vector<double> want_mixed((size_t) 24 * 256, 0.0);
+        attn_ref_24x256(want_mixed, q, wink, winv, mb, cells);
+        int bad_mixed = 0;
+        double worst_mixed = 0;
+        for (size_t i = 0; i < out_rot.size(); ++i) {
+            const double rel = std::fabs((double) out_rot[i] - want_mixed[i]) / (std::fabs(want_mixed[i]) + 1e-30);
+            worst_mixed = std::max(worst_mixed, rel);
+            if (!(rel <= 1e-3 || std::fabs((double) out_rot[i] - want_mixed[i]) <= 1e-4)) ++bad_mixed;
+        }
+
+        // ARM 3b: THE DE-ROTATION ITSELF, tested on its own.  The device's de-rotated output must be H applied ONCE
+        // to its own rotated output, computed on the host with the explicit matrix in double, with no f16 in the
+        // way.  A MISSING de-rotation and a DOUBLED one both fail here and nowhere else - which is why it is a
+        // separate arm rather than folded into the comparison above.
+        int bad_derot = 0;
+        double worst_derot = 0;
+        for (uint32_t r = 0; r < 24; ++r) {
+            for (uint32_t d = 0; d < 256; ++d) {
+                double acc = 0.0;
+                for (uint32_t c = 0; c < 256; ++c) {
+                    const uint32_t bits = (uint32_t) __builtin_popcount(d & c);
+                    acc += ((bits & 1u) ? -1.0 : 1.0) * (double) out_rot[(size_t) r * 256 + c];
+                }
+                const double want = acc / 16.0;
+                const double rel = std::fabs((double) out[(size_t) r * 256 + d] - want) / (std::fabs(want) + 1e-30);
+                worst_derot = std::max(worst_derot, rel);
+                if (!(rel <= 1e-4 || std::fabs((double) out[(size_t) r * 256 + d] - want) <= 1e-6)) ++bad_derot;
+            }
+        }
+
+        // ARM 4: the mode's accuracy claim, in the ORIGINAL basis, against the fp32-true attention from the
+        // unquantized rows.  Deliberately NOT tight: the V side is four bits, so the bound belongs to the quantiser.
+        std::vector<uint16_t> wok_raw(win, SENT), wov_raw(win, SENT);
+        double v_bound = 0.0;
+        for (uint32_t i = 0; i < cells; ++i)
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t j = ((size_t) i * kv_heads + h) * head_dim + d;
+                    wok_raw[j] = f16_from_f32(kraw[i][h * head_dim + d]);
+                    wov_raw[j] = f16_from_f32(vraw[i][h * head_dim + d]);
+                }
+                for (uint32_t b = 0; b < groups32; ++b) {
+                    uint16_t d_bits = 0;
+                    uint8_t codes[16];
+                    q4_group_ref(d_bits, codes, &vrot_dev[i][h * head_dim + b * 32]);
+                    v_bound = std::max(v_bound, std::fabs((double) strata::kernels::f32_from_f16(d_bits)) / 2.0);
+                }
+            }
+        std::vector<double> want_true((size_t) 24 * 256, 0.0);
+        attn_ref_24x256(want_true, q, wok_raw, wov_raw, mb, cells);
+
+        int bad_true = 0;
+        double worst_true = 0, worst_true_abs = 0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            const double g = (double) out[i];
+            const double rel = std::fabs(g - want_true[i]) / (std::fabs(want_true[i]) + 1e-30);
+            const double abs_err = std::fabs(g - want_true[i]);
+            worst_true = std::max(worst_true, rel);
+            worst_true_abs = std::max(worst_true_abs, abs_err);
+            if (!(rel <= 1e-2 || abs_err <= 4.0 * v_bound)) ++bad_true;
+        }
+        std::printf("      hybrid: K int8 + rotated Q4_0 V, attended in the MIXED basis, output de-rotated once\n"
+                    "        mixed basis vs its own windows: worst rel %.3g | de-rotation vs H once: worst rel "
+                    "%.3g | vs the fp32-true attention: worst abs %.3g (V-side bound %.3g)\n",
+                    worst_mixed, worst_derot, worst_true_abs, v_bound);
+        verdict("kv_hybrid: the attention in the mixed basis matches an oracle on the same two windows", bad_mixed == 0,
+                bad_mixed, (int) out_rot.size(), worst_mixed, "the mixed-basis attention (or a binding) is wrong");
+        verdict("kv_hybrid: the output is H applied ONCE to it (the de-rotation, tested alone)", bad_derot == 0,
+                bad_derot, (int) out.size(), worst_derot, "a missing or doubled de-rotation");
+        verdict("kv_hybrid: and it is within the V-side Q4_0 bound of the fp32-true attention", bad_true == 0,
+                bad_true, (int) out.size(), worst_true,
+                "the mode does not reproduce the true attention inside the quantisation bound");
+        ctx.free(b_q); ctx.free(b_m); ctx.free(b_o); ctx.free(b_or); ctx.free(b_ob);
+    }
+    ctx.free(b_q4_dummy);
+    ctx.free(b_k_scratch_dummy);
+    ctx.free(b_kq); ctx.free(b_ks); ctx.free(b_vq4); ctx.free(b_dummy_code); ctx.free(b_dummy_scale);
+    ctx.free(b_tab); ctx.free(b_step); ctx.free(b_kc); ctx.free(b_vc); ctx.free(b_ids); ctx.free(b_st16);
+    ctx.free(b_k); ctx.free(b_v); ctx.free(b_rot_in); ctx.free(b_rot_out);
+}
+
 void case_gdn_gate(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "gdn_gate.spv")) return;
     // The fixture MIXTURE is the engine's own (elementwise_parity.cpp): every third head is large, so the
@@ -7796,6 +8091,7 @@ int main(int argc, char** argv) {
     case_qsa_select(ctx, dir);             // the selection: block scores + the weighted top-k, and the chain to attention
     case_kv_f16_append(ctx, dir);          // the KV append: the cache's write half, chained into the gather
     case_kv_q4_rot(ctx, dir);              // the Q4_0 KV path: the FWHT rotation, the group rule, the design claim
+    case_kv_hybrid(ctx, dir);              // the hybrid mode: INT8 K, rotated Q4_0 V, the asymmetry
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

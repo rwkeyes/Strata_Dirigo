@@ -9,13 +9,14 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 
 **Result: the gate prints its own totals and those are the authority. On 2026-10-04, after the Radeon RX 7900 XTX
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
-short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append and the Q4_0 KV path (with its
-Walsh-Hadamard rotation) landed, the box's GPU run was **233 passed / 0 failed / 0 skipped** on the Intel ICD
-(`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 221 / 0 / 3 on llvmpipe and
-224 / 0 / 2 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone (both skip cooperative
-matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
+short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
+Walsh-Hadamard rotation) and the hybrid K8V4 mode landed, the box's GPU run was **238 passed / 0 failed / 0 skipped**
+on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV, Vulkan 1.4.318, subgroup size 32) - 226 / 0 / 3
+on llvmpipe and 228 / 1 / 2 on the radeon ICD, which now picks the AMD iGPU because the discrete card is gone (both
+skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
+tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 224/0/2 becomes 223/1/2
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 228/1/2 is the flaky case below (in a good run, 229/0/2)
 when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
 compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
 (`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
@@ -132,6 +133,20 @@ quantise+rotate K/V to Q4_0, attend, de-rotate, and compare with the unrotated a
 convention** (the other convention is also orthogonal and self-inverse - it is simply a different basis), and the
 injection proves it: flipping the branches fails only the explicit-matrix arm.  Round trip 0.4719 against the group
 bound |d|/2 = 0.4742.  Arc 233/0/0.
+
+**The hybrid K8V4 mode landed, with no new kernel - and llvmpipe caught a race in the case that the Arc did not
+(2026-10-04).**  The mode IS the wiring (`KV_MODE 3` of the engine's own `kv_hybrid_parity.cpp`): INT8 K, rotated
+Q4_0 V, the attention in the mixed basis, and one inverse Hadamard on the output.  The asymmetry is the content -
+ONLY V is rotated, so the query is not either - and the arms pin it in five ways, of which the interesting two are a
+tight oracle over the same two windows (worst rel 1.68e-06) and the de-rotation tested ALONE against `H` applied
+once (worst rel 1.19e-04), because a tight comparison cannot see what the quantisation cost and a bounded one cannot
+see a basis error inside its slack.  **The cross-implementation arm earned its keep:** the q4 append's unused K half
+was bound to the same pool as its V half, so two writers raced on the same bytes - harmless on the Arc, **3071 of
+3072 wrong on llvmpipe**.  One implementation would have shipped it.  Two wiring injections (the de-rotation applied
+twice, and omitted) fail exactly the arms they should, and both needed fixing first: the "twice" version dispatched
+the same input again (a no-op), and the "omitted" version left a push constant unused so `-Werror` failed the build
+and the run printed the STALE binary's numbers.  Arc 238/0/0.  See `RUN-ON-B70.md` for where this sits on the path to
+a running engine.
 
 | Case | Verdict | Method |
 |---|---|---|

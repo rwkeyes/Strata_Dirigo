@@ -542,6 +542,69 @@ query and the attention output get their FWHT).
 
 
 
+## THE ATTENTION BLOCK, KERNEL 6 (no new kernel): the hybrid mode - K in INT8, V in rotated Q4_0
+
+**What was added.**  Nothing to `shaders/`.  The hybrid mode IS the wiring: `kv_q8_append`/`kv_q8_gather` for K,
+`fwht256` + `kv_q4_append`/`kv_q4_gather` for V, `attn_decode_short` over the two windows, and one `fwht256` on the
+output - plus a gate that pins the asymmetry.  This is `KV_MODE 3` of the engine's own reference
+(`src/kernels/kv_hybrid_parity.cpp`), whose header describes it in one line: **INT8 K, rotated Q4_0 V**, then the
+output's inverse Hadamard.
+
+**THE ASYMMETRY IS THE POINT.**  Only V is rotated.  K keeps eight bits and does not need to be spread, and because
+K stays in the original basis the QUERY does too (`<Hq,Hk> = <q,k>` only has to hold for the side that moved).  So:
+rotate what you quantise to four bits, leave the other side and the query alone, and take the output back with one
+Hadamard at the end.  A port that "helpfully" rotated K as well would change every score; one that skipped the output
+rotation would return a correctly-scored answer in the wrong basis.  Both are what the arms exist to catch.
+
+**Evidence.**  Arc: **238 passed / 0 failed / 0 skipped** (five new verdicts), and the arms are deliberately of
+different kinds because one cannot do another's job:
+
+    K window vs the INT8 rule on the RAW rows        3072 values, 0 differ - "K is not rotated"
+    V window vs the Q4_0 rule on the ROTATED rows    3072 values, 0 differ
+    the mixed-basis attention vs an oracle on the same two windows      worst rel 1.68e-06 (tight)
+    the output is H applied ONCE to it (the de-rotation alone)          worst rel 1.19e-04 (tight)
+    vs the fp32-TRUE attention from the unquantized rows                bounded by the V-side |d|/2
+
+**The engine's own parity file does the same two-step thing** (a tight host attention over the SAME dequantized
+window, then a bounded comparison against the true one) and the reason is worth keeping: the tight comparison cannot
+see what the quantisation cost, and the bounded one cannot see a basis error inside its own slack.
+
+**A live demonstration of the "oracle built from the thing under test" trap, stumbled into rather than staged.**  The
+first version bound the q4 gather's UNUSED K scratch output to the INT8 K window.  Both scratch outputs are written
+unconditionally, so the q4 reader overwrote K with q4-dequantised V - and the composed arm still read **6143 of 6144
+as fine**, because the attention and the oracle were both reading the same corrupted window.  What caught it was the
+arm that does not go through the attention at all: **the K window check, 3072 of 3072 differing**.  Two lessons, both
+already in the skill and both re-earned here: an unused binding needs somewhere harmless (the unused POOL in the
+append is the same problem), and an arm that compares a kernel against its own output cannot be the only arm.
+
+**THE CROSS-IMPLEMENTATION ARM CAUGHT A RACE IN THE CASE, and that is the find of this increment.**  The q4 append's
+unused K half was bound to the SAME pool as its V half, so two writers raced on the same bytes with different data
+(the K half carried the raw V row).  The Arc ran the case green - the K half's write happened to be the one the V
+window check expected - while llvmpipe wrote the raw row's codes and the arm read **3071 of 3072 differing**.  A single
+implementation would have shipped this.  Fixing it took two goes and the second one is the lesson: the first fix sent
+the unused half to a throwaway pool but left the ROTATED row in the K input binding, which broke all three
+implementations at once - because the kernel reads `is_v ? VC_ : KC_`, so the V half reads VC_.  **Read the
+half-to-binding mapping off the kernel; "it passed" while two writers shared a buffer is not evidence that the
+wiring was right.**
+
+**Falsified (wiring is the mode, so the injections are in the case):**  the de-rotation applied twice and the
+de-rotation omitted.  Both were *first written wrong and fixed*, which is the more useful record: the "twice" version
+dispatched the same input again (a no-op that passed, and would have been reported as "the case cannot catch this"),
+and the "omit" version left a push constant unused so `-Werror` failed the build and the run printed the STALE
+binary's numbers.  An injection must change behaviour and must compile, and a script that does not check either is
+producing evidence about nothing.  With both fixed, each injection fails the de-rotation arm (0 of 6144, worst rel
+1.4e+03) and the bounded arm (12 of 6144), while the window arms and the mixed-basis arm stay green - and the two
+injections produce the SAME numbers, which is itself the check: H is an involution, so applying it twice returns the
+input, which is exactly what omitting it returns.
+
+**What this leaves.**  The KV storage modes now cover what the engine ships (f16, int8, q4_0, k8v4) at the level of
+a decode step.  The prompt path (`kv_append_q4_batch_kernel` and its staging pool, the tensor-core score variants,
+`kv_hybrid`'s own prompt pass), the ring/staging machinery of `kv_stream.cu` and the per-token call sites that
+decide which mode a step uses are still open - see `RUN-ON-B70.md` for what of it is on the critical path to a
+running engine and what is deferrable.
+
+
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one
