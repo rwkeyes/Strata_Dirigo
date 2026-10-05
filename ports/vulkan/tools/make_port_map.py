@@ -282,7 +282,7 @@ REFUSED = {
     'broadcast_streams', 'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
     'copy_rows_from_mapped', 'fetch_blobs', 'fused_gr_check', 'gdn_ab_multi', 'gdn_conv_commit', 'gdn_conv_l2_multi',
     'gdn_step_norm_multi', 'gpu_stamp', 'native_moe_combine_multi', 'native_router_top10_multi',
-    'native_expert_grouped', 'native_expert_layout', 'native_expert_scratch_bytes', 'ple_block_projected',
+    'native_expert_grouped', 'ple_block_projected',
     'rebase_ptrs', 'resident_plan', 'shared_expert_multi', 'wait_flag_ge', 'wait_flag_ge_or',
 }
 _stale_refusals = sorted(REFUSED - set(syms))

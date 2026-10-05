@@ -146,11 +146,18 @@ target_include_directories(strata_vulkan_spec PUBLIC ${STRATA_ROOT}/include)
 target_link_libraries(strata_vulkan_spec PUBLIC strata_vulkan_cudart)
 
 strata_vulkan_resolve(_vcpu src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-                      src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+                      src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
+                      src/kernels/native_expert_vk.cpp)   # the native (IQ) expert geometry a Vulkan build needs
 add_library(strata_vulkan_kernels_cpu STATIC EXCLUDE_FROM_ALL ${_vcpu})
 target_compile_features(strata_vulkan_kernels_cpu PRIVATE cxx_std_20)
 target_include_directories(strata_vulkan_kernels_cpu PUBLIC ${STRATA_ROOT}/include)
 target_link_libraries(strata_vulkan_kernels_cpu PUBLIC strata_vulkan_cudart Threads::Threads)
+# `expert_layout.cpp` switches its whole native branch on this macro, and the `option()` is declared above the
+# backend blocks (top-level CMakeLists.txt).  PRIVATE: only this target needs it - `src/prefill/prefill.cpp` (in
+# another target) must keep its no-MMQ branch, so PUBLIC propagation is deliberately avoided.
+if(STRATA_NATIVE_EXPERTS)
+  target_compile_definitions(strata_vulkan_kernels_cpu PRIVATE STRATA_NATIVE_EXPERTS=1)
+endif()
 # The AVX-512 / AVX2 source flags, mirrored from the top-level `strata_kernels_cpu`: without them
 # `expert.cpp`'s VNNI/VBMI intrinsics do not compile (measured - "target specific option mismatch").
 if(MSVC)

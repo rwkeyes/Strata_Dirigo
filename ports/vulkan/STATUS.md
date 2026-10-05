@@ -1,5 +1,58 @@
 # Status — what is done, what is verified, what is not
 
+## THE REAL PACK, AND THE NATIVE-EXPERT GATE — the IQ-pack load defect is FIXED at the cause, the port owns the native expert GEOMETRY, and the stopping point is a NAMED missing kernel (2026-10-05, `vega`)
+
+**No token from the real pack, and it is not a token's worth of guessing: the engine's own load path refuses
+`coder-iq1_m` on LAYER 0 because the port has no GROUPED native-expert kernel.**  Both runs (identical, `RC=1`)
+print exactly one line before anything is allocated:
+
+```
+strata generate: layer 0's experts are IQ3_XXS/IQ4_NL (ggml types 18/20), which this engine has no GPU kernels for
+```
+
+**THE DEFECT THAT STOOD IN FRONT OF IT, fixed at the cause.**  `option(STRATA_NATIVE_EXPERTS ...)` was declared at
+`CMakeLists.txt:977`, AFTER the Vulkan block's `return()` - the same ordering trap `STRATA_VERSION` documents.  A
+Vulkan configure never defined the macro, so `expert_layout.cpp` took its no-native branch and refused every IQ
+pack ("this pack has native (IQ) experts but the engine was built without STRATA_NATIVE_EXPERTS").  The option is
+now declared above the backend blocks and `strata_vulkan_kernels_cpu` carries the define; the ggml-cpu half stays
+excluded, and the port supplies the geometry itself (below).
+
+**THE PORT NOW OWNS THE ENGINE'S OWN EXPERT ADDRESSING.**  `vulkan/src/kernels/native_expert_vk.cpp` (new) gives
+`native_fmt` as REAL geometry - `gu_row`/`d_row` from the port's one `iq_row_bytes` table, `up_off = gu_row*n_ff`,
+`down_off = 2*up_off`, `bytes = down_off + d_row*n_embd`, `vec_dot_type` per ggml-cpu's traits table - so the
+engine's OWN load check (`expert_layout.cpp:285`, `f.bytes == the pack's blob column`) passes for ALL 48 layers.
+`iq_row_bytes` gained Q8_K (15, 292 B / 256).  `native_expert_layout` / `native_expert_scratch_bytes` are real
+(transcribed from `iq_kernels.cu:1869`/`:1879`); the four ggml-cpu ROW kernels refuse LOUDLY (a CPU-hybrid path
+this port forbids).  `native_expert_supported` is no longer a blanket `return false`: it answers from the grouped
+shader INVENTORY (`native_gu_iq2s` = IQ2_S gate/up, `native_down_iq4nl` = IQ4_NL down - 2 of the 7 (gu,d) pairs
+this pack uses) AND the still-missing launcher `native_expert_grouped` (the reference passes DEVICE POINTERS a
+Vulkan shader cannot dereference), so the honest answer is FALSE per pair and the hole is NAMED.
+
+**THE FIT, MEASURED.**  dense 1.374 GiB + experts 23.419 GiB = **24.793 GiB**, against **27.3-27.4 GiB usable** on
+the B70.  Through the port's own device layer: a **27 GiB** arena ALLOCATES; **28 GiB FAILS** (exit 3).  The
+weights fit with ~2.2-2.6 GiB for the dense arena's alignment/state, the KV/QSA/GDN state, the MoE/PLE/GR
+workspaces, staging and descriptors.  **Residency is not the problem; the kernel is.**
+
+**`--no-ple` IS IMPOSSIBLE WITH `--native`** (`generate.cpp:1789`/`:1830`) - the PLE key is native too, so the runs
+carry PLE ON (file-backed, never in VRAM).  A real pack's decode REQUIRES the P6 verify window
+(`Verifier::run`), which `Verifier::init` refuses today on the expert cache/profile AND `layer_verify_compatible`.
+
+**A DIAGNOSTIC (capability forced `true`, then REVERTED byte-identically) names what is behind the expert gate:**
+the device inits, the native pack loads its header ("largest blob 2.66 MB, embedding IQ4_XS, 322 MiB"), then exit 1
+at **`blk.0.attn_gate.weight: this pack holds the tensor only in its GGUF form (run with --native SHARD1)`** - the
+native DENSE coverage of the non-expert projections, BEFORE a single expert is read.  Also measured: the PCIe
+probe reads **0.1 GB/s -> pcie_frac 0.00**, which disables the GPU's PCIe expert share.
+
+**RESULTS (vega).**  Gate (`run_gate.sh`, background): Arc `intel_icd` **752/0/0** (exit 0; was 750 - the two new
+cases: `case_native_expert_capability_entry`, two-sided), llvmpipe **740/0/3**, Ryzen iGPU **739/4/2** - the four
+are the documented platform-level non-deterministic wrong-value defects, not this batch's cases.
+`check_port_map.py` passes; `make_port_map.py` regenerates byte-identically.  **Map: `168 = 78 kernel + 0 shader +
+45 host + 0 todo + 45 refused`** (two rows `refused -> host`; `refused` is NOT a capability).  **ENGINE BAR: 0
+remaining engine-API undefineds (0 `strata::kernels::`, 0 `cuda*`) - 0 BY CONSTRUCTION (the refusals define the
+unported symbols), NOT a porting gain.**  **`z820b` untouched.**
+
+
+
 ## FIRST TOKEN FROM THE INTEL ARC PRO B70 — the doorbell RING is a recorded device op, the STREAM SEAM is fixed, and the synthetic ZERO pack emits token 0 (2026-10-05, `vega`)
 
 **A TOKEN CAME OUT OF THE B70.**  `strata_vulkan` on `strata-synth-pack-zero` (synthetic, all weight MATRICES

@@ -20984,6 +20984,88 @@ void case_sample_tokens_entry(Ctx& ctx, const std::string& dir) {
     ctx.free(b_l); ctx.free(b_h); ctx.free(b_o);
 }
 
+// THE NATIVE-EXPERT CAPABILITY AND LAYOUT (this batch).  PURE HOST: `native_expert_supported`
+// (iq_kernels.hpp:51; reference `iq_kernels.cu:1863`), `native_expert_layout` (:1869) and
+// `native_expert_scratch_bytes` (:1879).  The two INVENTORY accessors are this BACKEND's own (declared here,
+// because the engine's headers are never edited): they expose the two components the composed answer is built
+// from, so the case can pin each against its own observable.
+namespace strata::kernels {
+bool native_expert_grouped_shaders(int gu_type, int d_type) noexcept;
+bool native_expert_grouped_launcher() noexcept;
+}  // namespace strata::kernels
+//
+// WHY THIS CASE IS TWO-SIDED.  These three symbols were answered by a blanket `return false` / a loud refusal -
+// the defect shape this port keeps finding (a capability with no code behind the answer).  The backend now
+// answers from TWO NAMED COMPONENTS: the grouped shader inventory it really ships (`native_gu_iq2s.spv` for
+// IQ2_S gate/up, `native_down_iq4nl.spv` for IQ4_NL down) and whether the `native_expert_grouped` LAUNCHER is
+// wired - it is NOT, because the reference passes an array of DEVICE POINTERS (`grp_ptr`) that a Vulkan shader
+// cannot dereference, and the port's shader takes a per-group BYTE OFFSET instead.  The case pins each component
+// against its OWN observable: the inventory is TRUE for at least one of the pack's pairs and FALSE for at least
+// one (so "always true" and "always false" both fail), while the COMPOSED answer is FALSE for every pair until
+// the launcher lands.  A reader that swapped the two would fail this arm.
+//
+// THE LAYOUT HALF IS THE MEASUREMENT, NOT A TRANSCRIPTION OF THE BACKEND.  It checks `native_expert_layout`
+// against the PACK'S OWN blob column (`strata-packs/coder-iq1_m/native_experts.txt`), for every one of the seven
+// (gu_type, d_type) pairs that pack uses at the model's n_embd 2560 / n_ff 640 - the bytes the engine itself
+// validated at load (`expert_layout_load`, expert_layout.cpp:285).  The rival: reading the DOWN row stride at
+// `n_embd` instead of `n_ff` (the element-size/stride trap) MOVES every one of the seven - the margin is
+// printed.  `iq_row_bytes` is the port's ONE row table, the same one the `*_mmvq` shaders take their stride from.
+void case_native_expert_capability_entry(Ctx& ctx, const std::string& dir) {
+    (void) ctx; (void) dir;
+    struct Pair { int gu, d; size_t blob; };     // blob bytes, quoted from native_experts.txt
+    const Pair pairs[] = {
+        {18, 20, 2176000},   // layer 0:  IQ3_XXS / IQ4_NL
+        {18, 42, 1715200},
+        {21, 20, 2329600},   // IQ3_S / IQ4_NL
+        {21, 42, 1868800},
+        {22, 20, 1971200},   // IQ2_S / IQ4_NL  (layers 2..47)
+        {22, 42, 1510400},   // layer 1:  IQ2_S / Q2_0
+        {23, 20, 2662400},   // IQ4_XS / IQ4_NL  (the pack's largest blob)
+    };
+    const int n = (int) (sizeof pairs / sizeof pairs[0]);
+    int bad = 0, inv_true = 0, inv_false = 0, cap_true = 0, rival_moves = 0;
+    for (const Pair& p : pairs) {
+        if (strata::kernels::native_expert_grouped_shaders(p.gu, p.d)) ++inv_true; else ++inv_false;
+        if (strata::kernels::native_expert_supported(p.gu, p.d, 2560, 640)) ++cap_true;
+        const strata::kernels::NativeExpertLayout L =
+            strata::kernels::native_expert_layout(p.gu, p.d, 2560, 640);
+        if (L.bytes != p.blob) ++bad;
+        // the rival: the down row stride read at n_embd (2560) instead of n_ff (640)
+        const size_t d_row_wrong = strata::kernels::iq_row_bytes(p.d, 2560);
+        if (L.down_off + (size_t) 2560 * d_row_wrong != p.blob) ++rival_moves;
+    }
+    std::printf("      native_expert entry: inventory true/false %d/%d, composed answer TRUE on %d of %d, "
+                "stride-rival moves %d/%d, launcher %d\n", inv_true, inv_false, cap_true, n, rival_moves, n,
+                (int) strata::kernels::native_expert_grouped_launcher());
+    verdict("native_expert entry: the pack's seven (gu,d) pairs laid out to the PACK'S OWN blob bytes, and the "
+            "capability answered from the shader inventory + the missing launcher",
+            bad == 0 && inv_true >= 1 && inv_false >= 1 && cap_true == 0 && rival_moves == n,
+            bad + (inv_true >= 1 ? 0 : 1) + (inv_false >= 1 ? 0 : 1) + (cap_true == 0 ? 0 : 1) +
+                (rival_moves == n ? 0 : 1), n, (double) bad,
+            "layout bytes vs native_experts.txt (7 pairs); >>1 inventory arm needs one TRUE and one FALSE; "
+            "the composed answer must be FALSE everywhere while native_expert_grouped is a refusal; the "
+            "wrong-stride rival must move every pair");
+
+    // `native_expert_scratch_bytes`: three fp32 buffers + the q8_1 image of h, 256-byte aligned (iq_kernels.cu:1879).
+    auto scratch_oracle = [](int64_t cap, int64_t n_ff) -> size_t {
+        const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
+        return 3 * ((f + 255) & ~(size_t) 255) +
+               (((size_t) cap * (size_t) (n_ff / 32) * 36u + 255) & ~(size_t) 255);
+    };
+    const int64_t caps[] = {10, 4, 1, 64};
+    int sbad = 0, smoved = 0;
+    const int sn = (int) (sizeof caps / sizeof caps[0]);
+    for (int64_t cap : caps) {
+        const size_t got = strata::kernels::native_expert_scratch_bytes(cap, 640);
+        if (got != scratch_oracle(cap, 640)) ++sbad;
+        if (got != scratch_oracle(cap, 512)) ++smoved;   // a different n_ff must move it
+    }
+    verdict("native_expert_scratch_bytes entry: wrapper == the CUDA rule (3 fp32 buffers + the q8_1 image, "
+            "256-aligned), and a different n_ff moves it",
+            sbad == 0 && smoved == sn, sbad + (smoved == sn ? 0 : 1), sn, (double) sbad,
+            "vs iq_kernels.cu:1879 transcribed here");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -21414,6 +21496,11 @@ int main(int argc, char** argv) {
     // THE STREAM SEAM: a NULL handle is CUDA's default stream (generate.cpp:3893).  APPENDED last for the
     // shared-RNG reason every batch above names.
     case_null_stream_default(ctx, dir);
+    // THIS BATCH: THE NATIVE (IQ) EXPERT PATH - the load-time geometry (`native_fmt`), the capability
+    // (`native_expert_supported`) answered from the port's own grouped-shader inventory and the still-missing
+    // launcher, and the blob layout checked against `coder-iq1_m`'s OWN `native_experts.txt` column.  APPENDED
+    // last for the shared-RNG reason every batch above names.
+    case_native_expert_capability_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

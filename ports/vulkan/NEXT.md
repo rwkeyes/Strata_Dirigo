@@ -1,5 +1,106 @@
 # Start here next session
 
+## THE REAL PACK REACHES THE NATIVE-EXPERT GATE: the CMake ordering defect that refused every IQ pack is fixed, the port owns the native (IQ) expert GEOMETRY, and the stopping point is now a NAMED missing kernel (2026-10-05, `vega`)
+
+**THE PACK LOADS AND THE LAYOUT IS VALIDATED.  `coder-iq1_m` no longer dies at "built without
+STRATA_NATIVE_EXPERTS"; it now stops at `generate.cpp:2007` with an exact, per-layer name.**  Raw output, both runs
+identical, `RC=1` (the full raw output is ONE line - nothing was allocated, nothing was dispatched):
+
+```
+strata generate: layer 0's experts are IQ3_XXS/IQ4_NL (ggml types 18/20), which this engine has no GPU kernels for
+```
+
+Exact command (run 1 and run 2, `RC=1` both, `/tmp/probe4.log` and `/tmp/run2.log`):
+
+```
+STRATA_VK_SPV_DIR=/home/bob/strata-vulkan-wt/ports/vulkan/shaders \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json STRATA_VK_ARENA_GIB=8 \
+  ~/vkbuild-vulkan/vulkan/strata_vulkan \
+  --pack /media/bob/.../strata-packs/coder-iq1_m \
+  --native ~/strata-models/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf \
+  --spec 4 --tokens 1 --max-new 1 --max-context 8
+```
+
+**`--no-ple` IS IMPOSSIBLE WITH `--native`, MEASURED.**  `generate.cpp:1789` requires the PLE key for `--native`
+(the key is native too), so `--native` + `--no-ple` exits 2 at option validation
+("--native requires --ple-gguf ...").  `--no-ple` and `--ple-gguf` are mutually exclusive (`:1830`).  The runs
+above therefore carry PLE ON; the PLE table (shard 2) is opened file-backed and NEVER held in VRAM, so it is not
+part of the fit.  **A real pack's decode REQUIRE the P6 verify window** (`generate.cpp:2165`: `--native`,
+`--spec >= 2`, `--prefill` or a 1-token prompt), i.e. `Verifier::run` - not the token-graph path.
+
+### DELIVERABLE A - THE FIT, MEASURED ON THE B70
+
+The model needs **dense 1.374 GiB + experts 23.419 GiB = 24.793 GiB** (sum over the 48 layers of
+`n_expert 256 x blob_bytes` from `native_experts.txt`; the header's own `total 25146163200` agrees).  A single
+device-local ARENA of that order was allocated on the Arc **through the port's own device layer** (the shim's one
+`VkDeviceMemory`, `strata_vulkan` + `STRATA_VK_ARENA_GIB=N`):
+
+| `STRATA_VK_ARENA_GIB` | arena line printed | driver free / usable |
+|---|---|---|
+| 24 / 26 / 27 | **YES** (`one arena of N GiB`) | 28.30-28.43 GiB free, **27.3-27.4 GiB usable** |
+| **28 / 29** | **NO** (exit 3, no arena line) | same free figure |
+
+**So the weights FIT: 24.793 GiB against 27.3-27.4 GiB of usable device heap, with ~2.2-2.6 GiB left over.**  The
+difference is consumed by the dense arena's 1079 tensors' 256-byte-aligned footprint + metadata, the KV/QSA/GDN
+session state, the MoE/PLE/GR workspaces, the PCIe staging ring and the descriptor pools - NOT by the experts,
+which are not staged.  **The resident arm is viable; the missing piece is the kernel, not the space.**
+
+### DELIVERABLE B - THE ENGINE'S OWN EXPERT ADDRESSING, IN THE PORT
+
+* **`vulkan/src/kernels/native_expert_vk.cpp` (new)** supplies the six native-expert symbols a Vulkan build needs
+  and the ggml half does not provide.  **`native_fmt` is REAL geometry**, not a stub: `gu_row`/`d_row` come from
+  the port's ONE row table (`iq_row_bytes`), `up_off = gu_row*n_ff`, `down_off = 2*up_off`,
+  `bytes = down_off + d_row*n_embd`, and `gu_act`/`d_act` are ggml's `vec_dot_type` map (i-quants -> Q8_K,
+  IQ4_NL/Q2_0 -> Q8_0), transcribed from `ggml-cpu.c`'s traits table in this tree.  **The engine's own load check
+  measures it**: `expert_layout_load` (`expert_layout.cpp:284-289`) requires `f.bytes == the pack's blob column`
+  for EVERY layer, and the run now gets past it - so all 48 layers' layouts match the pack.
+* **`iq_row_bytes` gained type 15 (Q8_K, 292 B / 256 values)** - the one table entry the geometry needs
+  (`block_q8_K`: `float d` + `int8 qs[256]` + `int16 bsums[16]`, confirmed by ggml-common.h's own static_assert).
+  It was a loud refusal before ("no row layout for ggml type 15"), which is how the gap was found.
+* **`native_expert_layout` and `native_expert_scratch_bytes` are now their REAL host rows** (transcribed from
+  `iq_kernels.cu:1869` / `:1879`), replacing refusals.  The MAP moves them `refused -> host`.
+* **The four CPU-hybrid rows refuse LOUDLY** (`native_quant_act/_h`, `native_gu_rows`, `native_down_rows`): they
+  are ggml-cpu's vec_dot rows, i.e. a CPU-hybrid execution path this port forbids; a silent zero there is a wrong
+  token.
+* **THE STAGING SEAM, NAMED.**  The engine gets expert bytes to the device through its PCIe fetch
+  (`GpuPlanSink::fetch` -> `cudaMemcpyAsync` on a device staging slot, `expert_source.cpp:2083-2102`), which the
+  shim already stages.  What is missing is the kernel that READS the staged blob: **`native_expert_grouped`**,
+  still a loud refusal, because the reference passes `grp_ptr` as an array of DEVICE POINTERS (a Vulkan shader
+  cannot dereference one) while the port's `native_gu_iq2s.comp` takes a per-group BYTE OFFSET.
+* **THE GROUPED SHADER INVENTORY IS 2 OF 7 PAIRS.**  The port ships `native_gu_iq2s.spv` (IQ2_S gate/up) and
+  `native_down_iq4nl.spv` (IQ4_NL down).  The Coder pack uses GU in {IQ3_XXS(18), IQ3_S(21), IQ2_S(22),
+  IQ4_XS(23)} and DOWN in {IQ4_NL(20), Q2_0(42)}.  **Layer 0's gate/up is IQ3_XXS: no shader.**
+
+### DELIVERABLE C - THE STOPPING POINT, AND THE ONE BEHIND IT (a DIAGNOSTIC, reverted)
+
+`native_expert_supported` was a blanket `return false` with no code behind it.  It now answers from TWO NAMED
+COMPONENTS - the grouped shader inventory above and whether the launcher is wired - and the honest composed answer
+is **FALSE for every pair** while `native_expert_grouped` is a refusal.  The engine asks it BEFORE allocating
+anything, so the pack stops on **layer 0**.  Pinned by `case_native_expert_capability_entry` (two-sided: inventory
+`1 true / 6 false`, composed answer `0 of 7`, the wrong-stride rival moves `7/7`).
+
+**A DIAGNOSTIC RUN (the capability temporarily forced `true`, then REVERTED byte-identically) names the NEXT
+blocker - it is NOT the experts:** the run inits the device, prints
+`native pack: ... experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB)`, then
+exits 1 at **`blk.0.attn_gate.weight: this pack holds the tensor only in its GGUF form (run with --native SHARD1)`**
+- i.e. the **native DENSE coverage** of the non-expert projections, before a single expert is read.  Two more
+firsts: the PCIe probe reads **0.1 GB/s host->device -> pcie_frac 0.00** (worth checking against the shim's
+staging copies, since 0.00 disables the GPU's PCIe expert share), and the run needs `--expert-profile` +
+`--expert-cache` before `Verifier::init` will even build its windows (`verify.cpp:324`).
+
+### RESULTS (vega)
+
+Gate (`run_gate.sh`, background): **Arc `intel_icd` 752 passed / 0 failed / 0 skipped** (exit 0; was 750 - the two
+new cases), llvmpipe **740/0/3**, Ryzen iGPU **739/4/2** - the four are the DOCUMENTED platform-level
+non-deterministic wrong-value defects (`budget: independent requery`, `fused_gdn_ab entry`,
+`bf16_gemv_fp32_mmvf_cols entry`, `bf16_gemv_fp32_mmvf_multi entry`), NOT this batch's cases, and the new case
+passes on all three arms.  Map: **`168 = 78 kernel + 0 shader + 45 host + 0 todo + 45 refused`** (`refused` is NOT
+a capability); `check_port_map.py` passes and `make_port_map.py` regenerates byte-identically.  Engine bar: the
+`strata_vulkan` program LINKS, 0 undefined - **0 BY CONSTRUCTION (the refusals define the unported symbols), not a
+porting gain.**  **`z820b` untouched (no XTX/K620 number claimed).**
+
+
+
 ## THE FIRST TOKEN from the Intel Arc Pro B70: the DOORBELL RING is a recorded device op, `doorbell_wait` is a no-op under capture, and the STREAM SEAM (a NULL handle is CUDA's default stream) is fixed once (2026-10-05, `vega`)
 
 **A TOKEN CAME OUT.  `strata_vulkan` --pack <synthetic ZERO-weight pack> ran the whole 48-layer decode ON THE

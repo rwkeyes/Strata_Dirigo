@@ -285,11 +285,30 @@ void native_expert_grouped(const NativeExpertLayout&, const unsigned long long*,
                            const int32_t*, const int32_t*, int64_t, int64_t, const void*, void*, float*, void*, int64_t) {
     refuse_unreachable("native_expert_grouped", "the P6 verifier OR --expert-cache-remote N / --peer-device (remote_experts.cpp:309-314, peer_experts.cpp:232-233)");
 }
-NativeExpertLayout native_expert_layout(int, int, int64_t, int64_t) {
-    refuse_unreachable("native_expert_layout", "the P6 verifier OR --expert-cache-remote / --peer-device; the native-expert tier is not selected single-device");
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    // TRANSCRIBED from the reference `src/kernels/cuda/iq_kernels.cu:1869` - this is host arithmetic over the
+    // SAME row table the port's `*_mmvq` shaders take their stride from (`iq_row_bytes`), so a blob's internal
+    // offsets here cannot disagree with the kernels that read it.  It is a layout description, not a dispatch:
+    // nothing about the LOGIC changed from the refusal it replaces, only that the answer is now the real one.
+    NativeExpertLayout L;
+    L.gu_type = gu_type;
+    L.d_type = d_type;
+    L.n_embd = n_embd;
+    L.n_ff = n_ff;
+    L.gu_row = strata::kernels::iq_row_bytes(gu_type, n_embd);
+    L.d_row = strata::kernels::iq_row_bytes(d_type, n_ff);
+    L.up_off = (size_t) n_ff * L.gu_row;
+    L.down_off = 2 * L.up_off;
+    L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    return L;
 }
-size_t native_expert_scratch_bytes(int64_t, int64_t) {
-    refuse_unreachable("native_expert_scratch_bytes", "the P6 verifier OR --expert-cache-remote / --peer-device; the native-expert tier");
+size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
+    // TRANSCRIBED from `src/kernels/cuda/iq_kernels.cu:1879`: three fp32 buffers (gate, up, swiglu h) plus the
+    // q8_1 image of h, each 256-byte aligned.  `block_q8_1` is 36 B (a 4-B fp16 d+s union and 32 int8 qs).
+    if (cap <= 0 || n_ff <= 0) return 0;
+    const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
+    return 3 * ((f + 255) & ~(size_t) 255) +
+           (((size_t) cap * (size_t) (n_ff / 32) * 36u + 255) & ~(size_t) 255);
 }
 void ple_block_projected(const float*, const float*, const float*, const float*, const PleWeights&, PleOut&, void*, void*) {
     refuse_unreachable("ple_block_projected", "the P6 verifier (verify.cpp); Verifier::init refuses");
@@ -327,10 +346,42 @@ void bf16_rows_dot_multi_avx1(const uint16_t*, int, int, const float*, int, floa
 }  // namespace cpu
 
 // ---- A CAPABILITY, ANSWERED NOT REFUSED: `native_expert_supported` ------------------------------------------
-// `bool ... noexcept` (iq_kernels.hpp:51).  The engine uses it to decide whether the native-expert grouped
-// kernel is usable; this backend has no native-expert shader, so it ANSWERS FALSE - the "backend reports what it
-// implements" pattern (`native_caps_vk.cpp`), which selects the ported grouped path.  A refusal here would abort
-// an init-time capability query the decode path does walk.
-bool native_expert_supported(int, int, int64_t, int64_t) noexcept { return false; }
+// `bool ... noexcept` (iq_kernels.hpp:51).  The engine's load path (generate.cpp:2007) asks it, BEFORE anything
+// is allocated, whether the GROUPED native-expert kernel can compute a given (gu_type, d_type) at this geometry;
+// a false answer refuses the pack by layer.  The reference (`src/kernels/cuda/iq_kernels.cu:1863`) answers from
+// its own kernel inventory and four geometry constraints.  THIS backend answers from ITS OWN inventory, which is
+// honestly NARROWER, and the difference is the whole point of the symbol:
+//
+//   * the GROUPED gate/up shader `native_gu_iq2s.spv` exists, for gu_type 22 (IQ2_S) only;
+//   * the GROUPED down shader `native_down_iq4nl.spv` exists, for d_type 20 (IQ4_NL) only;
+//   * AND THE LAUNCHER `native_expert_grouped` is a LOUD REFUSAL in this tree (above), because the reference
+//     passes `grp_ptr` as an array of DEVICE POINTERS and a Vulkan shader cannot dereference one; the port's
+//     `native_gu_iq2s.comp` takes a per-group BYTE OFFSET buffer instead, and producing those offsets from the
+//     engine's pointers (under the verifier's stream capture) is the un-done kernel-port job.
+//
+// So the honest answer TODAY is false for every pair: not because the types are unsupported in the abstract, but
+// because the launcher is absent, which is a NAMED hole rather than a blanket constant.  The shader-inventory
+// test below is real and is pinned by the gate; when the launcher lands, `kGroupedLauncher` flips and this
+// function starts answering per pair - IQ2_S gate/up with IQ4_NL down first.
+static bool grouped_gu_shader(int gu_type) noexcept { return gu_type == 22; }   // IQ2_S only (native_gu_iq2s.spv)
+static bool grouped_down_shader(int d_type) noexcept { return d_type == 20; }   // IQ4_NL only (native_down_iq4nl.spv)
+static constexpr bool kGroupedLauncher = false;   // `native_expert_grouped` is not wired (see the refusal above)
+
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+    if (!kGroupedLauncher) return false;
+    // The reference's structural test, restricted to what THIS backend ships a shader for.  All the i-quant
+    // gate/up and down formats are 256-value superblocks; the geometry tests are the reference's verbatim.
+    if (!grouped_gu_shader(gu_type) || !grouped_down_shader(d_type)) return false;
+    if (n_embd % 256 != 0 || n_ff % 256 != 0) return false;
+    if (n_embd % 256 != 0 || (n_ff * n_embd) % 256 != 0) return false;
+    return true;
+}
+
+// Exposed so the gate can pin the inventory itself (a two-sided check: the types with a built shader, and a type
+// without one) rather than only the composed answer, which today is false whatever the inventory says.
+bool native_expert_grouped_shaders(int gu_type, int d_type) noexcept {
+    return grouped_gu_shader(gu_type) && grouped_down_shader(d_type);
+}
+bool native_expert_grouped_launcher() noexcept { return kGroupedLauncher; }
 
 }  // namespace strata::kernels

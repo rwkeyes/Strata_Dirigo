@@ -705,6 +705,7 @@ size_t iq_row_bytes(int ggml_type, int64_t n) noexcept {
     case 12: return per256(144);   // Q4_K
     case 13: return per256(176);   // Q5_K
     case 14: return per256(210);   // Q6_K
+    case 15: return per256(292);   // Q8_K (block_q8_K: f32 d + int8 qs[256] + int16 bsums[16] = 292 B / 256)
     case 23: return per256(136);   // IQ4_XS
     case 20: return per32(18);     // IQ4_NL
     case 42: return (size_t) ((n / 64) * 18);   // Q2_0

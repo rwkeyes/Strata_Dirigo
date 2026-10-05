@@ -14,6 +14,16 @@ project(strata VERSION 0.1.39 LANGUAGES CXX)
 # Vulkan/SYCL configuration, and `generate.cpp` then fails to compile (the ordering defect the Vulkan engine
 # build hit - BACKEND-INTEGRATION.md deliverable B).
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# plan v0.3 P6's native-experts switch MUST be DECLARED before the per-backend blocks, for exactly the ordering
+# reason STRATA_VERSION is defined above: each backend block below `return()`s, so a Vulkan (or SYCL) configure
+# never reaches the `option(STRATA_NATIVE_EXPERTS ...)` that used to declare it.  The macro is then unset and
+# `src/kernels/cpu/expert_layout.cpp` takes its `#if !defined(STRATA_NATIVE_EXPERTS)` branch, which refuses every
+# native (IQ) pack at load - measured on vega: `coder-iq1_m` stopped at "this pack has native (IQ) experts but the
+# engine was built without STRATA_NATIVE_EXPERTS".  The `if(STRATA_NATIVE_EXPERTS)` block further down still builds
+# the ggml-cpu half for the CUDA/HIP configurations; the Vulkan configuration defines the macro for its own
+# `strata_vulkan_kernels_cpu` (vulkan/CMakeLists.txt) and supplies the native geometry itself
+# (vulkan/src/kernels/native_expert_vk.cpp) - the engine's own sources are not edited.
+option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
