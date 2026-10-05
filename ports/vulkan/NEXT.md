@@ -102,6 +102,38 @@ case), lvp 266/0/3, nvidia (K620) 269/0/2; the box's script exits 1 on that pre-
 write bitwise: the rule (direction, magnitude, the `hc` division, the fold and its order) is gated; the last bits
 of `__expf` are not claimed.
 
+## M-A 2/3: `gather_rows` - the MTP draft head's opaque-byte row gather
+
+`gather_rows.comp`, from `gather_rows` / `gather_rows_kernel` (`src/kernels/cuda/verify_kernels.cu:394`, `:303`);
+its decode-path call site is `MtpDrafter::bind` (`src/core/mtp.cpp:450`), which builds the draft head by keeping
+only the token subset `dvocab` of the head's weight table, one whole `row_bytes` row at a time.
+
+    for i in [0, n*row_bytes):  r = i / row_bytes;  o = i - r*row_bytes
+                                dst[i] = src[ ids[r]*row_bytes + o ]
+
+**The CUDA's element WIDTH is a performance choice, and it is the shape a port breaks.**  It templates on `uint4` /
+`uint32_t` / `uint8_t` by `row_bytes % 16 / % 4`, and `row_e = row_bytes / sizeof(E)` then stands in for
+`row_bytes` in BOTH the divisor and the source stride.  A port that keeps `row_e` in one place and `row_bytes` in
+the other computes a plausible, WRONG row - and nothing about the output looks wrong.  This kernel indexes in
+BYTES, where both alignments are one mapping, and the gate says so with two arms: `row_bytes = 64` (the `uint4`
+path) and `42` (the byte path).
+
+**The fixture is built so an identity gather cannot pass.**  `ids` is a DERANGEMENT (`ids[r] != r` for every r),
+and every source byte is distinct (`(k*31 + j*7 + 1) & 0xFF`), so a wrong source row and a wrong offset each land
+on a different byte.  64 guard bytes past the written range are compared against the sentinel the fixture wrote,
+so a kernel that wrote past its count fails as well.
+
+**Falsified.**  `gates/inject-verify.sh gather-rows-identity` ignores `ids[r]` (`src[ids[r]*row_bytes + o]` ->
+`src[r*row_bytes + o]`): `FAIL  gather_rows: 16-byte-aligned rows  64/576` (the faithful form reads 576/576).
+
+**Measured.**  vega: Intel Arc **281 passed / 0 failed / 0 skipped** (default and intel_icd), llvmpipe
+**269/0/3**, radeon-iGPU **272/0/2** (its budget-requery drift again: 1 fail in 3 runs of this binary).  z820b:
+radeon_icd (7900 XTX) **277/0/1**, lvp 269/0/3, nvidia (K620) 272/0/2; the box's script exits 1 on its
+pre-existing M8 skip, as at HEAD.
+
+**No honest limit to state**: the rule is a pure byte copy and the case compares bytes, so the arms are exact
+rather than tolerance-bearing.
+
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
 
 **Closed the same day the API was written.**  `case_recorded_step` (`harness/vk_gate.cpp`, six verdicts, one

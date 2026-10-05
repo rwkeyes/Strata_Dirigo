@@ -42,6 +42,11 @@ case "$name" in
     old=$'    if (steer && pc.mode == 0) dot = wg_sum(dot) * SL.v[pc.layer];'
     new=$'    if (steer && pc.mode == 0) dot = wg_sum(dot);   // INJECTION: the per-layer scale s dropped'
     want="FAIL  cvec_apply: project removes" ;;
+  gather-rows-identity)
+    file="$SH/gather_rows.comp"; spv="gather_rows"
+    old=$'    DST.b[i] = SRC.b[uint(IDS.v[r]) * pc.row_bytes + o];'
+    new=$'    DST.b[i] = SRC.b[r * pc.row_bytes + o];   // INJECTION: ids[r] ignored - the row at the position'
+    want="FAIL  gather_rows: 16-byte-aligned rows" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 

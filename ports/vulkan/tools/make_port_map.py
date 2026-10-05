@@ -37,6 +37,7 @@ TABLE = {
     'moe_hit_grouped_s2_dev':      ('kernel', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
     'moe_hit_grouped_s2_cpu_order':('kernel', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
     'cvec_apply':                  ('kernel', 'cvec_apply'),
+    'gather_rows':                 ('kernel', 'gather_rows'),
 
     # ---- the engine's own host side: no dispatch for the port to supply ----
     'cpu':                         ('host', 'the engine ticks its own clock'),
@@ -92,7 +93,6 @@ TABLE = {
     # ---- GPU work this port has NOT done: the honest hole list ----
     'embedding_gather':            ('kernel', 'embedding_gather'),
     'scatter_rows_f32':            ('todo', 'a row scatter, not ported'),
-    'gather_rows':                 ('todo', 'a row gather, not ported'),
     'iq_dequant_f32':              ('todo', 'a standalone IQ dequantiser (this port has the FUSED iq*_mmvq)'),
     'native_q5_k_f32':             ('todo', 'Q5_K matvec, not ported'),
     'moe_grouped_s2':              ('todo', 'the grouped S2 MoE, not ported'),

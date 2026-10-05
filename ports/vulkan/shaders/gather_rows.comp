@@ -1,0 +1,46 @@
+#version 450
+// ports/vulkan/shaders/gather_rows.comp - A ROW GATHER OVER OPAQUE BYTES.
+//
+// Transcribed from `gather_rows` (src/kernels/cuda/verify_kernels.cu:394) and `gather_rows_kernel` (:303).  Its
+// decode-path call site is `MtpDrafter::bind` (src/core/mtp.cpp:450): the draft head is built by copying the
+// token subset `dvocab` out of the native head's weight table, one whole row at a time, where a row is `row_bytes`
+// of an opaque quantised block whatever its format is.
+//
+// THE RULE, in bytes:
+//
+//     for i in [0, n * row_bytes):  r = i / row_bytes;  o = i % row_bytes
+//                                   dst[i] = src[ ids[r] * row_bytes + o ]
+//
+// THE CUDA TEMPLATES ON AN ELEMENT WIDTH - `uint4` when `row_bytes % 16 == 0`, `uint32_t` when `% 4 == 0`, else
+// `uint8_t` - and that is a PERFORMANCE choice, not part of the rule: all three produce the same bytes.  It is
+// also the shape a port silently breaks, because the width replaces `row_bytes` with `row_e = row_bytes /
+// sizeof(E)` in BOTH the divisor and the source stride, and a port that keeps `row_e` but uses `row_bytes` for the
+// other (or vice versa) computes a plausible, wrong row.  This kernel indexes in BYTES, so both alignments
+// produce the identical mapping, and the gate runs both a 16-byte-aligned and a non-aligned `row_bytes` to say so.
+//
+// The CUDA launches a FIXED 384-block grid and strides; a grid sized to the work writes exactly the same bytes,
+// so this port dispatches `ceil(n * row_bytes / 256)` groups and gives each invocation one element.
+//
+// No guard on `ids[r]`: the CUDA has none either (a negative id reads before the table there too).  That is the
+// caller's contract, kept identical rather than "improved".
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SRCb { uint8_t b[]; } SRC;
+layout(set = 0, binding = 1, std430) readonly buffer IDSb { int v[]; } IDS;
+layout(set = 0, binding = 2, std430) buffer DSTb { uint8_t b[]; } DST;
+
+layout(push_constant) uniform Pc {
+    uint row_bytes;
+    uint n;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n * pc.row_bytes) return;
+    const uint r = i / pc.row_bytes;
+    const uint o = i - r * pc.row_bytes;
+    DST.b[i] = SRC.b[uint(IDS.v[r]) * pc.row_bytes + o];
+}

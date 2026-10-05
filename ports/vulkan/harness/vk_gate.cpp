@@ -8803,6 +8803,61 @@ void case_cvec_apply(Ctx& ctx, const std::string& dir) {
     ctx.free(bR); ctx.free(bDir); ctx.free(bSl); ctx.free(bOn); ctx.free(bBo); ctx.free(bInj);
 }
 
+// gather_rows - the MTP draft head's row gather (src/kernels/cuda/verify_kernels.cu:394).  dst is indexed by
+// POSITION and the source by ids[r]; both a 16-byte-aligned and a non-aligned row_bytes are gated, because the
+// CUDA's element width is a performance choice and a port that keeps half of it computes a plausible wrong row.
+void case_gather_rows(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gather_rows.spv")) return;
+    struct Arm { const char* what; uint32_t row_bytes, n; };
+    const Arm arms[] = {
+        {"16-byte-aligned rows (the CUDA's uint4 width)", 64, 8},
+        {"unaligned rows (the CUDA's byte width)",        42, 6},
+    };
+    struct Pc { uint32_t row_bytes, n; };
+    const VkPipeline p = ctx.pipeline(dir + "/gather_rows.spv", 3, sizeof(Pc));
+    const uint32_t n_src = 16, guard = 64;
+    int bad_total = 0, checks_total = 0;
+    for (const Arm& a : arms) {
+        const uint32_t total = a.n * a.row_bytes;
+        // byte (k, j) = (k*31 + j*7 + 1) & 0xFF: every (row, offset) DISTINCT, so a wrong row or a wrong
+        // offset cannot land on the right byte by accident
+        std::vector<uint8_t> src((size_t) n_src * a.row_bytes);
+        for (uint32_t k = 0; k < n_src; ++k)
+            for (uint32_t j = 0; j < a.row_bytes; ++j)
+                src[(size_t) k * a.row_bytes + j] = (uint8_t) ((k * 31 + j * 7 + 1) & 0xFF);
+        // A DERANGEMENT: dst row r takes src row ids[r], so the identity gather fails on EVERY row
+        std::vector<int32_t> ids = {9, 0, 13, 2, 15, 4, 11, 6, 1, 14, 3, 12, 5, 8, 7, 10};
+        ids.resize(a.n);
+        std::vector<uint8_t> sent(total + guard, 0xA5);
+
+        Buf bs = ctx.alloc(src.size()), bi = ctx.alloc(ids.size() * 4), bd = ctx.alloc(sent.size());
+        ctx.write(bs, src.data(), src.size());
+        ctx.write(bi, ids.data(), ids.size() * 4);
+        ctx.write(bd, sent.data(), sent.size());
+        Pc pc{a.row_bytes, a.n};
+        ctx.dispatch(p, {&bs, &bi, &bd}, &pc, sizeof(pc), groups_for(total));
+        std::vector<uint8_t> got(sent.size());
+        ctx.read(bd, got.data(), got.size());
+
+        int bad = 0;
+        for (uint32_t r = 0; r < a.n; ++r)
+            for (uint32_t o = 0; o < a.row_bytes; ++o) {
+                ++checks_total;
+                if (got[(size_t) r * a.row_bytes + o] != src[(size_t) ids[r] * a.row_bytes + o]) ++bad;
+            }
+        for (uint32_t i = 0; i < guard; ++i) { ++checks_total; if (got[total + i] != 0xA5) ++bad; }
+        std::printf("      %-58s %u rows x %u B -> %d bad\n", a.what, a.n, a.row_bytes, bad);
+        char label[200];
+        std::snprintf(label, sizeof label, "gather_rows: %s", a.what);
+        verdict(label, bad == 0, bad, (int) (a.n * a.row_bytes + guard), 0.0,
+                "a wrong source row, a wrong row stride, or a guard byte moved");
+        bad_total += bad;
+        ctx.free(bs); ctx.free(bi); ctx.free(bd);
+    }
+    verdict("gather_rows: position is the row, ids[r] the source", bad_total == 0, bad_total, checks_total, 0.0,
+            "the fixture is a derangement, so an identity gather fails on every row");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -8938,6 +8993,7 @@ int main(int argc, char** argv) {
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
     case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
     case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)
+    case_gather_rows(ctx, dir);            // M-A: the MTP draft head's opaque-byte row gather
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

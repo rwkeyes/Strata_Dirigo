@@ -23,7 +23,7 @@ fused_gr_check	host	a capability check
 fused_gr_read	host	a workspace read
 fused_gr_supported	host	a capability check
 fwht256_inplace_cuda	kernel	fwht256
-gather_rows	todo	a row gather, not ported
+gather_rows	kernel	gather_rows
 gr_read	host	a workspace read
 gr_workspace_bytes	host	a size
 gr_workspace_init	host	a workspace hand-out
