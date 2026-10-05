@@ -112,6 +112,43 @@ engine's shared bitmap + `atomicOr`; the counts are identical (`id_to_sub` is th
 keeps the shader free of atomics, at O(nv x h) instead of O(h + hits x h) - the port's existing scan-instead-of-bitmap
 trade, acceptable for a correctness arm with the gate's small subset sizes.
 
+## THE `sample_tokens` ENTRY POINT: THE CHOICE, not just the two paths - **DONE AND VERIFIED 2026-10-05**
+
+The port had both sampled paths gated (`sampler_kernel`, `sampler_split`) and the greedy kernel gated
+(`sampler_greedy`), but nothing proved WHICH one a request takes - the `PORT-MAP.tsv` row named the shaders and the
+choice itself was untested.  `case_sample_tokens` (`harness/vk_gate.cpp`) pins it, as a pure predicate AND by
+running the chosen kernel:
+
+    sample_choice(greedy, temperature, n_vocab, n_tokens, split_ok):
+      greedy || temperature <= 0            -> GREEDY
+      n_blocks <= 64 && n_tokens <= 64      -> SPLIT   (the default)
+      otherwise                             -> ONEBLOCK (the fallback)
+
+**The arm the task names is `temperature == 0`.**  `sample_tokens` routes it to the GREEDY kernel - the argmax -
+NOT to the sampled path's uniform-over-the-shortlist draw (which is what the sampled kernel does when called
+DIRECTLY with temp 0, gated separately by `case_sampler_kernel`).  The fixture is 8 distinct logits 8..1, so the
+greedy token is id 0 while the sampled path would draw `floor(u*8)` over the 8, and the row's `sampled-path spread`
+is printed as evidence the arm discriminates.
+
+**Six rows**: the greedy flag; temperature 0; a sampled request (SPLIT); no scratch (ONEBLOCK fallback); a
+vocabulary wider than the merge holds (300000 logits -> 74 partitions > 64, ONEBLOCK); and 65 rows (> 64,
+ONEBLOCK).  Each runs its chosen pipeline and compares every token to that path's oracle.
+**One defect the multi-row arm found in the CASE**: the sampled kernels draw `philox(seed, counter + t)`, so the
+host oracle must use counter `t`, not `0` - reading `0` for every row passed the 1-row arms and failed the 65-row
+one (`-87/4`: more bad than compared, the signature of a wrong oracle rather than a wrong kernel).
+
+**Falsified.**  `gates/inject-verify.sh sample-tokens-choice-temp0-to-sampled` changes the predicate's
+`temperature <= 0.0f` to `temperature < 0.0f`, so a temp-0 request falls through to the sampled path:
+`FAIL  sample_tokens: temperature 0 takes the argmax, NOT the draw    3/    4  worst 0`.  This injection lives in
+the HARNESS, so `inject-verify.sh` now rebuilds the gate for a non-shader change (an earlier `if (greedy)` form
+was caught as `DID NOT COMPILE (harness)` on an unused-parameter `-Werror`, which is exactly the "an injection that
+does not build is a stale binary" rule).
+
+**Measured.**  vega: **Intel Arc 352 passed / 0 failed / 0 skipped**, llvmpipe 340/0/3, radeon-iGPU 343/0/2,
+`run_gate.sh` exit 0.  **+7 verdicts** (six rows + the group arm).  Box (7900 XTX): radeon_icd 348/0/1, lvp 340/0/3,
+nvidia 343/0/2.  The port map is unchanged: `sample_tokens` already named `sampler_greedy sampler_kernel
+sampler_split`, and the case adds no `kernels::` symbol.
+
 
 
 ## M-A: the standalone dequantiser's LAST TWO FORMATS - IQ2_XXS and IQ2_XS - **DONE AND VERIFIED 2026-10-05**

@@ -9314,6 +9314,130 @@ void case_sampler_split(Ctx& ctx, const std::string& dir) {
             "a wrong partition, merge order or tail would land here");
 }
 
+// === THE `sample_tokens` ENTRY POINT: WHICH PATH A REQUEST TAKES ============================================
+//
+// `sample_tokens` (src/kernels/cuda/sampler.cu) is the entry point the engine calls with logits; it CHOOSES between
+// three paths, and the choice is part of the contract:
+//   * `greedy || temperature <= 0` -> the GREEDY kernel.  A temperature of 0 is NOT the sampled path's uniform
+//     draw here: `sample_tokens` routes it to the argmax.  The uniform-over-the-shortlist behaviour is what the
+//     sampled kernel does when called DIRECTLY with temp 0, and its own case gates that separately.
+//   * otherwise the SPLIT sampler (the default), with the one-block `sampler_kernel` as the FALLBACK when the split
+//     cannot run: a vocabulary wider than the merge holds, more than 64 rows, a stream under capture, or no scratch.
+// The port had both paths gated but the CHOICE untested - the map row named both shaders and nothing proved which
+// one a request takes.  This case pins the choice as a pure predicate AND runs the chosen kernel for each row.
+enum SamplePath { P_GREEDY = 0, P_SPLIT = 1, P_ONEBLOCK = 2 };
+
+static SamplePath sample_choice(bool greedy, float temperature, int n_vocab, int n_tokens, bool split_ok) {
+    if (greedy || temperature <= 0.0f) return P_GREEDY;
+    const int n_blocks = (n_vocab + 4095) / 4096;      // kSplitBlockSpan, the merge's 4096-logit partitions
+    if (split_ok && n_blocks <= 64 && n_tokens <= 64) return P_SPLIT;
+    return P_ONEBLOCK;
+}
+
+void case_sample_tokens(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "sampler_greedy.spv") || !have(dir, "sampler_kernel.spv") || !have(dir, "sampler_split.spv")) return;
+    if (!ctx.info().shader_float64) {
+        skip("sample_tokens", "device has no fp64 - this port's sampled paths accumulate in double");
+    }
+    struct Row {
+        const char* what;
+        bool greedy; float temperature; int n_vocab, n_tokens; bool split_ok;
+        SamplePath want;
+    };
+    const Row rows[] = {
+        {"the greedy FLAG takes the argmax",                     true, 1.0f,   4096,  1, true,  P_GREEDY},
+        {"temperature 0 takes the argmax, NOT the draw",        false, 0.0f,   4096,  1, true,  P_GREEDY},
+        {"a sampled request takes the SPLIT path (default)",    false, 1.0f,   4096,  1, true,  P_SPLIT},
+        {"no scratch: the one-block fallback",                  false, 1.0f,   4096,  1, false, P_ONEBLOCK},
+        {"a vocabulary wider than the merge falls back",        false, 1.0f, 300000,  1, true,  P_ONEBLOCK},
+        {"more than 64 rows fall back",                         false, 1.0f,   4096, 65, true,  P_ONEBLOCK},
+    };
+    struct Pc {
+        int n_vocab, n_tokens, history_len, penalty_last_n, top_k, min_keep;
+        float temperature, top_p, min_p, penalty_repeat, penalty_freq, penalty_present;
+        uint32_t seed_lo, seed_hi, counter_lo, counter_hi;
+    };
+    VkPipeline p_greedy = ctx.pipeline(dir + "/sampler_greedy.spv", 3, 28);
+    VkPipeline p_split = ctx.pipeline(dir + "/sampler_split.spv", 3, sizeof(Pc));
+    VkPipeline p_block = ctx.pipeline(dir + "/sampler_kernel.spv", 3, sizeof(Pc));
+    const int history_len = 64, top_k = 8;
+    int choice_bad = 0, checks = 0, bad_total = 0;
+
+    for (const Row& r : rows) {
+        const SamplePath got = sample_choice(r.greedy, r.temperature, r.n_vocab, r.n_tokens, r.split_ok);
+        if (got != r.want) ++choice_bad;
+        const uint32_t nv = (uint32_t) r.n_vocab;
+        std::vector<float> logits((size_t) r.n_tokens * nv, -50.0f);
+        std::vector<int32_t> hist((size_t) r.n_tokens * history_len, 9999);
+        for (int t = 0; t < r.n_tokens; ++t)
+            for (int v = 0; v < 8; ++v) logits[(size_t) t * nv + (size_t) v] = 8.0f - (float) v;   // ids 0..7 = 8..1
+
+        Buf b_l = ctx.alloc(logits.size() * 4), b_h = ctx.alloc(hist.size() * 4);
+        Buf b_o = ctx.alloc((size_t) r.n_tokens * 4);
+        ctx.write(b_l, logits.data(), logits.size() * 4);
+        ctx.write(b_h, hist.data(), hist.size() * 4);
+        const int n_seeds = (r.n_vocab > 262144) ? 1 : 4;
+        int bad = 0, split_seen = 0;
+        std::vector<int32_t> sdistinct;
+        for (int si = 0; si < n_seeds; ++si) {
+            const uint64_t seed = 0x51ed270bULL + uint64_t(si) * 0x9E3779B97F4A7C15ULL;
+            Pc pc{};
+            pc.n_vocab = r.n_vocab; pc.n_tokens = r.n_tokens; pc.history_len = history_len;
+            pc.penalty_last_n = history_len; pc.top_k = top_k; pc.min_keep = 1;
+            pc.temperature = r.temperature; pc.top_p = 1.0f; pc.min_p = 0.0f;
+            pc.penalty_repeat = 1.0f; pc.penalty_freq = 0.0f; pc.penalty_present = 0.0f;
+            pc.seed_lo = uint32_t(seed); pc.seed_hi = uint32_t(seed >> 32); pc.counter_lo = 0; pc.counter_hi = 0;
+            std::vector<int32_t> sent((size_t) r.n_tokens, -1);
+            ctx.write(b_o, sent.data(), sent.size() * 4);
+            if (r.want == P_GREEDY) {
+                struct { int n_vocab, n_tokens, history_len, plen; float rep, freq, pres; } gp{
+                    r.n_vocab, r.n_tokens, history_len, history_len, 1.0f, 0.0f, 0.0f};
+                ctx.dispatch(p_greedy, {&b_l, &b_h, &b_o}, &gp, sizeof(gp), (uint32_t) r.n_tokens);
+            } else if (r.want == P_SPLIT) {
+                ctx.dispatch(p_split, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), (uint32_t) r.n_tokens);
+            } else {
+                ctx.dispatch(p_block, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), (uint32_t) r.n_tokens);
+            }
+            std::vector<int32_t> got_t((size_t) r.n_tokens);
+            ctx.read(b_o, got_t.data(), got_t.size() * 4);
+            ++checks;
+
+            const SamplerSpec spec{r.n_vocab, top_k, 1, r.temperature, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+            std::vector<int32_t> nohist(1, -1);
+            for (int t = 0; t < r.n_tokens; ++t) {
+                const int want_tok =
+                    (r.want == P_GREEDY)
+                        ? sampler_want(logits, (size_t) t * nv, (int) nv, hist, (size_t) t * history_len,
+                                       history_len, history_len, 1.0f, 0.0f, 0.0f)
+                        : sampler_pick(sampler_select(std::vector<float>(logits.begin() + (size_t) t * nv,
+                                                                         logits.begin() + (size_t) (t + 1) * nv),
+                                                      nohist, 0, spec),
+                                       r.temperature, seed, (uint64_t) t);   // the kernel draws counter + t
+                if (got_t[t] != want_tok) ++bad;
+            }
+            // How discriminating the temp-0/greedy rows are: what the SAMPLED path would have drawn (uniform over
+            // the shortlist at temp 0).  Printed as evidence; the injection below is the proof it bites.
+            if (r.want == P_GREEDY) {
+                const int s = sampler_pick(sampler_select(std::vector<float>(logits.begin(), logits.begin() + nv),
+                                                          nohist, 0, spec), 0.0f, seed, 0);
+                if (std::find(sdistinct.begin(), sdistinct.end(), s) == sdistinct.end()) { sdistinct.push_back(s); ++split_seen; }
+            }
+        }
+        std::printf("      %-54s -> %-8s (choice %s), %d tok-bad; sampled-path spread %d\n", r.what,
+                    got == P_GREEDY ? "GREEDY" : (got == P_SPLIT ? "SPLIT" : "ONEBLOCK"),
+                    got == r.want ? "ok" : "WRONG", bad, split_seen);
+        char label[220];
+        std::snprintf(label, sizeof label, "sample_tokens: %s", r.what);
+        verdict(label, bad == 0 && got == r.want, bad + (got != r.want ? 1 : 0), n_seeds * r.n_tokens, 0.0,
+                "the choice or the chosen path's token is wrong");
+        bad_total += bad;
+        ctx.free(b_l); ctx.free(b_h); ctx.free(b_o);
+    }
+    verdict("sample_tokens: six requests take the engine's path", choice_bad == 0, choice_bad,
+            (int) (sizeof(rows) / sizeof(rows[0])), 0.0,
+            "a wrong dispatch: temperature 0 is greedy, the split is default, the block kernel is the fallback");
+}
+
 // === THE COUPLED DRAFT PATH (speculative decoding) ===========================================================
 //
 // src/kernels/cuda/sampler.cu's `coupled_penalize_kernel` + `coupled_merge_kernel`, and the host arithmetic in
@@ -10460,6 +10584,7 @@ int main(int argc, char** argv) {
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
     case_sampler_split(ctx, dir);          // the split sampler: partition top-k + the ordered merge (the default path)
+    case_sample_tokens(ctx, dir);          // the sample_tokens ENTRY POINT: which path a request takes (the choice)
     case_coupled_draft(ctx, dir);          // the coupled draft: the speculative-decoding sampler (counter cell+1)
     case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
     case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)

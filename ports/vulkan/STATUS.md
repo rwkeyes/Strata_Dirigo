@@ -165,6 +165,16 @@ coupled_draft: the counter ... 1/8` and `coupled-draft-window-start` -> `FAIL co
 called unqualified in `src/core/mtp.cpp`, so `check_port_map.py` (which keys on `kernels::`) neither lists them nor
 the two coupled shaders - recorded, not papered over.
 
+**THE `sample_tokens` CHOICE landed (2026-10-05).**  Both sampled paths and the greedy kernel were gated; the CHOICE
+between them was not.  `case_sample_tokens` pins it (greedy || temp 0 -> GREEDY; n_blocks<=64 && n_tokens<=64 ->
+SPLIT, the default; else -> the one-block ONEBLOCK fallback) as a pure predicate AND by running the chosen kernel
+for six requests, including the task's named case: **temperature 0 routes to the ARGMAX, not the sampled path's
+uniform draw**.  Falsified by `gates/inject-verify.sh sample-tokens-choice-temp0-to-sampled` -> `FAIL sample_tokens:
+temperature 0 ... 3/4`; this injection is in the HARNESS, so `inject-verify.sh` now rebuilds the gate for a
+non-shader change (and refused an earlier form as `DID NOT COMPILE (harness)`).  **+7 verdicts: vega Arc 352/0/0**
+(`run_gate.sh` exit 0), llvmpipe 340/0/3, radeon-iGPU 343/0/2; box `radeon_icd` (7900 XTX) 348/0/1, lvp 340/0/3,
+nvidia 343/0/2.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the

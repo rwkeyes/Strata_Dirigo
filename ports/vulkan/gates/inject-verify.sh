@@ -41,7 +41,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
 SH="$ROOT/shaders"
 BUILD="$ROOT/harness/build"
 GATE="$BUILD/vk_gate"
+TREE="$(cd "$ROOT/../.." && pwd)"                 # the engine tree (for the real headers)
 [ -x "$GATE" ] || { echo "no gate binary at $GATE - run run_gate.sh once first"; exit 4; }
+
+# An injection can live in a SHADER (glslc) or in the HARNESS (a case's own rule, e.g. sample_tokens' dispatch
+# choice).  Both are real falsifications, so both must rebuild the artifact they change - an injection that does
+# not rebuild runs the stale binary and reports a clean result.
+rebuild_harness() {
+  g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" -o "$GATE" \
+      "$ROOT/harness/vk_compute.cpp" "$ROOT/harness/vk_compat.cpp" "$ROOT/harness/vk_stack.cpp" \
+      "$ROOT/harness/vk_gate.cpp" -lvulkan
+}
+is_harness_src() { case "$1" in "$ROOT"/harness/*.cpp|"$ROOT"/harness/*.hpp) return 0 ;; *) return 1 ;; esac; }
 
 name="${1:-}"; icd="${2:-}"
 case "$name" in
@@ -156,6 +167,16 @@ case "$name" in
     old=$'    const int start = pc.cap + pc.j - h;                                          // coupled_hist_start'
     new=$'    const int start = pc.cap - h;   // INJECTION: the draft index j dropped from the window start'
     want="FAIL  coupled_draft: the window" ;;
+  sample-tokens-choice-temp0-to-sampled)
+    # The entry point's choice, and the one the task names: `temperature == 0` must route to the GREEDY kernel,
+    # NOT to the sampled path's uniform draw.  Dropping the temperature test sends a temp-0 request to the sampler,
+    # which draws uniformly over the shortlist - a different token for most seeds.  The case's temp-0 row runs the
+    # chosen kernel, so the token moves (it also reads the pure choice table as WRONG).  This is a HARNESS source,
+    # so the script rebuilds the gate rather than running a stale binary.
+    file="$ROOT/harness/vk_gate.cpp"; spv="vk_gate"
+    old=$'    if (greedy || temperature <= 0.0f) return P_GREEDY;'
+    new=$'    if (greedy || temperature < 0.0f) return P_GREEDY;   // INJECTION: temp 0 no longer routes to the argmax'
+    want="FAIL  sample_tokens: temperature 0" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target
@@ -170,6 +191,7 @@ bak="$(mktemp)"
 cp "$file" "$bak"
 restore() {
   cp "$bak" "$file"; rm -f "$bak"
+  if is_harness_src "$file"; then rebuild_harness 2>/dev/null; return; fi
   if [ "${file#"$SH/common/"}" = "$file" ]; then
     glslc --target-env=vulkan1.3 -fshader-stage=compute "$file" -o "$SH/$spv.spv" 2>/dev/null
   fi
@@ -198,8 +220,13 @@ PY
 
 # 3. it must COMPILE - an injection that does not build is a stale binary wearing a new timestamp.
 #    `$COMPILE_TARGET` is the shader that INCLUDES the changed file when the change is in common/ (an include has
-#    no #version and cannot be compiled alone), and the changed file itself otherwise.
-if ! glslc --target-env=vulkan1.3 -fshader-stage=compute "$COMPILE_TARGET" -o "$SH/$spv.spv" 2>"$BUILD/$spv.glslerr"; then
+#    no #version and cannot be compiled alone), and the changed file itself otherwise.  A harness source rebuilds
+#    the harness instead.
+if is_harness_src "$file"; then
+  if ! rebuild_harness 2>"$BUILD/harness.builderr"; then
+    echo "DID NOT COMPILE (harness): $name"; sed -n '1,12p' "$BUILD/harness.builderr"; exit 3
+  fi
+elif ! glslc --target-env=vulkan1.3 -fshader-stage=compute "$COMPILE_TARGET" -o "$SH/$spv.spv" 2>"$BUILD/$spv.glslerr"; then
   echo "DID NOT COMPILE: $name"; sed -n '1,12p' "$BUILD/$spv.glslerr"; exit 3
 fi
 if [ "${file#"$SH/common/"}" != "$file" ]; then
