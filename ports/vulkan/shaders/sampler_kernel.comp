@@ -1,0 +1,189 @@
+// ports/vulkan/shaders/sampler_kernel.comp - the general sampler: penalties, top-k, top-p, min-p, temperature, and
+// one Philox draw.  Ported from src/kernels/cuda/sampler.cu (`sampler_kernel`).
+//
+// THE CHAIN, in the source's order (which is llama.cpp's, issue #53):
+//
+//   1. penalties   - repeat/frequency/presence over the TAIL of the history, applied ONCE, on the raw logits
+//   2. top_k       - `k` rounds of a block argmax over the not-yet-taken; the list is in SELECTION ORDER:
+//                    descending by value, ties to the LOWER index
+//   3. top_p       - on the penalised logits in that order: the shortest prefix whose probability reaches top_p,
+//                    never shorter than `min_keep`
+//   4. min_p       - then the descending prefix that stays within `log(min_p)` of the head
+//   5. temperature - applied to the SURVIVORS only, after the filters (`scaled(i) = sel_logit[i] / temperature`)
+//   6. softmax over the survivors, and ONE Philox draw (`seed`, `counter + t`) decides the token
+//
+// **`temperature == 0` IS NOT GREEDY HERE.**  The source computes `inv_t = 1/temperature` when temperature > 0 and
+// ZERO otherwise, so a temperature of zero scales every survivor to 0 and the draw is UNIFORM over the shortlist.
+// Greedy is the separate `sampler_greedy` path.  A port that "fixed" this into an argmax would change every token
+// with a zero temperature, and the case has an arm for it.
+//
+// **THE PENALTIES ARE APPLIED ONCE, BEFORE THE SELECTION.**  The source's comment records that they used to be
+// applied a second time after the temperature scaling, and llama.cpp's chain has one penalties stage; an arm checks
+// that a penalised token's rank is the same whether the temperature is 1 or 10.
+//
+// THE SELECTION ORDER IS A STRICT TOTAL ORDER: value descending, and on equality the lower id - NaN and -inf are
+// never picked, and a round that finds nothing stores id 0 with a -inf logit.  top_p and min_p are defined over that
+// order, so a tie broken the other way changes which tokens survive the cut, not just their order.
+//
+// 64 SURVIVORS AT MOST (`KMAX`), and every thread computes the whole tail of the chain redundantly over the shared
+// `sel_*` - exactly as the source does - so they agree on the pick and thread 0 writes it.
+//
+// DOUBLE ARITHMETIC IS THE SOURCE'S, AND THE DEVICE HAS TO HAVE IT.  Intel's own support article says Arc has no
+// shaderFloat64, while this box's ANV reports fp64 = 1 in the gate's `--list` - so the faithful variant runs HERE
+// and the portable f32 sibling (the pattern every other double kernel in this port follows, compared by
+// measurement) is still the right thing to ship for the devices the article describes.  It is the next step.
+//
+// WHAT THIS PORT DOES NOT DO YET, stated: the source builds a shared BITMAP of the history's ids for its penalty
+// membership test (~31 KB at this model's 248,320-token vocabulary).  This port scans the window per candidate
+// instead - what that source did before the bitmap, with identical counts - because the bitmap and this kernel's
+// shared arrays do not fit the port's 32 KB budget together.  See sampler_greedy.comp for the same note.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_ARB_gpu_shader_fp64 : require
+
+layout(local_size_x = 256) in;
+
+// glslang has no exp(double) - this include builds one (and the port keeps the double pieces in one place).
+#include "common/double_math.glsl"
+#include "common/philox.glsl"
+
+layout(set = 0, binding = 0, std430) readonly buffer LOGITS { float x[]; } LO_;
+layout(set = 0, binding = 1, std430) readonly buffer HIST { int h[]; } HI_;
+layout(set = 0, binding = 2, std430) buffer OUT { int o[]; } OUT_;
+
+layout(push_constant) uniform Pc {
+    int n_vocab;
+    int n_tokens;
+    int history_len;
+    int penalty_last_n;
+    int top_k;              // 1..63 as given; 0 ("off") and anything wider keep 64
+    int min_keep;           // a floor under the top_p cut
+    float temperature;
+    float top_p;
+    float min_p;
+    float penalty_repeat;
+    float penalty_freq;
+    float penalty_present;
+    uint seed_lo;
+    uint seed_hi;
+    uint counter_lo;
+    uint counter_hi;
+} pc;
+
+const int KMAX = 64;
+
+shared int sel_ids[KMAX];
+shared float sel_logit[KMAX];
+shared float rv[256];
+shared int ri[256];
+
+float apply_penalties(float logit, int count) {
+    if (count <= 0) return logit;
+    if (logit <= 0.0) logit *= pc.penalty_repeat;
+    else              logit /= pc.penalty_repeat;
+    logit -= float(count) * pc.penalty_freq + ((count > 0) ? 1.0 : 0.0) * pc.penalty_present;
+    return logit;
+}
+
+void main() {
+    const int t = int(gl_WorkGroupID.x);
+    if (t >= pc.n_tokens) return;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint row = uint(t) * uint(pc.n_vocab);
+
+    // Temperature is needed by both stages, but the chain APPLIES it after the truncation filters: survivors are
+    // chosen on the raw logits.
+    const float inv_t = (pc.temperature > 0.0) ? (1.0 / pc.temperature) : 0.0;
+
+    int hlen = 0, hbase = 0;
+    if (pc.history_len > 0) {
+        hlen = min(pc.penalty_last_n, pc.history_len);
+        if (hlen < 0) hlen = 0;
+        hbase = t * pc.history_len + (pc.history_len - hlen);      // the window is the TAIL
+    }
+
+    int k = (pc.top_k > 0 && pc.top_k < KMAX) ? pc.top_k : KMAX;
+    if (k > pc.n_vocab) k = pc.n_vocab;
+
+    // ---- top_k: k rounds, each a block argmax over the not-yet-taken ----
+    for (int i = 0; i < k; ++i) {
+        float bv = uintBitsToFloat(0xff800000u);      // -inf
+        int best = pc.n_vocab;                        // the sentinel loses every comparison
+        for (int v = int(lid); v < pc.n_vocab; v += 256) {
+            bool taken = false;
+            for (int j = 0; j < i; ++j) {
+                if (sel_ids[j] == v) { taken = true; break; }
+            }
+            if (taken) continue;
+            int count = 0;
+            if (hlen > 0) {
+                for (int q = 0; q < hlen; ++q) {
+                    if (HI_.h[hbase + q] == v) ++count;
+                }
+            }
+            const float s = apply_penalties(LO_.x[row + uint(v)], count);
+            if (s > bv) { bv = s; best = v; }         // strict: the lowest id wins a tie
+        }
+        rv[lid] = bv;
+        ri[lid] = best;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (int(lid) < off) {
+                const float ov = rv[lid + uint(off)];
+                const int oi = ri[lid + uint(off)];
+                if (ov > rv[lid] || (ov == rv[lid] && oi < ri[lid])) {
+                    rv[lid] = ov;
+                    ri[lid] = oi;
+                }
+            }
+            barrier();
+        }
+        if (lid == 0u) {
+            sel_ids[i] = (ri[0] < pc.n_vocab) ? ri[0] : 0;     // a round that found nothing: id 0, -inf logit
+            sel_logit[i] = rv[0];
+        }
+        barrier();
+    }
+
+    // ---- the tail of the chain: every thread computes it redundantly over the shared list ----
+    int n_keep = k;
+    float mx = sel_logit[0];
+    for (int i = 1; i < k; ++i) mx = max(mx, sel_logit[i]);
+
+    if (pc.top_p < 1.0) {
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) sum += double_exp(double(sel_logit[i]) - double(mx));
+        double cum = 0.0;
+        int cut = k;
+        for (int i = 0; i < k; ++i) {
+            cum += double_exp(double(sel_logit[i]) - double(mx)) / sum;
+            if (cum >= double(pc.top_p)) { cut = i + 1; break; }
+        }
+        if (cut < pc.min_keep) cut = (pc.min_keep < k) ? pc.min_keep : k;
+        n_keep = cut;
+    }
+
+    if (pc.min_p > 0.0) {
+        // In logit space: the threshold is `sel_logit[0] + log(min_p)`, which is `p >= min_p * p_max` without the
+        // overflow an exp of raw logits risks.  The head itself always survives.
+        const float thresh = sel_logit[0] + log(pc.min_p);
+        for (int i = 0; i < n_keep; ++i) {
+            if (sel_logit[i] < thresh) { n_keep = i; break; }
+        }
+    }
+
+    float smx = sel_logit[0] * inv_t;
+    for (int i = 1; i < n_keep; ++i) smx = max(smx, sel_logit[i] * inv_t);
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) sum += double_exp(double(sel_logit[i] * inv_t) - double(smx));
+
+    const float u = philox_uniform(pc.seed_lo, pc.seed_hi, pc.counter_lo + uint(t), pc.counter_hi);
+    double cum = 0.0;
+    int pick = sel_ids[n_keep - 1];                       // the fallback when the draw exceeds the sum
+    for (int i = 0; i < n_keep; ++i) {
+        cum += double_exp(double(sel_logit[i] * inv_t) - double(smx)) / sum;
+        if (double(u) < cum) { pick = sel_ids[i]; break; }
+    }
+    if (lid == 0u) OUT_.o[t] = pick;
+}

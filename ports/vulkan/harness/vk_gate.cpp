@@ -8152,6 +8152,230 @@ void case_exp_probe(Ctx& ctx, const std::string& dir) {
 
 }  // namespace
 
+// === THE GENERAL SAMPLER (src/kernels/cuda/sampler.cu) =====================================================
+// penalties -> top-k -> top-p -> min-p -> temperature -> softmax -> ONE Philox draw.
+//
+// The host side implements the same chain, so the case compares a chain against a chain.  Two of the port's own
+// notes apply here and are the reason this case is built the way it is:
+//   * the source's chain ORDER is llama.cpp's (issue #53): penalties on the raw logits, ONCE, before the filters -
+//     the source's comment records that they used to apply them a second time after the temperature.
+//   * `temperature == 0` is NOT greedy: `inv_t` is zero, so every survivor scales to zero and the draw is UNIFORM
+//     over the shortlist.  Greedy is the separate path in sampler_greedy.comp.
+// Those two are arms, because both are things a careful port would "fix".
+
+static inline void sampler_plx_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3, uint32_t k0, uint32_t k1) {
+    const uint32_t hi0 = uint32_t((uint64_t(0x9E3779B9u) * uint64_t(c0)) >> 32);
+    const uint32_t hi1 = uint32_t((uint64_t(0xBB67AE85u) * uint64_t(c2)) >> 32);
+    const uint32_t lo0 = 0x9E3779B9u * c0;
+    const uint32_t lo1 = 0xBB67AE85u * c2;
+    const uint32_t n0 = hi1 ^ c1 ^ k0, n1 = lo1, n2 = hi0 ^ c3 ^ k1, n3 = lo0;
+    c0 = n0; c1 = n1; c2 = n2; c3 = n3;
+}
+
+static float sampler_plx_uniform(uint64_t seed, uint64_t ctr) {
+    uint32_t c0 = uint32_t(ctr), c1 = uint32_t(ctr >> 32), c2 = uint32_t(seed), c3 = uint32_t(seed >> 32);
+    for (int i = 0; i < 10; ++i) sampler_plx_round(c0, c1, c2, c3, uint32_t(i), 0u);
+    return float(c0 >> 8) * (1.0f / 16777216.0f);
+}
+
+struct SamplerSpec {
+    int n_vocab, top_k, min_keep;
+    float temperature, top_p, min_p, pen_rep, pen_freq, pen_pres;
+};
+struct SamplerSel {
+    std::vector<int32_t> ids;       // the survivor list, in SELECTION order
+    std::vector<float> logits;      // their penalised logits
+};
+
+static SamplerSel sampler_select(const std::vector<float>& raw, const std::vector<int32_t>& hist, int hlen,
+                                 const SamplerSpec& a) {
+    const int nv = a.n_vocab;
+    std::vector<float> scored((size_t) nv, 0.0f);   // (nv, value): a bare size is a vexing parse
+    for (int v = 0; v < nv; ++v) {
+        int count = 0;
+        for (int q = 0; q < hlen; ++q) if (hist[size_t(q)] == v) ++count;
+        float lg = raw[size_t(v)];
+        if (count > 0) {
+            if (lg <= 0.0f) lg *= a.pen_rep; else lg /= a.pen_rep;
+            lg -= float(count) * a.pen_freq + 1.0f * a.pen_pres;
+        }
+        scored[size_t(v)] = lg;
+    }
+    int k = (a.top_k > 0 && a.top_k < 64) ? a.top_k : 64;
+    if (k > nv) k = nv;
+    SamplerSel o;
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int best = nv;
+        for (int v = 0; v < nv; ++v) {
+            bool taken = false;
+            for (size_t j = 0; j < o.ids.size(); ++j) if (o.ids[j] == v) { taken = true; break; }
+            if (taken) continue;
+            if (scored[size_t(v)] > bv) { bv = scored[size_t(v)]; best = v; }     // strict: the lower id wins
+        }
+        o.ids.push_back(best < nv ? best : 0);
+        o.logits.push_back(bv);
+    }
+    int n_keep = k;
+    const float mx = *std::max_element(o.logits.begin(), o.logits.end());
+    if (a.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) sum += std::exp(double(o.logits[size_t(i)]) - double(mx));
+        double cum = 0.0;
+        int cut = k;
+        for (int i = 0; i < k; ++i) {
+            cum += std::exp(double(o.logits[size_t(i)]) - double(mx)) / sum;
+            if (cum >= double(a.top_p)) { cut = i + 1; break; }
+        }
+        if (cut < a.min_keep) cut = (a.min_keep < k) ? a.min_keep : k;
+        n_keep = cut;
+    }
+    if (a.min_p > 0.0f) {
+        const float thresh = o.logits[0] + std::log(a.min_p);
+        for (int i = 0; i < n_keep; ++i) if (o.logits[size_t(i)] < thresh) { n_keep = i; break; }
+    }
+    o.ids.resize(size_t(n_keep));
+    o.logits.resize(size_t(n_keep));
+    return o;
+}
+
+static int sampler_pick(const SamplerSel& sel, float temperature, uint64_t seed, uint64_t counter) {
+    const int n = int(sel.ids.size());
+    const float inv_t = (temperature > 0.0f) ? (1.0f / temperature) : 0.0f;
+    float smx = sel.logits[0] * inv_t;
+    for (int i = 1; i < n; ++i) smx = std::max(smx, sel.logits[size_t(i)] * inv_t);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) sum += std::exp(double(sel.logits[size_t(i)] * inv_t) - double(smx));
+    const float u = sampler_plx_uniform(seed, counter);
+    double cum = 0.0;
+    int pick = sel.ids[size_t(n - 1)];
+    for (int i = 0; i < n; ++i) {
+        cum += std::exp(double(sel.logits[size_t(i)] * inv_t) - double(smx)) / sum;
+        if (double(u) < cum) { pick = sel.ids[size_t(i)]; break; }
+    }
+    return pick;
+}
+
+static void sampler_fixture(int kind, int nv, std::vector<float>& row, std::vector<int32_t>& hist, int history_len) {
+    const float NEG = -std::numeric_limits<float>::infinity();
+    row.assign(size_t(nv), -50.0f);
+    hist.assign(size_t(history_len), 9999);            // 9999 is never a candidate
+    switch (kind) {
+        case 0: row[11] = 3.0f; row[9] = NAN; row[7] = NEG; break;
+        case 1: for (int v = 0; v < 64 && v < nv; ++v) row[size_t(v)] = 1.0f; break;   // 64 equal survivors
+        case 2: row[100] = 8.0f;
+                for (int i = 1; i < 8; ++i) { row[size_t(100 + i * 10)] = 2.0f - 0.1f * float(i); }
+                break;
+        case 3: row[10] = 6.0f; row[20] = 5.5f; row[30] = 1.0f; row[40] = 0.5f; break;
+        case 4: row[10] = 6.0f; row[20] = 5.9f; row[30] = 5.8f; row[40] = 0.5f; break;   // min_keep: 3 close
+        case 5: row[10] = 6.0f; row[20] = 5.0f; row[30] = 1.0f; row[40] = 0.5f; break;
+        case 6: row[10] = 4.0f; row[20] = 4.0f; break;                                  // the tie, and the cut
+        case 7: row[10] = 4.0f; row[20] = 1.5f;      // 4.0/2 = 2.0 beats 1.5; penalised twice, 1.0 loses to it
+                for (int q = 0; q < 4; ++q) { hist[size_t(history_len - 4 + q)] = 10; }   // 4 hits, in the window
+                break;
+        case 8: row[1234] = 6.0f; row[200000] = 5.0f; row[70000] = 4.5f; break;
+        case 9: row[10] = 4.0f; row[20] = 2.0f; break;   // the cut is computed on THESE, not on logits/10
+        default: break;
+    }
+}
+
+// The arm modes.  `exact` pins every seed against the transcribed chain - which is what makes the equal-survivor
+// arm a direct probe of the RNG stream, since equal probabilities make the softmax cancel out of the walk.
+enum : int { SAMPLER_EXACT = 0, SAMPLER_MEMBERSHIP = 1 };
+
+void case_sampler_kernel(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "sampler_kernel.spv")) return;
+    if (!ctx.info().shader_float64) {
+        skip("sampler_kernel", "device has no fp64 - the source's softmax accumulates in double");
+    }
+    struct Arm {
+        const char* what;
+        int n_vocab, top_k, min_keep, fixture, n_seeds, mode, min_distinct;
+        float temperature, top_p, min_p, pen_rep, pen_freq, pen_pres;
+    };
+    const Arm arms[] = {
+        {"top_k = 1 is the argmax of the penalised row",           4096,  1, 1, 0,  4, SAMPLER_EXACT,      1, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"the draw IS the engine's Philox: 64 equal survivors name floor(u*64)",
+                                                                  4096, 64, 1, 1, 16, SAMPLER_EXACT,      2, 0.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"a non-degenerate distribution: the draw decides",        4096,  4, 1, 3, 16, SAMPLER_EXACT,      2, 1.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"the top_p cut admits nothing outside it",                4096, 64, 1, 3, 32, SAMPLER_MEMBERSHIP, 1, 1.0f, 0.90f, 0.0f, 1.0f, 0, 0},
+        {"min_keep floors the top_p cut to three survivors",         4096, 64, 3, 4, 32, SAMPLER_MEMBERSHIP, 3, 1.0f, 0.05f, 0.0f, 1.0f, 0, 0},
+        {"the min_p prefix leaves ONE survivor",                   4096, 64, 1, 5, 16, SAMPLER_EXACT,      1, 1.0f, 1.00f, 0.5f, 1.0f, 0, 0},
+        {"temperature 0 is UNIFORM over the shortlist, NOT greedy",4096,  8, 1, 2, 16, SAMPLER_EXACT,      5, 0.0f, 1.00f, 0.0f, 1.0f, 0, 0},
+        {"the cut is a >= boundary and a tie goes to the LOWER id (one survivor)",
+                                                                  4096, 64, 1, 6, 16, SAMPLER_EXACT,      1, 1.0f, 0.50f, 0.0f, 1.0f, 0, 0},
+        {"the penalised token is still the argmax: penalties rank the raw logits",
+                                                                  4096,  1, 1, 7, 16, SAMPLER_EXACT,      1, 1.0f, 1.00f, 0.0f, 2.0f, 0, 0},
+        {"the temperature scales the SURVIVORS, not the logits the cut sees",
+                                                                  4096, 64, 1, 9, 16, SAMPLER_EXACT,      1, 10.0f, 0.60f, 0.0f, 1.0f, 0, 0},
+        {"the real vocabulary (248320), a 64-wide list and a cut",248320, 64, 1, 8,  4, SAMPLER_MEMBERSHIP, 1, 1.0f, 0.95f, 0.0f, 1.0f, 0, 0},
+    };
+
+    struct Pc {
+        int n_vocab, n_tokens, history_len, penalty_last_n, top_k, min_keep;
+        float temperature, top_p, min_p, penalty_repeat, penalty_freq, penalty_present;
+        uint32_t seed_lo, seed_hi, counter_lo, counter_hi;
+    };
+    VkPipeline ps = ctx.pipeline(dir + "/sampler_kernel.spv", 3, sizeof(Pc));
+    const int history_len = 64;
+    int bad_total = 0, checks_total = 0;
+
+    for (const Arm& a : arms) {
+        std::vector<float> row;
+        std::vector<int32_t> hist;
+        sampler_fixture(a.fixture, a.n_vocab, row, hist, history_len);
+        const SamplerSpec spec{a.n_vocab, a.top_k, a.min_keep, a.temperature, a.top_p, a.min_p,
+                               a.pen_rep, a.pen_freq, a.pen_pres};
+        const SamplerSel sel = sampler_select(row, hist, history_len, spec);
+
+        Buf b_l = ctx.alloc(row.size() * 4), b_h = ctx.alloc(hist.size() * 4), b_o = ctx.alloc(4);
+        ctx.write(b_l, row.data(), row.size() * 4);
+        ctx.write(b_h, hist.data(), hist.size() * 4);
+
+        int bad = 0, distinct = 0;
+        std::vector<int32_t> seen;
+        const float temps[2] = {a.temperature, a.temperature};
+        const int n_pass = 1;
+        for (int pass = 0; pass < n_pass; ++pass) {
+            for (int si = 0; si < a.n_seeds; ++si) {
+                const uint64_t seed = 0x1234567890abcdefULL + uint64_t(si) * 0x9E3779B97F4A7C15ULL;
+                Pc pc{};
+                pc.n_vocab = a.n_vocab; pc.n_tokens = 1; pc.history_len = history_len;
+                pc.penalty_last_n = history_len; pc.top_k = a.top_k; pc.min_keep = a.min_keep;
+                pc.temperature = temps[pass]; pc.top_p = a.top_p; pc.min_p = a.min_p;
+                pc.penalty_repeat = a.pen_rep; pc.penalty_freq = a.pen_freq; pc.penalty_present = a.pen_pres;
+                pc.seed_lo = uint32_t(seed); pc.seed_hi = uint32_t(seed >> 32); pc.counter_lo = 0; pc.counter_hi = 0;
+                int32_t got = -1;
+                ctx.write(b_o, &got, 4);
+                ctx.dispatch(ps, {&b_l, &b_h, &b_o}, &pc, sizeof(pc), 1);
+                ctx.read(b_o, &got, 4);
+                ++checks_total;
+                const bool in_set = std::find(sel.ids.begin(), sel.ids.end(), got) != sel.ids.end();
+                const int want = sampler_pick(sel, temps[pass], seed, 0);
+                bool ok;
+                if (a.mode == SAMPLER_EXACT)          ok = (got == want);
+                else if (a.mode == SAMPLER_MEMBERSHIP) ok = in_set;
+                else                                   ok = in_set;
+                if (in_set) {
+                    if (std::find(seen.begin(), seen.end(), got) == seen.end()) { seen.push_back(got); ++distinct; }
+                }
+                if (!ok) ++bad;
+            }
+        }
+        if (distinct < a.min_distinct) ++bad;      // "uniform, not greedy" has to actually spread
+        std::printf("      %-62s vocab %6d top_k %2d -> %2d distinct, %2d bad\n",
+                    a.what, a.n_vocab, a.top_k, distinct, bad);
+        char label[240];
+        std::snprintf(label, sizeof label, "sampler_kernel: %s", a.what);
+        verdict(label, bad == 0, bad, a.n_seeds, 0.0,
+                "a token outside the survivor set, or not the one the track's chain gives");
+        bad_total += bad;
+        ctx.free(b_l); ctx.free(b_h); ctx.free(b_o);
+    }
+    verdict("sampler_kernel: eleven arms against the transcribed chain", bad_total == 0, bad_total, checks_total, 0.0,
+            "a wrong chain order, cut boundary, tie rule or RNG would land here");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -8284,6 +8508,7 @@ int main(int argc, char** argv) {
     case_kv_hybrid(ctx, dir);              // the hybrid mode: INT8 K, rotated Q4_0 V, the asymmetry
     case_descriptor_offset(ctx, dir);      // binding a row slice (the engine's pointer arithmetic, made bindable)
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
+    case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

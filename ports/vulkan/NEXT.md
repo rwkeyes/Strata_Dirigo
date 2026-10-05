@@ -653,6 +653,50 @@ after I touched it (arm 6's history still hit the runner-up once, so its count c
 walk with the Philox draw - the RNG and its reference implementation come with it), the split-warp and
 coupled/draft-staging variants (speculative decoding), and the `sample_tokens` entry point that picks between them.
 
+## THE SAMPLER, KERNEL 2: the general path - top-k, top-p, min-p, temperature, and the draw
+
+**What was ported.**  `sampler_kernel` (`src/kernels/cuda/sampler.cu`) and the Philox it draws with, as a shared
+`shaders/common/philox.glsl` (the split-warp and draft kernels will need the same generator).  The chain is the
+source's, which is llama.cpp's:
+
+    penalties (once, on the RAW logits, over the TAIL of the history)
+      -> top_k   : k rounds of a block argmax over the not-yet-taken; the list is in SELECTION order
+      -> top_p   : the shortest prefix whose probability reaches top_p, never shorter than min_keep
+      -> min_p   : then the descending prefix within log(min_p) of the head
+      -> temperature on the SURVIVORS only, softmax over them, and ONE Philox draw
+
+**TWO THINGS A CAREFUL PORT WOULD "FIX", both arms.**  The penalties belong on the raw logits, ONCE, before the
+filters - the source's own comment records that they used to be applied a second time after the temperature scaling.
+And **`temperature == 0` is NOT greedy**: the source sets `inv_t = 1/temperature` when temperature > 0 and ZERO
+otherwise, so zero scales every survivor to zero and the draw is UNIFORM over the shortlist.  Greedy is its own path
+(`sampler_greedy.comp`).  "Fix" either one and every zero-temperature token changes.
+
+**THE PHILOX CONSTANTS ARE THE ENGINE'S, NOT Random123's.**  Random123's philox4x32 uses M0 = 0xD2511F53 and
+M1 = 0xCD9E8D57; this engine uses 0x9E3779B9 and 0xBB67AE85.  A swap yields a perfectly good generator that produces
+different numbers - the kind of change that reads as "the model got a bit worse" rather than as a bug.
+
+**THE STREAM IS PINNED THROUGH THE SHORTLIST, not by reading the RNG back.**  Sixty-four EQUAL survivors at
+temperature 0 make `floor(u * 64)` directly observable in the token the kernel returns, so sixteen seeds pin six bits
+of the stream each - about 96 bits, which is what catches a swapped constant, nine rounds instead of ten, or the seed
+and counter swapped into the key.  That arm is EXACT, not approximate: equal probabilities make the softmax cancel
+out of the cumulative walk, so no `exp` difference can reach it.
+
+**THREE FIXTURES WERE STRENGTHENED WHILE FALSIFYING, because the planned injections would have passed invisibly:**
+equal logits make `inv_t` irrelevant (the temperature arm needs ONE dominant survivor, or "temp 0 is uniform" and
+"temp 0 is greedy" give the same spread); a membership check cannot see too FEW survivors (the min_keep arm needs its
+three survivors CLOSE, or one survivor is trivially inside a set of three); and a head that is REACHABLE is not a head
+that is ORDERED - a doubled penalty, the source's own recorded bug, passed 184/184 under the weak form, which is why
+that arm is now `top_k = 1` (a one-token shortlist makes the draw irrelevant and the order exact) plus an arm for the
+temperature being applied to the survivors rather than to what the cut sees.
+
+**THE DEVICE QUESTION, recorded as a disagreement.**  `shaders/common/double_math.glsl` says Intel's own support
+article reports Arc has no shaderFloat64; this box's ANV reports `fp64 1` in the gate's `--list`, and the faithful
+kernel runs here.  The portable f32 sibling that every other double kernel in this port has is therefore still to
+write, and the case skips (not passes) on a device without fp64.
+
+**WHAT THE SAMPLER STILL NEEDS.**  The split-warp and coupled/draft-staging variants (speculative decoding), and
+`sample_tokens`, which picks between the paths - plus that f32 sibling.
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one

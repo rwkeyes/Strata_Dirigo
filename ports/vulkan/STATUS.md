@@ -11,13 +11,13 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
 short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
 Walsh-Hadamard rotation), the hybrid K8V4 mode, descriptor OFFSETS and the first SAMPLER kernel landed, the box's GPU
-run was **253 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
-Vulkan 1.4.318, subgroup size 32) - 241 / 0 / 3 on llvmpipe and 244 / 0 / 2 on the radeon ICD, which now picks the AMD
+run was **265 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
+Vulkan 1.4.318, subgroup size 32) - 253 / 0 / 3 on llvmpipe and 256 / 0 / 2 on the radeon ICD, which now picks the AMD
 iGPU because the discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 244/0/2 becomes 243/1/2 when the flaky budget-requery case fires
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 256/0/2 becomes 255/1/2 when the flaky budget-requery case fires
 when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
 compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
 (`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
@@ -26,7 +26,7 @@ that shares system memory with everything else.  Verified by building the previo
 the same ICD.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
 stale seven times in two days; read the last line of your own run.** All three available implementations are exercised
 again by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 67 kernels, 18 shared includes, one generated table file (`harness/iq_grids.hpp`,
+box after the swap (`NEXT.md`). 68 kernels, 19 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -164,7 +164,7 @@ was NOT reproduced out of tree - the probe's device contract differs from the ga
 instead of the driver's and refuses the allocation first), and chasing it was not worth the time; what is verified is
 that the refusal machinery fires and names its cause.
 
-**The sampler has begun, and the port can now emit a TOKEN (2026-10-04).**  `sampler_greedy.comp` carries
+**The sampler is nearly complete, and the port can emit a TOKEN two ways (2026-10-04).**  `sampler_greedy.comp` carries
 `sampler_greedy_kernel` (`src/kernels/cuda/sampler.cu`) with the penalty pair it calls - the `--temp 0` path - so the
 port has a complete deterministic generation path: logits in, a token out.  The rules a paraphrase inverts are all
 arms: the repeat penalty MULTIPLIES for a non-positive logit and DIVIDES for a positive one (dividing unconditionally
@@ -174,6 +174,27 @@ carries the count; the window is the TAIL, so a head-only hit is not penalised; 
 of the rule as well.  **The falsification found a decorative arm:** the presence arm PASSED under the injection
 because its fixture let the penalised token lose under both rules - only an injection can say that.  Rebuilt, all
 four injections now fail exactly the arm built for them.  Arc 253/0/0.
+
+**The general sampler landed too - top-k, top-p, min-p, temperature and the Philox draw.**  `sampler_kernel.comp`
+plus `common/philox.glsl`, so every path a decode step needs is ported.  The chain is llama.cpp's, and two of its
+details are things a careful port would "fix": the penalties belong on the RAW logits, ONCE, before the filters (the
+source records fixing a second application after the temperature), and **`temperature == 0` is not greedy** - it
+scales every survivor to zero, making the draw UNIFORM over the shortlist.  The engine's Philox constants are its own
+(0x9E3779B9 / 0xBB67AE85), NOT Random123's, so a swap yields a valid generator with different numbers.
+
+**The RNG is pinned through the shortlist rather than read back:** 64 EQUAL survivors at temperature 0 make
+`floor(u*64)` observable in the returned token, so 16 seeds pin ~96 bits of the stream - and that arm is exact,
+because equal probabilities make the softmax cancel out of the cumulative walk.
+
+**Nine injections, all caught, and two of them changed the case.**  The volume of the penalty bitmap, the round count,
+the constants and the key/counter assignment do not go unnoticed: the RNG arm returns 0/16 for each.  But the doubled
+penalty (the source's own recorded bug) initially passed 184/184, because the arm asserted the head was REACHABLE and
+a two-token shortlist makes that true under either order; the fix was a `top_k = 1` arm, where a one-token shortlist
+makes the draw irrelevant and the order exact - it now returns -1/16.  Its fixture then had to be tightened again
+(2.0 against 1.5, not 0.2), because the margin that made the majority test safe made the flip invisible.  Separately,
+three fixtures were strengthened BEFORE injecting, on noticing that equal logits make `inv_t` irrelevant and that a
+membership check cannot see too FEW survivors.  Three of the nine injections also needed the compile target corrected
+to the shader that INCLUDES the file rather than the include itself.
 
 | Case | Verdict | Method |
 |---|---|---|
