@@ -140,6 +140,22 @@ case "$name" in
     old=$'                else take_a = (sc_sel_lg[a] > sc_tmp_lg[c]) ||\n                              (sc_sel_lg[a] == sc_tmp_lg[c] && sc_sel_id[a] < sc_tmp_id[c]);'
     new=$'                else take_a = (a < ncur);   // INJECTION: the merge drains the running list first'
     want="FAIL  sampler_split:" ;;
+  coupled-draft-counter-off-by-one)
+    # THE coupled rule: a draft at cell c is verified by a row drawn with counter c+1, so the drafter draws with
+    # counter c+1 too.  Dropping the +1 makes it draw with c - a different (still valid) Philox stream and a worse
+    # acceptance rate, which reads as "the model got a bit worse".  The equal-survivor arm observes the stream
+    # exactly (the softmax cancels out of the walk), so it must move.
+    file="$SH/coupled_sample.comp"; spv="coupled_sample"
+    old=$'        const uint counter_lo = uint(STEP_.o[0]) + 1u;   // coupled_draft_counter(cell) = cell + 1'
+    new=$'        const uint counter_lo = uint(STEP_.o[0]);   // INJECTION: the +1 of coupled_draft_counter dropped'
+    want="FAIL  coupled_draft: the counter" ;;
+  coupled-draft-window-start)
+    # Draft j's penalty window is the ring's [cap + j - h, cap + j) - coupled_hist_start.  Dropping j reads the
+    # STAGED BASE instead of the drafts, so the wrong subset indices are penalised (or none are).
+    file="$SH/coupled_penalize.comp"; spv="coupled_penalize"
+    old=$'    const int start = pc.cap + pc.j - h;                                          // coupled_hist_start'
+    new=$'    const int start = pc.cap - h;   // INJECTION: the draft index j dropped from the window start'
+    want="FAIL  coupled_draft: the window" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

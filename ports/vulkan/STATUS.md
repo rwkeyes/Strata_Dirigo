@@ -153,6 +153,18 @@ the merge's first version was a forward IN-PLACE pass, whose write index runs ah
 partition entry is taken - it read `dev 4200 want 100` on the top_p arm, and only the multi-partition arms could see
 it.
 
+**THE COUPLED DRAFT PATH (speculative decoding) landed (2026-10-05).**  `coupled_penalize.comp` +
+`coupled_sample.comp` (`coupled_penalize_kernel` / `coupled_merge_kernel`, `src/kernels/cuda/sampler.cu`; host side
+`include/strata/core/coupled_draft.hpp`).  In coupled mode the MTP draft layer samples its draft with the target's
+own chain and the target's Philox draw; four rules are arms - the counter is `cell + 1` (NOT `cell`), the penalty
+window is the ring's `[cap+j-h, cap+j)`, a history id maps through `id_to_sub`, and the pick maps through `sub_to_id`
+and is appended at `ring[cap+j]`.  Falsified by `gates/inject-verify.sh coupled-draft-counter-off-by-one` -> `FAIL
+coupled_draft: the counter ... 1/8` and `coupled-draft-window-start` -> `FAIL coupled_draft: the window ... 0/4`.
+**+5 verdicts: vega Arc 345/0/0** (`run_gate.sh` exit 0), llvmpipe 333/0/3, radeon-iGPU 336/0/2; box `radeon_icd`
+(7900 XTX) 341/0/1, lvp 333/0/3, nvidia 336/0/2.  Honest note: `coupled_draft_sample`/`coupled_draft_stage` are
+called unqualified in `src/core/mtp.cpp`, so `check_port_map.py` (which keys on `kernels::`) neither lists them nor
+the two coupled shaders - recorded, not papered over.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
 the gate now reads **`radeon_icd 280 passed / 0 failed / 1 skipped`**, `lvp_icd 272/0/3`, `nvidia_icd (K620)
 275/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the

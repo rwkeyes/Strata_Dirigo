@@ -1,0 +1,66 @@
+// ports/vulkan/shaders/coupled_penalize.comp - the coupled drafter's penalty pass, IN PLACE on the draft logits.
+// Ported from `coupled_penalize_kernel` (src/kernels/cuda/sampler.cu); the host side is
+// include/strata/core/coupled_draft.hpp.
+//
+// WHY THE DRAFTER PENALISES AT ALL.  In coupled mode the MTP draft layer SAMPLES its draft with the TARGET's own
+// chain - the request's top_k / top_p / min_p / temperature and ITS penalties over the SAME history - and the same
+// uniform the target will draw for the row that verifies the draft.  So the draft's logits must carry exactly the
+// penalties the target's row will apply, or the two inverse-CDF draws are of different distributions and the
+// acceptance rate collapses (the text never changes: verification is an exact-match against the target's sample).
+//
+// THE WINDOW IS THE RING, AND ITS POSITION IS THE COUNTER ARITHMETIC of coupled_draft.hpp: draft j's penalty window
+// is the ring's [cap + j - h, cap + j) - the staged base plus drafts 0 .. j-1 - because the window the target will
+// use for row j is the last h of (consumed', x', drafts 0..j-1).  `coupled_hist_start` is the same expression, and
+// `coupled_hist_len` (min(penalty_last_n, cap), 0 when penalties are off) is what `h` is here.
+//
+// The membership test is a per-subset-index scan rather than the engine's shared BITMAP + atomicOr: the counts are
+// identical (id_to_sub is the inverse of sub_to_id, so a subset index has exactly one original id), and a scan
+// keeps this shader free of the atomics the census would otherwise have to whitelist.  The port's sampler already
+// scans instead of bitmapping for the same reason (sampler_greedy.comp's note).
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer LOGITS { float x[]; } LO_;          // in place: the draft logits
+layout(set = 0, binding = 1, std430) readonly buffer RING { int v[]; } RING_;
+layout(set = 0, binding = 2, std430) readonly buffer ID_TO_SUB { int v[]; } ITS_;
+
+layout(push_constant) uniform Pc {
+    int n_vocab;            // the draft head's subset size (the logits this kernel owns)
+    int id_vocab;           // the full token-id space the ring's entries live in
+    int cap;                // the ring capacity (coupled_draft.hpp's kCoupledHistCap)
+    int j;                  // which draft: its window ends at cap + j
+    int penalty_last_n;
+    float penalty_repeat;
+    float penalty_freq;
+    float penalty_present;
+} pc;
+
+// The engine's `apply_penalties`: MULTIPLIES for a non-positive logit and DIVIDES for a positive one; the presence
+// penalty is `float(count > 0)`, a boolean; the frequency penalty carries the count.
+float apply_penalties(float logit, int count) {
+    if (count <= 0) return logit;
+    if (logit <= 0.0) logit *= pc.penalty_repeat;
+    else              logit /= pc.penalty_repeat;
+    logit -= float(count) * pc.penalty_freq + 1.0 * pc.penalty_present;
+    return logit;
+}
+
+void main() {
+    const int h = (pc.penalty_last_n <= 0) ? 0 : min(pc.penalty_last_n, pc.cap);   // coupled_hist_len
+    if (h <= 0) return;
+    const int start = pc.cap + pc.j - h;                                          // coupled_hist_start
+
+    for (int s = int(gl_LocalInvocationIndex); s < pc.n_vocab; s += 256) {
+        int cnt = 0;
+        for (int i = 0; i < h; ++i) {
+            const int v = RING_.v[start + i];
+            if (v < 0 || v >= pc.id_vocab) continue;                               // an id outside the vocabulary
+            const int ss = ITS_.v[v];
+            if (ss < 0 || ss >= pc.n_vocab) continue;                              // not in the draft head's subset
+            if (ss == s) ++cnt;
+        }
+        if (cnt > 0) LO_.x[s] = apply_penalties(LO_.x[s], cnt);
+    }
+}

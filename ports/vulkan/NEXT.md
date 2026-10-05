@@ -78,6 +78,40 @@ split arms + the parity arm + the group arm).  The parity arm reads **60/60** (t
 **What it still needs.**  The split is f64-only (its tail accumulates in double, like the engine's), so it carries
 the same fp64 requirement as `sampler_kernel` - the portable f32 sibling settles that next.
 
+## THE COUPLED DRAFT PATH (speculative decoding) - **DONE AND VERIFIED 2026-10-05**
+
+`coupled_penalize.comp` + `coupled_sample.comp`, from `coupled_penalize_kernel` and `coupled_merge_kernel`
+(src/kernels/cuda/sampler.cu); the host arithmetic is `include/strata/core/coupled_draft.hpp`.  In coupled mode
+(`STRATA_SPEC_COUPLED=1`, off by default) the MTP draft layer SAMPLES its draft with the TARGET's own chain and the
+SAME Philox draw the target will use for the row that verifies the draft, so the target's pick - and so the text -
+does not change (verification is an exact-match against the target's sample).  `coupled_sample` reuses the split
+sampler's selection and tail includes, so its chain cannot drift from the target's.
+
+**FOUR RULES, EACH AN ARM - and the first is the one a paraphrase gets wrong.**  `coupled_draft_counter(cell) =
+cell + 1`: the draft is verified by the NEXT window's row, drawn with counter `cell + 1`, so the drafter draws with
+`cell + 1` too - not `cell`.  A different counter is a different (still valid) generator and a worse acceptance
+rate, which reads as "the model got a bit worse".  Then: the penalty window is the ring's `[cap + j - h, cap + j)`
+(`coupled_hist_start`), NOT the staged base; a history id maps through `id_to_sub` to a subset index (the draft head
+owns a VOCABULARY SUBSET); and the pick maps through `sub_to_id` and is appended at `ring[cap + j]`.
+
+**Falsified (both).**  `gates/inject-verify.sh coupled-draft-counter-off-by-one` drops the `+1`:
+`FAIL  coupled_draft: the counter is cell+1: 8 equal survivors, cells 0..7    1/    8  worst 0` (the equal-survivor
+arm observes the stream exactly - the softmax cancels out of the walk).  `coupled-draft-window-start` drops `j` from
+the window start: `FAIL  coupled_draft: the window is the ring's [cap+j-h, cap+j)    0/    4  worst 0`.
+
+**Measured.**  vega, this commit: **Intel Arc (BMG G31) 345 passed / 0 failed / 0 skipped**, llvmpipe 333/0/3,
+radeon-iGPU 336/0/2, `run_gate.sh` exit 0.  **+5 verdicts** (four arms + the group arm).  Box (7900 XTX):
+radeon_icd 341/0/1, lvp 333/0/3, nvidia 336/0/2.
+
+**Two honest notes.**  (1) `coupled_draft_sample` / `coupled_draft_stage` are called UNQUALIFIED in `src/core/mtp.cpp`
+(`using namespace strata::kernels`), so `check_port_map.py` - which keys on `kernels::` - does not list them, and the
+two coupled shaders are therefore reported as UNCLAIMED by a `kernel` row rather than mapped.  The map's rule is
+unchanged and still passes; the coupled entry points are a pre-existing blind spot of the symbol scan, recorded here
+rather than papered over.  (2) `coupled_penalize` scans a subset index's occurrences in the window instead of the
+engine's shared bitmap + `atomicOr`; the counts are identical (`id_to_sub` is the inverse of `sub_to_id`) and it
+keeps the shader free of atomics, at O(nv x h) instead of O(h + hits x h) - the port's existing scan-instead-of-bitmap
+trade, acceptable for a correctness arm with the gate's small subset sizes.
+
 
 
 ## M-A: the standalone dequantiser's LAST TWO FORMATS - IQ2_XXS and IQ2_XS - **DONE AND VERIFIED 2026-10-05**

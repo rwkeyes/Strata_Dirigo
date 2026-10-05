@@ -9314,6 +9314,166 @@ void case_sampler_split(Ctx& ctx, const std::string& dir) {
             "a wrong partition, merge order or tail would land here");
 }
 
+// === THE COUPLED DRAFT PATH (speculative decoding) ===========================================================
+//
+// src/kernels/cuda/sampler.cu's `coupled_penalize_kernel` + `coupled_merge_kernel`, and the host arithmetic in
+// include/strata/core/coupled_draft.hpp.  In coupled mode the MTP draft layer SAMPLES its draft with the TARGET's
+// own chain and the SAME Philox draw the target will use for the row that verifies it, so the target's pick - and
+// so the text - does not change (verification is an exact-match against the target's sample).  The rules a
+// paraphrase gets wrong, each an arm: **the counter is `cell + 1`, NOT `cell`** (coupled_draft_counter); the
+// penalty window is the ring's `[cap + j - h, cap + j)`; a history id maps through `id_to_sub` to a subset index;
+// and the pick maps through `sub_to_id` and is appended at `ring[cap + j]`.
+static float coupled_ap(float logit, int count, float rep, float freq, float pres) {
+    if (count <= 0) return logit;
+    if (logit <= 0.0f) logit *= rep; else logit /= rep;
+    logit -= float(count) * freq + 1.0f * pres;
+    return logit;
+}
+
+void case_coupled_draft(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "coupled_penalize.spv") || !have(dir, "coupled_sample.spv")) return;
+    if (!ctx.info().shader_float64) {
+        skip("coupled_draft", "device has no fp64 - the coupled tail accumulates in double");
+    }
+    struct PenPc { int n_vocab, id_vocab, cap, j, penalty_last_n; float rep, freq, pres; };
+    struct SmpPc { int n_vocab, top_k, min_keep, greedy; float temperature, top_p, min_p;
+                   uint32_t seed_lo, seed_hi; int cap, j; };
+    VkPipeline p_pen = ctx.pipeline(dir + "/coupled_penalize.spv", 3, sizeof(PenPc));
+    VkPipeline p_smp = ctx.pipeline(dir + "/coupled_sample.spv", 6, sizeof(SmpPc));
+    const int ring_len = 64;
+
+    struct Arm {
+        const char* what;
+        int n_vocab, id_vocab, cap, j, top_k, min_keep, greedy, h, n_cells, deranged_sub;
+        float temperature, top_p, min_p, rep, freq, pres;
+    };
+    const Arm arms[] = {
+        // The counter rule.  8 EQUAL survivors at temperature 1 make the draw `floor(u*8)` - exact, because the
+        // softmax cancels out of the walk - so each cell observes `philox(seed, cell+1)` and a `cell` counter is
+        // a different token for most cells.
+        {"the counter is cell+1: 8 equal survivors, cells 0..7", 4096, 4096, 16, 0, 8, 1, 0, 0, 8, 0, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+        // sub_to_id is a DERANGEMENT, so a shader that returned the subset index would return 0 instead of 1000.
+        {"the pick maps through sub_to_id (a derangement)",       256,  256, 16, 0, 1, 1, 0, 0, 4, 1, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+        // The ring window.  j = 2, h = 2, so the window is ring[cap, cap+2) = drafts 0 and 1; the staged base
+        // ring[cap-h, cap) holds junk that must NOT be read.  The in-window token is the raw argmax and must lose
+        // after the penalty; if the window is wrong it survives and the token changes.
+        {"the window is the ring's [cap+j-h, cap+j)",               64,10000,  8, 2, 1, 1, 0, 2, 4, 0, 1.0f, 1.0f, 0.0f, 2.0f, 0.0f, 1.0f},
+        // The defensive argmax branch (a coupled call is never greedy, but the engine keeps it).
+        {"greedy takes the argmax with prob 1",                   256,  256, 16, 0, 4, 1, 1, 0, 3, 0, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+    };
+
+    int bad_total = 0, checks_total = 0;
+    for (const Arm& a : arms) {
+        const int nv = a.n_vocab;
+        std::vector<float> raw((size_t) nv, -50.0f);
+        std::vector<int32_t> ring((size_t) ring_len, -1);
+        std::vector<int32_t> id_to_sub((size_t) a.id_vocab, -1);
+        std::vector<int32_t> sub_to_id((size_t) nv);
+        for (int s = 0; s < nv; ++s) sub_to_id[(size_t) s] = a.deranged_sub ? 1000 + s : s;
+
+        if (a.n_vocab == 4096) {
+            for (int v = 0; v < 8; ++v) raw[(size_t) v] = 1.0f;                       // 8 equal survivors
+        } else if (a.j == 2) {                                                        // the window arm
+            raw[5] = 4.0f; raw[10] = 3.0f;                                            // 5 is in-window, 10 is not
+            id_to_sub[5000] = 5; id_to_sub[6000] = 6; id_to_sub[7000] = 7; id_to_sub[8000] = 8;
+            ring[6] = 7000; ring[7] = 8000;                                           // the staged base (outside)
+            ring[a.cap + 0] = 5000; ring[a.cap + 1] = 6000;                           // drafts 0 and 1 (in-window)
+        } else if (a.greedy) {
+            raw[3] = 5.0f; raw[20] = 2.0f;                                            // a plain head
+        } else {
+            raw[0] = 5.0f; raw[1] = 4.0f;                                             // the head is subset 0
+        }
+
+        // The host chain, from the SAME rules - the oracle (coupled_draft.hpp + the kernels).
+        auto host_run = [&](int cell, int* pick_out, float* prob_out) -> int {
+            std::vector<float> lg(raw);
+            if (a.h > 0) {
+                const int start = a.cap + a.j - a.h;               // coupled_hist_start
+                for (int s = 0; s < nv; ++s) {
+                    int cnt = 0;
+                    for (int i = 0; i < a.h; ++i) {
+                        const int v = ring[(size_t) (start + i)];
+                        if (v < 0 || v >= a.id_vocab) continue;
+                        const int ss = id_to_sub[(size_t) v];
+                        if (ss < 0 || ss >= nv) continue;
+                        if (ss == s) ++cnt;
+                    }
+                    if (cnt > 0) lg[(size_t) s] = coupled_ap(lg[(size_t) s], cnt, a.rep, a.freq, a.pres);
+                }
+            }
+            const SamplerSpec spec{nv, a.top_k, a.min_keep, a.temperature, a.top_p, a.min_p, a.rep, a.freq, a.pres};
+            std::vector<int32_t> nohist(1, -1);
+            const SamplerSel sel = sampler_select(lg, nohist, 0, spec);
+            int pick = sel.ids[0];
+            float prob = 1.0f;
+            if (!(a.greedy || a.temperature <= 0.0f)) {
+                pick = sampler_pick(sel, a.temperature, 0x00c0ffee12345678ULL, uint64_t(cell) + 1);   // cell + 1
+                const int n = int(sel.ids.size());
+                const float inv_t = 1.0f / a.temperature;
+                float smx = sel.logits[0] * inv_t;
+                for (int i = 1; i < n; ++i) smx = std::max(smx, sel.logits[(size_t) i] * inv_t);
+                double sum = 0.0;
+                for (int i = 0; i < n; ++i) sum += std::exp(double(sel.logits[(size_t) i] * inv_t) - double(smx));
+                int at = 0;
+                while (sel.ids[(size_t) at] != pick) ++at;
+                prob = float(std::exp(double(sel.logits[(size_t) at] * inv_t) - double(smx)) / sum);
+            }
+            *pick_out = pick;
+            *prob_out = prob;
+            return sub_to_id[(size_t) pick];
+        };
+
+        Buf b_l = ctx.alloc((size_t) nv * 4), b_ring = ctx.alloc((size_t) ring_len * 4);
+        Buf b_its = ctx.alloc((size_t) a.id_vocab * 4), b_sub = ctx.alloc((size_t) nv * 4);
+        Buf b_step = ctx.alloc(4), b_id = ctx.alloc(4), b_prob = ctx.alloc(4);
+
+        int bad = 0;
+        for (int c = 0; c < a.n_cells; ++c) {
+            int host_pick = 0; float host_prob = 1.0f;
+            const int want_id = host_run(c, &host_pick, &host_prob);
+            ctx.write(b_l, raw.data(), raw.size() * 4);
+            ctx.write(b_ring, ring.data(), ring.size() * 4);
+            ctx.write(b_its, id_to_sub.data(), id_to_sub.size() * 4);
+            ctx.write(b_sub, sub_to_id.data(), sub_to_id.size() * 4);
+            ctx.write(b_step, &c, 4);
+            int32_t sent = -7;
+            ctx.write(b_id, &sent, 4);
+            float psent = -7.0f;
+            ctx.write(b_prob, &psent, 4);
+
+            PenPc pp{nv, a.id_vocab, a.cap, a.j, a.h, a.rep, a.freq, a.pres};
+            ctx.dispatch(p_pen, {&b_l, &b_ring, &b_its}, &pp, sizeof(pp), groups_for((uint64_t) nv));
+            SmpPc sp{};
+            sp.n_vocab = nv; sp.top_k = a.top_k; sp.min_keep = a.min_keep; sp.greedy = a.greedy;
+            sp.temperature = a.temperature; sp.top_p = a.top_p; sp.min_p = a.min_p;
+            sp.seed_lo = uint32_t(0x00c0ffee12345678ULL); sp.seed_hi = uint32_t(0x00c0ffee12345678ULL >> 32);
+            sp.cap = a.cap; sp.j = a.j;
+            ctx.dispatch(p_smp, {&b_l, &b_step, &b_sub, &b_ring, &b_id, &b_prob}, &sp, sizeof(sp), 1);
+
+            int32_t got_id = 0; float got_prob = 0.0f; int32_t got_ring = 0;
+            ctx.read(b_id, &got_id, 4);
+            ctx.read(b_prob, &got_prob, 4);
+            ctx.read(b_ring, &got_ring, 4, (uint64_t) (a.cap + a.j) * 4);
+            ++checks_total;
+            if (got_id != want_id) ++bad;
+            if (!(got_prob > 0.0f && got_prob <= 1.0f)) ++bad;
+            if (std::fabs(got_prob - host_prob) > 1e-3) ++bad;
+            if (got_ring != got_id) ++bad;                                   // draft j joins the ring at cap+j
+            if (c == 0) std::printf("      %-56s cell %d -> id %6d (rule %6d) prob %.4f\n",
+                                    a.what, c, got_id, want_id, got_prob);
+        }
+        std::printf("      %-56s %d cells, %d bad\n", a.what, a.n_cells, bad);
+        char label[220];
+        std::snprintf(label, sizeof label, "coupled_draft: %s", a.what);
+        verdict(label, bad == 0, bad, a.n_cells, 0.0, "not the coupled chain's token");
+        bad_total += bad;
+        ctx.free(b_l); ctx.free(b_ring); ctx.free(b_its); ctx.free(b_sub); ctx.free(b_step);
+        ctx.free(b_id); ctx.free(b_prob);
+    }
+    verdict("coupled_draft: four arms against the coupled rule", bad_total == 0, bad_total, checks_total, 0.0,
+            "a wrong counter, window, mapping or ring write would land here");
+}
+
 // === THE EMBEDDING GATHER (src/kernels/cuda/verify_kernels.cu) ===============================================
 // packed codes + per-group scales (+ optional per-group offsets) -> a float row, for a table of tokens.
 //
@@ -10300,6 +10460,7 @@ int main(int argc, char** argv) {
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
     case_sampler_split(ctx, dir);          // the split sampler: partition top-k + the ordered merge (the default path)
+    case_coupled_draft(ctx, dir);          // the coupled draft: the speculative-decoding sampler (counter cell+1)
     case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
     case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)
     case_gather_rows(ctx, dir);            // M-A: the MTP draft head's opaque-byte row gather
