@@ -1,5 +1,49 @@
 # Status — what is done, what is verified, what is not
 
+## THE BF16-PROJECTION PAIR — `bf16_gemv` + `bf16_gemv_split` (one shared shader) — and the 8 SPECULATIVE-DRAFTER ROWS LABELLED CLASS C (2026-10-05)
+
+The SECOND soft edge the batch-5 REACHABILITY AUDIT raised is CLOSED by porting BOTH members of the
+`native_bf16_projections` toggle that `project_bf16` (`src/core/layer.cpp:94-100`) selects between.  The setting
+(`layer.cpp:91`) DEFAULT is **false** and the port pins it nowhere, so the DEFAULT selected the UNPORTED
+`bf16_gemv_split` (layer.cpp:291/:292/:367) and `bf16_gemv` (:918/:962) on the MAIN forward path — the same shape
+as the `native_qsa_indexer_append` hole.  `--native` sets the setting true (generate.cpp:1805 → :2286) and the
+TRUE branch was already the ported `bf16_gemv_fp32_mmvf`; porting both sides closes the edge for EITHER value.
+Pinning `layer_set_native_bf16(true)` was rejected (the setter is engine host code the port does not fork).
+
+| case | rule (the engine's OWN body = the oracle) | measured (vega Arc) | falsified by |
+|---|---|---|---|
+| `bf16_gemv` (4 arms 2560/512, 2560/128, 128/64, 2/1) | `bf16_gemv.cu`: `y[o]=Σ f32(x[i])·f32(w[o*n_in+i])`, products exact in f32, row read as 32-bit PAIRS, plain `acc+=a*b` (NOT `__fmaf_rn`) | **515/515 w 1.22e-02**, 131/131 w 5.73e-03, 67/67 w 3.2e-02, 4/4 w 1.84e-03 (terms-derived `gemv_bound`) | `bf16-gemv-swap-halves` → FAIL 4/515 w 1.54e+05 |
+| `bf16_gemv_split` (same shader; 4 arms 2560/512, 2560/48, 64/32, 2/1) | `bf16_gemv_split_kernel`/`bf16_gemv_warp_kernel` — same RULE, different reduction; both entry points rendered as ONE WORKGROUP per row (subgroup ops banned; the CUDA's warp shapes are a strategy, not the rule) | **515/515 w 6.99e-03**, 51/51 w 6.37e-03, 35/35 w 1.42e-02, 4/4 w 9.61e-03 | `bf16-gemv-row-base` → FAIL 4/515 w 2.62e+34 |
+
+**A MEASUREMENT THAT CHANGED THE SHIPPED KERNEL.**  The naive one-thread-per-row decomposition (a real CUDA path)
+was built and timed FIRST: at the engine's shapes it is **14–18x slower** than the workgroup form (Arc
+`split/serial 0.073` at n_out=512, 0.057 at 48; Ryzen iGPU 0.103/0.055) because it is uncoalesced — the CUDA's own
+comment says so, and CUDA takes it only below n_out=64.  The port therefore SHIPS the workgroup-per-row rendering
+and the naive variant is not in the tree.  ONE shader serves both engine symbols (the
+`bf16_gemv_fp32_mmvf`/`_cols` precedent).
+
+**THE MEASUREMENT (ported `bf16_gemv` vs the ported native `bf16_gemv_fp32_mmvf`; same workgroup-per-row
+decomposition, only the activation precision differs → a WASH is expected; full table in `bench/README.md`).**
+A **WASH**: native/ported `bf16_gemv` **1.000** (Arc, n_out=512), **1.006** (Arc, 48), **0.996 / 0.997** (Ryzen
+iGPU), **0.933 / 0.956** (llvmpipe).
+
+**THE DRAFTER ROWS.**  `add_streams_broadcast`, `fused_gr_read_multi`, `window_ids`, `qsa_decode_attn_batch`,
+`moe_group_resident`, `row_top_prob`, `map_ids`, `mtp_select` are labelled **CLASS C**: reachable only under the
+`--spec 4 --mtp` draft loop, which this port does not select (`Verifier::init` refuses under
+`layer_verify_compatible()`, which needs `g_fused_gr` false→forced, `native_qsa_indexer_enabled()` false, and
+`native_bf16_projections` unpinned).  The flag chain that WOULD enable them is `--spec 4 --mtp` AND a
+verifier-compatible native stack.  The TSV keeps kind `todo` but carries the class-C reason; the classification is
+in `plan/DECODE-PATH-TRIAGE.md`.
+
+**THE MAP MOVES BY TWO ROWS:** `168 — 76 kernel, 61 host, 31 todo` → **`168 — 78 kernel, 61 host, 29 todo`**;
+`check_port_map.py` passes (`111 shaders built, 92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.  **Gate, after the change: vega Arc 444/0/0, lvp 432/0/3, radeon-iGPU 435/0/2 (exit 0)**;
+**box `z820b`: NOT RUN — the box was UNREACHABLE this batch** (`No route to host`, ARP `INCOMPLETE`, no WoL path
+from vega), so the box run is PENDING a whole-tree sync + `run_gate.sh`/`run_bench.sh` there.  Both injections
+BIT (raw lines in `NEXT.md`).  Full detail in `NEXT.md`'s top section and `plan/DECODE-PATH-TRIAGE.md`.
+
+---
+
 ## THE QSA GATE'S NATIVE MEMBER — class B batch 5 — `native_qsa_enabled()` FLIPS TO TRUE + the REACHABILITY AUDIT (2026-10-05)
 
 `native_qsa_gate_apply` — the LAST symbol `native_qsa_enabled()` gates — is ported, gated against the engine's OWN

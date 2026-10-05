@@ -25,6 +25,13 @@ TABLE = {
     'bf16_gemv_fp32_mmvf':            ('kernel', 'bf16_mmvf_f32'),
     'bf16_gemv_fp32_mmvf_cols':       ('kernel', 'bf16_mmvf_f32'),
     'bf16_gemv_fp32_mmvf_multi':      ('kernel', 'bf16_mmvf_f32_multi'),
+    # THE BF16-PROJECTION PAIR, the OTHER side of the `native_bf16_projections` setting (layer.cpp:91, default
+    # FALSE; set by `--native`/`--native-bf16`).  `project_bf16` (layer.cpp:94-100) reaches them when the
+    # setting is OFF, on the main forward path (layer.cpp:291/:292/:367/:918/:962); both are now ported so the
+    # setting cannot route the engine at an unported symbol whichever way it answers.  See DECODE-PATH-TRIAGE.md
+    # -> THE REACHABILITY AUDIT and the cases `case_bf16_gemv` / `case_bf16_gemv_split`.
+    'bf16_gemv':                      ('kernel', 'bf16_gemv'),        # 1 workgroup/row (split=false call sites)
+    'bf16_gemv_split':                ('kernel', 'bf16_gemv'),        # 1 workgroup/row, SAME shader (split=true)
     'coupled_draft_sample':           ('kernel', 'coupled_penalize coupled_sample'),
     'cvec_apply':                     ('kernel', 'cvec_apply'),
     'embedding_gather':               ('kernel', 'embedding_gather'),
@@ -184,40 +191,38 @@ TABLE = {
     'shared_expert_native_bf16_enabled': ('host', 'a capability check'),
     'shared_expert_scratch_bytes':    ('host', 'a size'),
     # ---- GPU work this port has NOT done: the honest hole list ----
-    'add_streams_broadcast':          ('todo', 'no shader in this tree yet'),
-    'bf16_gemv':                      ('todo', 'no shader in this tree yet'),
-    'bf16_gemv_split':                ('todo', 'no shader in this tree yet'),
+    'add_streams_broadcast':          ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'broadcast_streams':              ('todo', 'no shader in this tree yet'),
     'fetch_blobs':                    ('todo', 'no shader in this tree yet'),
     'fused_gdn_ab':                   ('kernel', 'fused_gdn_ab'),          # replaces 2x bf16 mmvf + beta_gate + gate
     'fused_gdn_conv_l2':              ('kernel', 'fused_gdn_conv_l2'),     # replaces native_gdn_conv_silu + 2x l2_norm
     'fused_gdn_step_norm':            ('kernel', 'fused_gdn_step_norm'),   # replaces native_gdn_step + native_gdn_out_norm
     'fused_gr_read':                  ('todo', 'a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes'),
-    'fused_gr_read_multi':            ('todo', 'no shader in this tree yet'),
+    'fused_gr_read_multi':            ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'gdn_ab_multi':                   ('todo', 'no shader in this tree yet'),
     'gdn_conv_commit':                ('todo', 'no shader in this tree yet'),
     'gdn_conv_l2_multi':              ('todo', 'no shader in this tree yet'),
     'gdn_step_norm_multi':            ('todo', 'no shader in this tree yet'),
     'gpu_stamp':                      ('todo', 'no shader in this tree yet'),
-    'map_ids':                        ('todo', 'no shader in this tree yet'),
-    'moe_group_resident':             ('todo', 'no shader in this tree yet'),
-    'mtp_select':                     ('todo', 'no shader in this tree yet'),
+    'map_ids':                        ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
+    'moe_group_resident':             ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
+    'mtp_select':                     ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),
     'native_qsa_indexer_append':      ('todo', 'no shader in this tree yet'),
     'native_router_top10_multi':      ('todo', 'no shader in this tree yet'),
     'ple_block_projected':            ('todo', 'no shader in this tree yet'),
     'qsa_attend_step':                ('todo', 'no shader in this tree yet'),
-    'qsa_decode_attn_batch':          ('todo', 'no shader in this tree yet'),
+    'qsa_decode_attn_batch':          ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'qsa_index_step':                 ('todo', 'no shader in this tree yet'),
     'rebase_ptrs':                    ('todo', 'no shader in this tree yet'),
     'resident_plan':                  ('todo', 'no shader in this tree yet'),
-    'row_top_prob':                   ('todo', 'no shader in this tree yet'),
+    'row_top_prob':                   ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     's_gemv_q8_0_split':              ('todo', 'no shader in this tree yet'),
     's_gemv_q8k_split':               ('todo', 'no shader in this tree yet'),
     'topk_512_step':                  ('todo', 'no shader in this tree yet'),
     'wait_flag_ge':                   ('todo', 'no shader in this tree yet'),
     'wait_flag_ge_or':                ('todo', 'no shader in this tree yet'),
-    'window_ids':                     ('todo', 'no shader in this tree yet'),
+    'window_ids':                     ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
 }
 
 missing = [s for s in syms if s not in TABLE]

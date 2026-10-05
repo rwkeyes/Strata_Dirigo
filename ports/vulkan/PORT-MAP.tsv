@@ -5,12 +5,12 @@
 # symbol, a shader that is not built, an unclaimed shader or an unlisted src/core/ symbol all fail.
 # symbol	kind	shader(s) or reason
 add_inplace	kernel	add
-add_streams_broadcast	todo	no shader in this tree yet
-bf16_gemv	todo	no shader in this tree yet
+add_streams_broadcast	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
+bf16_gemv	kernel	bf16_gemv
 bf16_gemv_fp32_mmvf	kernel	bf16_mmvf_f32
 bf16_gemv_fp32_mmvf_cols	kernel	bf16_mmvf_f32
 bf16_gemv_fp32_mmvf_multi	kernel	bf16_mmvf_f32_multi
-bf16_gemv_split	todo	no shader in this tree yet
+bf16_gemv_split	kernel	bf16_gemv
 broadcast_streams	todo	no shader in this tree yet
 build_rope_table	host	the engine builds the table; rope_neox is the kernel that reads it
 copy_from_mapped	host	a mapped-buffer copy
@@ -42,7 +42,7 @@ fused_gdn_conv_l2	kernel	fused_gdn_conv_l2
 fused_gdn_step_norm	kernel	fused_gdn_step_norm
 fused_gr_check	host	a capability check
 fused_gr_read	todo	a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes
-fused_gr_read_multi	todo	no shader in this tree yet
+fused_gr_read_multi	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 fused_gr_supported	host	a capability check
 fwht256_inplace_cuda	kernel	fwht256
 gather_rows	kernel	gather_rows
@@ -81,9 +81,9 @@ kv_ring_table	host	ring bookkeeping
 kv_stream_map_bytes	host	the expert file tier: a size
 kv_stream_reset	host	the expert file tier: bookkeeping
 kv_stream_resolve	host	the expert file tier: whether a row is resident
-map_ids	todo	no shader in this tree yet
+map_ids	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 moe_combine	kernel	moe_combine_f32 moe_combine_f64
-moe_group_resident	todo	no shader in this tree yet
+moe_group_resident	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 moe_grouped_s2	kernel	s2expert_gu_grouped s2expert_swiglu quantize_q8_0 s2expert_down_grouped
 moe_hit_add	kernel	moe_hit_add
 moe_hit_grouped_s2	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down
@@ -91,7 +91,7 @@ moe_hit_grouped_s2_cpu_order	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 m
 moe_hit_grouped_s2_dev	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
 moe_hit_grouped_scratch_bytes	host	a size
 moe_hit_select	kernel	moe_hit_select
-mtp_select	todo	no shader in this tree yet
+mtp_select	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 native_expert_grouped	kernel	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
 native_expert_layout	host	a layout description
 native_expert_scratch_bytes	host	a size
@@ -133,7 +133,7 @@ ple_native_postops_enabled	host	a capability check
 qsa_attend_step	todo	no shader in this tree yet
 qsa_block_scores	kernel	qsa_block_scores
 qsa_block_topk	kernel	qsa_block_topk
-qsa_decode_attn_batch	todo	no shader in this tree yet
+qsa_decode_attn_batch	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 qsa_decode_attn_scratch_floats	host	a size
 qsa_decode_attn_step	kernel	attn_decode_short
 qsa_gate_apply_f32	kernel	qsa_gate_apply_f32
@@ -155,7 +155,7 @@ rope_scaling	host	a table parameter
 rope_table_release	host	table bookkeeping
 rope_table_set	host	table bookkeeping
 router_top10	kernel	router_top10_f32 router_top10_f64
-row_top_prob	todo	no shader in this tree yet
+row_top_prob	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 s2_gemv_q8	kernel	s2_gemv_q8
 s_gemv_q8_0_split	todo	no shader in this tree yet
 s_gemv_q8k_split	todo	no shader in this tree yet
@@ -171,4 +171,4 @@ silu_inplace	kernel	silu_f32
 topk_512_step	todo	no shader in this tree yet
 wait_flag_ge	todo	no shader in this tree yet
 wait_flag_ge_or	todo	no shader in this tree yet
-window_ids	todo	no shader in this tree yet
+window_ids	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)

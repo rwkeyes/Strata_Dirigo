@@ -1,5 +1,81 @@
 # Start here next session
 
+## THE BF16-PROJECTION PAIR — `bf16_gemv` + `bf16_gemv_split` PORTED (one shared shader) — and the
+## 8 SPECULATIVE-DRAFTER SYMBOLS LABELLED CLASS C — **DONE 2026-10-05**
+
+This increment closes the **SECOND soft edge** the batch-5 REACHABILITY AUDIT raised.  The audit marked
+`bf16_gemv` / `bf16_gemv_split` a soft edge because the setting that selects them
+(`native_bf16_projections`) is not named in the port's capability contract.  Hole-hunted to the end:
+
+**THE CHAIN.**  `project_bf16` (`src/core/layer.cpp:94-100`) is the ONLY caller of BOTH:
+`native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)`.  The setting
+(`layer.cpp:91`) DEFAULTS **false**; `layer_set_native_bf16` (`:174`) is called from `generate.cpp:2286` with
+`o.native_bf16`, which `--native` sets true (`generate.cpp:1805`) and `--native-bf16` sets independently.  The
+**port pins the setting nowhere** (it is a host setting, not a capability getter — `native_caps_vk.cpp` answers
+neither), so with the flag off the layer dispatches the UNPORTED members on the main forward path:
+`bf16_gemv_split` at `layer.cpp:291`/`:292` (GDN alpha/beta) and `:367` (router logits), `bf16_gemv` at
+`:918`/`:962` (QSA indexer projections).
+
+**VERDICT: REACHABLE BY DEFAULT → a HOLE, and BOTH MEMBERS ARE PORTED** (the preferred fix; `--native`'s TRUE
+branch was already covered by the ported `bf16_gemv_fp32_mmvf`).  Pinning `layer_set_native_bf16(true)` was the
+alternative and was REJECTED: the setter is engine host code (`src/core/layer.cpp`) the port does not fork, so a
+pin would be a claim about a setting the port does not own — porting both sides makes the setting irrelevant.
+
+| symbol (shader) | the rule (the engine's own body = the oracle) | case |
+|---|---|---|
+| `bf16_gemv` (`bf16_gemv.comp`) | `bf16_gemv.cu`: `y[o]=Σ f32(x[i])·f32(w[o*n_in+i])`, products exact in f32, the row read as 32-bit PAIRS, plain `acc += a*b` (NOT `__fmaf_rn`) | 4 arms: 2560×512, 2560×128, 128×64, 2×1 |
+| `bf16_gemv_split` (SAME `bf16_gemv.comp`) | `bf16_gemv_split_kernel`/`bf16_gemv_warp_kernel` — the same RULE, a different reduction.  ONE shared shader: the CUDA's three kernels differ only in PARALLELISM STRATEGY, the engine's call sites all land on the coalesced warp paths (n_out 512/128/48, tpr 32), and subgroup ops are BANNED here — so both are rendered as ONE WORKGROUP per output row through the barrier tree (`threads_per_row` dropped).  Two map rows, one shader — the `bf16_gemv_fp32_mmvf`/`_cols` precedent. | 4 arms: 2560×512, 2560×48, 64×32, 2×1 |
+
+**A MEASUREMENT THAT CHANGED THE SHIPPED KERNEL.**  The naive ONE-THREAD-PER-ROW decomposition was built and
+benchmarked first, and it is **14–18x slower** than the workgroup form at the engine's shapes (Arc `split/serial
+0.073` at n_out=512 / 0.057 at 48; Ryzen iGPU 0.103/0.055) — the CUDA's own comment says why (uncoalesced: 32
+transactions per load), and CUDA uses the naive path only below n_out=64, which this engine never does for
+`bf16_gemv`.  So the port ships the workgroup-per-row rendering; the naive variant is NOT in the tree.
+
+**THE ORACLE is the double transcription of the shared rule, bounded by the row's TERMS** (`gemv_bound`,
+`rtol·|want| + 16·2⁻²⁴·Σ|terms|`) — never a relative tolerance, because a cancellation row's `Σ|terms|` dominates
+its result.  Fixture: row 0 is the LAYOUT PROBE (low halves ~1e3, high halves ~1e-3 → a pair-halves swap is
+O(1)); row 1 is ALL-ZERO (the bound's `1e-30` floor is load-bearing); both margins (halves swap, off-by-one row)
+are asserted host-side to MOVE the oracle; the output buffer carries a 0x5E guard region behind a surplus
+workgroup.  Verdicts (Arc, all PASS): `bf16_gemv` 515/515 w 1.22e-02, 131/131 w 5.73e-03, 67/67 w 3.2e-02,
+4/4 w 1.84e-03; `bf16_gemv_split` 515/515 w 6.99e-03, 51/51 w 6.37e-03, 35/35 w 1.42e-02, 4/4 w 9.61e-03.
+
+**FALSIFICATION (both BIT, on the shared shader):** `bf16-gemv-swap-halves` → `FAIL bf16_gemv n_in=2560 n_out=512
+4/515 w 1.54e+05`; `bf16-gemv-row-base` (weight row indexed by the OUTPUT stride) → `FAIL bf16_gemv n_in=2560
+n_out=512 4/515 w 2.62e+34`.
+
+**THE MEASUREMENT** (there is NO legacy sibling — this IS the non-native branch, so the pair is the ported
+`bf16_gemv` against the PORTED native sibling `bf16_gemv_fp32_mmvf`; same workgroup-per-row decomposition, only the
+activation precision differs, so a WASH is expected and measured; `XPAIR` ratio `<1.0` = first row faster, `reps=9`):
+
+| pair (ported `bf16_gemv` ← native `bf16_gemv_fp32_mmvf`) | Arc B70 | Ryzen iGPU | lvp (vega) |
+|---|---:|---:|---:|
+| `bf16_gemv` n_out=512 | 1.000 | 0.996 | 0.933 |
+| `bf16_gemv` n_out=48  | 1.006 | 0.997 | 0.956 |
+
+**THE 8 SPECULATIVE-DRAFTER SYMBOLS → CLASS C (labelled, not ported).**  `add_streams_broadcast`,
+`fused_gr_read_multi`, `window_ids`, `qsa_decode_attn_batch`, `moe_group_resident`, `row_top_prob`, `map_ids`,
+`mtp_select` run only in the `--spec 4 --mtp` DRAFT loop, which THE PORT DOES NOT SELECT: the loop needs
+`Verifier::init`, and `layer_verify_compatible()` (`layer.cpp:476-491`) demands `g_fused_gr` (forced FALSE by the
+GR contract), `native_qsa_indexer_enabled()` (answered FALSE — the native append is unported) and
+`native_bf16_projections` (a setting the port does not pin).  **The flag chain that would enable them is
+`--spec 4 --mtp` AND a verifier-compatible native stack; the selected branch is a `--spec 0` run.**  The TSV rows
+keep kind `todo` (its vocabulary is kernel/host/todo) but carry a `class C` reason string; the classification and
+its chain are in `plan/DECODE-PATH-TRIAGE.md` → THE REACHABILITY AUDIT.
+
+**THE MAP DROPS BY TWO.**  `168 — 76 kernel, 61 host, 31 todo` → **`168 — 78 kernel, 61 host, 29 todo`**;
+`check_port_map.py` passes (`111 shaders built, 92 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.
+
+**GATE, after the change.  vega:** intel_icd (Arc B70) **444 / 0 / 0** (`run_gate.sh` exit **0**), llvmpipe
+**432 / 0 / 3**, radeon_icd (Ryzen iGPU) **435 / 0 / 2** — **+8 verdicts** each (4 arms × 2 symbols), 0 failed;
+the intermittent `budget: independent requery agrees` flake did not fire.  **Box (`z820b`): NOT RUN — the box
+was UNREACHABLE this batch** (`ssh bob@192.168.1.116` → `No route to host`; ARP `INCOMPLETE`; the `z820b` tunnel
+alias refuses; no Wake-on-LAN helper exists on vega).  The box run is **PENDING**: sync the WHOLE tree
+(`tar czf - --exclude='*/build' --exclude='./.git' . | ssh bob@192.168.1.116 'tar xzf - -C ~/strata-vulkan-wt'`)
+and re-run `run_gate.sh` + `run_bench.sh` there before the batch is treated as closed on both boxes.  Everything
+in this section above is measured on vega.
+
 ## THE QSA GATE'S NATIVE MEMBER — class B batch 5 — **DONE 2026-10-05** — `native_qsa_enabled()` FLIPS TO TRUE,
 ## plus the REACHABILITY AUDIT of every remaining `todo` row and ONE HOLE FIXED
 

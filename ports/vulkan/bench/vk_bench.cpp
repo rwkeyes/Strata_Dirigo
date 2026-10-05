@@ -1021,6 +1021,52 @@ void bench_fused_gdn_step_norm_pair(Ctx& ctx, const std::string& dir, int reps, 
     ctx.free(bo); ctx.free(bz); ctx.free(bgm); ctx.free(by);
 }
 
+// =========================================================================================================
+// THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`, ONE shared shader) - the DEFAULT side of the
+// `native_bf16_projections` setting, ported so the setting cannot route the engine at an unported symbol.  There
+// is NO legacy sibling to compare against (this IS the non-native branch), so the pair is measured against the
+// PORTED native sibling `bf16_gemv_fp32_mmvf` (`bf16_mmvf_f32`), which the setting selects when it is ON: same
+// workgroup-per-row decomposition, the only difference being the activation's precision (bf16 vs f32).  XPAIR
+// convention is `<row>/<baseline>`; < 1.0 means the first row is faster, and a same-shape drop-in is EXPECTED to
+// wash.  The CUDA's one-thread-per-row naive decomposition was ALSO measured and is NOT shipped: at the engine's
+// shapes it is 14-18x slower on the GPUs (Arc 0.073x, Ryzen iGPU 0.103x of the workgroup form at n_out=512) and
+// the CUDA does not take it above n_out=64 anyway.
+// =========================================================================================================
+void bench_bf16_gemv_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int shapes[][2] = {{2560, 512}, {2560, 48}};   // the router/indexer projection; the GDN alpha/beta projection
+    for (const auto& s : shapes) {
+        const int n_in = s[0], n_out = s[1];
+        const size_t xw = (size_t) n_in / 2;             // bf16 activation, 2 per 32-bit word
+        const size_t ww = (size_t) n_out * n_in / 2;     // bf16 weights, 2 per 32-bit word
+        std::vector<uint32_t> xbuf(xw, 0), wbuf(ww, 0);
+        for (auto& w : xbuf) w = next_rand();
+        for (auto& w : wbuf) w = next_rand();
+        std::vector<float> xf = floats((size_t) n_in);
+        Buf bx = alloc(ctx, xw * 4), bx32 = alloc(ctx, (size_t) n_in * 4), bw = alloc(ctx, ww * 4),
+            by = alloc(ctx, (size_t) n_out * 4 + 64);
+        ctx.write(bx, xbuf.data(), xw * 4);
+        ctx.write(bx32, xf.data(), (size_t) n_in * 4);
+        ctx.write(bw, wbuf.data(), ww * 4);
+        struct { int32_t n_in; int32_t n_out; } pc{n_in, n_out};
+        char shape[64];
+        std::snprintf(shape, sizeof shape, "n_in=%d n_out=%d", n_in, n_out);
+        Timing tv, tm;
+        {
+            VkPipeline p = ctx.pipeline(dir + "/bf16_gemv.spv", 3, (int) sizeof(pc));
+            tv = time_kernel(ctx, p, {&bx, &bw, &by}, &pc, sizeof(pc), (uint32_t) n_out, 1, 64, reps, warmups);
+            report("bf16_gemv_wg_row", shape, tv, (double) n_out, (double) n_out * n_in);
+        }
+        {
+            VkPipeline p = ctx.pipeline(dir + "/bf16_mmvf_f32.spv", 3, (int) sizeof(pc));
+            tm = time_kernel(ctx, p, {&bx32, &bw, &by}, &pc, sizeof(pc), (uint32_t) n_out, 1, 64, reps, warmups);
+            report("bf16_gemv_fp32_mmvf", shape, tm, (double) n_out, (double) n_out * n_in);
+        }
+        std::printf("XPAIR bf16_gemv %s | ported bf16_gemv (bf16 act) | native bf16_gemv_fp32_mmvf (f32 act) | "
+                    "native/bf16_gemv %.3f\n", shape, tm.med / tv.med);
+        ctx.free(bx); ctx.free(bx32); ctx.free(bw); ctx.free(by);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1117,6 +1163,8 @@ int main(int argc, char** argv) {
     bench_fused_gdn_conv_l2_pair(ctx, dir, reps, warmups);
     bench_fused_gdn_ab_pair(ctx, dir, reps, warmups);
     bench_fused_gdn_step_norm_pair(ctx, dir, reps, warmups);
+    // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`): the DEFAULT side of `native_bf16_projections`.
+    bench_bf16_gemv_pair(ctx, dir, reps, warmups);
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a

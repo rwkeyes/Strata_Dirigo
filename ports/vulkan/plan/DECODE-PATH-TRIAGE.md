@@ -1,15 +1,16 @@
 # Decode-path triage — the 52 `todo` rows, from the engine's own sources
 #
-# CURRENT 2026-10-05 (after class-B batch 5, `native_qsa_gate_apply` + the REACHABILITY AUDIT): the map reads
-# **168 = 76 kernel + 61 host + 31 todo** (the LAST symbol `native_qsa_enabled()` gates is now `kernel`, so that flag
-# answers TRUE; the class-A set is CLOSED and the performance tier's class-B native fast paths are ALL ported: the
-# four of batch 1, ALL SIX native GDN / DeltaNet mixer kernels (batches 2 and 3), the THREE fused GDN paths (batch 4)
-# and the QSA gate (batch 5).)  The **REACHABILITY AUDIT** at the end of this file converts the remaining 31 `todo`
-# rows into a decision list under the port's CURRENT capability answers; it found and this batch FIXED one hole
-# (`native_qsa_indexer_append` was reachable because its gating flag `native_qsa_indexer_enabled()` had no Vulkan
-# definition at all).  M-A is RE-DEFINED over the class-A set at the end of this file ("THE RE-DEFINED MILESTONE
-# M-A").  The numbers quoted immediately below are the state at `7c317c4`, kept as the record the triage was written
-# against.
+# CURRENT 2026-10-05 (after the BF16-PROJECTION batch: `bf16_gemv` + `bf16_gemv_split` PORTED, and the eight
+# SPECULATIVE-DRAFTER symbols LABELLED CLASS C): the map reads **168 = 78 kernel + 61 host + 29 todo**.  The
+# class-A set is CLOSED; the performance tier's class-B native fast paths are ALL ported (batch 1's four, ALL SIX
+# native GDN / DeltaNet mixer kernels, the THREE fused GDN paths, the QSA gate); and this batch ports the TWO
+# BF16-PROJECTION entry points that `project_bf16` (layer.cpp:94-100) reaches on the DEFAULT side of the
+# `native_bf16_projections` setting, so that setting can no longer route the engine at an unported symbol whichever
+# way it answers.  The **REACHABILITY AUDIT** at the end of this file is the decision list under the port's
+# capability answers; batch 5 fixed one hole (`native_qsa_indexer_append`, an UNIMPLEMENTED gating flag) and this
+# batch CLOSES the second soft edge it raised (the two BF16-projection rows).  M-A is RE-DEFINED over the class-A
+# set at the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted immediately below are the state
+# at `7c317c4`, kept as the record the triage was written against.
 
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads
@@ -322,6 +323,9 @@ I2–I5 are **not** re-scoped here — that is their own checkpoint; only the co
   moe_grouped_s2`, `:600 native_moe_combine`, `:644 map_ids`, `:710 mtp_select`).  The P6 verifier *is* blocked
   in any case: `Verifier::init` refuses unless `layer_verify_compatible()` holds, and that demands the native
   GDN and the native QSA indexer — both class A.
+  **RESOLVED BY THIS BATCH (2026-10-05):** the eight `mtp.cpp`-only symbols are labelled **CLASS C** — the
+  drafter config is one THIS PORT does not select (`Verifier::init` refuses under the port's answers, so the
+  draft loop is never entered).  See "THE REACHABILITY AUDIT" → the class-C drafter group.
 * **`native_gdn_gate`.**  Its named fallback `gdn_gate` IS ported, which would make it B; but the fallback
   *branch* is `{ gdn_beta_gate; gdn_gate; }` and `gdn_beta_gate` is `todo`, so the dodge is not sound.  Placed
   in A (the unsafe reading), as instructed.
@@ -435,10 +439,11 @@ Counts after the closure batch: **`168 = 62 kernel + 61 host + 45 todo`**, and t
 1. **The shipped `--spec 4` loop.**  `setup.py:4224-4227` writes `--spec 4 --mtp`, so the MTP drafter DOES run on
    the shipped product and its `mtp.cpp`-only symbols (`map_ids`, `mtp_select`, `moe_group_resident`,
    `row_top_prob`, `window_ids`, `add_streams_broadcast`, `fused_gr_read_multi`, `qsa_decode_attn_batch`) are
-   classified D on the brief's definition.  **That is a JUDGEMENT, not a measurement**: read against the shipped
-   `--spec 4` loop they become forward-path holes and M-A is short by them.  The P6 verifier is blocked in any
-   case — `Verifier::init` refuses unless `layer_verify_compatible()` holds, which demands `native_gdn &&
-   g_fused_gdn` and `native_qsa_indexer_enabled()` — all false under the contract.
+   **CLASS C** (this batch's labelling, see the REACHABILITY AUDIT above): they are selected only by the
+   `--spec 4 --mtp` draft loop, which the PORT does not enable — `Verifier::init` refuses because
+   `layer_verify_compatible()` needs `g_fused_gr` (forced false), `native_qsa_indexer_enabled()` (answered false)
+   and `native_bf16_projections` (unpinned).  The P6 verifier is blocked in any case, so the port's selected
+   branch is a `--spec 0` run.
 2. **`gr_read` vs `fused_gr_read`** (above): the pair is closed by CONTRACT, not by matching the shipped launch's
    own selection.
 
@@ -511,8 +516,8 @@ answer can be re-checked when a default changes.
 |---|---|---|---|---|
 | 1 | `native_qsa_gate_apply` | todo → **kernel** | — **DONE this batch** | `layer.cpp:1010` `if (native_qsa_enabled())`; shader landed, flag flipped |
 | 2 | `native_qsa_indexer_append` | todo | **was a HOLE → DONE this batch** | `layer.cpp:944` `if (native_qsa_indexer_enabled())`; the flag is now ANSWERED false (was unimplemented), selecting the ported `indexer_key_append` (`:948`) |
-| 3 | `bf16_gemv` | todo (C) | **no** (soft edge) | `layer.cpp:99` in `project_bf16`: `native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)`. The shipped `--native` sets `native_bf16_projections = true` → the PORTED `bf16_gemv_fp32_mmvf`. **Soft edge: the port's contract table does not name this setting**; if the port ever runs without `--native`, `bf16_gemv_split` (the layers' `split=true` calls) becomes reachable and unported. Pin it. |
-| 4 | `bf16_gemv_split` | todo (C) | **no** (soft edge) | same chain; `split=true` is the `gdn_layer` alpha/beta call (`layer.cpp:290-291`) |
+| 3 | `bf16_gemv` | todo → **kernel** | — **DONE this batch** | `layer.cpp:99` in `project_bf16`: `native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)`. The setting (`layer.cpp:91`) DEFAULTS **false** and the port pins it nowhere, so the DEFAULT selects the UNPORTED member; the shipped `--native` (`generate.cpp:1805` → `:2286`) sets it true. **Porting BOTH members closes the edge for either value** — `case_bf16_gemv` / `case_bf16_gemv_split`. |
+| 4 | `bf16_gemv_split` | todo → **kernel** | — **DONE this batch** | same chain; `split=true` is the `gdn_layer` alpha/beta call (`layer.cpp:291-292`) and the router logits (`:367`) |
 | 5 | `s_gemv_q8_0_split` | todo (C) | **no** | `layer.cpp:172` in `gemv_quantized`, reached only when `w.native_data == nullptr`; the shipped dense weights ARE native (`:142` → `native_mmvq`) |
 | 6 | `s_gemv_q8k_split` | todo (C) | **no** | `layer.cpp:172` (same) and `layer.cpp:1017` (`!w_attno->native_data`); shipped `attn_output` is native |
 | 7 | `qsa_index_step` | todo (C) | **no** | `layer.cpp:973` `else` of `if (g_fast_select)`; `g_fast_select` defaults true → the ported `qsa_block_scores`/`qsa_block_topk` |
@@ -551,23 +556,83 @@ AND `native_qsa_indexer_enabled()` (**false** — the indexer is unported).  So 
 port runs.  **The batch-4 flip did not change this**: it satisfied one term of that conjunction, and three other
 terms keep it false.
 
-**THE REACHABLE-BUT-UNPORTED QUEUE, in the order the work should land.**  The forward-path hole (row 2) is
-closed.  What remains is ELEVEN rows, in two groups:
+**THE REACHABLE-BUT-UNPORTED QUEUE, re-read after this batch.**  Both forward-path holes are now CLOSED:
+`native_qsa_indexer_append` by the FLAG (batch 5) and the two BF16-projection rows by PORTING BOTH MEMBERS (this
+batch).  What remains is the drafter's eight, and this batch LABELS them **class C**:
 
-1. **The speculative drafter's eight (`mtp.cpp`)** — reachable ONLY because the shipped `setup.py` writes
-   `--spec 4 --mtp`; a `--spec 0` run is the whole model and nothing less.  This is the milestone's
-   "judgement, not a measurement" made concrete: under the shipped launch these ARE forward-path dispatches of
-   unported symbols.  Ordered by the drafter's own sequence: `add_streams_broadcast` (497) →
-   `fused_gr_read_multi` (510) → `window_ids`/`qsa_decode_attn_batch` (551/552) → `moe_group_resident` (579) →
-   `fused_gr_read_multi` again (620) → `row_top_prob`/`map_ids` (643/644) → `mtp_select` (710/719/738).
-   `fused_gr_read_multi` is the one the port has a sibling for (`gr_read` + `gr_write` are ported); the rest are
-   new kernels.  **They are class D only under a `--spec 0` product.**
-2. **The two BF16-projection rows (`bf16_gemv`, `bf16_gemv_split`)** — NOT reachable under the shipped launch,
-   but reachable the moment `native_bf16_projections` is false, and **the port's contract table does not name
-   that setting**.  Either port them or pin `layer_set_native_bf16(true)` in the contract; until then this is a
-   documented SOFT EDGE, not a closed hole.
+1. **The speculative drafter's eight (`mtp.cpp`) → CLASS C.**  `add_streams_broadcast` (497) →
+   `fused_gr_read_multi` (510/571/620) → `window_ids` / `qsa_decode_attn_batch` (551/552) → `moe_group_resident`
+   (579) → `row_top_prob` / `map_ids` (643/644) → `mtp_select` (710/719/738).  They run ONLY when the engine takes
+   the `--spec 4 --mtp` DRAFT loop — a configuration THE PORT DOES NOT SELECT, because the loop needs
+   `Verifier::init` to succeed and `layer_verify_compatible()` (`layer.cpp:476-491`) demands a conjunction the
+   port's contract leaves false: `g_fused_gr` (forced FALSE by the GR contract), `native_qsa_indexer_enabled()`
+   (answered FALSE — the native append is unported) and `native_bf16_projections` (a setting the port does not
+   pin).  **The flag chain that WOULD enable them is `--spec 4 --mtp` AND a verifier-compatible native stack; the
+   selected branch (a `--spec 0` / non-drafting run) is the whole model.**  That is exactly the class-C shape — a
+   NON-SELECTED configuration whose selected branch IS ported.  The port's own contract is what keeps the
+   verifier out, so the drafter is not a branch this backend takes.  (`fused_gr_read_multi`'s ported siblings,
+   `gr_read` + `gr_write`, are already in the tree; the other seven are new kernels.)
 
-**Counts, stated, not rounded:** of the 32 rows audited, **1 is now `kernel`** (`native_qsa_gate_apply`), **11
-are reachable-but-unported** (8 drafter + `native_qsa_indexer_append` (now flag-closed) + 2 BF16 soft edges),
-and **20 are unreachable under the current answers**, each with the deciding condition named above.
+**Counts, stated, not rounded:** of the 32 rows audited, **3 are now `kernel`** (`native_qsa_gate_apply`,
+`bf16_gemv`, `bf16_gemv_split`); **8 are CLASS C** (the drafter rows above, reachable only under the non-selected
+`--spec 4 --mtp` config); `native_qsa_indexer_append` stays `todo` but is **flag-closed**; and **20 are
+unreachable** under the current answers, each with its deciding condition named in the table above.  3 + 8 + 1 +
+20 = 32.
+
+# THE BF16-PROJECTION PAIR — the second soft edge, CLOSED (2026-10-05)
+
+The REACHABILITY AUDIT above raised the `bf16_gemv` / `bf16_gemv_split` SOFT EDGE and asked for it to be pinned.
+This batch RESOLVED it by porting BOTH ENGINE MEMBERS, which closes the edge for EITHER value of the setting:
+
+| # | symbol | shader | case | call sites (split) |
+|---|---|---|---|---|
+| 1 | `bf16_gemv` | `bf16_gemv.comp` — ONE WORKGROUP per output row through the barrier tree (the engine's `bf16_gemv` call sites are n_out = 128 and 512, where CUDA takes its WARP kernel; subgroup ops are banned here) | `case_bf16_gemv` (4 arms: 2560×512, 2560×128, 128×64, 2×1) | `layer.cpp:918`/`:962` (QSA indexer projections, `split=false`) |
+| 2 | `bf16_gemv_split` | the SAME `bf16_gemv.comp` — the CUDA's split/warp kernels differ from `bf16_gemv` only in parallelism STRATEGY, and the engine calls this entry point with `threads_per_row = 32` (a warp), so the port renders it identically and DROPS `threads_per_row`.  Two map rows, one shader (the `bf16_gemv_fp32_mmvf`/`_cols` precedent). | `case_bf16_gemv_split` (4 arms: 2560×512, 2560×48, 64×32, 2×1) | `layer.cpp:291`/`:292` (GDN alpha/beta), `:367` (router logits), all `split=true` |
+
+**A MEASUREMENT THAT CHANGED THE SHIPPED KERNEL.**  The naive ONE-THREAD-PER-ROW decomposition was built and
+benchmarked first, and at the engine's shapes it is **14–18x slower** than the workgroup form (Arc `split/serial`
+0.073 at n_out=512 / 0.057 at 48; Ryzen iGPU 0.103/0.055) because it is uncoalesced — the CUDA's own comment says
+so, and CUDA uses the naive path only below n_out=64, which this engine never does for `bf16_gemv`.  The port
+therefore SHIPS the workgroup-per-row rendering; the naive variant is not in the tree.
+
+**THE CHAIN, in full.**  `project_bf16` (`src/core/layer.cpp:94-100`) is the ONLY caller of both:
+
+    native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)
+
+The setting `native_bf16_projections` (`layer.cpp:91`) DEFAULT **false**; `layer_set_native_bf16`
+(`layer.cpp:174`) writes it, called from `generate.cpp:2286` with `o.native_bf16`, which `--native` sets true
+(`generate.cpp:1805`) and `--native-bf16` sets independently.  The **port pins the setting NOWHERE**, and the
+native-capability contract (`vulkan/src/kernels/native_caps_vk.cpp`) does not answer it — it is a host setting,
+not a capability getter.  So the honest reading is: with the flag off, the layer dispatches the UNPORTED member
+(`bf16_gemv_split` at three call sites, `bf16_gemv` at two), on the main forward path.  That is the SAME shape as
+the `native_qsa_indexer_append` hole batch 5 fixed — the difference being that here the flag has a real host
+definition and both values are now covered.
+
+**Why PORTING rather than pinning.**  `layer_set_native_bf16` lives in engine host code
+(`src/core/layer.cpp`), which the port does NOT fork; the backend cannot redefine it, and pinning it true would
+have been a claim about a setting the port does not own.  Porting both members is stronger: whichever way the
+setting answers, the engine reaches a shader.
+
+**The oracle and the bound.**  Both kernels compute the same rule (`bf16_gemv.hpp`: the split variant is "NOT
+bit-identical ... the partial sums are added in a different order") on the same fixture: `y[o] = Σ
+f32_from_bf16(x[i]) · f32_from_bf16(w[o*n_in+i])`, every product exact in f32.  The comparison is the port's
+TERMS-derived `gemv_bound` (never a relative tolerance — with cancellation `Σ|terms|` dominates `|result|`), the
+weight row read as 32-bit PAIRS (element 2p LOW, 2p+1 HIGH).  Fixture: row 0 is the LAYOUT PROBE (low halves
+~1e3, high halves ~1e-3, so a halves swap is O(1)); row 1 is ALL-ZERO (the `gemv_bound` floor is load-bearing);
+four arms, including a non-square `128×64` and the degenerate `2×1`.  Both margins (the halves swap, an
+off-by-one row) are asserted host-side to MOVE the oracle, and the output buffer carries a 0x5E guard region
+behind a surplus dispatched group.
+
+**Falsified, and both bit:** `bf16-gemv-swap-halves` → `FAIL bf16_gemv n_in=2560 n_out=512 4/515 worst 1.54e+05`;
+`bf16-gemv-row-base` (the weight row indexed by the OUTPUT stride) → `FAIL bf16_gemv n_in=2560 n_out=512 4/515
+worst 2.62e+34`.
+
+**Measured (bench/README.md; the ported `bf16_gemv` vs the ported native `bf16_gemv_fp32_mmvf`, same
+workgroup-per-row decomposition, only the activation precision differs → a WASH is expected):** native/bf16_gemv
+**1.000** (Arc 512), **1.006** (Arc 48), **0.996 / 0.997** (Ryzen iGPU), **0.933 / 0.956** (llvmpipe).
+
+**Map:** `168 = 76 kernel + 61 host + 31 todo` → **`168 = 78 kernel + 61 host + 29 todo`** (both rows
+`todo → kernel`); `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  The eight drafter rows keep
+kind `todo` in the TSV (its kind vocabulary is `kernel`/`host`/`todo`) but carry a `class C` reason string and
+are classified in the AUDIT above, so the map no longer reports them as open forward-path work.
 

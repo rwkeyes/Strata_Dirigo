@@ -103,6 +103,13 @@
 #   inject-verify.sh fused-gdn-step-norm-silu-not-sigmoid  fused_gdn_step_norm.comp  SiLU instead of sigmoid
 #                                       -> must FAIL  "fused_gdn_step_norm"
 #
+#   (the BF16-projection pair: `bf16_gemv` / `bf16_gemv_split`, ONE shared shader, the DEFAULT side of
+#    `native_bf16_projections`)
+#   inject-verify.sh bf16-gemv-swap-halves  bf16_gemv.comp  swap the BF16 pair halves
+#                                       -> must FAIL  "bf16_gemv"
+#   inject-verify.sh bf16-gemv-row-base     bf16_gemv.comp  index the weight row with the OUTPUT stride
+#                                       -> must FAIL  "bf16_gemv"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -486,6 +493,22 @@ case "$name" in
     old=$'        yb.v[head * S + j] = weighted * (1.0f / (1.0f + exp(-zb.v[head * S + j])));'
     new=$'        yb.v[head * S + j] = weighted * (zb.v[head * S + j] / (1.0f + exp(-zb.v[head * S + j])));   // INJECTION: SiLU instead of sigmoid'
     want="FAIL  fused_gdn_step_norm" ;;
+  bf16-gemv-swap-halves)
+    # The port reads a BF16 weight row as 32-bit PAIRS: element 2p in the LOW half, 2p+1 in the HIGH half.  The
+    # swap is a plausible slip and is invisible on equal-magnitude data; row 0 of the fixture is the LAYOUT PROBE
+    # (low halves ~1e3, high halves ~1e-3), so the swap moves every arm's row 0 by O(1) and this case must fail.
+    file="$SH/bf16_gemv.comp"; spv="bf16_gemv"
+    old=$'        acc += bf16_to_f32(pw & 0xFFFFu) * bf16_to_f32(px & 0xFFFFu);   // element 2p\n        acc += bf16_to_f32(pw >> 16u)    * bf16_to_f32(px >> 16u);      // element 2p+1'
+    new=$'        acc += bf16_to_f32(pw >> 16u)    * bf16_to_f32(px & 0xFFFFu);   // INJECTION: pair halves swapped\n        acc += bf16_to_f32(pw & 0xFFFFu) * bf16_to_f32(px >> 16u);'
+    want="FAIL  bf16_gemv n_in=2560 n_out=512" ;;
+  bf16-gemv-row-base)
+    # The OTHER layout trap: row o's weights start at `o * (n_in/2)` 32-bit words.  Reading at `o * n_out` (the
+    # row stride of the OUTPUT, a plausible confusion) lands on a different row's weights; the arms are
+    # NON-SQUARE on purpose so n_in/2 != n_out and the misread is O(1), not rounding.
+    file="$SH/bf16_gemv.comp"; spv="bf16_gemv"
+    old=$'    const uint wbase = o * npair;                    // row o of the weight is a contiguous run of npair words'
+    new=$'    const uint wbase = o * uint(pc.n_out);   // INJECTION: the weight row base uses the OUTPUT stride'
+    want="FAIL  bf16_gemv n_in=2560 n_out=512" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

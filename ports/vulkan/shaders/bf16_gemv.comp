@@ -1,0 +1,79 @@
+// ports/vulkan/shaders/bf16_gemv.comp - the BF16-weight / BF16-activation GEMV.  ONE SHADER SERVES BOTH ENGINE
+// ENTRY POINTS `bf16_gemv` and `bf16_gemv_split` (see below), so it is in the map as the shader for both rows.
+//
+// Source: src/kernels/cuda/bf16_gemv.cu (`bf16_gemv_naive_kernel`, `bf16_gemv_warp_kernel`, `bf16_gemv_split_kernel`);
+// contract include/strata/kernels/bf16_gemv.hpp.
+//
+//     y[o] = sum_i f32_from_bf16(x[i]) * f32_from_bf16(w[o*n_in + i])
+//
+// WHY THIS EXISTS.  Upstream `project_bf16` (src/core/layer.cpp:94-100) selects between THREE entry points:
+//
+//     native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)
+//
+// `bf16_gemv_fp32_mmvf` (the ported `bf16_mmvf_f32`) is selected only while `native_bf16_projections` is TRUE
+// (`--native`, generate.cpp:1805 -> :2286).  Its DEFAULT is FALSE, so with the flag off the layer dispatches
+// `bf16_gemv_split` at layer.cpp:291/:292 (GDN alpha/beta) and :367 (router logits) and `bf16_gemv` at :918/:962
+// (the QSA indexer projections) - all on the main forward path.  A missing shader here is a dispatch of an
+// unported symbol on every token, whichever way the setting answers.
+//
+// WHY ONE SHADER FOR TWO SYMBOLS.  The CUDA's three kernels differ ONLY in PARALLELISM STRATEGY, not in the rule
+// (`bf16_gemv.hpp`: the split variant is "NOT bit-identical ... the partial sums are added in a different
+// order").  The engine's own call sites all land on the COALESCED paths: `bf16_gemv` is called with n_out = 128
+// and 512 (both >= 64, so CUDA takes `bf16_gemv_warp_kernel`), and `bf16_gemv_split` is called with
+// threads_per_row = 32 (the CUDA's warp-per-row branch).  Both are 32-lane warp reductions, and this port BANS
+// subgroup ops (the driver picks the SIMD width per kernel on Intel - see common/wg_reduce.glsl), so both are
+// rendered the same portable way: ONE WORKGROUP PER OUTPUT ROW through the barrier tree.  `threads_per_row` is
+// therefore DROPPED; the naive one-thread-per-row decomposition is NOT shipped because CUDA uses it only below
+// n_out = 64, which this engine never does for `bf16_gemv` - measured on the Arc, shipping it costs 14-18x
+// (bench/README.md).  Mapping two decode-path rows to one shader has precedent here (`bf16_gemv_fp32_mmvf` and
+// `_cols` both name `bf16_mmvf_f32`).
+//
+// TWO DETAILS THAT ARE NOT STYLE, and the reason the fixture is built the way it is:
+//
+//   * THE WEIGHT ROW IS READ AS 32-BIT PAIRS (element 2p in the LOW half, 2p+1 in the HIGH half) - the port's
+//     convention for a BF16 weight everywhere.  It is a pure implementation choice for a sum (same terms, same
+//     order), and it makes a HALVES SWAP observable at all: equal-magnitude data would show only a rounding-level
+//     error, so the gate gives row 0 its low halves at ~1e3 and its high halves at ~1e-3 (O(1) under the swap).
+//   * THE ACCUMULATOR IS PLAIN `acc += a*b` PER ELEMENT, in ascending `i` - the CUDA is `acc += f32(x)*f32(w)`,
+//     a separate multiply and add, NOT `__fmaf_rn` (that is the fp32-activation MMVF's rule).  Do not "improve"
+//     it to fma.
+//
+// PRECONDITION: n_in is EVEN (the engine projects from n_embd = 2560; the CUDA's own fp32 sibling carries the
+// same contract).  n_out > 0.  The guarded early return is WORKGROUP-UNIFORM (`o` is the workgroup id), which is
+// what makes the barriers in `wg_sum` legal.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer X { uint v[]; } x;   // bf16 ACTIVATION bits, 2 per word
+layout(set = 0, binding = 1, std430) readonly buffer W { uint v[]; } w;   // bf16 weights, row-major, 2 per word
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; } pc;
+
+// bf16 -> f32 is a pure widening (bf16_bits.hpp's `f32_from_bf16` is `bitcast(h << 16)`), so there is no rounding
+// here to get wrong.
+float bf16_to_f32(uint h) { return uintBitsToFloat(h << 16u); }
+
+void main() {
+    const uint o = gl_WorkGroupID.x;                 // ONE WORKGROUP PER OUTPUT ROW
+    if (o >= uint(pc.n_out)) return;                 // workgroup-uniform: every barrier below is reached by all
+
+    const uint n_in = uint(pc.n_in);
+    const uint npair = n_in >> 1u;                   // an EVEN n_in: n_in/2 32-bit words per row
+    const uint wbase = o * npair;                    // row o of the weight is a contiguous run of npair words
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float acc = 0.0f;
+    for (uint p = lid; p < npair; p += lsize) {      // each thread takes pairs p, p+256, ... (strided)
+        const uint pw = w.v[wbase + p];
+        const uint px = x.v[p];
+        acc += bf16_to_f32(pw & 0xFFFFu) * bf16_to_f32(px & 0xFFFFu);   // element 2p
+        acc += bf16_to_f32(pw >> 16u)    * bf16_to_f32(px >> 16u);      // element 2p+1
+    }
+
+    const float total = wg_sum(acc);
+    if (lid == 0u) y.v[o] = total;
+}

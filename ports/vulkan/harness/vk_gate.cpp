@@ -12311,6 +12311,168 @@ void case_native_qsa_gate_apply(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// =========================================================================================================
+// THE BF16-PROJECTION PAIR: `bf16_gemv` and `bf16_gemv_split` - the SOFT EDGE, RESOLVED BY PORTING BOTH SIDES.
+//
+// upstream `project_bf16` (src/core/layer.cpp:94-100) selects one of THREE entry points:
+//     native_bf16_projections ? bf16_gemv_fp32_mmvf : (split ? bf16_gemv_split : bf16_gemv)
+// The ONE selecting input is the HOST SETTING `native_bf16_projections` (layer.cpp:91, DEFAULT FALSE), set from
+// `o.native_bf16` by `layer_set_native_bf16` (layer.cpp:174) at generate.cpp:2286, which `--native` turns on
+// (generate.cpp:1805) and `--native-bf16` sets independently.  The port does NOT pin the setting and no Vulkan
+// definition forces it, so a run with the default would dispatch `bf16_gemv_split` (layer.cpp:291/:292, the GDN
+// alpha/beta projections, split=true; :367, the router logits) and `bf16_gemv` (:918/:962, the QSA indexer
+// projections, split=false) - on the MAIN forward path.  That is the same shape as the `native_qsa_indexer`
+// hole: a symbol the default/shipped options select with no shader.  Porting BOTH branches closes it for EITHER
+// value of the setting (the ported `bf16_gemv_fp32_mmvf` already covers the TRUE branch).
+//
+// The two entry points share a RULE (`bf16_gemv.hpp`: "the split variant is NOT bit-identical ... the partial
+// sums are added in a different order") and differ only in the reduction strategy, so they share the fixture
+// and the oracle; each is dispatched and compared separately.
+// =========================================================================================================
+
+// x = the activation, w = the weight, both bf16-valued (so every product is exact in f32 and only the summation
+// order differs).  Row 0 is THE LAYOUT PROBE - its low halves at ~1e3 and high halves at ~1e-3, which turns a
+// PAIR-HALVES SWAP into an O(1) error (this port reads the weight as 32-bit pairs) where equal-magnitude data
+// would show only a rounding-level one.  Row 1 is ALL-ZERO: it makes `gemv_bound`'s floor load-bearing (a zero
+// oracle AND zero sum|terms| give dev/bound = 0/0, which is why that floor exists).
+static void bf16_gemv_fixture(int n_in, int n_out, std::vector<uint16_t>& xw, std::vector<uint16_t>& ww) {
+    xw.assign((size_t) n_in, 0);
+    for (int i = 0; i < n_in; ++i) xw[(size_t) i] = bf16_from_f32(rndf(1.0f));
+    ww.assign((size_t) n_out * n_in, 0);
+    for (int o = 0; o < n_out; ++o)
+        for (int i = 0; i < n_in; ++i) {
+            float v = rndf(1.0f);
+            if (o == 0) v = (i % 2 == 0) ? 1000.0f * (1.0f + 0.25f * rndf(1.0f))
+                                         : 0.001f * (1.0f + 0.25f * rndf(1.0f));
+            if (o == 1) v = 0.0f;
+            ww[(size_t) o * n_in + i] = bf16_from_f32(v);
+        }
+}
+
+// The rule, transcribed in double.  `swap_halves` is the rival reading (element 2p takes the HIGH half's weight
+// and 2p+1 the low) - computed for the margin, never for the comparison.
+static void bf16_gemv_ref_row(const std::vector<uint16_t>& xw, const std::vector<uint16_t>& ww, int o, int n_in,
+                              bool swap_halves, double& val, double& terms) {
+    double s = 0, m = 0;
+    for (int i = 0; i < n_in; i += 2) {
+        const double x0 = strata::kernels::f32_from_bf16(xw[(size_t) i]);
+        const double x1 = strata::kernels::f32_from_bf16(xw[(size_t) i + 1]);
+        double w0 = strata::kernels::f32_from_bf16(ww[(size_t) o * n_in + i]);
+        double w1 = strata::kernels::f32_from_bf16(ww[(size_t) o * n_in + i + 1]);
+        if (swap_halves) std::swap(w0, w1);
+        s += x0 * w0 + x1 * w1;
+        m += std::fabs(x0 * w0) + std::fabs(x1 * w1);
+    }
+    val = s;
+    terms = m;
+}
+
+struct Bf16Shape { int n_in, n_out; };
+
+static void case_bf16_gemv_impl(Ctx& ctx, const std::string& dir, const Bf16Shape* shapes, int n_shapes,
+                                const char* label) {
+    const char* spv = "bf16_gemv";                   // ONE SHADER serves both engine entry points
+    if (!have(dir, "bf16_gemv.spv")) return;
+    for (int si = 0; si < n_shapes; ++si) {
+        const Bf16Shape& sh = shapes[si];
+        const int n_in = sh.n_in, n_out = sh.n_out;
+        std::vector<uint16_t> xw, ww;
+        bf16_gemv_fixture(n_in, n_out, xw, ww);
+
+        std::vector<double> want(n_out), terms(n_out), want_swap(n_out);
+        for (int o = 0; o < n_out; ++o) {
+            double t;
+            bf16_gemv_ref_row(xw, ww, o, n_in, false, want[o], terms[o]);
+            bf16_gemv_ref_row(xw, ww, o, n_in, true, want_swap[o], t);
+        }
+        // FIXTURE MARGINS, measured host-side: the two rivals this kernel can plausibly read must MOVE the
+        // output, or the arm is decorative (the port's presence-penalty lesson).
+        //   (1) the PAIR-HALVES SWAP - row 0's halves are ~1e6 apart;
+        //   (2) an OFF-BY-ONE ROW - row 0 against the all-zero row 1.
+        double swap_move = 0;
+        for (int o = 0; o < n_out; ++o)
+            swap_move = std::max(swap_move, std::fabs(want[o] - want_swap[o]) / (std::fabs(want[o]) + 1e-30));
+        double row_move = 0;
+        if (n_out >= 2)
+            for (int o = 0; o < n_out; ++o) {
+                const int nb = (o + 1) % n_out;
+                row_move = std::max(row_move, std::fabs(want[o] - want[nb]) / (std::fabs(want[o]) + 1e-30));
+            }
+
+        const size_t xw_words = (size_t) n_in / 2;
+        const uint64_t padded = (uint64_t) n_out * 4u + 64u;
+        Buf bx = ctx.alloc(xw_words * 4), bw = ctx.alloc((size_t) n_out * n_in * 2), by = ctx.alloc(padded);
+        ctx.write(bx, xw.data(), xw_words * 4);
+        ctx.write(bw, ww.data(), (size_t) n_out * n_in * 2);
+        std::vector<uint8_t> sink((size_t) padded, 0x5E);
+        ctx.write(by, sink.data(), sink.size());
+
+        struct { int32_t n_in; int32_t n_out; } pc{n_in, n_out};
+        VkPipeline p = ctx.pipeline(dir + "/" + spv + ".spv", 3, (int) sizeof(pc));
+        // ONE SURPLUS WORKGROUP (one workgroup per row): the guard (`o >= n_out`) is what stops a stray write,
+        // and the output buffer's 0x5E tail is the sentinel that detects one.
+        const uint32_t groups = (uint32_t) n_out + 1u;
+        ctx.dispatch(p, {&bx, &bw, &by}, &pc, sizeof(pc), groups);
+        std::vector<uint8_t> img((size_t) padded);
+        ctx.read(by, img.data(), img.size());
+        const float* got = reinterpret_cast<const float*>(img.data());
+
+        int bad = 0;
+        double worst = 0;
+        for (int o = 0; o < n_out; ++o) {
+            const double dev = std::fabs((double) got[o] - want[o]);
+            const double bound = gemv_bound(want[o], terms[o], 1e-6);
+            if (std::isnan(dev) || std::isnan(bound) || !(bound > 0.0)) {
+                std::printf("      row %d: got %.9g want %.9g abs_sum %.9g -> dev %.9g bound %.9g\n", o,
+                            (double) got[o], want[o], terms[o], dev, bound);
+            }
+            const double ratio = dev / bound;                  // NaN-safe by construction (bound > 0)
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+        for (size_t i = (size_t) n_out * 4; i < img.size(); ++i)
+            if (img[i] != 0x5E) ++bad;                         // the output guard region
+
+        double mass = 0;
+        for (int o = 0; o < n_out; ++o) mass += std::fabs(want[o]);
+        char tag[80];
+        std::snprintf(tag, sizeof tag, "%s n_in=%d n_out=%d", label, n_in, n_out);
+        const bool margins_ok = swap_move > 0.05 && (n_out < 2 || row_move > 0.05);
+        const bool ok = bad == 0 && margins_ok && mass > 1e-3;
+        verdict(tag, ok, bad + (margins_ok ? 0 : 1) + (mass > 1e-3 ? 0 : 1), n_out + 3, worst,
+                "rows outside the terms-derived bound (worst err/tol) + output-guard + fixture margins");
+        if (!ok) {
+            if (!margins_ok)
+                std::printf("      FIXTURE: swap_move %.3g row_move %.3g (one must exceed 0.05)\n", swap_move,
+                            row_move);
+            if (!(mass > 1e-3)) std::printf("      FIXTURE: the oracle is all-zero (mass %.3g)\n", mass);
+            int printed = 0;
+            for (int o = 0; o < n_out && printed < 4; ++o) {
+                const double bound = gemv_bound(want[o], terms[o], 1e-6);
+                if (!(std::fabs((double) got[o] - want[o]) / bound <= 1.0)) {
+                    std::printf("      offender o=%d want=%.9g got=%.9g\n", o, want[o], (double) got[o]);
+                    ++printed;
+                }
+            }
+        }
+        ctx.free(bx); ctx.free(bw); ctx.free(by);
+    }
+}
+
+// `bf16_gemv` - the QSA indexer projections (layer.cpp:918/:962, split=false; n_out = 128 and 512).  ONE
+// WORKGROUP PER OUTPUT ROW (the CUDA's warp path at these shapes, rendered portably - subgroup ops are banned).
+void case_bf16_gemv(Ctx& ctx, const std::string& dir) {
+    static const Bf16Shape shapes[] = {{2560, 512}, {2560, 128}, {128, 64}, {2, 1}};
+    case_bf16_gemv_impl(ctx, dir, shapes, 4, "bf16_gemv");
+}
+// `bf16_gemv_split` - the GDN alpha/beta (layer.cpp:291/:292) and router logits (:367) projections, split=true
+// (n_out = 48 and 512).  Same shared shader; `threads_per_row` is dropped (the split's warps are rendered as the
+// workgroup barrier tree - see the shader).
+void case_bf16_gemv_split(Ctx& ctx, const std::string& dir) {
+    static const Bf16Shape shapes[] = {{2560, 512}, {2560, 48}, {64, 32}, {2, 1}};
+    case_bf16_gemv_impl(ctx, dir, shapes, 4, "bf16_gemv_split");
+}
+
 // THE CAPABILITY CONTRACT, CHECKED.  This increment makes the Vulkan backend answer the four native capability
 // checks itself (vulkan/src/kernels/native_caps_vk.cpp) so the engine can take the native branch.  A capability
 // must be TRUE only for a symbol this port implements, and FALSE when the check ALSO gates an unimplemented
@@ -13531,6 +13693,11 @@ int main(int argc, char** argv) {
     // APPENDED last for the same shared-RNG reason; `case_native_capabilities` now requires BOTH the qsa and gdn
     // flags to answer TRUE.
     case_native_qsa_gate_apply(ctx, dir);        // native_qsa_gate_apply <- qsa_gate_apply_f32 (both f32 here)
+    // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`): the DEFAULT side of the `native_bf16_projections`
+    // setting `project_bf16` (layer.cpp:94-100) selects when the port does not pin it.  APPENDED last for the
+    // same shared-RNG reason as every batch above.
+    case_bf16_gemv(ctx, dir);                    // bf16_gemv       (1 thread/row; split=false call sites)
+    case_bf16_gemv_split(ctx, dir);              // bf16_gemv_split (1 workgroup/row; split=true call sites)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

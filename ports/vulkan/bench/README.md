@@ -371,6 +371,35 @@ pair is ALSO measured against the two-dispatch chain.
   the native arithmetic and the fused readout scale.  The barrier-tree variant is NOT in the tree; its numbers
   are recorded here and in `NEXT.md`/`STATUS.md` as the price of the port's no-subgroup rule at this shape.
 
+## The BF16-projection pair (`bf16_gemv` / `bf16_gemv_split`) — the DEFAULT side of `native_bf16_projections` (2026-10-05)
+
+`project_bf16` (`src/core/layer.cpp:94-100`) selects `bf16_gemv_fp32_mmvf` only while `native_bf16_projections`
+is TRUE (`--native`, generate.cpp:1805 → :2286); the setting **defaults false** and the port pins it nowhere, so
+the default side — `bf16_gemv` (QSA indexer projections, `split=false`) and `bf16_gemv_split` (GDN alpha/beta,
+router logits, `split=true`) — is on the main forward path.  Both are now ported as ONE shared shader, ONE
+WORKGROUP per output row (the CUDA's warp/tpr shapes are a parallelism strategy, and subgroup ops are banned
+here).  There is **no legacy sibling** to compare against (this IS the non-native branch), so the pair is the
+ported `bf16_gemv` against the ported native sibling `bf16_gemv_fp32_mmvf`: the same workgroup-per-row
+decomposition, only the activation precision differs (bf16 vs f32), so a WASH is expected.
+
+| pair (ported `bf16_gemv` ← native `bf16_gemv_fp32_mmvf`) | Arc B70 (ms) native/ported | ratio | Ryzen iGPU | ratio | lvp (vega) | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `bf16_gemv` n_in=2560 n_out=512 | 0.0089 / 0.0089 | 1.000 | 0.1127 / 0.1131 | 0.996 | 0.6626 / 0.7099 | 0.933 |
+| `bf16_gemv` n_in=2560 n_out=48  | 0.0066 / 0.0065 | 1.006 | 0.0134 / 0.0134 | 0.997 | 0.0777 / 0.0812 | 0.956 |
+
+**The honest reading.**  A WASH on the GPUs (0.996–1.006), exactly as a same-decomposition drop-in should be: the
+only difference is that `bf16_gemv` carries the activation as bf16 (products bf16×bf16, exact in f32, half the
+activation bytes) while the native sibling takes it already f32.  llvmpipe reads 0.933 / 0.956 — the
+bf16-activation form is marginally FASTER there; reported, not tuned.  **NOTE on the raw log:** the `XPAIR
+bf16_gemv n_out=512` line on the GPUs interleaved with the device layer's descriptor-pool-growth notice on
+stderr; the ratios above are taken from the two `ROW` medians.
+
+**A variant that is NOT shipped, with its numbers.**  The CUDA's naive ONE-THREAD-PER-ROW decomposition was built
+and benchmarked first: at these shapes it is **14–18x slower** than the workgroup form — Arc `split/serial` 0.073
+(n_out=512) / 0.057 (48), Ryzen iGPU 0.103 / 0.055, llvmpipe 1.084 / 0.646 — because it is uncoalesced (the
+CUDA's own comment: 32 transactions per load at a fixed `i`).  CUDA takes the naive path only below n_out=64,
+which this engine never does for `bf16_gemv`, so the port ships the workgroup-per-row rendering.
+
 ## The one number that is a problem, not a baseline
 
 `sampler_kernel_f32` **202–1165 ms per token** on every device (202 ms on the XTX, 547 ms on the Arc).
