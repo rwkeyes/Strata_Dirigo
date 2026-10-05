@@ -1,0 +1,41 @@
+// ports/vulkan/shaders/ptr_to_off.comp - DEVICE POINTER -> (within-window byte offset, window index).
+//
+// The grouped native-expert launcher's rebase pass.  The reference `native_expert_grouped` (iq_kernels.cu:2448)
+// hands its kernels an array of DEVICE POINTERS (`grp_ptr`, one per group, each at that expert's weights); a
+// Vulkan shader cannot dereference one.  The port's grouped shaders take a per-group BYTE OFFSET into ONE weights
+// buffer instead - so this shader converts the pointer table into that offset table, ON THE DEVICE, so the whole
+// chain RECORDS under the verifier's stream capture (a host readback would invalidate the capture).
+//
+// WHY TWO OUTPUTS AND NOT ONE.  A storage-buffer descriptor carries a 64-bit base offset, but a SHADER's index
+// into the buffer is 32-bit: glslang 15.1 rejects a 64-bit buffer index (measured 2026-10-05 - `w_b.b[u64]` does
+// not compile), so one binding reaches at most 4 GiB after its base.  The real pack's experts sit at 1.4 .. 24.8
+// GiB inside the port's single arena, so the launcher binds the weights VIEWED AT `win_id * WIN_BYTES` and this
+// shader writes, per group, the WITHIN-WINDOW offset (`off`) and the WINDOW (`win`).  `WIN_BYTES` is 4 GiB minus
+// 64 MiB so a blob cannot straddle the 4 GiB index limit at the top of a window; the launcher passes it in, so
+// the two cannot disagree.
+//
+// THE ARENA'S SYNTHETIC BASE (Stream::kArenaBase, `0x700000000000`) is subtracted here with 64-BIT ARITHMETIC
+// ONLY (the table is read as lo/hi 32-bit words, so no shaderInt64 feature is needed).  A 32-bit INDEX is what
+// the compiler requires, not 32-bit arithmetic.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer P { uint v[]; } ptr_b;   // 2 uint per device pointer (lo, hi)
+layout(set = 0, binding = 1, std430) readonly buffer N { int v[]; } n_b;      // the group count, on the device
+layout(set = 0, binding = 2, std430) buffer O { uint v[]; } off_b;           // within-window byte offset / group
+layout(set = 0, binding = 3, std430) buffer W { uint v[]; } win_b;           // window index / group
+
+layout(push_constant, std430) uniform PC { uint base_lo; uint base_hi; uint win_bytes; } pc;
+
+void main() {
+    const uint g = gl_GlobalInvocationID.x;
+    if (g >= uint(n_b.v[0])) return;
+    const uint64_t p = (uint64_t(ptr_b.v[2u * g + 1u]) << 32) | uint64_t(ptr_b.v[2u * g]);
+    const uint64_t base = (uint64_t(pc.base_hi) << 32) | uint64_t(pc.base_lo);
+    const uint64_t f = p - base;
+    const uint64_t wb = uint64_t(pc.win_bytes);
+    const uint64_t w = f / wb;
+    off_b.v[g] = uint(f - w * wb);
+    win_b.v[g] = uint(w);
+}

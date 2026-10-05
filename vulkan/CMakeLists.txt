@@ -58,6 +58,7 @@ target_link_libraries(strata_vulkan_device PUBLIC Vulkan::Vulkan)
 
 # --- the kernel translation units: one engine entry point per symbol, behind the macro -----------------------
 strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_vk.cpp
+ src/kernels/native_expert_grouped_vk.cpp      # THE GROUPED IQ-EXPERT LAUNCHER (native_expert_grouped)
   src/kernels/elementwise_vk.cpp
   src/kernels/doorbell_vk.cpp
   src/kernels/gdn_vk.cpp

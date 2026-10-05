@@ -1,5 +1,63 @@
 # Start here next session
 
+## THE NATIVE-EXPERT LAUNCHER LANDS: the grouped IQ experts run over a DEVICE-POINTER->BYTE-OFFSET rebase and TWO GENERIC shaders covering all seven (gu,d) pairs, and the real pack's stopping point moves OFF the expert gate to the NATIVE-DENSE Q4_K/Q5_K/Q6_K (2026-10-05, `vega`)
+
+**THE RUN NOW PASSES THE CAPABILITY GATE ON ALL 48 LAYERS AND STOPS AT THE NATIVE DENSE PROJECTIONS - NOT AT
+LAYER 0.**  Raw tail (exact command below, `/tmp/run_real2.log`, `RC=1`):
+
+```
+strata generate: native pack: .../coder-iq1_m experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB)
+strata generate: blk.0.attn_gate.weight: this pack holds the tensor only in its GGUF form (run with --native SHARD1)
+```
+
+`native_expert_supported` was a blanket/blanket-narrow answer that refused layer 0; it now answers TRUE for the
+pack's seven (gu,d) pairs from the port's OWN two grouped shaders and FALSE for an unshipped type, and the engine
+gets past the check.
+
+### DELIVERABLE A - ONE GENERIC shader per side, covering all seven pairs
+
+`shaders/native_gu_any.comp` (gate/up, ggml {18 IQ3_XXS, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS}) and
+`shaders/native_down_any.comp` (down, {20 IQ4_NL, 42 Q2_0}) each `#include` the already-gated per-format dots and
+select by a `ty` push constant; the grouping/row/activation addressing is written ONCE.  **No pair remains
+uncovered.**  All four gate/up formats share the 256-value / 8-part / step-2/4 geometry, so the type is a
+parameter, not a shape.  `case_native_grouped` gained a BITWISE arm (generic vs the specialised `native_gu_iq2s` /
+`native_down_iq4nl`, same fixture) - PASS 757/0/0 on the Arc.
+
+### DELIVERABLE B - the launcher `native_expert_grouped` (native_expert_grouped_vk.cpp)
+
+The reference passes `grp_ptr` as an array of DEVICE POINTERS a shader cannot dereference.  The port answers it in
+TWO capture-safe dispatches, never a host readback (the verifier calls this INSIDE `cudaStreamBeginCapture`):
+`ptr_to_off.spv` reads the pointer table (as lo/hi 32-bit words - no `shaderInt64` feature) and writes, per group,
+a within-window byte offset and a 4 GiB WINDOW index; then each window is one dispatch of the generic grouped
+shaders with the weights VIEWED AT `win_id * (4 GiB - 64 MiB)`.  **THE WINDOWING IS NOT OPTIONAL**: glslang 15.1
+has no 64-bit buffer index (measured - `w_b.b[u64]` does not compile), so one binding reaches 4 GiB, and the real
+pack's experts sit at 1.4 .. 24.8 GiB.  The launcher then runs gu -> swiglu -> `native_quantize_q8_1` -> down,
+writing `out[ent_dst[e]*n_embd + r]`.  Injection `native_gu_any` ty-22 block size 82->98: **the bitwise arm FAILS
+3/3 (0/1)**; reverted.  (Not yet wired into `gates/inject-verify.sh`; the manual falsification is on the record.)
+
+### DELIVERABLE C - THE NEXT STOPPING POINT, MEASURED: the native-dense K-quants
+
+Under `--native`, the pack's index gives the eligible dense projections `dst_bytes 0`; `NativeDense::load`
+(`src/core/native_dense.cpp`) uploads them from the GGUF shard and the layer computes them through `native_mmvq`.
+The port's `native_mmvq` covers only the IQ formats, so `served_names` does not skip them and `WeightTable::load`
+refuses (`src/core/weights.cpp:269`).  **The GGUF types of the 300 eligible dense tensors, read from the shard:**
+Q6_K **128**, Q4_K **47**, IQ4_NL 47, IQ4_XS 42, Q5_K **35**, Q8_0 **1**.  The port now has Q8_0
+(`q8_0_mmvq.comp`, +case 8 in `native_mmvq`) but the **K-quants Q4_K/Q5_K/Q6_K (210 tensors) have NO native MMVQ
+shader** - that is the whole remaining gap, and it is more than this batch.
+
+### DELIVERABLE D/E - the run, the map, the bar, the gate
+
+Command: `STRATA_VK_SPV_DIR=.../shaders VK_ICD_FILENAMES=.../intel_icd.json STRATA_VK_ARENA_GIB=26 ~/bin/memguard
+40G ~/vkbuild-vulkan/vulkan/strata_vulkan --pack .../coder-iq1_m --native ~/strata-models/IQ1_M/
+Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf --spec 4 --tokens 1 --max-new 1 --max-context 8`.
+**The experts are never reached**: the run stops on the dense projection above, and `Verifier::init` would refuse
+next anyway (the fixed command carries no `--expert-profile`/`--expert-cache`; `verify.cpp:324`).  Map:
+**`168 = 79 kernel + 0 shader + 45 host + 0 todo + 44 refused`** (`native_expert_grouped` refused -> kernel);
+`check_port_map.py` passes, `make_port_map.py` regenerates byte-identically.  Engine bar: the program LINKS, 0
+undefined - **0 BY CONSTRUCTION**.  Gate (vega): Arc `intel_icd` **757/0/0**, llvmpipe 745/0/3, Ryzen iGPU 747/1/2
+- the one radeon failure is the DOCUMENTED non-deterministic `bf16_gemv n_in=2560 n_out=512`, not this batch's
+case.  **`z820b` untouched.**
+
 ## THE REAL PACK REACHES THE NATIVE-EXPERT GATE: the CMake ordering defect that refused every IQ pack is fixed, the port owns the native (IQ) expert GEOMETRY, and the stopping point is now a NAMED missing kernel (2026-10-05, `vega`)
 
 **THE PACK LOADS AND THE LAYOUT IS VALIDATED.  `coder-iq1_m` no longer dies at "built without

@@ -8466,6 +8466,35 @@ static void native_gu_arm(Ctx& ctx, const std::string& dir, const NativeGroupedC
     for (size_t i = n_out * 4u; i < img_g.size(); ++i) {
         if (img_g[i] != 0xC3 || img_u[i] != 0xC3) ++bad;
     }
+    // ---- THE GENERIC SHADER (`native_gu_any.spv`, ty = IQ2_S) MUST BE BITWISE THE SPECIALISED ONE.  Same fixture,
+    //      same offsets, window 0; the generic shader's only new machinery is the `ty` dispatch and the window
+    //      filter, so a disagreement here is that machinery - not the dot, which both share.
+    std::vector<int> bad_generic(0);
+    {
+        Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
+        Buf b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+        Buf b_win = ctx.alloc((size_t) n_groups * 4u);
+        std::vector<uint32_t> win((size_t) n_groups, 0u);
+        ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+        ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+        ctx.write(b_win, win.data(), win.size() * 4u);
+        Buf b_og2 = ctx.alloc(n_out * 4u + 64u), b_ou2 = ctx.alloc(n_out * 4u + 64u);
+        std::vector<uint8_t> s2(n_out * 4u + 64u, 0xC3);
+        ctx.write(b_og2, s2.data(), s2.size());
+        ctx.write(b_ou2, s2.data(), s2.size());
+        struct { int n_embd; int n_ff; int ty; int win_id; } pc2{c.n_embd, c.n_ff, 22, 0};
+        VkPipeline p2 = ctx.pipeline(dir + "/native_gu_any.spv", 12, (int) sizeof(pc2));
+        ctx.dispatch(p2, {&b_w, &b_a, &b_g, &b_g3, &b_g4, &b_o, &b_win, &b_s, &b_ng, &b_e, &b_og2, &b_ou2},
+                     &pc2, sizeof(pc2), (uint32_t) (2 * c.n_ff), (uint32_t) grid_y);
+        std::vector<uint8_t> ag(s2.size(), 0), au(s2.size(), 0);
+        ctx.read(b_og2, ag.data(), ag.size());
+        ctx.read(b_ou2, au.data(), au.size());
+        for (size_t i = 0; i < n_out * 4u; ++i) {
+            if (ag[i] != img_g[i] || au[i] != img_u[i]) { bad_generic.push_back(1); break; }
+        }
+        for (size_t i = n_out * 4u; i < ag.size(); ++i) if (ag[i] != 0xC3 || au[i] != 0xC3) { bad_generic.push_back(1); break; }
+        ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_win); ctx.free(b_og2); ctx.free(b_ou2);
+    }
     char label[192];
     std::snprintf(label, sizeof label, "native_gu_iq2s (groups=%d, entries=%d, n_ff=%d, grid.y=%d, %s)", n_groups,
                   c.grp_start.back(), c.n_ff, grid_y, what);
@@ -8474,6 +8503,9 @@ static void native_gu_arm(Ctx& ctx, const std::string& dir, const NativeGroupedC
     const bool live = mass > 1e-3;
     if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
     verdict(label, bad == 0 && live, bad, (int) n_out * 2, worst, "values outside tolerance (worst err/tol)");
+    verdict("native_gu_any (generic, ty=IQ2_S) == native_gu_iq2s BITWISE", bad_generic.empty() && live,
+            (int) bad_generic.size(), 1, (double) bad_generic.size(),
+            "the generic shader's bytes differ from the specialised one's (ty dispatch / window filter / binding order)");
     ctx.free(b_w); ctx.free(b_a); ctx.free(b_o); ctx.free(b_s); ctx.free(b_ng); ctx.free(b_e); ctx.free(b_g);
     ctx.free(b_og); ctx.free(b_ou);
 }
@@ -8553,6 +8585,26 @@ static void native_down_arm(Ctx& ctx, const std::string& dir, const NativeGroupe
     for (size_t i = n_out * 4u; i < img.size(); ++i) {
         if (img[i] != 0xC3) ++bad;
     }
+    // THE DOWN SIDE OF THE GENERIC SHADER (`native_down_any.spv`, ty = IQ4_NL) vs the specialised one, BITWISE.
+    std::vector<int> bad_generic(0);
+    {
+        Buf b_win = ctx.alloc((size_t) n_groups * 4u);
+        std::vector<uint32_t> win((size_t) n_groups, 0u);
+        ctx.write(b_win, win.data(), win.size() * 4u);
+        Buf b_y2 = ctx.alloc(n_out * 4u + 64u);
+        std::vector<uint8_t> s2(n_out * 4u + 64u, 0xC3);
+        ctx.write(b_y2, s2.data(), s2.size());
+        struct { int n_embd; int n_ff; int ty; int win_id; int d_row; int down_off; } pc2{
+            c.n_embd, c.n_ff, 20, 0, d_row, 0};
+        VkPipeline p2 = ctx.pipeline(dir + "/native_down_any.spv", 8, (int) sizeof(pc2));
+        ctx.dispatch(p2, {&b_w, &b_a, &b_o, &b_win, &b_s, &b_ng, &b_e, &b_y2}, &pc2, sizeof(pc2),
+                     (uint32_t) c.n_embd, (uint32_t) grid_y);
+        std::vector<uint8_t> a2(s2.size(), 0);
+        ctx.read(b_y2, a2.data(), a2.size());
+        for (size_t i = 0; i < n_out * 4u; ++i) if (a2[i] != img[i]) { bad_generic.push_back(1); break; }
+        for (size_t i = n_out * 4u; i < a2.size(); ++i) if (a2[i] != 0xC3) { bad_generic.push_back(1); break; }
+        ctx.free(b_win); ctx.free(b_y2);
+    }
     char label[192];
     std::snprintf(label, sizeof label, "native_down_iq4nl (groups=%d, entries=%d, n_embd=%d, grid.y=%d, %s)",
                   n_groups, n_entries, c.n_embd, grid_y, what);
@@ -8561,6 +8613,9 @@ static void native_down_arm(Ctx& ctx, const std::string& dir, const NativeGroupe
     const bool live = mass > 1e-3;
     if (!live) std::printf("      every expected value is ~zero: this comparison proves nothing\n");
     verdict(label, bad == 0 && live, bad, (int) n_out, worst, "values outside tolerance (worst err/tol)");
+    verdict("native_down_any (generic, ty=IQ4_NL) == native_down_iq4nl BITWISE", bad_generic.empty() && live,
+            (int) bad_generic.size(), 1, (double) bad_generic.size(),
+            "the generic down shader's bytes differ from the specialised one's");
     ctx.free(b_w); ctx.free(b_a); ctx.free(b_o); ctx.free(b_s); ctx.free(b_ng); ctx.free(b_e); ctx.free(b_y);
 }
 
@@ -21023,9 +21078,9 @@ void case_native_expert_capability_entry(Ctx& ctx, const std::string& dir) {
         {23, 20, 2662400},   // IQ4_XS / IQ4_NL  (the pack's largest blob)
     };
     const int n = (int) (sizeof pairs / sizeof pairs[0]);
-    int bad = 0, inv_true = 0, inv_false = 0, cap_true = 0, rival_moves = 0;
+    int bad = 0, inv_true = 0, cap_true = 0, rival_moves = 0;
     for (const Pair& p : pairs) {
-        if (strata::kernels::native_expert_grouped_shaders(p.gu, p.d)) ++inv_true; else ++inv_false;
+        if (strata::kernels::native_expert_grouped_shaders(p.gu, p.d)) ++inv_true;
         if (strata::kernels::native_expert_supported(p.gu, p.d, 2560, 640)) ++cap_true;
         const strata::kernels::NativeExpertLayout L =
             strata::kernels::native_expert_layout(p.gu, p.d, 2560, 640);
@@ -21034,17 +21089,25 @@ void case_native_expert_capability_entry(Ctx& ctx, const std::string& dir) {
         const size_t d_row_wrong = strata::kernels::iq_row_bytes(p.d, 2560);
         if (L.down_off + (size_t) 2560 * d_row_wrong != p.blob) ++rival_moves;
     }
-    std::printf("      native_expert entry: inventory true/false %d/%d, composed answer TRUE on %d of %d, "
-                "stride-rival moves %d/%d, launcher %d\n", inv_true, inv_false, cap_true, n, rival_moves, n,
-                (int) strata::kernels::native_expert_grouped_launcher());
+    // THE OTHER SIDE OF THE INVENTORY: a gate/up and a down type the two grouped shaders do NOT cover.  If the
+    // capability answered TRUE for these it would send the engine at an unported format (a wrong token), so the
+    // arm requires both FALSE - which is what keeps `native_expert_supported` from being a blanket `return true`.
+    const int inv_false = (int) (!strata::kernels::native_expert_grouped_shaders(29, 20)) +      // gu IQ1_M: no shader
+                          (int) (!strata::kernels::native_expert_grouped_shaders(22, 23)) +      // down IQ4_XS: no shader
+                          (int) (!strata::kernels::native_expert_supported(29, 20, 2560, 640)) +
+                          (int) (!strata::kernels::native_expert_supported(22, 23, 2560, 640));
+    const int launcher = (int) strata::kernels::native_expert_grouped_launcher();
+    std::printf("      native_expert entry: inventory TRUE on %d/%d shipped pairs, FALSE on %d/4 unshipped, "
+                "composed answer TRUE on %d of %d, stride-rival moves %d/%d, launcher %d\n", inv_true, n, inv_false,
+                cap_true, n, rival_moves, n, launcher);
     verdict("native_expert entry: the pack's seven (gu,d) pairs laid out to the PACK'S OWN blob bytes, and the "
-            "capability answered from the shader inventory + the missing launcher",
-            bad == 0 && inv_true >= 1 && inv_false >= 1 && cap_true == 0 && rival_moves == n,
-            bad + (inv_true >= 1 ? 0 : 1) + (inv_false >= 1 ? 0 : 1) + (cap_true == 0 ? 0 : 1) +
-                (rival_moves == n ? 0 : 1), n, (double) bad,
-            "layout bytes vs native_experts.txt (7 pairs); >>1 inventory arm needs one TRUE and one FALSE; "
-            "the composed answer must be FALSE everywhere while native_expert_grouped is a refusal; the "
-            "wrong-stride rival must move every pair");
+            "capability answered TRUE for exactly those pairs (FALSE for an unshipped type), launcher wired",
+            bad == 0 && inv_true == n && inv_false == 4 && cap_true == n && rival_moves == n && launcher == 1,
+            bad + (inv_true == n ? 0 : 1) + (inv_false == 4 ? 0 : 1) + (cap_true == n ? 0 : 1) +
+                (rival_moves == n ? 0 : 1) + (launcher == 1 ? 0 : 1), n, (double) bad,
+            "layout bytes vs native_experts.txt (7 pairs); inventory must be TRUE for all seven shipped pairs "
+            "and FALSE for the four unshipped questions; the composed answer must be TRUE for the seven; the "
+            "wrong-stride rival must move every pair; the launcher must be wired");
 
     // `native_expert_scratch_bytes`: three fp32 buffers + the q8_1 image of h, 256-byte aligned (iq_kernels.cu:1879).
     auto scratch_oracle = [](int64_t cap, int64_t n_ff) -> size_t {

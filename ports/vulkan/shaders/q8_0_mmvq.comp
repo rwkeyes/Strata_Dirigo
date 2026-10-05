@@ -1,0 +1,64 @@
+// ports/vulkan/shaders/q8_0_mmvq.comp - ONE Q8_0 WEIGHT ROW against q8_1 activations, one workgroup per row.
+//
+// WHY THIS EXISTS (the native-dense gap).  Under `--native` a pack's dense projections that are stored ONLY in the
+// GGUF shard (the pack's index gives them `dst_bytes 0`) are served by `NativeDense::load`, which uploads the raw
+// GGUF blocks and attaches them to the WeightRef; the layer then computes with them through `native_mmvq`.  The
+// port shipped `native_mmvq` for the six IQ formats only, so `native_mmvq_supported(8 /*Q8_0*/)` was FALSE and
+// `served_names` did NOT skip `blk.0.attn_gate.weight` - the pack's loader then refused at
+// `src/core/weights.cpp:269` ("holds the tensor only in its GGUF form").  In `coder-iq1_m` every eligible dense
+// projection (.attn_gate/.attn_qkv/.attn_q/k/v/.attn_output/.ssm_out/.ffn_*_shexp) is Q8_0, so this ONE shader
+// opens the whole native-dense path.
+//
+// THE GEOMETRY.  block_q8_0 (third_party/ggml/ggml-common.h) is 34 bytes per 32 values: a half `d` at 0, then
+// int8 `qs[32]` at 2.  block_q8_1 is 36 bytes per 32 values: half2 `ds` at 0 (d at 0, the sum at 2 - THIS DOT
+// reads `d` ONLY), then int8 `qs[32]` at 4.  The dot is `d_w * d_a * sum(qs_w[j] * qs_a[j])` - the same quantity
+// as the CUDA's `vec_dot_q8_0_q8_1`, whose integer core is a dp4a over the two int8 blocks.
+//
+// THE SHAPE is the port's standard MMVQ shape: one 256-thread workgroup per output row, a strided block walk, and
+// the workgroup barrier tree for the sum (`common/wg_reduce.glsl`).  The dp4a is written out as a scalar int8
+// product loop - `iq*_mmvq` uses the same `dp4a` helper shape, and perf is a later question than correctness.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;      // Q8_0 weights
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;    // q8_1 activations
+layout(set = 0, binding = 2, std430) buffer Y { float v[]; } y;
+
+#include "common/wg_reduce.glsl"
+
+layout(push_constant, std430) uniform PC { int n_in; int n_out; int row_bytes; int ncols; } pc;
+
+const uint Q8_0_BLOCK = 34u;    // bytes per 32 values
+const uint Q8_1_BLOCK = 36u;    // bytes per 32 values
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.n_out)) return;              // workgroup-uniform: the reduction's barriers stay legal
+    const uint nb = uint(pc.n_in) / 32u;
+    const uint arow_bytes = nb * Q8_1_BLOCK;
+    const uint wrow = row * uint(pc.row_bytes);
+    const uint lid = gl_LocalInvocationIndex;
+
+    for (uint c = 0u; c < uint(pc.ncols); ++c) {
+        const uint arow = c * arow_bytes;
+        float acc = 0.0;
+        for (uint k = lid; k < nb; k += gl_WorkGroupSize.x) {
+            const uint wb = wrow + k * Q8_0_BLOCK;
+            const uint ab = arow + k * Q8_1_BLOCK;
+            const float dw = unpackHalf2x16(uint(w_b.b[wb]) | (uint(w_b.b[wb + 1u]) << 8u)).x;
+            const float da = unpackHalf2x16(uint(act_b.b[ab]) | (uint(act_b.b[ab + 1u]) << 8u)).x;
+            int sumi = 0;
+            for (uint j = 0u; j < 32u; ++j) {
+                const int wq = (int(w_b.b[wb + 2u + j]) << 24) >> 24;      // sign-extend the int8 code
+                const int aq = (int(act_b.b[ab + 4u + j]) << 24) >> 24;
+                sumi += wq * aq;
+            }
+            acc += (dw * da) * float(sumi);
+        }
+        const float total = wg_sum(acc);
+        if (lid == 0u) y.v[c * uint(pc.n_out) + row] = total;
+    }
+}

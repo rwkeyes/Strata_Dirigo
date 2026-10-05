@@ -281,10 +281,8 @@ void native_moe_combine_multi(const float*, const float*, const float*, float*, 
 void native_router_top10_multi(const float*, int32_t*, float*, int, void*) {
     refuse_unreachable("native_router_top10_multi", "the P6 verifier (verify.cpp:916); Verifier::init refuses");
 }
-void native_expert_grouped(const NativeExpertLayout&, const unsigned long long*, const int32_t*, const int32_t*,
-                           const int32_t*, const int32_t*, int64_t, int64_t, const void*, void*, float*, void*, int64_t) {
-    refuse_unreachable("native_expert_grouped", "the P6 verifier OR --expert-cache-remote N / --peer-device (remote_experts.cpp:309-314, peer_experts.cpp:232-233)");
-}
+// `native_expert_grouped` is DEFINED (not refused) in vulkan/src/kernels/native_expert_grouped_vk.cpp: the grouped
+// IQ-expert launcher, over the port's byte-offset group table.  See that file's header note.
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     // TRANSCRIBED from the reference `src/kernels/cuda/iq_kernels.cu:1869` - this is host arithmetic over the
     // SAME row table the port's `*_mmvq` shaders take their stride from (`iq_row_bytes`), so a blob's internal
@@ -349,31 +347,33 @@ void bf16_rows_dot_multi_avx1(const uint16_t*, int, int, const float*, int, floa
 // `bool ... noexcept` (iq_kernels.hpp:51).  The engine's load path (generate.cpp:2007) asks it, BEFORE anything
 // is allocated, whether the GROUPED native-expert kernel can compute a given (gu_type, d_type) at this geometry;
 // a false answer refuses the pack by layer.  The reference (`src/kernels/cuda/iq_kernels.cu:1863`) answers from
-// its own kernel inventory and four geometry constraints.  THIS backend answers from ITS OWN inventory, which is
-// honestly NARROWER, and the difference is the whole point of the symbol:
+// its own kernel inventory and four geometry constraints.  THIS backend answers from ITS OWN inventory, and the
+// two grouped shaders cover the real pack's four gate/up formats and two down formats:
 //
-//   * the GROUPED gate/up shader `native_gu_iq2s.spv` exists, for gu_type 22 (IQ2_S) only;
-//   * the GROUPED down shader `native_down_iq4nl.spv` exists, for d_type 20 (IQ4_NL) only;
-//   * AND THE LAUNCHER `native_expert_grouped` is a LOUD REFUSAL in this tree (above), because the reference
-//     passes `grp_ptr` as an array of DEVICE POINTERS and a Vulkan shader cannot dereference one; the port's
-//     `native_gu_iq2s.comp` takes a per-group BYTE OFFSET buffer instead, and producing those offsets from the
-//     engine's pointers (under the verifier's stream capture) is the un-done kernel-port job.
+//   * `native_gu_any.spv`   - grouped gate/up, ggml {18 IQ3_XXS, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS} (one generic shader)
+//   * `native_down_any.spv` - grouped down,    ggml {20 IQ4_NL, 42 Q2_0} (one generic shader)
+//   * AND THE LAUNCHER `native_expert_grouped` IS WIRED (native_expert_grouped_vk.cpp).
 //
-// So the honest answer TODAY is false for every pair: not because the types are unsupported in the abstract, but
-// because the launcher is absent, which is a NAMED hole rather than a blanket constant.  The shader-inventory
-// test below is real and is pinned by the gate; when the launcher lands, `kGroupedLauncher` flips and this
-// function starts answering per pair - IQ2_S gate/up with IQ4_NL down first.
-static bool grouped_gu_shader(int gu_type) noexcept { return gu_type == 22; }   // IQ2_S only (native_gu_iq2s.spv)
-static bool grouped_down_shader(int d_type) noexcept { return d_type == 20; }   // IQ4_NL only (native_down_iq4nl.spv)
-static constexpr bool kGroupedLauncher = false;   // `native_expert_grouped` is not wired (see the refusal above)
+// `coder-iq1_m`'s seven (gu,d) pairs are all inside that product, so this answers TRUE for every one of its 48
+// layers - and FALSE for a type outside the two shaders, which is the capability telling the engine which branch
+// its own code may take (a Vulkan backend has no `--native` dispatch table to fall back on).
+static bool grouped_gu_shader(int gu_type) noexcept {
+    return gu_type == 18 || gu_type == 21 || gu_type == 22 || gu_type == 23;   // native_gu_any.spv
+}
+static bool grouped_down_shader(int d_type) noexcept {
+    return d_type == 20 || d_type == 42;                                        // native_down_any.spv
+}
+static constexpr bool kGroupedLauncher = true;   // native_expert_grouped_vk.cpp
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
     if (!kGroupedLauncher) return false;
-    // The reference's structural test, restricted to what THIS backend ships a shader for.  All the i-quant
-    // gate/up and down formats are 256-value superblocks; the geometry tests are the reference's verbatim.
     if (!grouped_gu_shader(gu_type) || !grouped_down_shader(d_type)) return false;
-    if (n_embd % 256 != 0 || n_ff % 256 != 0) return false;
-    if (n_embd % 256 != 0 || (n_ff * n_embd) % 256 != 0) return false;
+    // The port's shader geometry: gate/up is a 256-value block format, down is 32-value (IQ4_NL) or 64-value
+    // (Q2_0); the activation is q8_1, so (n_ff * n_embd) % 256 == 0 as the reference also requires.
+    if (n_embd % 256 != 0) return false;
+    if (d_type == 20 && n_ff % 32 != 0) return false;
+    if (d_type == 42 && n_ff % 64 != 0) return false;
+    if ((n_ff * n_embd) % 256 != 0) return false;
     return true;
 }
 

@@ -228,7 +228,8 @@ void native_mmvq(Stream& s, int ggml_type, const void* weights, const void* x_q8
     case 18: spv = "iq3xxs_mmvq.spv"; break;
     case 20: spv = "iq4nl_mmvq.spv"; break;
     case 23: spv = "iq4xs_mmvq.spv"; break;
-    default: refuse("native_mmvq", "this backend has no shader for this ggml type (IQ1_M/IQ2_S/IQ3_S/IQ3_XXS/IQ4_NL/IQ4_XS only)");
+    case 8:  spv = "q8_0_mmvq.spv"; break;   // Q8_0: the native-DENSE path (dense projections from the GGUF shard)
+    default: refuse("native_mmvq", "this backend has no shader for this ggml type (IQ1_M/IQ2_S/IQ3_S/IQ3_XXS/IQ4_NL/IQ4_XS/Q8_0 only)");
     }
     const uint64_t row_bytes = strata::kernels::iq_row_bytes(ggml_type, n_in);
     const uint64_t wbytes = strata::kernels::native_mmvq_weight_bytes(ggml_type, (int) n_in, (int) n_out);
@@ -727,6 +728,7 @@ size_t iq_row_bytes(int ggml_type, int64_t n) noexcept {
 bool native_mmvq_supported(int ggml_type) noexcept {
     switch (ggml_type) {
     case 29: case 22: case 21: case 18: case 20: case 23: return true;
+    case 8: return true;   // Q8_0 - q8_0_mmvq.spv: the native-DENSE projections served from the GGUF shard
     default: return false;
     }
 }

@@ -1,0 +1,103 @@
+// ports/vulkan/shaders/native_gu_any.comp - THE GENERIC GROUPED EXPERT GATE/UP, all four pack formats.
+//
+// WHY ONE SHADER AND NOT FOUR MORE.  The port shipped `native_gu_iq2s.comp` (IQ2_S only) as the first of a
+// planned family; the real `coder-iq1_m` pack needs gate/up in {IQ2_S(22) 20 layers, IQ3_XXS(18) 17, IQ3_S(21)
+// 10, IQ4_XS(23) 1} - every one of them a 256-value superblock with the SAME part geometry (8 parts, one 32-value
+// q8_1 activation block per part).  So the format is a PARAMETER, not a shape: this file includes the four already
+// gated per-format dots and selects by `pc.ty`, and the row/part/activation addressing is written ONCE.  A
+// specialised variant per format would have been four copies of the grouping logic - the exact duplication that
+// has caused this port's worst defects (a helper taking a byte offset where the CUDA took a pointer).
+//
+// WHAT EACH DOT IS ASKED.  For every `(row, part k)` the weight block is `wrow + (k/8)*BLOCK[T]` and the activation
+// block is `arow + k*36` - part k of a row IS its activation block, because one 256-value weight block spans eight
+// 32-value q8_1 blocks.  `iqs` is the format's step times the part index (2 for IQ2_S/IQ3_XXS/IQ3_S, 4 for IQ4_XS).
+// The block byte sizes are the four `iq*_mmvq` shaders' own constants, so this file cannot drift from them.
+//
+// THE GROUPING (unchanged from `native_gu_iq2s.comp`, which is the source's `native_gu_kernel<TG>`): rows are
+// 2*n_ff (first n_ff gate, rest up); group g reads its weights at its own byte offset; entries
+// [grp_start[g], grp_start[g+1]) each read token `ent_tok[e]`'s q8_1 row and write `gate[e*n_ff+r]` / `up[...]`.
+//
+// THE WINDOWED WEIGHTS ADDRESS (why there are TWO offset buffers, not one).  A Vulkan storage-buffer descriptor
+// can carry a 64-bit base offset, but the SHADER's index into the buffer is 32-bit: glslang 15.1 rejects a 64-bit
+// buffer index (measured 2026-10-05 - `w_b.b[uint64_t_expr]` does not compile), so one binding can reach only
+// 4 GiB.  The real pack's experts live at 1.4 .. 24.8 GiB inside the port's single arena, so a single window is
+// not enough.  The launcher therefore binds the weights VIEW at `pc.win_id * WIN_BYTES` and passes each group's
+// WITHIN-WINDOW byte offset (`grp_off`) plus its window index (`grp_win`); a group whose window is not this
+// dispatch's is skipped.  `WIN_BYTES` leaves 64 MiB of headroom so a blob (largest 2.66 MB) cannot straddle the
+// 4 GiB index limit.  Nothing about this changes the arithmetic - only which groups a given dispatch computes.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer W { uint8_t b[]; } w_b;        // the expert weights (one window)
+layout(set = 0, binding = 1, std430) readonly buffer A { uint8_t b[]; } act_b;      // the q8_1 activation blocks
+layout(set = 0, binding = 2, std430) readonly buffer G1 { uint v[]; } iq2s_grid_b;
+layout(set = 0, binding = 3, std430) readonly buffer G2 { uint v[]; } iq3xxs_grid_b;
+layout(set = 0, binding = 4, std430) readonly buffer G3 { uint v[]; } iq3s_grid_b;
+layout(set = 0, binding = 5, std430) readonly buffer GO { uint v[]; } grp_off;      // within-window byte offset / group
+layout(set = 0, binding = 6, std430) readonly buffer GW { uint v[]; } grp_win;      // window index / group
+layout(set = 0, binding = 7, std430) readonly buffer GS { int v[]; } grp_start;     // n_groups + 1 entries
+layout(set = 0, binding = 8, std430) readonly buffer NG { int v[]; } n_groups;
+layout(set = 0, binding = 9, std430) readonly buffer ET { int v[]; } ent_tok;
+layout(set = 0, binding = 10, std430) buffer OG { float v[]; } out_gate;
+layout(set = 0, binding = 11, std430) buffer OU { float v[]; } out_up;
+
+#include "common/wg_reduce.glsl"
+#include "common/iq2s_dot.glsl"
+#include "common/iq3xxs_dot.glsl"
+#include "common/iq3s_dot.glsl"
+#include "common/iq4xs_dot.glsl"
+
+layout(push_constant, std430) uniform PC { int n_embd; int n_ff; int ty; int win_id; } pc;
+
+// the format's dot-call count per row: `nb * 8` (all four share the 256-value/8-part geometry).
+// the block bytes are the four `iq*_mmvq` shaders' own constants.
+float gu_dot(int ty, uint wblk, uint ablk, uint iqs) {
+    if (ty == 22) return iq2s_dot(wblk, ablk, iqs);        // 82 B / 256, step 2
+    if (ty == 18) return iq3xxs_dot(wblk, ablk, iqs);      // 98 B / 256, step 2
+    if (ty == 21) return iq3s_dot(wblk, ablk, iqs);        // 110 B / 256, step 2
+    return iq4xs_dot(wblk, ablk, iqs);                     // 136 B / 256, step 4 (ty 23)
+}
+
+uint gu_block_bytes(int ty) {
+    if (ty == 22) return 82u;
+    if (ty == 18) return 98u;
+    if (ty == 21) return 110u;
+    return 136u;
+}
+
+void main() {
+    const uint n_ff = uint(pc.n_ff);
+    const uint row = gl_WorkGroupID.x;
+    if (row >= 2u * n_ff) return;                // workgroup-uniform: the barriers stay legal
+    const bool is_up = row >= n_ff;
+    const uint r = is_up ? row - n_ff : row;
+    const uint gu_row = uint(gu_block_bytes(pc.ty)) * (uint(pc.n_embd) / 256u);
+    const uint up_off = gu_row * n_ff;
+    const uint off = (is_up ? up_off : 0u) + r * gu_row;
+    const uint nb = uint(pc.n_embd) / 256u;      // blocks per row (all four formats)
+    const uint lid = gl_LocalInvocationIndex;
+    const uint ng = uint(n_groups.v[0]);
+
+    for (uint g = gl_WorkGroupID.y; g < ng; g += gl_NumWorkGroups.y) {
+        if (grp_win.v[g] != uint(pc.win_id)) continue;    // workgroup-uniform: barrier-legal
+        const uint wrow = grp_off.v[g] + off;
+        const int e0 = grp_start.v[g], e1 = grp_start.v[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const uint arow = uint(ent_tok.v[e]) * (uint(pc.n_embd) / 32u) * 36u;
+            float acc = 0.0;
+            for (uint k = lid; k < nb * 8u; k += gl_WorkGroupSize.x) {
+                const uint iqs = (pc.ty == 23) ? 4u * (k % 8u) : 2u * (k % 8u);
+                acc += gu_dot(pc.ty, wrow + (k / 8u) * gu_block_bytes(pc.ty), arow + k * 36u, iqs);
+            }
+            const float s = wg_sum(acc);
+            if (lid == 0u) {
+                const uint idx = uint(e) * n_ff + r;
+                if (is_up) out_up.v[idx] = s;
+                else out_gate.v[idx] = s;
+            }
+        }
+    }
+}

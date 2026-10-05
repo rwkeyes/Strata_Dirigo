@@ -80,7 +80,7 @@ TABLE = {
     'moe_hit_grouped_s2_cpu_order':   ('shader', 's2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64'),
     'moe_hit_grouped_s2_dev':         ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down'),
     'moe_hit_select':                 ('kernel', 'moe_hit_select'),
-    'native_expert_grouped':          ('shader', 'native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu'),
+    'native_expert_grouped':          ('kernel', 'native_gu_any native_down_any ptr_to_off'),
     'native_flash_attn_short_step':   ('kernel', 'attn_decode_short'),
     'native_mmvq':                    ('kernel', 'iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq'),
     'native_q5_k_f32':                ('kernel', 'native_q5_k_f32'),
@@ -282,7 +282,7 @@ REFUSED = {
     'broadcast_streams', 'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
     'copy_rows_from_mapped', 'fetch_blobs', 'fused_gr_check', 'gdn_ab_multi', 'gdn_conv_commit', 'gdn_conv_l2_multi',
     'gdn_step_norm_multi', 'gpu_stamp', 'native_moe_combine_multi', 'native_router_top10_multi',
-    'native_expert_grouped', 'ple_block_projected',
+    'ple_block_projected',
     'rebase_ptrs', 'resident_plan', 'shared_expert_multi', 'wait_flag_ge', 'wait_flag_ge_or',
 }
 _stale_refusals = sorted(REFUSED - set(syms))

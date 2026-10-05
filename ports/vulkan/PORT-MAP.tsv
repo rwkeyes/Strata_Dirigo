@@ -104,7 +104,7 @@ moe_hit_grouped_s2_dev	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert
 moe_hit_grouped_scratch_bytes	host	a size
 moe_hit_select	kernel	moe_hit_select
 mtp_select	refused	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
-native_expert_grouped	refused	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
+native_expert_grouped	kernel	native_gu_any native_down_any ptr_to_off
 native_expert_layout	host	a layout description
 native_expert_scratch_bytes	host	a size
 native_flash_attn_short_step	refused	attn_decode_short
