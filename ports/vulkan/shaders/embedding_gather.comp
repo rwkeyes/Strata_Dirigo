@@ -1,0 +1,76 @@
+// ports/vulkan/shaders/embedding_gather.comp - the token embedding gather: packed codes + per-group scales (+ optional
+// per-group offsets) -> a float row.
+//
+// Ported from src/kernels/cuda/verify_kernels.cu's `embedding_gather_dev_kernel` and the host-side reference in
+// src/kernels/elementwise_parity.cpp.  The rule, with nothing paraphrased:
+//
+//     per_byte = 8 / code_bits                      // 4 for S2, 2 for S4, 1 for S8
+//     mask     = (1 << code_bits) - 1
+//     code     = (codes[tok*row_codes + i/per_byte] >> ((i % per_byte) * code_bits)) & mask
+//     group    = i / group_elems                    // per-group scales, group_elems wide
+//     out[tok*n + i] = (float)(code + code_bias) * scale[group]  +  (offsets ? offset[group] : 0)
+//
+// **THE MULTIPLY AND THE ADD ARE TWO ROUNDINGS, NOT A FUSED ONE.**  The device kernel writes `__fmul_rn` and then
+// `__fadd_rn`, and the engine's parity test compares the result BITWISE against a separately-computed
+// `code * scale` then `+ offset`, merely COUNTING the values where the fused `fma` would have differed.  A port that
+// reaches for `fma` because it is "the better instruction" fails that comparison exactly where the two disagree - so
+// this shader keeps the two steps apart, and the case reports the count of values where they differ.
+//
+// THE PACKING IS LSB-FIRST WITHIN EACH BYTE.  `(i % per_byte) * code_bits` is the shift, so element 0 is the LOW
+// bits of byte 0 and, at 4 bits, elements 0 and 1 share byte 0 with 0 low.  Reading it MSB-first produces a
+// plausible-looking embedding table with the pairs swapped, which is the kind of error that shows up as "the model
+// is a bit worse" rather than as a crash.
+//
+// The token can come from a device array (the `*_dev` form the engine also has) or be a single row (the form
+// layer.cpp's decode step calls); `has_tokens` picks between them.  One dispatch covers many tokens in y, exactly as
+// the CUDA grid does.
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer CODES { uint8_t c[]; } CO_;
+layout(set = 0, binding = 1, std430) readonly buffer SCALES { float s[]; } SC_;
+layout(set = 0, binding = 2, std430) readonly buffer OFFSETS { float o[]; } OF_;
+layout(set = 0, binding = 3, std430) readonly buffer TOKENS { int t[]; } TO_;
+layout(set = 0, binding = 4, std430) writeonly buffer OUT { float y[]; } OU_;
+
+layout(push_constant) uniform Pc {
+    int   n;              // elements per row
+    int   code_bits;      // 2, 4 or 8
+    int   code_bias;      // added to the unpacked code before scaling
+    int   group_elems;    // elements that share one scale
+    uint  row_codes;      // packed bytes per token row
+    uint  row_groups;     // scales per token row
+    int   has_offsets;
+    int   has_tokens;     // 1: read the token from TO_; 0: this dispatch IS token `single_token`
+    int   single_token;
+} pc;
+
+void main() {
+    const uint64_t i = uint64_t(gl_GlobalInvocationID.x);
+    if (i >= uint64_t(pc.n)) return;
+
+    const uint64_t tok = (pc.has_tokens != 0) ? uint64_t(TO_.t[gl_GlobalInvocationID.y])
+                                              : uint64_t(pc.single_token);
+
+    const uint64_t per_byte = uint64_t(8) / uint64_t(pc.code_bits);   // glslang rejects the `ull` literal suffix
+    const uint code = (uint(CO_.c[uint(tok * uint64_t(pc.row_codes) + i / per_byte)]) >> ((i % per_byte) * uint64_t(pc.code_bits)))
+                      & ((1u << uint(pc.code_bits)) - 1u);
+    const uint64_t group = i / uint64_t(pc.group_elems);
+
+    // Two roundings, deliberately: see the header.
+    //
+    // **`precise` IS LOAD-BEARING.**  GLSL lets a driver CONTRACT a multiply and an add into one fused op unless the
+    // result is qualified `precise` - and a fused op rounds once where the engine's `__fmul_rn` + `__fadd_rn` round
+    // twice.  Measured: without `precise`, four of the six arms here failed on exactly the values where the two
+    // roundings differ (the arms whose products happen to be exact passed, which is what made the cause obvious).
+    precise float product = float(int(code) + pc.code_bias) * SC_.s[uint(tok * uint64_t(pc.row_groups) + group)];
+    precise float offset = (pc.has_offsets != 0) ? OF_.o[uint(tok * uint64_t(pc.row_groups) + group)] : 0.0;
+
+    // 64-bit arithmetic, 32-bit INDEX: glslang requires a scalar integer (not int64) inside []
+    precise float sum = product + offset;
+    OU_.y[uint(tok * uint64_t(pc.n) + i)] = sum;
+}

@@ -89,8 +89,8 @@ TABLE = {
     'shared_expert_scratch_bytes': ('host', 'a size'),
 
     # ---- GPU work this port has NOT done: the honest hole list ----
+    'embedding_gather':            ('kernel', 'embedding_gather'),
     'cvec_apply':                  ('todo', 'a vector-table apply, not ported'),
-    'embedding_gather':            ('todo', 'the embedding gather, not ported'),
     'gather_rows':                 ('todo', 'a row gather, not ported'),
     'scatter_rows_f32':            ('todo', 'a row scatter, not ported'),
     'iq_dequant_f32':              ('todo', 'a standalone IQ dequantiser (this port has the FUSED iq*_mmvq)'),

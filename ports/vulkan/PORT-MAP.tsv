@@ -16,7 +16,7 @@ doorbell_publish	host	a host-device sync primitive
 doorbell_ring	host	a host-device sync primitive
 doorbell_wait	host	a host-device sync primitive
 embed_type_supported	host	a capability check
-embedding_gather	todo	the embedding gather, not ported
+embedding_gather	kernel	embedding_gather
 f16_from_f32	host	a type conversion helper
 f32_from_f16	host	a type conversion helper
 fused_gr_check	host	a capability check

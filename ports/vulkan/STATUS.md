@@ -11,13 +11,13 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
 short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
 Walsh-Hadamard rotation), the hybrid K8V4 mode, descriptor OFFSETS and the first SAMPLER kernel landed, the box's GPU
-run was **265 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
-Vulkan 1.4.318, subgroup size 32) - 253 / 0 / 3 on llvmpipe and 256 / 0 / 2 on the radeon ICD, which now picks the AMD
+run was **272 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
+Vulkan 1.4.318, subgroup size 32) - 260 / 0 / 3 on llvmpipe and 263 / 0 / 2 on the radeon ICD, which now picks the AMD
 iGPU because the discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
 misreading the device - BMG's matrix config is M8 N16 K16, not the M16 the criterion demanded - and since then the
-matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 256/0/2 becomes 255/1/2 when the flaky budget-requery case fires
+matrix path RUNS on XMX, including the prefill GEMM.  On the iGPU, 263/0/2 becomes 262/1/2 when the flaky budget-requery case fires
 when the budget-requery case fires - and as of this increment it fires on EVERY run, not intermittently: the case
 compares two queries of the driver's free-memory figure and RADV's moves ~2.8 MB against the 1.7 MB tolerance
 (`requery delta: budget 2793472 bytes, usage 0 bytes`).  **That is the box, not the port: the PREVIOUS commit's
@@ -26,7 +26,7 @@ that shares system memory with everything else.  Verified by building the previo
 the same ICD.  Before the swap the same gate read 160 / 0 / 0 on RADV and on radeon. That count has gone
 stale seven times in two days; read the last line of your own run.** All three available implementations are exercised
 again by `run_gate.sh`: it used to stop at the Intel skip, which meant the cross-implementation arm never ran on this
-box after the swap (`NEXT.md`). 68 kernels, 19 shared includes, one generated table file (`harness/iq_grids.hpp`,
+box after the swap (`NEXT.md`). 69 kernels, 19 shared includes, one generated table file (`harness/iq_grids.hpp`,
 holding the IQ1_S, IQ2_S, IQ3_XXS and IQ3_S grids). TWO RECONCILIATION NOTES, both verified against a full run:
 the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcendental probe prints `INFO` while
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
@@ -203,6 +203,19 @@ naming a shader that is not built, and on any decode-path symbol the map does no
 point: a new call site cannot join the decode path unnoticed.  It says 77 symbols - 17 kernel, 50 host, **10 todo** -
 so the decode path's remaining GPU work is ten named kernels rather than the ~250 KB of prefill and fused-MoE code.
 Falsified three ways before landing.
+
+**THE EMBEDDING GATHER LANDED, and `precise` turned out to be LOAD-BEARING.**  `embedding_gather.comp` (packed
+codes + per-group scales -> float rows, from `verify_kernels.cu`'s `_dev` kernel and the parity reference).  The
+finding generalises beyond this kernel: **a driver may FUSE a multiply and an add unless the result is `precise`.**
+The SPIR-V carries no fma op, but GLSL's default permits contraction, so the backend can still fuse - and one fused op
+rounds once where the engine's `__fmul_rn` + `__fadd_rn` round twice, which the engine compares bitwise against.
+Measured: four of six arms failed before `precise`, and the two that passed were those whose products happen to be
+exact - that signature is what identified the cause.  The shader qualifies the product, the offset and the sum; the
+SPIR-V now carries six `NoContraction` decorations.  The fixture was built to SEE this: the host searches for
+(code, scale, offset) triples where the fused and two-step forms differ and puts one at element 0, reporting the
+count - the engine's own `fma_diff` datum.  Five injections all bite: contractable arithmetic, MSB-first codes, the
+group as the element-within-group, the bias dropped, and the token array ignored.  The port map's hole list is now
+ten kernels.
 
 | Case | Verdict | Method |
 |---|---|---|

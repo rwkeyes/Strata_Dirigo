@@ -745,6 +745,35 @@ The first-token path's gather, and the smallest of the ten holes.  What the engi
 * `iq_embed_rows` (the IQ/BF16 table form, `include/strata/kernels/iq_kernels.hpp`) is a SECOND kernel on the same
   path and is easy to mistake for host-side bookkeeping; it is not - the map said `host` until the header was read.
 
+## THE EMBEDDING GATHER LANDED - and `precise` is load-bearing
+
+**What was ported.**  `embedding_gather.comp`, from `verify_kernels.cu`'s `embedding_gather_dev_kernel` and the host
+reference in `elementwise_parity.cpp`: packed codes + per-group scales (+ optional offsets) -> a float row.
+
+    per_byte = 8 / code_bits;  mask = (1 << code_bits) - 1
+    code  = (codes[tok*row_codes + i/per_byte] >> ((i % per_byte) * code_bits)) & mask    <- LSB FIRST in the byte
+    group = i / group_elems
+    out[tok*n + i] = (float)(code + code_bias) * scale[group] + (offsets ? offset[group] : 0)
+
+**THE FINDING, and it is a general one for this port: A DRIVER MAY FUSE A MULTIPLY AND AN ADD UNLESS THE RESULT IS
+`precise`.**  The SPIR-V contains no fma op, but GLSL's default permits *contraction* - so the driver's own backend
+may still fuse, and one fused op rounds ONCE where the engine's `__fmul_rn` + `__fadd_rn` round TWICE.  The engine
+compares bitwise against the two-rounding form, so a fused result is wrong wherever the two disagree.  **Measured:
+four of the six arms failed before `precise`, and the two that passed were the ones whose products happen to be
+exact** - which is what identified the cause.  The shader now qualifies the product, the offset and the sum, and the
+SPIR-V carries six `NoContraction` decorations.
+
+**The fixture was built to make that catchable**, rather than hoping: the host side SEARCHES for (code, scale,
+offset) triples where the fused and two-step forms differ (e.g. code -7 with scale 0.1 and offset 0.1 gives
+-0.599999964 two-step against -0.600000024 fused) and the probe arm puts one of them at element 0, reporting the
+count of differing values - the same datum the engine tracks as `fma_diff`.
+
+**Evidence.**  Six arms, all bitwise against the engine's rule: S8 without offsets; S8 with offsets; S4 (two codes
+per byte, low bits first); S2 (four per byte) with a non-zero code bias; the rounding probe; and the group boundary.
+A multi-token dispatch uses the device token array and the grid's y dimension, as the CUDA grid does, and a guard
+region after the last row must stay untouched.  Falsified five ways: contractable arithmetic, MSB-first codes, the
+group index as the element-within-group, the bias dropped, and the token array ignored.
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one

@@ -8376,6 +8376,164 @@ void case_sampler_kernel(Ctx& ctx, const std::string& dir) {
             "a wrong chain order, cut boundary, tie rule or RNG would land here");
 }
 
+// === THE EMBEDDING GATHER (src/kernels/cuda/verify_kernels.cu) ===============================================
+// packed codes + per-group scales (+ optional per-group offsets) -> a float row, for a table of tokens.
+//
+// THE RULE, taken from the device kernel and the host reference in elementwise_parity.cpp:
+//     per_byte = 8 / code_bits;  mask = (1 << code_bits) - 1
+//     code  = (codes[tok*row_codes + i/per_byte] >> ((i % per_byte) * code_bits)) & mask     <- LSB FIRST in the byte
+//     group = i / group_elems
+//     out[tok*n + i] = (float)(code + code_bias) * scale[group] + (offsets ? offset[group] : 0)
+//
+// **THE MULTIPLY AND THE ADD ARE TWO ROUNDINGS.**  The device kernel writes __fmul_rn then __fadd_rn, and the engine's
+// parity test compares BITWISE against a separately computed product-then-sum while merely COUNTING where the fused
+// form would differ.  So the interesting arm is not "does it match" but "does it match on the values where a fused
+// implementation would NOT": the fixture carries triples found by search where the two roundings differ, and the case
+// reports that count (the engine's own `fma_diff` datum).
+
+static void embedding_fixture(int bits, int group_elems, int n_tok, int n,
+                              std::vector<uint8_t>& codes, std::vector<float>& scales,
+                              std::vector<float>& offs, std::vector<int32_t>& toks, uint32_t& row_codes,
+                              uint32_t& row_groups, bool fma_probe) {
+    const int per_byte = 8 / bits;
+    row_codes = uint32_t((n + per_byte - 1) / per_byte);
+    row_groups = uint32_t((n + group_elems - 1) / group_elems);
+    // element 0 of token 0 is the search-found triple when probing: code 1 with bias -8 IS -7 (codes are unsigned).
+    codes.assign(size_t(row_codes) * size_t(n_tok), 0);
+    for (int t = 0; t < n_tok; ++t) {
+        for (int i = 0; i < n; ++i) {
+            const int code = (fma_probe && i == 0 && t == 0) ? 1 : (i * 7 + t * 3) % (1 << bits);
+            const size_t byte = size_t(t) * row_codes + size_t(i / per_byte);
+            codes[byte] |= uint8_t((code & ((1 << bits) - 1)) << ((i % per_byte) * bits));
+        }
+    }
+    scales.assign(size_t(row_groups) * size_t(n_tok), 0.0f);
+    offs.assign(size_t(row_groups) * size_t(n_tok), 0.0f);
+    for (int t = 0; t < n_tok; ++t) {
+        for (int k = 0; k < int(row_groups); ++k) {
+            const float scale = fma_probe ? (k % 3 == 0 ? 0.1f : (k % 3 == 1 ? 0.7f : 123.456f))
+                                          : 0.1f + 0.01f * float(k % 7);
+            scales[size_t(t) * row_groups + size_t(k)] = scale;
+            offs[size_t(t) * row_groups + size_t(k)] = fma_probe ? (k % 2 == 0 ? 0.1f : -0.3f) : 0.1f * float(k % 5) - 0.2f;
+        }
+    }
+    toks.resize(size_t(n_tok));
+    for (int t = 0; t < n_tok; ++t) toks[size_t(t)] = t;
+}
+
+// The engine's two-step rule, and the fused variant it merely counts.
+static void embedding_want(int bits, int bias, int group_elems, int n, const uint8_t* codes, const float* scales,
+                           const float* offs, float* out, int* fma_diff) {
+    const int per_byte = 8 / bits;
+    const unsigned mask = (1u << bits) - 1u;
+    if (fma_diff) *fma_diff = 0;
+    for (int i = 0; i < n; ++i) {
+        const unsigned code = (unsigned(codes[i / per_byte]) >> ((i % per_byte) * bits)) & mask;
+        const int64_t g = i / group_elems;
+        const float a = (float) (int(code) + bias) * scales[g];
+        const float two = a + (offs ? offs[g] : 0.0f);
+        out[i] = two;
+        if (fma_diff) {
+            const float fused = std::fma((float) (int(code) + bias), scales[g], offs ? offs[g] : 0.0f);
+            if (std::memcmp(&fused, &two, sizeof(float)) != 0) ++(*fma_diff);
+        }
+    }
+}
+
+void case_embedding_gather(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "embedding_gather.spv")) return;
+    struct Arm {
+        const char* what;
+        int bits, bias, group_elems, n_tok, n;
+        bool with_offsets, fma_probe;
+    };
+    const Arm arms[] = {
+        {"S8 codes, per-group scales, no offsets",              8,   0, 16, 3, 512,  false, false},
+        {"S8 codes with per-group offsets",                     8,   0, 16, 3, 512,  true,  false},
+        {"S4: TWO codes per byte, the LOW bits first",          4,   0, 16, 3, 512,  true,  false},
+        {"S2: FOUR codes per byte, with a non-zero code bias",   2,  -1, 16, 3, 512,  true,  false},
+        {"the two roundings, on values where a FUSED mul-add would differ",
+                                                               8,  -8,  1, 1, 512,  true,  true},
+        {"the group boundary: 16 elements share one scale",      4,   0, 16, 1, 512,  true,  false},
+    };
+    const int pad = 64;                     // the guard: nothing beyond n may be written
+    struct Pc {
+        int n, code_bits, code_bias, group_elems;
+        uint32_t row_codes, row_groups;
+        int has_offsets, has_tokens, single_token;
+    };
+    VkPipeline ps = ctx.pipeline(dir + "/embedding_gather.spv", 5, sizeof(Pc));
+    int bad_total = 0, checks_total = 0;
+
+    for (const Arm& a : arms) {
+        std::vector<uint8_t> codes, dummy;
+        std::vector<float> scales, offs;
+        std::vector<int32_t> toks;
+        uint32_t row_codes = 0, row_groups = 0;
+        embedding_fixture(a.bits, a.group_elems, a.n_tok, a.n, codes, scales, offs, toks, row_codes, row_groups,
+                          a.fma_probe);
+
+        // the row the oracle says each token must produce, and how many of its values a fused port would get wrong
+        std::vector<float> want(size_t(a.n) * size_t(a.n_tok), 0.0f);
+        int fma_diff_total = 0;
+        for (int t = 0; t < a.n_tok; ++t) {
+            int fd = 0;
+            embedding_want(a.bits, a.bias, a.group_elems, a.n,
+                           &codes[size_t(t) * row_codes], &scales[size_t(t) * row_groups],
+                           a.with_offsets ? &offs[size_t(t) * row_groups] : nullptr,
+                           &want[size_t(t) * a.n], &fd);
+            fma_diff_total += fd;
+        }
+
+        const size_t out_len = size_t(a.n) * size_t(a.n_tok) + size_t(pad);   // contiguous rows: stride is n
+        std::vector<float> guard(out_len, -12345.0f);
+        Buf b_c = ctx.alloc(codes.size()), b_s = ctx.alloc(scales.size() * 4), b_o = ctx.alloc(offs.size() * 4),
+            b_t = ctx.alloc(toks.size() * 4), b_y = ctx.alloc(out_len * 4);
+        ctx.write(b_c, codes.data(), codes.size());
+        ctx.write(b_s, scales.data(), scales.size() * 4);
+        ctx.write(b_o, offs.data(), offs.size() * 4);
+        ctx.write(b_t, toks.data(), toks.size() * 4);
+        ctx.write(b_y, guard.data(), guard.size() * 4);
+
+        Pc pc{};
+        pc.n = a.n; pc.code_bits = a.bits; pc.code_bias = a.bias; pc.group_elems = a.group_elems;
+        pc.row_codes = row_codes; pc.row_groups = row_groups;
+        pc.has_offsets = a.with_offsets ? 1 : 0;
+        // The multi-token form uses the device token array and the grid's y dimension, exactly as the CUDA grid does.
+        pc.has_tokens = 1; pc.single_token = 0;
+        const uint32_t gx = uint32_t((a.n + 255) / 256);
+        ctx.dispatch(ps, {&b_c, &b_s, &b_o, &b_t, &b_y}, &pc, sizeof(pc), gx, uint32_t(a.n_tok));
+
+        std::vector<float> got(out_len);
+        ctx.read(b_y, got.data(), got.size() * 4);
+
+        int bad = 0;
+        for (int t = 0; t < a.n_tok; ++t) {
+            for (int i = 0; i < a.n; ++i) {
+                ++checks_total;
+                const float w = want[size_t(t) * a.n + i], g = got[size_t(t) * a.n + i];
+                if (std::memcmp(&w, &g, sizeof(float)) != 0) ++bad;      // BITWISE: the two roundings are the contract
+            }
+            if (t == a.n_tok - 1) {                                      // the guard after the LAST row
+                for (int i = 0; i < pad; ++i) {
+                    ++checks_total;
+                    if (got[size_t(a.n) * size_t(a.n_tok) + size_t(i)] != -12345.0f) ++bad;
+                }
+            }
+        }
+        std::printf("      %-62s %d bits, %d tok -> %d bad (fma differs on %d value(s))\n",
+                    a.what, a.bits, a.n_tok, bad, fma_diff_total);
+        char label[240];
+        std::snprintf(label, sizeof label, "embedding_gather: %s", a.what);
+        verdict(label, bad == 0, bad, int(a.n * a.n_tok + pad), 0.0,
+                "a value that is not bitwise the two-rounding rule, or a guard region that moved");
+        bad_total += bad;
+        ctx.free(b_c); ctx.free(b_s); ctx.free(b_o); ctx.free(b_t); ctx.free(b_y);
+    }
+    verdict("embedding_gather: six arms against the engine's own rule", bad_total == 0, bad_total, checks_total, 0.0,
+            "a wrong packing order, group index, bias or fused rounding would land here");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -8509,6 +8667,7 @@ int main(int argc, char** argv) {
     case_descriptor_offset(ctx, dir);      // binding a row slice (the engine's pointer arithmetic, made bindable)
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
+    case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);
