@@ -37,9 +37,9 @@ f16_from_f32	host	a type conversion helper
 f32_from_f16	host	a type conversion helper
 f32_to_bf16_bulk	kernel	f32_to_bf16
 fetch_blobs	todo	no shader in this tree yet
-fused_gdn_ab	todo	no shader in this tree yet
-fused_gdn_conv_l2	todo	no shader in this tree yet
-fused_gdn_step_norm	todo	no shader in this tree yet
+fused_gdn_ab	kernel	fused_gdn_ab
+fused_gdn_conv_l2	kernel	fused_gdn_conv_l2
+fused_gdn_step_norm	kernel	fused_gdn_step_norm
 fused_gr_check	host	a capability check
 fused_gr_read	todo	a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes
 fused_gr_read_multi	todo	no shader in this tree yet

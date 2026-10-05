@@ -1,10 +1,12 @@
 # Decode-path triage — the 52 `todo` rows, from the engine's own sources
 #
-# CURRENT 2026-10-05 (after the class-B batch 3): the map reads **168 = 72 kernel + 61 host + 35 todo** (the
-# class-A set is CLOSED and the performance tier is in progress: ALL TEN of the scoreboard's class-B native fast
-# paths are ported - the four of batch 1 plus ALL SIX native GDN / DeltaNet mixer kernels (batches 2 and 3)).  M-A
-# is RE-DEFINED over the class-A set at the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted
-# immediately below are the state at `7c317c4`, kept as the record the triage was written against.
+# CURRENT 2026-10-05 (after the class-B batch 4, the FUSED GDN PATHS): the map reads **168 = 75 kernel + 61 host + 32 todo**
+# (the class-A set is CLOSED and the performance tier's class-B native fast paths are ALL ported: the four of batch
+# 1, ALL SIX native GDN / DeltaNet mixer kernels (batches 2 and 3), and the THREE fused GDN paths - `fused_gdn_conv_l2`,
+# `fused_gdn_ab`, `fused_gdn_step_norm` - as batch 4.  The three `fused_gdn_*` rows that stood for the class-B batch-4
+# gap are now `kernel`, and with them `native_gdn_enabled()` flips to TRUE.)  M-A is RE-DEFINED over the class-A set at
+# the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted immediately below are the state at
+# `7c317c4`, kept as the record the triage was written against.
 
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads

@@ -71,8 +71,9 @@
 #                                       -> must FAIL  "native capabilities"
 #
 #   (performance tier, class B, batch 2 - the native GDN / DeltaNet mixer)
-#   inject-verify.sh native-caps-gdn-true  vulkan/src/kernels/native_caps_vk.cpp  answer the GDN flag true while
-#                                       a gated symbol (the three fused_gdn_* paths) is unported
+#   inject-verify.sh native-caps-gdn-false  vulkan/src/kernels/native_caps_vk.cpp  answer the GDN flag FALSE
+#                                       while every gated shader exists (batch 4 flipped it TRUE; the pre-batch-4
+#                                       injection that answered it true is now the truth and is retired)
 #                                       -> must FAIL  "native capabilities: gdn flag"
 #   inject-verify.sh native-gdn-conv-silu-drop-silu  native_gdn_conv_silu.comp  drop the fused SiLU
 #                                       -> must FAIL  "native_gdn_conv_silu"
@@ -88,6 +89,14 @@
 #                                       sigmoid (the gdn_parity.cpp s4 trap) -> must FAIL  "native_gdn_out_norm"
 #   inject-verify.sh native-gdn-step-drop-readout-scale  native_gdn_step.comp  drop the folded 1/sqrt(S)
 #                                       readout scale the native kernel fuses -> must FAIL  "native_gdn_step"
+#
+#   (performance tier, class B, batch 4 - the three fused GDN paths; the flag now answers TRUE)
+#   inject-verify.sh fused-gdn-conv-l2-drop-norm  fused_gdn_conv_l2.comp  drop the per-head L2 scale
+#                                       -> must FAIL  "fused_gdn_conv_l2"
+#   inject-verify.sh fused-gdn-ab-swap-bf16-halves  fused_gdn_ab.comp  swap the BF16 pair halves
+#                                       -> must FAIL  "fused_gdn_ab"
+#   inject-verify.sh fused-gdn-step-norm-silu-not-sigmoid  fused_gdn_step_norm.comp  SiLU instead of sigmoid
+#                                       -> must FAIL  "fused_gdn_step_norm"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -377,14 +386,15 @@ case "$name" in
     old=$'bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported'
     new=$'bool native_qsa_enabled() { return true; }        // INJECTION: a capability answered true for a symbol that is NOT implemented'
     want="FAIL  native capabilities" ;;
-  native-caps-gdn-true)
-    # THE GDN FLAG'S own falsification, and it is the batch's capability point: `native_gdn_enabled()` gates the
-    # six native kernels this tree ports AND the three `fused_gdn_*` paths it does not, so it must stay FALSE.
-    # The case's gdn arm asserts `flag == (every gated symbol has a built shader)`; answering true while the
-    # three unported fused shaders are absent is exactly the lie the arm exists to catch.
+  native-caps-gdn-false)
+    # THE GDN FLAG'S own falsification, and it is batch 4's capability point: `native_gdn_enabled()` now answers
+    # TRUE because ALL NINE gated symbols (the six native kernels and the three fused paths) have shaders.  The
+    # mirror lie - the flag answering FALSE while every gated shader exists - is what the invariant must catch now
+    # (before batch 4 the lie was `true` while a gated symbol was unported, which is what `native-caps-gdn-true`
+    # checked; that injection is now the truth and is retired here).
     file="$TREE/vulkan/src/kernels/native_caps_vk.cpp"
-    old=$'bool native_gdn_enabled() { return false; }        // see the header note: the three fused_gdn_* paths are unported'
-    new=$'bool native_gdn_enabled() { return true; }        // INJECTION: the GDN flag answered true while the three fused_gdn_* paths are unported'
+    old=$'bool native_gdn_enabled() { return true; }         // all nine gated symbols have shaders (six native + three fused)'
+    new=$'bool native_gdn_enabled() { return false; }        // INJECTION: the GDN flag answered false while every gated shader exists'
     want="FAIL  native capabilities: gdn flag" ;;
   native-gdn-conv-silu-drop-silu)
     # The native body's new content vs `gdn_conv_step` is the FUSED SiLU and the second output.  Writing the raw
@@ -433,6 +443,31 @@ case "$name" in
     old=$'    ob.v[h * S + j] = attn * pc.scale;                  // the native body\'s folded 1/sqrt(S) readout scale'
     new=$'    ob.v[h * S + j] = attn;   // INJECTION: the folded 1/sqrt(S) readout scale dropped'
     want="FAIL  native_gdn_step" ;;
+  fused-gdn-conv-l2-drop-norm)
+    # `fused_gdn_conv_l2`'s fused content is the per-head L2 norm on top of the conv+SiLU: the kernel writes
+    # `y * rsqrt(sum(y^2) + eps)` for the q/k heads.  Dropping the scale writes the plain SiLU for every head,
+    # so the q/k arms move (the norm scales by ~1/sqrt(128) of the value there) and the v-untouched arm still
+    # passes - the case compares the q/k heads against the fused rule.
+    file="$SH/fused_gdn_conv_l2.comp"; spv="fused_gdn_conv_l2"
+    old=$'        h.v[c] = norm_this_head ? (y * red[hg * 128u]) : y;'
+    new=$'        h.v[c] = y;   // INJECTION: the per-head L2 scale of the fused conv+L2 dropped'
+    want="FAIL  fused_gdn_conv_l2" ;;
+  fused-gdn-ab-swap-bf16-halves)
+    # The fused AB kernel reads each BF16 weight row as 32-bit PAIRS: the LOW half is element 2p, the HIGH half
+    # 2p+1.  Swapping them is a plausible slip and is invisible on equal-magnitude data; the case's fixture
+    # gives the two halves magnitudes 100x apart, so the swap moves every row by O(1).
+    file="$SH/fused_gdn_ab.comp"; spv="fused_gdn_ab"
+    old=$'        acc = fma(bf16_to_f32(w0 & 0xFFFFu), x.v[xb + 0u], acc);\n        acc = fma(bf16_to_f32(w0 >> 16u),    x.v[xb + 1u], acc);'
+    new=$'        acc = fma(bf16_to_f32(w0 >> 16u),    x.v[xb + 0u], acc);   // INJECTION: the bf16 pair halves swapped\n        acc = fma(bf16_to_f32(w0 & 0xFFFFu), x.v[xb + 1u], acc);'
+    want="FAIL  fused_gdn_ab" ;;
+  fused-gdn-step-norm-silu-not-sigmoid)
+    # The fused closing gate is `sigmoid(z)`, NOT SiLU (the gdn_parity.cpp section 4 trap: this artifact does not
+    # use qwen3.5's SiLU).  The fixture's z spans +-20, so the SiLU reading moves the large-z third of every row
+    # by ~z at z = 20 - and the case host-checks that the SiLU rival moves the output before judging.
+    file="$SH/fused_gdn_step_norm.comp"; spv="fused_gdn_step_norm"
+    old=$'        yb.v[head * S + j] = weighted * (1.0f / (1.0f + exp(-zb.v[head * S + j])));'
+    new=$'        yb.v[head * S + j] = weighted * (zb.v[head * S + j] / (1.0f + exp(-zb.v[head * S + j])));   // INJECTION: SiLU instead of sigmoid'
+    want="FAIL  fused_gdn_step_norm" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

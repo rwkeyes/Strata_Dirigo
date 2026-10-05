@@ -188,9 +188,9 @@ TABLE = {
     'bf16_gemv_split':                ('todo', 'no shader in this tree yet'),
     'broadcast_streams':              ('todo', 'no shader in this tree yet'),
     'fetch_blobs':                    ('todo', 'no shader in this tree yet'),
-    'fused_gdn_ab':                   ('todo', 'no shader in this tree yet'),
-    'fused_gdn_conv_l2':              ('todo', 'no shader in this tree yet'),
-    'fused_gdn_step_norm':            ('todo', 'no shader in this tree yet'),
+    'fused_gdn_ab':                   ('kernel', 'fused_gdn_ab'),          # replaces 2x bf16 mmvf + beta_gate + gate
+    'fused_gdn_conv_l2':              ('kernel', 'fused_gdn_conv_l2'),     # replaces native_gdn_conv_silu + 2x l2_norm
+    'fused_gdn_step_norm':            ('kernel', 'fused_gdn_step_norm'),   # replaces native_gdn_step + native_gdn_out_norm
     'fused_gr_read':                  ('todo', 'a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes'),
     'fused_gr_read_multi':            ('todo', 'no shader in this tree yet'),
     'gdn_ab_multi':                   ('todo', 'no shader in this tree yet'),

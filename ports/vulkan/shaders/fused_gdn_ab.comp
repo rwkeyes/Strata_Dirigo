@@ -1,0 +1,94 @@
+#version 450
+// ports/vulkan/shaders/fused_gdn_ab.comp - the PERFORMANCE tier's fused GDN alpha/beta projector, ported from
+// src/kernels/cuda/fused_gdn.cu's `gdn_ab_kernel` (host wrapper `fused_gdn_ab`, fused_gdn.hpp:28), which
+// replaces FOUR dispatches: the two BF16 matrix-vector products for alpha and beta (`bf16_gemv_fp32_mmvf`) plus
+// the two elementwise epilogues `native_gdn_beta_gate` and `native_gdn_gate` (src/core/layer.cpp:287/291-297).
+//
+// THE RULE (fused_gdn.cu:95-123).  The two weight matrices are BF16 `(h_v, n)`; the activation `x` is FP32;
+// one warp per output row in the CUDA:
+//
+//     row in [0, 2*h_v):  is_beta = row >= h_v;  r = is_beta ? row - h_v : row
+//     acc = sum_j  bf16_to_f32(w[r][j]) * x[j]              // FP32, fused multiply-add per term
+//     beta[r]  = 1 / (1 + expf(-acc))                       // the beta epilogue
+//     alpha[r]: v = acc + dt[r]; sp = v > 20 ? v : log1pf(expf(v));  gate[r] = sp * ssm_a[r]
+//
+// THE BF16 UNPACK IS THE CUDA'S OWN.  It reads the weight row as 32-bit PAIRS (`uint4`), takes the LOW half as
+// element (2p) and the HIGH half as element (2p+1) via `__uint_as_float(w << 16)` / `w & 0xffff0000`, and reads
+// the activation as consecutive PAIRS.  Transcribed here from `uint` pairs, so a swapped half is caught by the
+// gate's layout fixture (the halves differ by orders of magnitude).
+//
+// THE DECOMPOSITION.  The CUDA is one 32-LANE WARP per row with a shuffle-xor reduction; subgroup ops are BANNED
+// in this port (Intel picks the SIMD width per kernel; see common/wg_reduce.glsl), so this ships ONE WORKGROUP
+// PER ROW (256 threads striding over the row's 8-element chunks) reduced with the port's barrier tree.  The
+// dispatch is exactly `2*h_v` groups, one per row, so a workgroup never straddles rows and every barrier is
+// reached by every invocation.
+//
+// THE ORACLE is this same fused rule transcribed in double by the gate case (`case_fused_gdn_ab`); the sums are
+// bounded by their TERMS (a BF16 dot can cancel - the port's `gemv_bound` rule), not by their result.  The gate
+// checks host-side that dropping the softplus, the `ssm_a` factor, or the beta sigmoid each MOVES the output.
+// NO subgroup op, NO atomic.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float v[]; } x;      // (n,) FP32 activation
+layout(set = 0, binding = 1, std430) readonly buffer WA { uint v[]; } wa;     // (h_v, n) BF16 as 32-bit pairs
+layout(set = 0, binding = 2, std430) readonly buffer WB { uint v[]; } wb;     // (h_v, n) BF16 as 32-bit pairs
+layout(set = 0, binding = 3, std430) readonly buffer DT { float v[]; } dt;    // (h_v,)
+layout(set = 0, binding = 4, std430) readonly buffer SSMA { float v[]; } ssm_a;   // (h_v,)
+layout(set = 0, binding = 5, std430) buffer GATE { float v[]; } gate;         // (h_v,)
+layout(set = 0, binding = 6, std430) buffer BETA { float v[]; } beta;         // (h_v,)
+layout(push_constant, std430) uniform PC { int n; int h_v; } pc;
+
+#include "common/wg_reduce.glsl"
+
+// bf16 -> f32 is a pure widening (`bf16_bits.hpp`'s f32_from_bf16 is `bitcast(h << 16)`): no rounding to get
+// wrong.  Same helper the native `bf16_mmvf_f32` port uses.
+float bf16_to_f32(uint hbits) { return uintBitsToFloat(hbits << 16u); }
+
+// softplus, identical to `native_gdn_gate.comp`'s: the driver's `log` is inaccurate near u=1, where softplus of
+// a negative value IS exp(x), so the log1p series is used below 0.5 (see gdn_gate.comp's measured history).
+float log1p_series(float z) {
+    float r = 1.0f / 18.0f;
+    for (int k = 17; k >= 1; --k) r = (1.0f / float(k)) - z * r;
+    return z * r;
+}
+float log1p_s(float z) { return (z < 0.5f) ? log1p_series(z) : log(1.0f + z); }
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const int hv = pc.h_v;
+    if (row >= uint(2 * hv)) return;                  // workgroup-uniform
+    const bool is_beta = row >= uint(hv);
+    const uint r = is_beta ? row - uint(hv) : row;
+    const uint n = uint(pc.n);
+    const uint base = r * (n >> 1u);                  // the row's uint pair base (n is a multiple of 8)
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float acc = 0.0f;
+    for (uint j = lid; j * 8u < n; j += lsize) {
+        const uint ub = base + j * 4u;
+        const uint w0 = is_beta ? wb.v[ub + 0u] : wa.v[ub + 0u];
+        const uint w1 = is_beta ? wb.v[ub + 1u] : wa.v[ub + 1u];
+        const uint w2 = is_beta ? wb.v[ub + 2u] : wa.v[ub + 2u];
+        const uint w3 = is_beta ? wb.v[ub + 3u] : wa.v[ub + 3u];
+        const uint xb = j * 8u;
+        acc = fma(bf16_to_f32(w0 & 0xFFFFu), x.v[xb + 0u], acc);
+        acc = fma(bf16_to_f32(w0 >> 16u),    x.v[xb + 1u], acc);
+        acc = fma(bf16_to_f32(w1 & 0xFFFFu), x.v[xb + 2u], acc);
+        acc = fma(bf16_to_f32(w1 >> 16u),    x.v[xb + 3u], acc);
+        acc = fma(bf16_to_f32(w2 & 0xFFFFu), x.v[xb + 4u], acc);
+        acc = fma(bf16_to_f32(w2 >> 16u),    x.v[xb + 5u], acc);
+        acc = fma(bf16_to_f32(w3 & 0xFFFFu), x.v[xb + 6u], acc);
+        acc = fma(bf16_to_f32(w3 >> 16u),    x.v[xb + 7u], acc);
+    }
+
+    const float total = wg_sum(acc);
+    if (lid == 0u) {
+        if (is_beta) {
+            beta.v[r] = 1.0f / (1.0f + exp(-total));
+        } else {
+            const float v = total + dt.v[r];
+            const float sp = (v > 20.0f) ? v : log1p_s(exp(v));
+            gate.v[r] = sp * ssm_a.v[r];
+        }
+    }
+}

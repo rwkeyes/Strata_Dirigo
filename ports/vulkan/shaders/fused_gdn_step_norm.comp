@@ -1,0 +1,101 @@
+#version 450
+// ports/vulkan/shaders/fused_gdn_step_norm.comp - the PERFORMANCE tier's fused GDN recurrence, ported from
+// src/kernels/cuda/fused_gdn.cu's `gdn_step_norm_kernel` (host wrapper `fused_gdn_step_norm`, fused_gdn.hpp:31),
+// which replaces the two-dispatch native chain `native_gdn_step` + `native_gdn_out_norm` (src/core/layer.cpp:322
+// under `fused_gdn`, else :308 + :324).
+//
+// THE RULE (fused_gdn.cu:16-71), one head per block in the CUDA, the (S, h_v, S) state with j fastest:
+//
+//     g       = expf(gate[head])                                  // decay, formed ONCE per head
+//     kv_col  = sum_i state[(i,head,col)] * k[src*S + i]          // the UNDECAYED state dotted with k
+//     delta   = (v[head*S + col] - g * kv_col) * beta[head]
+//     s_i     = g * s_i + k[src*S + i] * delta                    // decay + rank-1 update in ONE step
+//     o       = sum_i s_i * q[src*S + i]                          // readout against the UPDATED state
+//     oc      = o * rsqrtf(S)                                     // the folded 1/sqrt(S) readout scale
+//     scale   = rsqrtf( sum_{col} oc^2 / S  + eps )               // the closing RMS norm, eps on the MEAN
+//     y       = oc * scale * gamma[col] * sigmoid(z[head*S + col])// gamma (ssm_norm.weight) and sigmoid(z)
+//
+// The head pairing is `src = h % h_k` (MODULO, not interleave).  The closing norm is the native `out_norm`'s
+// rule (SAME multiply order `(scale*value)*gamma*sigmoid`), computed on the READOUT `oc` after the fused
+// `1/sqrt(S)` scale - exactly what the native chain does across its two kernels.
+//
+// THE DECOMPOSITION, AND A MEASUREMENT DISCIPLINE (batch 3's finding).  The CUDA uses 512 threads per head
+// (128 columns x 4 row-groups), each owning 32 state rows, with `__shfl_xor_sync` trees.  Subgroup ops are
+// BANNED in this port (Intel picks the SIMD width per kernel; see common/wg_reduce.glsl), and the faithful
+// workgroup-per-column barrier-tree rendering of the native step was measured at **1.564x the Arc, 8.33x the
+// Ryzen iGPU and 43.5x llvmpipe** the legacy kernel (batch 3, bench/README.md).  So this carries the COALESCED
+// one-thread-per-column recurrence the native `step` port already ships (adjacent threads read adjacent `j`)
+// and adds the closing norm as a 128-LANE HALF-WORKGROUP tree: a 256-lane workgroup covers exactly TWO heads
+// (S = 128 wide), and each hg reduces ITS OWN head's 128 readout values with 7 barrier rounds.  The dispatch
+// is `groups_for(h_v * S)`; the flattened column `h*S + j` puts head 2*gid in the low hg and head 2*gid+1 in
+// the high hg, which is what makes the hg-reduction a per-head reduction.
+//
+// THE ORACLE is this same fused rule transcribed in double by the gate case (`case_fused_gdn_step_norm`); the
+// gate checks host-side that the INTERLEAVE head pairing, the dropped readout scale and a SiLU-instead-of-
+// sigmoid closing gate each MOVE the output before judging.  An out-of-range column contributes 0 to the
+// reduction and writes nothing, so every barrier is reached by every invocation.  NO subgroup op, NO atomic.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;        // (S, h_v, S), j fastest, in place
+layout(set = 0, binding = 1, std430) readonly buffer Q { float v[]; } qb;      // (h_k, S)
+layout(set = 0, binding = 2, std430) readonly buffer K { float v[]; } kb;      // (h_k, S)
+layout(set = 0, binding = 3, std430) readonly buffer V { float v[]; } vb;      // (h_v, S)
+layout(set = 0, binding = 4, std430) readonly buffer G { float v[]; } gb;      // (h_v,)
+layout(set = 0, binding = 5, std430) readonly buffer B { float v[]; } bb;      // (h_v,)
+layout(set = 0, binding = 6, std430) readonly buffer Z { float v[]; } zb;      // (h_v, S)
+layout(set = 0, binding = 7, std430) readonly buffer GAMMA { float v[]; } gmb; // (S,)
+layout(set = 0, binding = 8, std430) buffer Y { float v[]; } yb;               // (h_v, S)
+layout(push_constant, std430) uniform PC { int S; int h_k; int h_v; float eps; } pc;
+
+// ONE shared array for the per-head closing norm; the two 128-lane halves reduce independently in place.
+shared float red[256];
+
+void main() {
+    const uint S = uint(pc.S), hv = uint(pc.h_v);
+    const uint col = gl_GlobalInvocationID.x;            // j fastest, then h: col = h*S + j
+    const bool live = col < S * hv;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint hg = lid >> 7u;                         // which of the group's two heads
+    const uint lane = lid & 127u;
+
+    float oc = 0.0f;
+    if (live) {
+        const uint head = col / S;
+        const uint j = col % S;
+        const uint src = head % uint(pc.h_k);            // MODULO head pairing (not h / (h_v/h_k))
+        const float g = exp(gb.v[head]);
+        const float b = bb.v[head];
+        // pass 1: the contract against the UNDECAYED state (the native body's `kv_col`).
+        float kv = 0.0f;
+        for (uint i = 0u; i < S; ++i) kv += state.v[(i * hv + head) * S + j] * kb.v[src * S + i];
+        const float delta = (vb.v[head * S + j] - g * kv) * b;
+        // pass 2: the single folded decay+rank-1 update, the readout against the UPDATED state, and the state
+        // write-back.
+        float attn = 0.0f;
+        for (uint i = 0u; i < S; ++i) {
+            const uint idx = (i * hv + head) * S + j;
+            const float s = g * state.v[idx] + kb.v[src * S + i] * delta;   // g*s + k*delta, one step
+            state.v[idx] = s;
+            attn += s * qb.v[src * S + i];
+        }
+        oc = attn * inversesqrt(float(S));               // the native body's folded 1/sqrt(S) readout scale
+    }
+
+    // the per-head closing norm: each hg reduces the 128 lanes of ITS head (head = 2*gid + hg)
+    red[lid] = live ? oc * oc : 0.0f;
+    barrier();
+    for (uint step = 64u; step > 0u; step >>= 1u) {
+        if (lane < step) red[hg * 128u + lane] += red[hg * 128u + lane + step];
+        barrier();
+    }
+    if (lane == 0u) {
+        red[hg * 128u] = inversesqrt(red[hg * 128u] / float(S) + pc.eps);   // eps on the MEAN
+    }
+    barrier();
+    if (live) {
+        const uint head = col / S;
+        const uint j = col % S;
+        const float scale = red[hg * 128u];
+        const float weighted = (scale * oc) * gmb.v[j];
+        yb.v[head * S + j] = weighted * (1.0f / (1.0f + exp(-zb.v[head * S + j])));
+    }
+}

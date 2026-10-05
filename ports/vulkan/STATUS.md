@@ -1,5 +1,56 @@
 # Status — what is done, what is verified, what is not
 
+## THE PERFORMANCE TIER'S FUSED GDN PATHS — class B batch 4 — and `native_gdn_enabled()` FLIPS TO TRUE (2026-10-05)
+
+The three fused **GDN paths** — `fused_gdn_conv_l2`, `fused_gdn_ab`, `fused_gdn_step_norm` — the LAST symbols
+`native_gdn_enabled()` gates.  Each is gated and oracled against the engine's OWN fused body
+(`src/kernels/cuda/fused_gdn.cu`), each MEASURED against the multi-dispatch chain it replaces and against the
+non-fused native kernel(s) where a comparison exists.  With ALL NINE gated symbols now having a shader, the
+invariant `case_native_capabilities` asserts is satisfied and **`native_gdn_enabled()` answers TRUE**.
+
+| case | rule (the engine's OWN fused body = the oracle) | measured (vega Arc) | falsified by |
+|---|---|---|---|
+| `fused_gdn_conv_l2` (3 arms C=10240/512/384) | `fused_gdn.cu` `gdn_conv_l2_kernel`: 4-tap conv (no zero-bias) + SiLU + slide, then a per-head L2 `rsqrt(sum y^2 + eps)` on the q/k heads only | **51200/51200 w 2.66e-05**, 2560/2560 w 9.46e-06, 1920/1920 w 2.68e-05 (Arc); slid history bit-exact | `fused-gdn-conv-l2-drop-norm` → FAIL 49149/51200 w 1.93e+05 |
+| `fused_gdn_ab` (3 arms h_v=48 n=2560 / h_v=4 n=64 / h_v=3 n=512) | `fused_gdn.cu` `gdn_ab_kernel`: BF16 mat-vec (32-bit pairs, low=2p/high=2p+1) then `beta=sigmoid(acc)`, `gate=softplus(acc+dt)*ssm_a` | **99/99 w 4.25e-07**, 11/11 w 1.33e-07, 9/9 w 7.79e-08 (Arc); terms bound, per-row margins | `fused-gdn-ab-swap-bf16-halves` → FAIL 3/99 w 25.9 |
+| `fused_gdn_step_norm` (3 arms S=128; h_v=48/8/9) | `fused_gdn.cu` `gdn_step_norm_kernel`: folded-decay recurrence (contract vs UNDECAYED state) + readout vs UPDATED state + fused `1/sqrt(S)` + closing RMS (eps on the MEAN) with gamma and sigmoid(z) | **792580/792580 err/tol 0.319**, 132100/132100 w 0.0508, 148612/148612 w 0.0109 (Arc) | `fused-gdn-step-norm-silu-not-sigmoid` → FAIL 788501/792580 w 9.34e+04 |
+| `native capabilities: gdn flag` | `native_gdn_enabled()` == "every gated symbol has a built shader"; all 9 now built | **4/4** — flag **TRUE** | `native-caps-gdn-false` → FAIL 3/4 (the old `native-caps-gdn-true` is retired — true is now the truth) |
+
+**THE MEASUREMENT (fused/legacy, same shape, same device — < 1.0 is faster; full table in `bench/README.md`).**
+Every fused path beats the multi-dispatch chain it replaces on every device measured: `fused_gdn_conv_l2` vs
+conv_silu+2× l2_norm **0.452 Arc / 0.712 iGPU / 0.560 lvp**; `fused_gdn_ab` vs 2× mmvf+beta_gate+gate **0.398 /
+0.878 / 0.744**; `fused_gdn_step_norm` vs step+out_norm **0.929 / 0.987 / 0.930**.  The fused-vs-`native_gdn_step`
+pair is a wash (1.021 / 0.998 / 1.092 — the fused kernel does that recurrence PLUS the norm's work), and the
+fused-vs-`native_gdn_out_norm` row (6.2–63.7) is **not a like-for-like ratio** (the fused dispatch does the whole
+step while out_norm alone is a ~70× smaller elementwise pass).  The win is in REMOVING DISPATCHES, as batches 2–3
+found; a wash and a non-like-for-like row are both reported.
+
+**THE FLAG FLIPS, and the fused paths' extra gates are SETTINGS, not capabilities.**  `fused_gdn_step_norm` is
+selected by `g_fused_gdn && native_gdn_enabled() && state==128` (layer.cpp:306) — **no `native_bf16_projections`
+term** — and `g_fused_gdn` **defaults true** (layer.cpp:42), so the flag flip alone makes that path reachable on
+the default config: the shader HAD to exist before the flip (the strict invariant's point).  `fused_gdn_conv_l2` /
+`fused_gdn_ab` additionally need `native_bf16_projections` (layer.cpp:247), a host setting defaulting false, set
+by `--native-bf16`/`--native` (generate.cpp:2286), whose dependency `bf16_mmvf_f32` IS ported and gated.  The P6
+verifier stays unreachable after the flip (`g_fused_gr` false, `native_qsa_indexer_enabled()` false,
+`native_bf16_projections` false), so the router/moe `_multi` symbols stay off the path.
+
+**THE MAP MOVES BY THREE ROWS:** `168 — 72 kernel, 61 host, 35 todo` → **`168 — 75 kernel, 61 host, 32 todo`**;
+`check_port_map.py` passes (`109 shaders built, 90 claimed`) and `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.  **Gate, after the commit: vega Arc 432/0/0, lvp 420/0/3, radeon-iGPU 423/0/2 (exit 0)** — the
+radeon run's sole `budget: independent requery agrees` failure was the documented intermittent flake (a direct
+re-run read 423/0/2 twice).  **Box `z820b`: XTX 428/0/1 (the 1 is the pre-existing M8 skip, so `run_gate.sh`
+exits 1 there), K620 423/0/2, llvmpipe 420/0/3 — 0 failed on every arm**; the XTX's first run carried the same
+`budget` flake (two direct re-runs read 428/0/1).  Four falsification injections all BIT.  **NOTE for the next
+batch: the box's `vulkan/` must be synced too (the brief's sync command omits it) — a stale
+`native_caps_vk.cpp` fails the flag arm 3/4.**
+
+**TWO FIXTURE FINDINGS (both fixed, both recorded in `NEXT.md`).**  (1) The dropped-readout-scale rival is NOT an
+exact invariance under the closing RMS (measured 0.109–0.19 rel-L1 — it is a moving margin, asserted > 0.05; the
+first case asserted the opposite and the gate caught it).  (2) The vector rel-L1 softplus margin in `fused_gdn_ab`
+was swamped by the forced branch row, so the case now uses a per-row max and a fixture whose `acc` lands in the
+softplus-sensitive band.  The device matched the rule throughout — the fixtures were the defect.
+
+---
+
 ## THE PERFORMANCE TIER'S GDN / DELTANET MIXER, the remaining three native kernels — class B batch 3 (2026-10-05)
 
 The LAST three native **GDN / DeltaNet mixer** kernels — **COMPLETING the six** — `native_gdn_gate`,

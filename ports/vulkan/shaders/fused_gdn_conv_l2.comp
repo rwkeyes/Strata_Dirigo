@@ -1,0 +1,89 @@
+#version 450
+// ports/vulkan/shaders/fused_gdn_conv_l2.comp - the PERFORMANCE tier's fused GDN pre-processing kernel, ported
+// from src/kernels/cuda/fused_gdn.cu's `gdn_conv_l2_kernel` (host wrapper `fused_gdn_conv_l2`, fused_gdn.hpp:22),
+// which replaces the three-dispatch native chain `native_gdn_conv_silu` + `native_gdn_l2_norm` (q) +
+// `native_gdn_l2_norm` (k) (src/core/layer.cpp:250 under `fused_pre`, else :253/266-267).
+//
+// THE RULE (fused_gdn.cu:73-93), one 128-channel head-block per block in the CUDA:
+//
+//     values = { hist[c*3], hist[c*3+1], hist[c*3+2], qkv[c] }        // oldest first, then the new column
+//     sum    = values[0]*w[c*4] + values[1]*w[c*4+1] + values[2]*w[c*4+2] + values[3]*w[c*4+3]
+//     slide: hist[c*3+0]=values[1]; hist[c*3+1]=values[2]; hist[c*3+2]=values[3]
+//     y      = sum / (1 + expf(-sum))                                  // FP32 fast-math SiLU
+//     if (head(c) < qk_heads)  y *= rsqrtf( sum_{i in head} y_i^2  + eps )   // eps on the SQUARED NORM
+//     h[c]   = y
+//
+// WHAT THE FUSED BODY DOES DIFFERENTLY FROM THE NATIVE `conv_silu` + `l2_norm` CHAIN, stated rather than
+// assumed:
+//   * the four-tap conv has NO zero-bias fold here (the native `conv_silu` adds `sum + 0.0f`; the fused body
+//     does not) - transcribed literally, because the oracle is the ENGINE'S OWN fused body.
+//   * the L2 norm is the engine's FUSED rule `rsqrtf(sum(y^2) + eps)`, NOT the native `l2_norm` kernel's
+//     `rsqrtf(partial/S + eps/S)` with a folded `1/sqrt(S)` `scale_after`.  At a full row the two agree up to
+//     the sqrt(S) cancellation; the fused body keeps eps on the SQUARED NORM (the legacy `gdn_l2_norm`
+//     convention), which the gate's near-zero row probes.
+//   * the L2 is applied ONLY to the q and k heads (`head < qk_heads`, the layer passes `2*ssm_k_heads`); the v
+//     heads pass through as plain SiLU.
+//
+// THE DECOMPOSITION, AND A MEASUREMENT DISCIPLINE (batch 3's finding).  The CUDA uses ONE BLOCK PER 128-CHANNEL
+// HEAD with a 32-lane warp shuffle for the norm.  Subgroup ops are BANNED in this port (Intel picks the SIMD
+// width per kernel; see common/wg_reduce.glsl), and a faithful one-workgroup-per-head barrier tree was measured
+// a large REGRESSION for the step at this shape (batch 3: 1.564x the Arc).  So this ships the COALESCED
+// one-thread-per-channel decomposition the native `conv_silu` port already uses (a measured win over the legacy
+// conv), and performs the per-head norm as a 128-LANE HALF-WORKGROUP tree: a 256-lane workgroup covers exactly
+// TWO 128-channel heads, and each hg reduces its own head with 7 barrier rounds.  The whole workgroup is
+// active for the conv (full coalescing), and only the q/k heads pay for the norm.
+//
+// THE ORACLE is this same fused rule transcribed in double by the gate case (`case_fused_gdn_conv_l2`); the
+// SLID history and the whole pre-L2 conv output are compared through the rule.  The dispatch is one thread per
+// channel; the in-range guard leaves the reduction lanes uniform (a channel past `channels` contributes 0 and
+// writes nothing), so every barrier is reached by every invocation.  NO subgroup op, NO atomic.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer HIST { float v[]; } hist;          // (channels, 3), oldest first, updated
+layout(set = 0, binding = 1, std430) readonly buffer QKV { float v[]; } qkv;   // (channels,)
+layout(set = 0, binding = 2, std430) readonly buffer W { float v[]; } w;       // (channels, 4), tap fastest
+layout(set = 0, binding = 3, std430) buffer H { float v[]; } h;                // (channels,)
+layout(push_constant, std430) uniform PC { int channels; int qk_heads; float eps; } pc;
+
+// ONE shared array for the per-head norm; the two 128-lane halves reduce independently in place.  The tree is
+// custom (not common/wg_reduce.glsl's whole-workgroup `wg_sum`) because a workgroup spans TWO heads here.
+shared float red[256];
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    const uint hg = lid >> 7u;                     // 0 or 1: which of the group's two heads
+    const uint lane = lid & 127u;                    // 0..127: this thread's column within its head
+    const uint c = gl_WorkGroupID.x * 256u + lid;    // the channel
+    const int channels = pc.channels;
+
+    float y = 0.0f;
+    if (c < uint(channels)) {
+        const float v0 = hist.v[c * 3u + 0u];
+        const float v1 = hist.v[c * 3u + 1u];
+        const float v2 = hist.v[c * 3u + 2u];
+        const float x = qkv.v[c];
+        // the four-tap dot in the CUDA's own order, tap fastest; NO zero-bias fold (the fused body has none)
+        const float sum = v0 * w.v[c * 4u + 0u] + v1 * w.v[c * 4u + 1u] + v2 * w.v[c * 4u + 2u] + x * w.v[c * 4u + 3u];
+        hist.v[c * 3u + 0u] = v1;                    // slide: drop the oldest, the new column lands LAST
+        hist.v[c * 3u + 1u] = v2;
+        hist.v[c * 3u + 2u] = x;
+        y = sum / (1.0f + exp(-sum));                // FP32 fast-math SiLU
+    }
+
+    // this half's head index; the two heads a 256-lane group covers are 2*gid and 2*gid+1
+    const int head = int(gl_WorkGroupID.x * 2u + hg);
+    const bool norm_this_head = (head < pc.qk_heads);
+    red[lid] = (c < uint(channels) && norm_this_head) ? y * y : 0.0f;
+    barrier();
+    // pairwise tree over the 128 lanes of THIS hg only (both halves run it in parallel)
+    for (uint step = 64u; step > 0u; step >>= 1u) {
+        if (lane < step) red[hg * 128u + lane] += red[hg * 128u + lane + step];
+        barrier();
+    }
+    if (norm_this_head && lane == 0u) {
+        red[hg * 128u] = inversesqrt(red[hg * 128u] + pc.eps);   // eps on the SQUARED NORM (the fused rule)
+    }
+    barrier();
+    if (c < uint(channels)) {
+        h.v[c] = norm_this_head ? (y * red[hg * 128u]) : y;
+    }
+}

@@ -23,9 +23,14 @@
 //                                   native_router_top10_multi in verify.cpp:916.  The `_multi` symbol is not
 //                                   ported, BUT the verifier cannot run under this port's contract:
 //                                   `Verifier::init` refuses unless `layer_verify_compatible()` holds
-//                                   (layer.cpp:476-491), which demands the native GDN and the native QSA
-//                                   indexer - both answered false.  So the reachable set is {native_router_top10},
-//                                   which is ported.  ANSWER: true.
+//                                   (layer.cpp:476-491), which demands the native BF16 projections, the fused
+//                                   hyper-connection read, the fused native GDN kernels, the split-K decode
+//                                   attention, the block top-k selection AND the native QSA indexer, ALL answering
+//                                   true.  After batch 4 flipped `native_gdn_enabled()` true, that conjunction is
+//                                   STILL false: `native_bf16_projections` is a setting that defaults false,
+//                                   `g_fused_gr` defaults false, and `native_qsa_indexer_enabled()` is false
+//                                   (unported).  So the verifier is unreachable and the reachable set is
+//                                   {native_router_top10}, which is ported.  ANSWER: true.
 //
 //   native_moe_combine_enabled() -> native_moe_combine (layer.cpp:463, mtp.cpp:601) on the forward path, and
 //                                   native_moe_combine_multi (verify.cpp:1081).  Same argument as the router:
@@ -47,14 +52,16 @@
 //                                   `native_gdn_beta_gate` at layer.cpp:253/266-267/296; `native_gdn_gate`,
 //                                   `native_gdn_step`, `native_gdn_out_norm` at layer.cpp:297/308/324) AND the
 //                                   THREE fused paths `fused_gdn_conv_l2` / `fused_gdn_ab` / `fused_gdn_step_norm`
-//                                   (layer.cpp:250/287/322, additionally gated on `g_fused_gdn` and
-//                                   `native_bf16_projections`).  This backend has ported ALL SIX native GDN
-//                                   kernels; the THREE fused paths have no shader.  Answering true would
-//                                   dispatch them.  ANSWER: false - and the answer is not "nothing is
-//                                   implemented": all six ported shaders exist and are gated.  The flag stays
-//                                   false until EVERY symbol it selects has a shader, which is what
-//                                   `case_native_capabilities`'s gdn arm enforces (it requires the flag to equal
-//                                   "every gated symbol has a built shader").
+//                                   (layer.cpp:250/287/322).  This backend has ported ALL NINE (batch 4 lands the
+//                                   three fused paths), so EVERY gated symbol has a shader and the flag answers
+//                                   TRUE - the invariant `case_native_capabilities` enforces.  The fused paths'
+//                                   extra runtime conditions are SETTINGS, not capabilities this backend answers:
+//                                   `g_fused_gdn` defaults true (layer.cpp:42), and `native_bf16_projections`
+//                                   defaults false and is set from `--native-bf16`/`--native` (generate.cpp:2286).
+//                                   Both of their dependencies are ported: the fused step+norm is self-contained,
+//                                   and the conv_l2/ab paths' bf16 dependency is `bf16_mmvf_f32`, which is
+//                                   ported and gated.  So a flag flip cannot route the engine at an unported
+//                                   symbol.  ANSWER: true.
 //
 // THE SETTERS are the engine's option plumbing (`generate.cpp` calls `native_X_set_enabled(o.native_X)`).  On this
 // backend they do NOT decide the answer: the backend reports its own implementation, so a `--native` launch
@@ -66,7 +73,8 @@
 // getters, requires the exact answers above, and requires each ported symbol's .spv to be present - so a
 // capability cannot answer true for a symbol whose shader was deleted.  Its GDN arm is the invariant rather
 // than a hard-coded boolean: `native_gdn_enabled()` must equal "every symbol this flag gates has a built
-// shader" (currently false, because the six unported GDN symbols and the three fused paths have none).
+// shader" (now TRUE, because ALL NINE gated symbols - the six native GDN kernels and the three fused paths -
+// have a shader).
 #if !defined(STRATA_ENABLE_VULKAN)
 #error "native_caps_vk.cpp is the Vulkan backend: compile it only in a -DSTRATA_ENABLE_VULKAN=1 build"
 #endif
@@ -95,13 +103,12 @@ bool native_moe_combine_enabled() { return true; } // native_moe_combine.comp, g
 void native_qsa_set_enabled(bool) { /* see the header note */ }
 bool native_qsa_enabled() { return false; }        // see the header note: shared switch, sibling unported
 
-// ---- native GDN: the flag also gates the UNPORTED three fused paths ----------------------------------------
-// ALL SIX native GDN kernels (`native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate`,
-// `native_gdn_gate`, `native_gdn_step`, `native_gdn_out_norm`) ARE ported and gated, but the SAME flag also
-// selects the three `fused_gdn_*` paths, none of which has a shader - so the answer is false and must stay
-// false while any of them is missing.  This is the "symbol-at-a-time truth" rule; `case_native_capabilities`'s
-// gdn arm asserts the invariant directly.
+// ---- native GDN: ALL NINE gated symbols (six native kernels + three fused paths) are now ported -------------
+// `native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate`, `native_gdn_gate`, `native_gdn_step`,
+// `native_gdn_out_norm` (batches 2-3) AND `fused_gdn_conv_l2`, `fused_gdn_ab`, `fused_gdn_step_norm` (batch 4)
+// all have shaders and gated cases, so the flag answers TRUE.  The fused paths' extra gates (`g_fused_gdn`,
+// `native_bf16_projections`) are engine SETTINGS whose dependencies are ported - see the header note.
 void native_gdn_set_enabled(bool) { /* see the header note */ }
-bool native_gdn_enabled() { return false; }        // see the header note: the three fused_gdn_* paths are unported
+bool native_gdn_enabled() { return true; }         // all nine gated symbols have shaders (six native + three fused)
 
 }  // namespace strata::kernels

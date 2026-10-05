@@ -125,6 +125,43 @@ Timing time_two(Ctx& ctx, VkPipeline pa, const std::vector<const Buf*>& ba, cons
     return t;
 }
 
+// Time an N-KERNEL chain: per batch iteration, record each step in order into the same command buffer
+// (`record_dispatch` inserts the compute->compute barrier between consecutive dispatches).  This is the
+// generalized `time_two`, used for the fused paths' multi-dispatch comparisons (a 3- or 4-kernel legacy/native
+// chain).  The reported figure is the median per-ITERATION time (all dispatches) / batch, directly comparable
+// to a single-dispatch `time_kernel` row.
+struct ChainStep {
+    VkPipeline p;
+    std::vector<const Buf*> bufs;
+    const void* pc;
+    uint32_t pc_bytes;
+    uint32_t groups;
+    uint32_t groups_y;
+};
+Timing time_chain(Ctx& ctx, const std::vector<ChainStep>& steps, int batch, int reps, int warmups) {
+    ctx.record_begin();
+    for (int i = 0; i < batch; ++i)
+        for (const ChainStep& s : steps) ctx.record_dispatch(s.p, s.bufs, s.pc, s.pc_bytes, s.groups, s.groups_y);
+    ctx.record_end_and_submit();
+    for (int w = 0; w < warmups; ++w) ctx.replay_recorded();
+    std::vector<double> ms;
+    ms.reserve((size_t) reps);
+    for (int r = 0; r < reps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ctx.replay_recorded();
+        const auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / (double) batch);
+    }
+    std::sort(ms.begin(), ms.end());
+    Timing t;
+    t.reps = reps;
+    t.batch = batch;
+    t.med = ms[ms.size() / 2];
+    t.lo = ms.front();
+    t.hi = ms.back();
+    return t;
+}
+
 // The one row format.  `elems` is the number of logical output elements the dispatch produces; `macs` is the
 // multiply-accumulate count it performs (0 where the kernel does no reduction, and then the unit is elems/s).
 void report(const char* kernel, const std::string& shape, const Timing& t, double elems, double macs) {
@@ -771,6 +808,185 @@ void bench_gdn_step_pair(Ctx& ctx, const std::string& dir, int reps, int warmups
     ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo);
 }
 
+// =========================================================================================================
+// THE PERFORMANCE TIER, class B, batch 4: the THREE FUSED GDN PATHS.  Each is measured against (a) the
+// multi-dispatch chain it replaces - where a fusion shows, by removing dispatches - and (b) the non-fused
+// native kernel(s) it also replaces, where a comparison exists.  Same XPAIR convention (fused/legacy or
+// fused/chain, < 1.0 means the fused path is faster).
+// =========================================================================================================
+
+void bench_fused_gdn_conv_l2_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int C = 10240, dc = 4, qk = 32, k_heads = 16;      // the model: ssm_conv_channels, 2*ssm_k_heads
+    const size_t hist = (size_t) C * 3;
+    std::vector<float> cs = floats(hist), x = floats((size_t) C), kw = floats((size_t) C * dc);
+    Buf bcs = alloc(ctx, hist * 4), bx = alloc(ctx, (size_t) C * 4), bkw = alloc(ctx, (size_t) C * dc * 4),
+        braw = alloc(ctx, (size_t) C * 4), bh = alloc(ctx, (size_t) C * 4);
+    ctx.write(bcs, cs.data(), hist * 4);
+    ctx.write(bx, x.data(), (size_t) C * 4);
+    ctx.write(bkw, kw.data(), (size_t) C * dc * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "C=%d qk_heads=%d d_conv=4", C, qk);
+    const uint32_t cg = (uint32_t) ((C + 255) / 256);
+    Timing tcs;
+    {   // the single native kernel it also replaces
+        struct { int32_t channels; int32_t d_conv; } pc{C, dc};
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_conv_silu.spv", 5, 8);
+        tcs = time_kernel(ctx, p, {&bcs, &bx, &bkw, &braw, &bh}, &pc, sizeof(pc), cg, 1, 64, reps, warmups);
+        report("native_gdn_conv_silu", shape, tcs, (double) C, 0.0);
+    }
+    Timing tf;
+    {   // the fused path: conv + SiLU + both L2 norms, ONE dispatch
+        struct { int32_t channels; int32_t qk_heads; float eps; } pc{C, qk, 1e-6f};
+        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_conv_l2.spv", 4, 12);
+        tf = time_kernel(ctx, p, {&bcs, &bx, &bkw, &bh}, &pc, sizeof(pc), cg, 1, 64, reps, warmups);
+        report("fused_gdn_conv_l2", shape, tf, (double) C, 0.0);
+    }
+    std::printf("XPAIR gdn_conv_l2 %s | native native_gdn_conv_silu (1 dispatch) | fused fused_gdn_conv_l2 (1) | "
+                "fused/native %.3f\n", shape, tf.med / tcs.med);
+    {   // the chain the fused path replaces: conv_silu -> l2_norm(q) -> l2_norm(k), THREE dispatches
+        struct { int32_t channels; int32_t d_conv; } pcc{C, dc};
+        struct { int32_t rows; int32_t cols; float eps; float inv_sqrt_cols; } pcl{2 * k_heads, 128, 1e-6f,
+                                                                                  1.0f / std::sqrt(128.0f)};
+        VkPipeline pc_ = ctx.pipeline(dir + "/native_gdn_conv_silu.spv", 5, 8);
+        VkPipeline pl_ = ctx.pipeline(dir + "/native_gdn_l2_norm.spv", 1, 16);
+        const uint32_t lg = (uint32_t) (2 * k_heads);
+        Timing tc = time_chain(ctx,
+                               {{pc_, {&bcs, &bx, &bkw, &braw, &bh}, &pcc, sizeof(pcc), cg, 1},
+                                {pl_, {&bh}, &pcl, sizeof(pcl), lg, 1},
+                                {pl_, {&bh}, &pcl, sizeof(pcl), lg, 1}},
+                               64, reps, warmups);
+        report("native_gdn_conv_silu+2x l2_norm (chain)", shape, tc, (double) C, 0.0);
+        std::printf("XPAIR gdn_conv_l2_fused %s | native conv_silu+2x l2_norm (3 dispatches) | fused "
+                    "fused_gdn_conv_l2 (1) | fused/chain %.3f\n", shape, tf.med / tc.med);
+    }
+    ctx.free(bcs); ctx.free(bx); ctx.free(bkw); ctx.free(braw); ctx.free(bh);
+}
+
+void bench_fused_gdn_ab_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int n = 2560, h_v = 48;                            // n_embd, ssm_v_heads
+    auto bf16_of = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t) (u >> 16); };
+    std::vector<float> x = floats((size_t) n);
+    std::vector<uint16_t> wa((size_t) h_v * n), wb((size_t) h_v * n);
+    for (size_t i = 0; i < wa.size(); ++i) {
+        wa[i] = bf16_of(rndf() * 0.1f);
+        wb[i] = bf16_of(rndf() * 0.1f);
+    }
+    std::vector<float> dt = floats((size_t) h_v), a = floats((size_t) h_v);
+    for (auto& v : a) v = -std::fabs(v) - 0.1f;              // ssm_a = -exp(A_log)
+    Buf bx = alloc(ctx, (size_t) n * 4), bwa = alloc(ctx, (size_t) h_v * n * 2), bwb = alloc(ctx, (size_t) h_v * n * 2),
+        bdt = alloc(ctx, (size_t) h_v * 4), bssm = alloc(ctx, (size_t) h_v * 4), balpha = alloc(ctx, (size_t) h_v * 4),
+        bbeta = alloc(ctx, (size_t) h_v * 4), bg = alloc(ctx, (size_t) h_v * 4);
+    ctx.write(bx, x.data(), (size_t) n * 4);
+    ctx.write(bwa, wa.data(), (size_t) h_v * n * 2);
+    ctx.write(bwb, wb.data(), (size_t) h_v * n * 2);
+    ctx.write(bdt, dt.data(), (size_t) h_v * 4);
+    ctx.write(bssm, a.data(), (size_t) h_v * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "h_v=%d n=%d", h_v, n);
+    Timing tm;
+    {   // the bf16 mat-vec it also replaces (one of the two)
+        struct { int32_t n_in; int32_t n_out; } pc{n, h_v};
+        VkPipeline p = ctx.pipeline(dir + "/bf16_mmvf_f32.spv", 3, 8);
+        tm = time_kernel(ctx, p, {&bx, &bwa, &balpha}, &pc, sizeof(pc), (uint32_t) h_v, 1, 64, reps, warmups);
+        report("bf16_mmvf_f32 (alpha)", shape, tm, (double) h_v, 0.0);
+    }
+    Timing tf;
+    {   // the fused path: BOTH bf16 mat-vecs + BOTH epilogues, ONE dispatch
+        struct { int32_t n; int32_t h_v; } pc{n, h_v};
+        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_ab.spv", 7, 8);
+        tf = time_kernel(ctx, p, {&bx, &bwa, &bwb, &bdt, &bssm, &bg, &bbeta}, &pc, sizeof(pc), (uint32_t) (2 * h_v),
+                         1, 64, reps, warmups);
+        report("fused_gdn_ab", shape, tf, (double) (2 * h_v), 0.0);
+    }
+    std::printf("XPAIR gdn_ab %s | bf16 bf16_mmvf_f32 (1 dispatch, one row set) | fused fused_gdn_ab (1, both) | "
+                "fused/mmvf %.3f\n", shape, tf.med / tm.med);
+    {   // the chain the fused path replaces: mmvf(alpha) -> mmvf(beta) -> beta_gate -> gate, FOUR dispatches
+        struct { int32_t n_in; int32_t n_out; } pcm{n, h_v};
+        struct { int32_t n; } pcb{h_v};
+        struct { int32_t heads; } pcg{h_v};
+        VkPipeline pm_ = ctx.pipeline(dir + "/bf16_mmvf_f32.spv", 3, 8);
+        VkPipeline pgb = ctx.pipeline(dir + "/native_gdn_beta_gate.spv", 1, 4);
+        VkPipeline pgn = ctx.pipeline(dir + "/native_gdn_gate.spv", 4, 4);
+        const uint32_t g1 = (uint32_t) h_v, ge = (uint32_t) ((h_v + 255) / 256);
+        Timing tc = time_chain(ctx,
+                               {{pm_, {&bx, &bwa, &balpha}, &pcm, sizeof(pcm), g1, 1},
+                                {pm_, {&bx, &bwb, &bbeta}, &pcm, sizeof(pcm), g1, 1},
+                                {pgb, {&bbeta}, &pcb, sizeof(pcb), ge, 1},
+                                {pgn, {&balpha, &bdt, &bssm, &bg}, &pcg, sizeof(pcg), ge, 1}},
+                               64, reps, warmups);
+        report("2x bf16_mmvf + beta_gate + gate (chain)", shape, tc, (double) (2 * h_v), 0.0);
+        std::printf("XPAIR gdn_ab_fused %s | native 2x bf16_mmvf+beta_gate+gate (4 dispatches) | fused "
+                    "fused_gdn_ab (1) | fused/chain %.3f\n", shape, tf.med / tc.med);
+    }
+    ctx.free(bx); ctx.free(bwa); ctx.free(bwb); ctx.free(bdt); ctx.free(bssm); ctx.free(balpha); ctx.free(bbeta);
+    ctx.free(bg);
+}
+
+void bench_fused_gdn_step_norm_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int S = 128, h_k = 16, h_v = 48;                   // the native wrapper requires S == 128
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st = floats(nstate), q = floats((size_t) h_k * S), k = floats((size_t) h_k * S),
+                        v = floats(no), gate = floats((size_t) h_v), beta = floats((size_t) h_v), z = floats(no),
+                        gamma = floats((size_t) S);
+    for (auto& g : gate) g = -std::fabs(g) - 0.5f;
+    Buf bst = alloc(ctx, nstate * 4), bq = alloc(ctx, (size_t) h_k * S * 4), bk = alloc(ctx, (size_t) h_k * S * 4),
+        bv = alloc(ctx, no * 4), bg = alloc(ctx, (size_t) h_v * 4), bb2 = alloc(ctx, (size_t) h_v * 4),
+        bo = alloc(ctx, no * 4), bz = alloc(ctx, no * 4), bgm = alloc(ctx, (size_t) S * 4), by = alloc(ctx, no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    ctx.write(bz, z.data(), no * 4);
+    ctx.write(bgm, gamma.data(), (size_t) S * 4);
+    char shape[64];
+    std::snprintf(shape, sizeof shape, "S=128 h_k=16 h_v=48 (3 MiB state)");
+    const uint32_t sg = (uint32_t) ((no + 255) / 256);
+    const float scale = 1.0f / std::sqrt((float) S);
+    Timing ts;
+    {   // native_gdn_step (one of the two kernels the fused path replaces)
+        struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pc{S, h_k, h_v, scale};
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+        ts = time_kernel(ctx, p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pc, sizeof(pc), sg, 1, 8, reps, warmups);
+        report("native_gdn_step", shape, ts, (double) no, (double) no * 3.0 * (double) S);
+    }
+    Timing tn;
+    {   // native_gdn_out_norm (the other one)
+        struct { int32_t heads; int32_t S; float eps; } pc{h_v, S, 1e-6f};
+        VkPipeline p = ctx.pipeline(dir + "/native_gdn_out_norm.spv", 4, 12);
+        tn = time_kernel(ctx, p, {&bo, &bz, &bgm, &by}, &pc, sizeof(pc), (uint32_t) h_v, 1, 64, reps, warmups);
+        report("native_gdn_out_norm", shape, tn, (double) no, 0.0);
+    }
+    Timing tf;
+    {   // the fused path: step + closing norm, ONE dispatch
+        struct { int32_t S; int32_t h_k; int32_t h_v; float eps; } pc{S, h_k, h_v, 1e-6f};
+        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_step_norm.spv", 9, 16);
+        tf = time_kernel(ctx, p, {&bst, &bq, &bk, &bv, &bg, &bb2, &bz, &bgm, &by}, &pc, sizeof(pc), sg, 1, 8, reps,
+                         warmups);
+        report("fused_gdn_step_norm", shape, tf, (double) no, (double) no * 3.0 * (double) S);
+    }
+    std::printf("XPAIR gdn_step_norm_step %s | native native_gdn_step (1 dispatch) | fused fused_gdn_step_norm "
+                "(1) | fused/native %.3f\n", shape, tf.med / ts.med);
+    std::printf("XPAIR gdn_step_norm_out %s | native native_gdn_out_norm (1 dispatch) | fused "
+                "fused_gdn_step_norm (1) | fused/native %.3f\n", shape, tf.med / tn.med);
+    {   // the chain the fused path replaces: native_gdn_step -> native_gdn_out_norm, TWO dispatches
+        struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pcs{S, h_k, h_v, scale};
+        struct { int32_t heads; int32_t S; float eps; } pcn{h_v, S, 1e-6f};
+        VkPipeline ps_ = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+        VkPipeline pn_ = ctx.pipeline(dir + "/native_gdn_out_norm.spv", 4, 12);
+        Timing tc = time_chain(ctx,
+                               {{ps_, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pcs, sizeof(pcs), sg, 1},
+                                {pn_, {&bo, &bz, &bgm, &by}, &pcn, sizeof(pcn), (uint32_t) h_v, 1}},
+                               8, reps, warmups);
+        report("native_gdn_step+native_gdn_out_norm (chain)", shape, tc, (double) no, (double) no * 3.0 * (double) S);
+        std::printf("XPAIR gdn_step_norm_fused %s | native step+out_norm (2 dispatches) | fused "
+                    "fused_gdn_step_norm (1) | fused/chain %.3f\n", shape, tf.med / tc.med);
+    }
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2);
+    ctx.free(bo); ctx.free(bz); ctx.free(bgm); ctx.free(by);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -861,6 +1077,11 @@ int main(int argc, char** argv) {
     bench_gdn_gate_pair(ctx, dir, reps, warmups);
     bench_gdn_out_norm_pair(ctx, dir, reps, warmups);
     bench_gdn_step_pair(ctx, dir, reps, warmups);
+    // PERFORMANCE TIER, batch 4: the THREE FUSED GDN PATHS, each against the multi-dispatch chain it replaces and
+    // against the non-fused native kernel(s) where a comparison exists.
+    bench_fused_gdn_conv_l2_pair(ctx, dir, reps, warmups);
+    bench_fused_gdn_ab_pair(ctx, dir, reps, warmups);
+    bench_fused_gdn_step_norm_pair(ctx, dir, reps, warmups);
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a

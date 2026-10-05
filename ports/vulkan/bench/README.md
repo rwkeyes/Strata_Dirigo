@@ -105,6 +105,9 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `gdn_out_norm` vs `native_gdn_out_norm` | h_v=48 S=128 | elements/s |
 | `gdn_step` vs `native_gdn_step` | S=128 h_k=16 h_v=48 (3 MiB state) | GMAC/s (3·S MACs per output) |
 | `scale`+`gdn_step` vs `native_gdn_step` | S=128 h_k=16 h_v=48 (the 2-dispatch legacy chain) | GMAC/s |
+| `fused_gdn_conv_l2` vs `native_gdn_conv_silu`+2× `native_gdn_l2_norm` | C=10240 qk_heads=32 d_conv=4 (the 3-dispatch native chain) | elements/s |
+| `fused_gdn_ab` vs 2× `bf16_mmvf_f32` + `native_gdn_beta_gate` + `native_gdn_gate` | h_v=48 n=2560 (the 4-dispatch chain) | elements/s |
+| `fused_gdn_step_norm` vs `native_gdn_step` + `native_gdn_out_norm` | S=128 h_k=16 h_v=48 (3 MiB state; the 2-dispatch chain) | GMAC/s |
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
@@ -245,6 +248,63 @@ means the native kernel is faster**; `reps=9`.
 * **A native kernel is not required to be faster.**  The batch's value for these two is that the ONE
   `native_gdn_enabled()` flag now has all three of its simple mixer stages on the native arithmetic path; the
   flag stays false until the six remaining gated symbols land (see `NEXT.md`).
+
+### The class-B FUSED GDN PATHS, batch 4 — measured 2026-10-05
+
+The three fused mixer paths, each timed against the **multi-dispatch chain it replaces** (that is where a fusion
+shows — the batches so far found the win is in REMOVING DISPATCHES) and against the non-fused native kernel(s)
+where a comparison exists.  Same `XPAIR` convention (`fused/legacy`, **< 1.0 means the fused path is faster**);
+`reps=9`.  Each fused path is ONE recorded dispatch; the chains are recorded with a compute→compute barrier
+between dispatches (`time_chain`).
+
+| pair (fused ← what it replaces) | vega Arc B70 (ms) fused/chain | ratio | Ryzen iGPU | ratio | llvmpipe (vega) | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `fused_gdn_conv_l2` ← conv_silu + 2× l2_norm (**3 dispatches**) | 0.0059 / 0.0131 | **0.452** | 0.0212 / 0.0298 | **0.712** | 0.0705 / 0.1259 | **0.560** |
+| `fused_gdn_conv_l2` ← `native_gdn_conv_silu` (1 dispatch) | 0.0059 / 0.0053 | 1.122 | 0.0212 / 0.0235 | 0.903 | 0.0705 / 0.0252 | 2.803 |
+| `fused_gdn_ab` ← 2× bf16_mmvf + beta_gate + gate (**4 dispatches**) | 0.0075 / 0.0188 | **0.398** | 0.0240 / 0.0273 | **0.878** | 0.1319 / 0.1773 | **0.744** |
+| `fused_gdn_ab` ← `bf16_mmvf_f32` (1, one row set) | 0.0075 / 0.0066 | 1.136 | 0.0240 / 0.0128 | 1.868 | 0.1319 / 0.0742 | 1.776 |
+| `fused_gdn_step_norm` ← native_gdn_step + native_gdn_out_norm (**2 dispatches**) | 0.0442 / 0.0476 | **0.929** | 0.4148 / 0.4202 | **0.987** | 0.4247 / 0.4566 | **0.930** |
+| `fused_gdn_step_norm` ← `native_gdn_step` (1 dispatch) | 0.0442 / 0.0433 | 1.021 | 0.4148 / 0.4154 | 0.998 | 0.4247 / 0.3887 | 1.092 |
+| `fused_gdn_step_norm` ← `native_gdn_out_norm` (1; NOT like-for-like) | 0.0442 / 0.0059 | 7.533 | 0.4148 / 0.0065 | 63.722 | 0.4247 / 0.0683 | 6.220 |
+
+The same rows on the **box `z820b`** (RX 7900 XTX / RADV NAVI31 and Quadro K620 / NVIDIA):
+
+| pair (fused ← what it replaces) | XTX (ms) fused / chain | ratio | K620 (ms) | ratio | llvmpipe (box) | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `fused_gdn_conv_l2` ← conv_silu + 2× l2_norm (3) | 0.0026 / 0.0045 | **0.584** | 0.0163 / 0.0298 | **0.547** | 0.1845 / 0.3691 | **0.500** |
+| `fused_gdn_conv_l2` ← `native_gdn_conv_silu` (1) | 0.0026 / 0.0022 | 1.175 | 0.0163 / 0.0150 | 1.089 | 0.1845 / 0.1206 | 1.530 |
+| `fused_gdn_ab` ← 2× bf16_mmvf + beta_gate + gate (4) | 0.0030 / 0.0065 | **0.466** | 0.0289 / 0.0332 | **0.869** | 0.2731 / 0.4293 | **0.636** |
+| `fused_gdn_ab` ← `bf16_mmvf_f32` (1, one row set) | 0.0030 / 0.0032 | 0.946 | 0.0289 / 0.0147 | 1.969 | 0.2731 / 0.1563 | 1.747 |
+| `fused_gdn_step_norm` ← step + out_norm (2) | 0.0509 / 0.0507 | 1.003 | 0.3597 / 0.3620 | **0.994** | 0.9909 / 1.0932 | **0.906** |
+| `fused_gdn_step_norm` ← `native_gdn_step` (1) | 0.0509 / 0.0504 | 1.009 | 0.3597 / 0.3550 | 1.013 | 0.9909 / 0.9337 | 1.061 |
+| `fused_gdn_step_norm` ← `native_gdn_out_norm` (1; NOT like-for-like) | 0.0509 / 0.0028 | 17.945 | 0.3597 / 0.0123 | 29.310 | 0.9909 / 0.1443 | 6.867 |
+
+**And the ONE non-win it produced, reported as measured: the XTX's `fused_gdn_step_norm` chain pair reads 1.003**
+(0.0509 vs 0.0507 ms) — a wash inside run noise.  The XTX's step is fast and memory-bound (0.050 ms for 3 MiB),
+so the second dispatch (`native_gdn_out_norm`, 0.0028 ms) fits inside the same fence window and the fusion buys
+nothing there — the SAME effect batch 3 measured for the XTX's `scale`+`gdn_step` chain (1.022).  Every other
+chain pair on every other device is a win (0.466–0.994).
+
+**The honest reading, including the pairs that are NOT wins.**
+
+* **Every fused path BEATS the multi-dispatch chain it replaces on every device measured, with ONE exception at a
+  wash (0.398–1.003).**  The conv+L2 path is 1.7–2.2× the `native_gdn_conv_silu`+`2× native_gdn_l2_norm` chain;
+  the AB path is 1.15–2.5× the `2× bf16_mmvf + beta_gate + gate` chain; the step+norm path is ~1.01–1.13× the
+  `native_gdn_step + native_gdn_out_norm` chain SAVE the XTX, where that pair reads **1.003** (a wash — the XTX's
+  memory-bound step leaves no room for a 0.0028 ms second dispatch to matter; see above).  This is the same
+  finding as batches 2–3: a fusion's win here is the dispatches it removes, not arithmetic.
+* **The fused-vs-SINGLE-native rows are washes-to-slower, and that is expected.**  Per dispatch the fused path
+  does MORE than any one kernel it replaces: `fused_gdn_conv_l2` reads the conv inputs and writes the normed
+  output (1.122 / 0.903 / 2.803 the `native_gdn_conv_silu` it also subsumes); `fused_gdn_ab` does BOTH mat-vecs
+  and BOTH epilogues (1.136 / 1.868 / 1.776 one `bf16_mmvf_f32`); `fused_gdn_step_norm` does the whole step PLUS
+  the norm (1.021 / 0.998 / 1.092 `native_gdn_step`).  Recorded as measured, not tuned.
+* **The fused-vs-`native_gdn_out_norm` row (6.2–63.7) is NOT a like-for-like fusion ratio.**  The fused dispatch
+  still carries the whole 3 MiB step (~0.42 ms) while the standalone out_norm is a ~0.006 ms 48-workgroup
+  elementwise pass — the ratio is the step's cost over a ~70× smaller kernel.  Printed so the reader sees it;
+  the like-for-like comparator is the two-dispatch chain above.
+* **The llvmpipe conv/L2 rows are above the fence-clock floor for the chain and near it for the fused path**, so
+  the CPU driver's 2.803-vs-`native_gdn_conv_silu` is a floor/toolchain artifact of comparing one fused pass
+  against one smaller pass, not a device result; the CHAIN ratio (0.560) is the meaningful llvmpipe number.
 
 ### The class-B NATIVE vs LEGACY pairs, batch 3 — the REST of the GDN / DeltaNet MIXER — measured 2026-10-05
 

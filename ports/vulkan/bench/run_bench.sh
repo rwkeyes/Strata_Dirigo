@@ -30,7 +30,8 @@ KERNELS=(gdn_conv_step gdn_l2_norm gdn_beta_gate gdn_gate gdn_step gdn_out_norm 
          rope_neox native_rope_apply router_top10_f32 native_router_top10
          moe_combine_f32 native_moe_combine rms_norm native_qsa_rms_norm_weighted
          silu_f32 native_gdn_conv_silu native_gdn_l2_norm native_gdn_beta_gate
-         native_gdn_gate native_gdn_out_norm native_gdn_step)
+         native_gdn_gate native_gdn_out_norm native_gdn_step bf16_mmvf_f32
+         fused_gdn_conv_l2 fused_gdn_ab fused_gdn_step_norm)
 
 rc=0
 echo "== compiling the measured kernels from source -> $SPV"
