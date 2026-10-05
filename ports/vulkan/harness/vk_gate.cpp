@@ -48,6 +48,9 @@
 #include "strata/kernels/qsa.hpp"            // I4: kv_append_step / kv_gather_step (the fp16 KV cache)
 #include "strata/kernels/qsa_select.hpp"     // QSA/attention batch: qsa_block_scores / qsa_block_topk
 #include "strata/kernels/rope.hpp"           // QSA/attention batch: rope_neox_apply
+#include "strata/kernels/gr.hpp"             // PLE/GR batch: gr_read / gr_write / gr_workspace_init
+#include "strata/kernels/ple.hpp"            // PLE/GR batch: ple_block / ple_history_advance / ple_block_scratch_bytes
+#include "strata/kernels/router_top10.hpp"   // PLE/GR batch: router_top10 (the generic MoE router)
 
 #include <algorithm>
 #include <cmath>
@@ -17866,6 +17869,673 @@ void case_qsa_decode_attn(Ctx& ctx, const std::string& dir) {
     qsa_decode_attn_arm(ctx, dir, 8, 16, true, "page_size=8, 16 ids, 2 pages masked");
 }
 
+// ============================================================================================================
+// THE PLE / GR SHARED STAGES AND THE MoE ROUTING ROWS (vulkan/src/kernels/ple_vk.cpp)
+// ============================================================================================================
+//
+// Every case here runs the port's EXISTING fixture twice: (A) the SHADER PATH on the harness device, (B) the
+// ENGINE WRAPPER `strata::kernels::<symbol>` on its own engine stream (`EnginePin`-pinned), and asserts (C) the
+// wrapper's answer equals the shader path's BITWISE and (D) equals the case's explicit oracle.  THE ORACLE IS A
+// TRANSCRIPTION OF THE ENGINE'S OWN RULE (the .cu body), not of the shader - so a shared shader/oracle mistake
+// cannot agree with itself and pass.  Where a fixture arms a RIVAL READING it is given its own DISTINCT
+// observable, and a host-side margin proves the rival MOVES the reference (a decorative arm is not a margin).
+
+// #1 `gr_write` (layer.cpp:1261/:1195/:1329) -> gr_write.spv.  Rule: `out[i] = R[i] + block_out[d]*w[c]`,
+// `w[c] = 2*sigmoid(inject[c]/hc)`, block_out added to EVERY stream identically.  Fixture: case_gr_write's, with
+// inject ~ O(hc) so the sigmoid sits in its RESPONSIVE band.  THREE rivals, each with its own observable:
+// (i) drop the 2 (breaks the centring on 1), (ii) drop the /hc, (iii) read block_out PER STACK ELEMENT
+// (`bo[i]`) instead of per column (`bo[i % n_embd]`).  The zero-inject property (`w == 1` EXACTLY) is a
+// separate arm.
+void case_gr_write_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "gr_write.spv")) return;
+    struct Shape { int n_embd, hc; };
+    const Shape shapes[] = {{2560, 4}, {64, 3}};
+    for (const Shape& sh : shapes) {
+        const int n_embd = sh.n_embd, hc = sh.hc;
+        const size_t n = (size_t) hc * n_embd;
+        const float NaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> R(n), bo(n_embd), inj(hc), bo_stack(n);
+        for (size_t i = 0; i < n; ++i) R[i] = rndf(1.0f);
+        for (int d = 0; d < n_embd; ++d) bo[d] = rndf(0.5f);
+        for (size_t i = 0; i < n; ++i) bo_stack[i] = rndf(0.5f);   // the "per stack element" rival's own reading
+        for (int c = 0; c < hc; ++c)
+            inj[c] = (c % 3 == 0) ? 0.0f : (float) hc * (0.5f + 0.5f * (float) (rnd() % 1000) / 1000.0f);
+        auto sig = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+        std::vector<float> ref(n), ref_zero(n), r_drop2(n), r_nodiv(n), r_bostack(n);
+        for (size_t i = 0; i < n; ++i) {
+            const int c = (int) (i / n_embd), d = (int) (i % n_embd);
+            const double w = 2.0 * sig((double) inj[c] / (double) hc);
+            ref[i] = (float) ((double) R[i] + (double) bo[d] * w);
+            ref_zero[i] = (float) ((double) R[i] + (double) bo[d]);
+            r_drop2[i] = (float) ((double) R[i] + (double) bo[d] * sig((double) inj[c] / (double) hc));
+            r_nodiv[i] = (float) ((double) R[i] + (double) bo[d] * 2.0 * sig((double) inj[c]));
+            r_bostack[i] = (float) ((double) R[i] + (double) bo_stack[i] * w);
+        }
+        const bool drop2_moves = rel_l1_f(r_drop2, ref) > 0.05;
+        const bool nodiv_moves = rel_l1_f(r_nodiv, ref) > 0.05;
+        const bool bostack_moves = rel_l1_f(r_bostack, ref) > 0.05;
+
+        Buf bR = ctx.alloc(n * 4), bbo = ctx.alloc((size_t) n_embd * 4), binj = ctx.alloc((size_t) hc * 4),
+            bout = ctx.alloc(n * 4);
+        ctx.write(bR, R.data(), n * 4);
+        ctx.write(bbo, bo.data(), (size_t) n_embd * 4);
+        ctx.write(binj, inj.data(), (size_t) hc * 4);
+        std::vector<float> init(n, NaN);
+        ctx.write(bout, init.data(), n * 4);
+        {
+            VkPipeline p = ctx.pipeline(dir + "/gr_write.spv", 4, 8);
+            struct { int32_t n_embd, hc; } pc{n_embd, hc};
+            ctx.dispatch(p, {&bR, &bbo, &binj, &bout}, &pc, sizeof(pc), groups_for(n) + 1u);
+        }
+        std::vector<float> ref_y(n);
+        ctx.read(bout, ref_y.data(), n * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) {
+            verdict("gr_write entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+            ctx.free(bR); ctx.free(bbo); ctx.free(binj); ctx.free(bout); return;
+        }
+        float* dR = strata::vulkan::arena_alloc<float>(*s, n);
+        float* dbo = strata::vulkan::arena_alloc<float>(*s, (size_t) n_embd);
+        float* dinj = strata::vulkan::arena_alloc<float>(*s, (size_t) hc);
+        strata::vulkan::stream_write(*s, dR, R.data(), n * 4);
+        strata::vulkan::stream_write(*s, dbo, bo.data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_write(*s, dinj, inj.data(), (size_t) hc * 4);
+        strata::kernels::GrShapes gs{}; gs.n_embd = n_embd; gs.hc = hc; gs.hc_lr = 0;
+        strata::kernels::gr_write(dR, dbo, dinj, gs, dR, s);   // IN PLACE (the engine's own shape)
+        std::vector<float> got(n);
+        strata::vulkan::stream_read(*s, dR, got.data(), n * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < n; ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "gr_write entry (n_embd=%d hc=%d): engine wrapper == shader path, bitwise", n_embd, hc);
+        verdict(tag, bad_bw == 0, bad_bw, (int) n, 0.0, "words differ - the wrapper's dispatch does not match the ported shader's own path");
+        int bad = 0, prop_bad = 0; double worst = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double tol = 2e-6 * std::fabs((double) ref[i]) + 1e-7;
+            if (std::fabs((double) got[i] - (double) ref[i]) > tol) ++bad;
+            worst = std::max(worst, std::fabs((double) got[i] - (double) ref[i]) / tol);
+        }
+        for (int d = 0; d < n_embd; ++d) if (got[d] != ref_zero[d]) ++prop_bad;   // stream 0 has inject 0
+        std::snprintf(tag, sizeof tag, "gr_write entry (n_embd=%d hc=%d): wrapper vs the engine rule (double), zero-inject EXACT", n_embd, hc);
+        verdict(tag, bad == 0 && prop_bad == 0 && drop2_moves && nodiv_moves && bostack_moves,
+                bad + prop_bad + (drop2_moves ? 0 : 1) + (nodiv_moves ? 0 : 1) + (bostack_moves ? 0 : 1), (int) n, worst,
+                "vs gr.cu's rule; margins: drop-2 / drop-/hc / per-stack-element block_out must each move it");
+        if (!drop2_moves) std::printf("      FIXTURE: dropping the 2 does not move the output\n");
+        if (!nodiv_moves) std::printf("      FIXTURE: dropping the /hc does not move the output\n");
+        if (!bostack_moves) std::printf("      FIXTURE: the per-stack-element block_out rival does not move the output\n");
+        ctx.free(bR); ctx.free(bbo); ctx.free(binj); ctx.free(bout);
+    }
+}
+
+// #2 `ple_block` (layer.cpp:1208) -> quantize_q8_0 + s2_gemv_q8 (key), f32_to_bf16 + bf16_gemv (value), then
+// gnorm/gate/bcast/gnorm/conv/add3.  THE KEY AND VALUE PROJECTIONS ARE PART OF THIS SYMBOL, so the shader path
+// reconstructs the WHOLE nine-dispatch chain.  The oracle for the post-ops is the ENGINE'S OWN RULE fed the
+// DEVICE's own key/value (`ple.cu`'s chain), which is the port's "the oracle is fed the device's input for that
+// stage" method - so a shared mistake would have to live in the RULE.  Two rivals with their own observables:
+// the conv's row-FASTEST history (`hist[row + nhist*c]`, not `hist[c*nhist + row]`), and `normalized` (not
+// `gated`) as the conv input.
+void case_ple_block_entry(Ctx& ctx, const std::string& dir) {
+    for (const char* spv : {"quantize_q8_0.spv", "s2_gemv_q8.spv", "f32_to_bf16.spv", "bf16_gemv.spv",
+                            "ple_gnorm.spv", "ple_gate.spv", "ple_bcast.spv", "ple_conv.spv", "add3.spv", "copy.spv"})
+        if (!have(dir, spv)) return;
+    if (!ctx.info().storage_buffer_8bit || !ctx.info().storage_buffer_16bit) {
+        skip("ple_block", "device lacks 8-bit/16-bit storage for the S2 key projection");
+        return;
+    }
+    const int n_embd = 2560, hc = 4, hc_dim = 10240, kern = 4, dil = 3, nhist = 9;
+    const float eps = 1e-6f;
+
+    std::vector<float> emb(n_embd), hidden(hc_dim), hist((size_t) nhist * hc_dim);
+    std::vector<float> w_key(hc_dim), w_query(hc_dim), w_conv(hc_dim);
+    for (int i = 0; i < n_embd; ++i) emb[i] = rndf(1.0f);
+    for (int i = 0; i < hc_dim; ++i) {
+        hidden[i] = rndf(1.0f) * 2.0f;
+        w_key[i] = 1.0f + 0.25f * rndf(1.0f);
+        w_query[i] = 1.0f + 0.25f * rndf(1.0f);
+        w_conv[i] = 1.0f + 0.25f * rndf(1.0f);
+    }
+    for (size_t i = 0; i < hist.size(); ++i) hist[i] = rndf(1.0f);
+    std::vector<uint8_t> key_codes((size_t) hc_dim * (n_embd / 4));
+    for (size_t i = 0; i < key_codes.size(); ++i) key_codes[i] = (uint8_t) ((i * 37 + 11) & 0xFF);
+    std::vector<float> key_scales((size_t) hc_dim * (n_embd / 64));
+    for (int o = 0; o < hc_dim; ++o)
+        for (int g = 0; g < n_embd / 64; ++g)
+            key_scales[(size_t) o * (n_embd / 64) + g] = 0.0625f * (float) ((o + g) % 7 + 1);
+    std::vector<uint16_t> value_bf16((size_t) n_embd * n_embd);
+    for (size_t i = 0; i < value_bf16.size(); ++i) value_bf16[i] = bf16_from_f32(0.02f * rndf(1.0f));
+    std::vector<uint16_t> kw((size_t) kern * hc_dim);
+    for (size_t i = 0; i < kw.size(); ++i) kw[i] = strata::kernels::f16_from_f32(0.5f * rndf(1.0f));
+
+    // ---- the SHADER PATH: the full nine-dispatch chain on the harness device ----
+    Buf b_emb = ctx.alloc((size_t) n_embd * 4), b_act = ctx.alloc((size_t) (n_embd / 32) * 34);
+    Buf b_codes = ctx.alloc(key_codes.size()), b_scales = ctx.alloc(key_scales.size() * 4);
+    Buf b_key = ctx.alloc((size_t) hc_dim * 4), b_wk = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_hidden = ctx.alloc((size_t) hc_dim * 4), b_query = ctx.alloc((size_t) hc_dim * 4), b_wq = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_emb16 = ctx.alloc((size_t) n_embd * 2), b_value = ctx.alloc((size_t) n_embd * 4), b_vb = ctx.alloc((size_t) n_embd * n_embd * 2);
+    Buf b_gate = ctx.alloc((size_t) hc * 4), b_gated = ctx.alloc((size_t) hc_dim * 4), b_norm = ctx.alloc((size_t) hc_dim * 4);
+    Buf b_conv = ctx.alloc((size_t) hc_dim * 4), b_wcv = ctx.alloc((size_t) hc_dim * 4), b_kw = ctx.alloc((size_t) kern * hc_dim * 2);
+    Buf b_hist = ctx.alloc((size_t) nhist * hc_dim * 4), b_result = ctx.alloc((size_t) hc_dim * 4);
+    ctx.write(b_emb, emb.data(), (size_t) n_embd * 4);
+    ctx.write(b_codes, key_codes.data(), key_codes.size());
+    ctx.write(b_scales, key_scales.data(), key_scales.size() * 4);
+    ctx.write(b_wk, w_key.data(), (size_t) hc_dim * 4);
+    ctx.write(b_hidden, hidden.data(), (size_t) hc_dim * 4);
+    ctx.write(b_wq, w_query.data(), (size_t) hc_dim * 4);
+    ctx.write(b_vb, value_bf16.data(), (size_t) n_embd * n_embd * 2);
+    ctx.write(b_wcv, w_conv.data(), (size_t) hc_dim * 4);
+    ctx.write(b_kw, kw.data(), (size_t) kern * hc_dim * 2);
+    ctx.write(b_hist, hist.data(), (size_t) nhist * hc_dim * 4);
+    {
+        struct { int32_t n_blocks; } pc{n_embd / 32};
+        VkPipeline p = ctx.pipeline(dir + "/quantize_q8_0.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_emb, &b_act}, &pc, sizeof(pc), groups_for((uint64_t) (n_embd / 32)));
+    }
+    {
+        struct { int32_t n_in, n_out; } pc{n_embd, hc_dim};
+        VkPipeline p = ctx.pipeline(dir + "/s2_gemv_q8.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_act, &b_codes, &b_scales, &b_key}, &pc, sizeof(pc), (uint32_t) hc_dim);
+    }
+    {
+        struct { int32_t rows, cols; float eps; } pc{hc, n_embd, eps};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gnorm.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_key, &b_wk}, &pc, sizeof(pc), (uint32_t) hc);   // key: in place
+    }
+    ctx.write(b_query, hidden.data(), (size_t) hc_dim * 4);
+    {
+        struct { int32_t rows, cols; float eps; } pc{hc, n_embd, eps};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gnorm.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_query, &b_wq}, &pc, sizeof(pc), (uint32_t) hc);
+    }
+    {
+        struct { int32_t n; } pc{n_embd};
+        VkPipeline p = ctx.pipeline(dir + "/f32_to_bf16.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_emb, &b_emb16}, &pc, sizeof(pc), groups_for((uint64_t) n_embd));
+    }
+    {
+        struct { int32_t n_in, n_out; } pc{n_embd, n_embd};
+        VkPipeline p = ctx.pipeline(dir + "/bf16_gemv.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_emb16, &b_vb, &b_value}, &pc, sizeof(pc), (uint32_t) n_embd + 1u);
+    }
+    {
+        struct { int32_t streams, n; float inv_sqrt_n; } pc{hc, n_embd, 1.0f / std::sqrt((float) n_embd)};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gate.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_key, &b_query, &b_gate}, &pc, sizeof(pc), (uint32_t) hc);
+    }
+    {
+        struct { int32_t n, hc; } pc{n_embd, hc};
+        VkPipeline p = ctx.pipeline(dir + "/ple_bcast.spv", 3, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_value, &b_gate, &b_gated}, &pc, sizeof(pc), groups_for((uint64_t) hc_dim));
+    }
+    ctx.write(b_norm, w_conv.data(), 0);   // (no-op; the copy below fills it)
+    {   // gnorm(gated -> normalized): the port's gnorm is in place, so copy first
+        std::vector<float> g(hc_dim);
+        ctx.read(b_gated, g.data(), (size_t) hc_dim * 4);
+        ctx.write(b_norm, g.data(), (size_t) hc_dim * 4);
+        struct { int32_t rows, cols; float eps; } pc{hc, n_embd, eps};
+        VkPipeline p = ctx.pipeline(dir + "/ple_gnorm.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_norm, &b_wcv}, &pc, sizeof(pc), (uint32_t) hc);
+    }
+    {
+        struct { int32_t hc_dim, kern, dil, nhist; } pc{hc_dim, kern, dil, nhist};
+        VkPipeline p = ctx.pipeline(dir + "/ple_conv.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_hist, &b_norm, &b_kw, &b_conv}, &pc, sizeof(pc), groups_for((uint64_t) hc_dim));
+    }
+    {
+        struct { int32_t n; } pc{hc_dim};
+        VkPipeline p = ctx.pipeline(dir + "/add3.spv", 4, (int) sizeof(pc));
+        ctx.dispatch(p, {&b_hidden, &b_gated, &b_conv, &b_result}, &pc, sizeof(pc), groups_for((uint64_t) hc_dim));
+    }
+    std::vector<float> sf_key(hc_dim), sf_value(n_embd), sf_gate(hc), sf_gated(hc_dim), sf_norm(hc_dim), sf_conv(hc_dim), sf_result(hc_dim);
+    ctx.read(b_key, sf_key.data(), (size_t) hc_dim * 4);
+    ctx.read(b_value, sf_value.data(), (size_t) n_embd * 4);
+    ctx.read(b_gate, sf_gate.data(), (size_t) hc * 4);
+    ctx.read(b_gated, sf_gated.data(), (size_t) hc_dim * 4);
+    ctx.read(b_norm, sf_norm.data(), (size_t) hc_dim * 4);
+    ctx.read(b_conv, sf_conv.data(), (size_t) hc_dim * 4);
+    ctx.read(b_result, sf_result.data(), (size_t) hc_dim * 4);
+
+    // ---- the ENGINE WRAPPER, with every export requested ----
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("ple_block entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        return;
+    }
+    float* d_emb = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    float* d_hidden = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* d_hist = strata::vulkan::arena_alloc<float>(*s, (size_t) nhist * hc_dim);
+    uint8_t* d_codes = strata::vulkan::arena_alloc<uint8_t>(*s, key_codes.size());
+    float* d_scales = strata::vulkan::arena_alloc<float>(*s, key_scales.size());
+    uint16_t* d_vb = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) n_embd * n_embd);
+    float* d_wk = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* d_wq = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* d_wcv = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    uint16_t* d_kw = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) kern * hc_dim);
+    uint8_t* d_scratch = strata::vulkan::arena_alloc<uint8_t>(*s, strata::kernels::ple_block_scratch_bytes());
+    float* o_key = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* o_value = strata::vulkan::arena_alloc<float>(*s, n_embd);
+    float* o_gate = strata::vulkan::arena_alloc<float>(*s, hc);
+    float* o_gated = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* o_norm = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* o_conv = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    float* o_result = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    strata::vulkan::stream_write(*s, d_emb, emb.data(), (size_t) n_embd * 4);
+    strata::vulkan::stream_write(*s, d_hidden, hidden.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_write(*s, d_hist, hist.data(), (size_t) nhist * hc_dim * 4);
+    strata::vulkan::stream_write(*s, d_codes, key_codes.data(), key_codes.size());
+    strata::vulkan::stream_write(*s, d_scales, key_scales.data(), key_scales.size() * 4);
+    strata::vulkan::stream_write(*s, d_vb, value_bf16.data(), (size_t) n_embd * n_embd * 2);
+    strata::vulkan::stream_write(*s, d_wk, w_key.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_write(*s, d_wq, w_query.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_write(*s, d_wcv, w_conv.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_write(*s, d_kw, kw.data(), (size_t) kern * hc_dim * 2);
+    strata::kernels::PleWeights w{};
+    w.key_codes = d_codes; w.key_scales = d_scales; w.value_bf16 = d_vb;
+    w.norm_key = d_wk; w.norm_query = d_wq; w.norm_conv = d_wcv; w.conv1d_f16 = d_kw;
+    strata::kernels::PleOut out{};
+    out.key = o_key; out.value = o_value; out.gate = o_gate; out.gated = o_gated;
+    out.normalized = o_norm; out.conv = o_conv; out.result = o_result;
+    strata::kernels::ple_block(d_emb, d_hidden, d_hist, w, out, d_scratch, s);   // THE ENGINE WRAPPER
+    std::vector<float> g_key(hc_dim), g_value(n_embd), g_gate(hc), g_gated(hc_dim), g_norm(hc_dim), g_conv(hc_dim), g_result(hc_dim);
+    strata::vulkan::stream_read(*s, o_key, g_key.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_read(*s, o_value, g_value.data(), (size_t) n_embd * 4);
+    strata::vulkan::stream_read(*s, o_gate, g_gate.data(), (size_t) hc * 4);
+    strata::vulkan::stream_read(*s, o_gated, g_gated.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_read(*s, o_norm, g_norm.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_read(*s, o_conv, g_conv.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_read(*s, o_result, g_result.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_close(s);
+
+    auto bitcount = [](const std::vector<float>& a, const std::vector<float>& b) {
+        int bad = 0;
+        for (size_t i = 0; i < a.size(); ++i) { uint32_t x, y; std::memcpy(&x, &a[i], 4); std::memcpy(&y, &b[i], 4); if (x != y) ++bad; }
+        return bad;
+    };
+    struct Ex { const char* name; const std::vector<float>* sf; const std::vector<float>* en; };
+    const Ex ex[] = {{"key", &sf_key, &g_key}, {"value", &sf_value, &g_value}, {"gate", &sf_gate, &g_gate},
+                     {"gated", &sf_gated, &g_gated}, {"normalized", &sf_norm, &g_norm}, {"conv", &sf_conv, &g_conv},
+                     {"result", &sf_result, &g_result}};
+    int total_bad = 0;
+    char tag[160];
+    for (const Ex& e : ex) {
+        const int bb = bitcount(*e.sf, *e.en);
+        total_bad += bb;
+        std::snprintf(tag, sizeof tag, "ple_block entry: engine wrapper == shader path, bitwise (%s)", e.name);
+        verdict(tag, bb == 0, bb, (int) e.sf->size(), (double) bb, "words differ from the ported shader chain");
+    }
+    (void) total_bad;
+
+    // ---- ORACLE: the engine's own post-op rule fed the DEVICE's own key/value ----
+    std::vector<float> o_gate2(hc), o_gated2(hc_dim), o_norm2(hc_dim), o_conv2(hc_dim);
+    std::vector<float> qn(hc_dim);   // the query the gate consumes is gnorm(hidden), rebuilt from the SAME rule
+    ple_gnorm_host(hidden, w_query, qn, hc, n_embd, eps);
+    ple_gate_host(sf_key, qn, o_gate2, hc, n_embd);
+    ple_bcast_host(sf_value, o_gate2, o_gated2, n_embd, hc);
+    ple_gnorm_host(o_gated2, w_conv, o_norm2, hc, n_embd, eps);
+    ple_conv_host(hist, o_norm2, kw, o_conv2, hc_dim, kern, dil, nhist);
+    int bad = 0; double worst = 0;
+    for (int i = 0; i < hc_dim; ++i) {
+        const double want = (double) hidden[i] + (double) o_gated2[i] + (double) o_conv2[i];
+        const double dev = (double) sf_result[i];
+        const double tol = 1e-4 * std::fabs(want) + 2e-3 * (std::fabs((double) o_gated2[i]) + std::fabs((double) o_conv2[i])) + 1e-6;
+        if (!(std::fabs(dev - want) <= tol)) ++bad;
+        worst = std::max(worst, std::fabs(dev - want) / tol);
+    }
+    std::snprintf(tag, sizeof tag, "ple_block entry: engine wrapper vs the engine's own post-op rule");
+    verdict(tag, bad == 0, bad, hc_dim, worst, "result outside tolerance vs ple.cu's chain fed the device's key/value");
+
+    // ---- RIVAL MARGINS (host-side): the conv's row-FASTEST history and `normalized` (not `gated`) as the
+    //      conv input must each MOVE the reference - the fixture separates the rule from those readings ----
+    std::vector<uint16_t> kw_rowmajor = kw;   // a no-op; the rival is a different HISTORY read
+    std::vector<float> rival_conv_rowmajor(hc_dim);
+    for (int c = 0; c < hc_dim; ++c) {
+        float acc = 0.0f;
+        for (int k = 0; k < kern; ++k) {
+            const int row = nhist - (kern - 1 - k) * dil;
+            const float v = (row == nhist) ? o_norm2[c] : hist[(size_t) c + (size_t) hc_dim * row];   // row-MAJOR (wrong)
+            acc += strata::kernels::f32_from_f16(kw[k + kern * c]) * v;
+        }
+        rival_conv_rowmajor[c] = acc / (1.0f + std::exp(-acc));
+    }
+    int rowmajor_moved = 0;
+    for (int i = 0; i < hc_dim; ++i)
+        if (std::fabs((double) rival_conv_rowmajor[i] - (double) o_conv2[i]) > 1e-3 * std::fabs((double) o_conv2[i])) ++rowmajor_moved;
+    const bool rowmajor_moves = rowmajor_moved > hc_dim / 100;
+    std::vector<float> rival_conv_gated(hc_dim);
+    ple_conv_host(hist, o_gated2, kw, rival_conv_gated, hc_dim, kern, dil, nhist);   // gated as conv input (wrong)
+    const bool gated_input_moves = rel_l1_f(rival_conv_gated, o_conv2) > 0.05;
+    std::snprintf(tag, sizeof tag, "ple_block margin: the row-major history rival and the gated-as-conv-input rival move the rule");
+    verdict(tag, rowmajor_moves && gated_input_moves, (rowmajor_moves ? 0 : 1) + (gated_input_moves ? 0 : 1), 2, (double) rowmajor_moved,
+            "the fixture does not separate the conv rule from those readings");
+    (void) kw_rowmajor;
+}
+
+// #3 `ple_history_advance` (layer.cpp:1222) -> ple_history_advance.spv.  Rule: row-fastest `hist[r + nhist*c]`,
+// shift r -> r+1 then append `normalized[c]` at the last row, IN PLACE, one thread per channel.  The rival is
+// the natural-but-wrong FLAT memmove (`hist[r*channels + c]`), which scrambles the channels; the fixture gives
+// each channel a distinct magnitude so it MOVES.
+void case_ple_history_advance_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "ple_history_advance.spv")) return;
+    const int channels = 10240, nhist = 9;
+    std::vector<float> hist((size_t) nhist * channels), norm(channels);
+    for (int c = 0; c < channels; ++c) {
+        const float sc = 1.0f + 0.0001f * (float) (c % 97);
+        for (int r = 0; r < nhist; ++r) hist[(size_t) r + (size_t) nhist * c] = sc * ((float) r + 1.0f + 0.01f * (float) (c % 13));
+        norm[c] = sc * 10.0f;
+    }
+    std::vector<float> want((size_t) nhist * channels);
+    for (int c = 0; c < channels; ++c) {
+        for (int r = 0; r + 1 < nhist; ++r) want[(size_t) r + (size_t) nhist * c] = hist[(size_t) (r + 1) + (size_t) nhist * c];
+        want[(size_t) (nhist - 1) + (size_t) nhist * c] = norm[c];
+    }
+    // rival: the FLAT memmove reading (row-major)
+    std::vector<float> rival((size_t) nhist * channels);
+    for (int r = 0; r < nhist; ++r)
+        for (int c = 0; c < channels; ++c)
+            rival[(size_t) r * channels + c] = (r + 1 < nhist) ? hist[(size_t) (r + 1) * channels + c]
+                                                               : norm[c];
+    const bool rival_moves = rel_l1_f(rival, want) > 0.05;
+
+    const uint64_t guard = 64;
+    Buf bh = ctx.alloc((size_t) nhist * channels * 4 + guard), bn = ctx.alloc((size_t) channels * 4);
+    {
+        std::vector<uint8_t> img((size_t) nhist * channels * 4 + guard, 0x77);
+        std::memcpy(img.data(), hist.data(), hist.size() * 4);
+        ctx.write(bh, img.data(), img.size());
+    }
+    ctx.write(bn, norm.data(), (size_t) channels * 4);
+    {
+        struct { int32_t channels, nhist; } pc{channels, nhist};
+        VkPipeline p = ctx.pipeline(dir + "/ple_history_advance.spv", 2, (int) sizeof(pc));
+        ctx.dispatch(p, {&bh, &bn}, &pc, sizeof(pc), groups_for((uint64_t) channels));
+    }
+    std::vector<uint8_t> img((size_t) nhist * channels * 4 + guard);
+    ctx.read(bh, img.data(), img.size());
+    const float* ref_y = reinterpret_cast<const float*>(img.data());
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("ple_history_advance entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(bh); ctx.free(bn); return;
+    }
+    float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) nhist * channels);
+    float* dn = strata::vulkan::arena_alloc<float>(*s, channels);
+    strata::vulkan::stream_write(*s, dh, hist.data(), (size_t) nhist * channels * 4);
+    strata::vulkan::stream_write(*s, dn, norm.data(), (size_t) channels * 4);
+    strata::kernels::ple_history_advance(dh, dn, s);   // THE ENGINE WRAPPER
+    std::vector<float> got((size_t) nhist * channels);
+    strata::vulkan::stream_read(*s, dh, got.data(), got.size() * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < got.size(); ++i) { uint32_t a, b; std::memcpy(&a, &ref_y[i], 4); std::memcpy(&b, &got[i], 4); if (a != b) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "ple_history_advance entry: engine wrapper == shader path, bitwise");
+    verdict(tag, bad_bw == 0, bad_bw, (int) got.size(), 0.0, "words differ - the wrapper's dispatch does not match the ported shader");
+    int bad = 0;
+    for (size_t i = 0; i < want.size(); ++i) if (got[i] != want[i]) ++bad;   // a copy, so bit-exact
+    std::snprintf(tag, sizeof tag, "ple_history_advance entry: wrapper vs the engine rule (row-fastest shift, bit-exact)");
+    verdict(tag, bad == 0 && rival_moves, bad + (rival_moves ? 0 : 1), (int) want.size(), (double) bad,
+            "differing floats, or the flat-memmove rival does not move the rule");
+    if (!rival_moves) std::printf("      FIXTURE: the flat-memmove (row-major) reading does not move the rule\n");
+    ctx.free(bh); ctx.free(bn);
+}
+
+// #4 `gr_read` (layer.cpp:1255/:1278) -> gr_norm + gr_down + gr_gate + gr_mean + gr_inject.  Fixture:
+// case_gr_read's per-stream-scaled stacks (1,4,16,...) so the whole-stack vs per-stream RMS rival MOVES.  The
+// oracle is the ENGINE'S rule (`gr_parity.cpp::reference`), and the rivals - whole-stack RMS and SUM-over-
+// streams instead of MEAN - are computed host-side and required to move the reference.  The engine's FINAL
+// MIXER shape (`w_inject == nullptr` writes NOTHING) is a separate arm.
+void case_gr_read_entry(Ctx& ctx, const std::string& dir) {
+    for (const char* spv : {"gr_norm.spv", "gr_down.spv", "gr_gate.spv", "gr_mean.spv", "gr_inject.spv"})
+        if (!have(dir, spv)) return;
+    struct Shape { int n_embd, hc, hc_lr; };
+    const Shape shapes[] = {{64, 2, 8}, {16, 3, 4}};
+    const float EPS = 1e-6f;
+    for (const Shape& sh : shapes) {
+        const int n_embd = sh.n_embd, hc = sh.hc, hc_lr = sh.hc_lr, hc_dim = hc * n_embd;
+        auto to_bf16 = [](double d) {
+            float f = (float) d; uint32_t i; std::memcpy(&i, &f, 4);
+            i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u; std::memcpy(&f, &i, 4); return f;
+        };
+        std::vector<float> R(hc_dim), w_norm(hc_dim);
+        std::vector<std::vector<float>> w_down(hc_lr, std::vector<float>(hc_dim)), w_up(hc_dim, std::vector<float>(hc_lr)),
+            w_inject(hc, std::vector<float>(hc_dim));
+        for (int c = 0; c < hc; ++c) {
+            const float sc = std::pow(4.0f, (float) c);
+            for (int d = 0; d < n_embd; ++d) R[c * n_embd + d] = sc * rndf(1.0f);
+        }
+        for (auto& x : w_norm) x = 1.0f + 0.1f * rndf(1.0f);
+        for (auto& row : w_down) for (auto& x : row) x = to_bf16(0.02f * rndf(1.0f));
+        for (auto& row : w_up) for (auto& x : row) x = to_bf16(0.05f * rndf(1.0f));
+        for (auto& row : w_inject) for (auto& x : row) x = to_bf16(0.02f * rndf(1.0f));
+        auto b16 = [&](float f) { const float bf = to_bf16(f); uint32_t u; std::memcpy(&u, &bf, 4); return u >> 16; };
+        std::vector<uint32_t> wd_pack((size_t) hc_lr * (hc_dim / 2)), wu_pack((size_t) hc_dim * (hc_lr / 2)), wi_pack((size_t) hc * (hc_dim / 2));
+        for (int k = 0; k < hc_lr; ++k) for (int p = 0; p < hc_dim / 2; ++p) wd_pack[(size_t) k * (hc_dim / 2) + p] = b16(w_down[k][2 * p]) | (b16(w_down[k][2 * p + 1]) << 16);
+        for (int i = 0; i < hc_dim; ++i) for (int p = 0; p < hc_lr / 2; ++p) wu_pack[(size_t) i * (hc_lr / 2) + p] = b16(w_up[i][2 * p]) | (b16(w_up[i][2 * p + 1]) << 16);
+        for (int c = 0; c < hc; ++c) for (int p = 0; p < hc_dim / 2; ++p) wi_pack[(size_t) c * (hc_dim / 2) + p] = b16(w_inject[c][2 * p]) | (b16(w_inject[c][2 * p + 1]) << 16);
+        // ---- the ORACLE: gr_parity.cpp::reference in double ----
+        std::vector<float> xn(hc_dim), act(hc_dim), lq(hc_lr), gated(hc_dim), ref_mixed(n_embd), ref_inj(hc);
+        for (int c = 0; c < hc; ++c) {
+            double ms = 0; for (int d = 0; d < n_embd; ++d) ms += (double) R[c * n_embd + d] * R[c * n_embd + d];
+            ms /= n_embd; const float rs = (float) (1.0 / std::sqrt(ms + EPS));
+            for (int d = 0; d < n_embd; ++d) { const int i = c * n_embd + d; xn[i] = R[i] * rs * w_norm[i]; act[i] = to_bf16(xn[i]); }
+        }
+        for (int k = 0; k < hc_lr; ++k) {
+            double a = 0; for (int i = 0; i < hc_dim; ++i) a += (double) act[i] * w_down[k][i];
+            const float p = (float) a / (float) hc; lq[k] = to_bf16(p / (1.0f + std::exp(-p)));
+        }
+        for (int i = 0; i < hc_dim; ++i) {
+            double a = 0; for (int k = 0; k < hc_lr; ++k) a += (double) lq[k] * w_up[i][k];
+            gated[i] = xn[i] * (float) (1.0 / (1.0 + std::exp(-a)));
+        }
+        for (int d = 0; d < n_embd; ++d) { double m = 0; for (int c = 0; c < hc; ++c) m += (double) gated[c * n_embd + d]; ref_mixed[d] = (float) (m / hc); }
+        for (int c = 0; c < hc; ++c) { double a = 0; for (int i = 0; i < hc_dim; ++i) a += (double) act[i] * w_inject[c][i]; ref_inj[c] = (float) a; }
+        std::vector<float> xn_whole(hc_dim), r_sum(n_embd);
+        { double ms = 0; for (int i = 0; i < hc_dim; ++i) ms += (double) R[i] * R[i]; ms /= hc_dim; const float rs = (float)(1.0/std::sqrt(ms+EPS)); for (int i = 0; i < hc_dim; ++i) xn_whole[i] = R[i]*rs*w_norm[i]; }
+        for (int d = 0; d < n_embd; ++d) { double m = 0; for (int c = 0; c < hc; ++c) m += (double) gated[c*n_embd+d]; r_sum[d] = (float) m; }
+        const bool norm_moves = rel_l1_f(xn_whole, xn) > 0.05;
+        const bool sum_moves = rel_l1_f(r_sum, ref_mixed) > 0.05;
+
+        // ---- the SHADER PATH ----
+        Buf bR = ctx.alloc((size_t) hc_dim * 4), bWN = ctx.alloc((size_t) hc_dim * 4);
+        Buf bXN = ctx.alloc((size_t) hc_dim * 4), bXQ = ctx.alloc((size_t) hc_dim * 4), bWD = ctx.alloc(wd_pack.size() * 4);
+        Buf bLQ = ctx.alloc((size_t) hc_lr * 4), bWU = ctx.alloc(wu_pack.size() * 4), bGT = ctx.alloc((size_t) hc_dim * 4);
+        Buf bMX = ctx.alloc((size_t) n_embd * 4), bWI = ctx.alloc(wi_pack.size() * 4), bINJ = ctx.alloc((size_t) hc * 4);
+        ctx.write(bR, R.data(), (size_t) hc_dim * 4);
+        ctx.write(bWN, w_norm.data(), (size_t) hc_dim * 4);
+        ctx.write(bWD, wd_pack.data(), wd_pack.size() * 4);
+        ctx.write(bWU, wu_pack.data(), wu_pack.size() * 4);
+        ctx.write(bWI, wi_pack.data(), wi_pack.size() * 4);
+        { struct { int32_t n_embd, hc; float eps; } pc{n_embd, hc, EPS}; VkPipeline p = ctx.pipeline(dir + "/gr_norm.spv", 4, (int) sizeof(pc)); ctx.dispatch(p, {&bR, &bWN, &bXN, &bXQ}, &pc, sizeof(pc), (uint32_t) hc); }
+        { struct { int32_t hc_dim, hc_lr, hc; } pc{hc_dim, hc_lr, hc}; VkPipeline p = ctx.pipeline(dir + "/gr_down.spv", 3, (int) sizeof(pc)); ctx.dispatch(p, {&bXQ, &bWD, &bLQ}, &pc, sizeof(pc), (uint32_t) hc_lr); }
+        { struct { int32_t hc_dim, hc_lr; } pc{hc_dim, hc_lr}; VkPipeline p = ctx.pipeline(dir + "/gr_gate.spv", 4, (int) sizeof(pc)); ctx.dispatch(p, {&bLQ, &bWU, &bXN, &bGT}, &pc, sizeof(pc), (uint32_t) hc_dim); }
+        { struct { int32_t n_embd, hc; } pc{n_embd, hc}; VkPipeline p = ctx.pipeline(dir + "/gr_mean.spv", 2, (int) sizeof(pc)); ctx.dispatch(p, {&bGT, &bMX}, &pc, sizeof(pc), groups_for((uint64_t) n_embd)); }
+        { struct { int32_t hc_dim, hc; } pc{hc_dim, hc}; VkPipeline p = ctx.pipeline(dir + "/gr_inject.spv", 3, (int) sizeof(pc)); ctx.dispatch(p, {&bXQ, &bWI, &bINJ}, &pc, sizeof(pc), (uint32_t) hc); }
+        std::vector<float> sf_mixed(n_embd), sf_inj(hc);
+        ctx.read(bMX, sf_mixed.data(), (size_t) n_embd * 4);
+        ctx.read(bINJ, sf_inj.data(), (size_t) hc * 4);
+
+        // ---- the ENGINE WRAPPER ----
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+        if (s == nullptr) { verdict("gr_read entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
+        float* dR = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+        float* dWN = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+        uint16_t* dWD = strata::vulkan::arena_alloc<uint16_t>(*s, wd_pack.size() * 2);
+        uint16_t* dWU = strata::vulkan::arena_alloc<uint16_t>(*s, wu_pack.size() * 2);
+        uint16_t* dWI = strata::vulkan::arena_alloc<uint16_t>(*s, wi_pack.size() * 2);
+        float* dMX = strata::vulkan::arena_alloc<float>(*s, n_embd);
+        float* dINJ = strata::vulkan::arena_alloc<float>(*s, hc);
+        strata::kernels::GrShapes gs{}; gs.n_embd = n_embd; gs.hc = hc; gs.hc_lr = hc_lr;
+        uint8_t* wsmem = strata::vulkan::arena_alloc<uint8_t>(*s, strata::kernels::gr_workspace_bytes(gs));
+        strata::kernels::GrWorkspace ws{}; strata::kernels::gr_workspace_init(gs, wsmem, ws);
+        strata::vulkan::stream_write(*s, dR, R.data(), (size_t) hc_dim * 4);
+        strata::vulkan::stream_write(*s, dWN, w_norm.data(), (size_t) hc_dim * 4);
+        strata::vulkan::stream_write(*s, dWD, wd_pack.data(), wd_pack.size() * 4);
+        strata::vulkan::stream_write(*s, dWU, wu_pack.data(), wu_pack.size() * 4);
+        strata::vulkan::stream_write(*s, dWI, wi_pack.data(), wi_pack.size() * 4);
+        strata::kernels::gr_read(dR, dWN, dWD, dWU, dWI, EPS, gs, ws, dMX, dINJ, s);   // THE ENGINE WRAPPER
+        std::vector<float> g_mixed(n_embd), g_inj(hc);
+        strata::vulkan::stream_read(*s, dMX, g_mixed.data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_read(*s, dINJ, g_inj.data(), (size_t) hc * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (int i = 0; i < n_embd; ++i) { uint32_t a, b; std::memcpy(&a, &sf_mixed[i], 4); std::memcpy(&b, &g_mixed[i], 4); if (a != b) ++bad_bw; }
+        for (int i = 0; i < hc; ++i) { uint32_t a, b; std::memcpy(&a, &sf_inj[i], 4); std::memcpy(&b, &g_inj[i], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "gr_read entry (n=%d hc=%d hc_lr=%d): engine wrapper == shader path, bitwise", n_embd, hc, hc_lr);
+        verdict(tag, bad_bw == 0, bad_bw, n_embd + hc, 0.0, "words differ - the wrapper's dispatch does not match the ported shader chain");
+        int bad = 0; double worst = 0;
+        for (int i = 0; i < n_embd; ++i) { const double t = 1e-3 * std::fabs((double) ref_mixed[i]) + 1e-6; if (std::fabs((double) g_mixed[i] - ref_mixed[i]) > t) ++bad; worst = std::max(worst, std::fabs((double) g_mixed[i] - ref_mixed[i]) / t); }
+        std::snprintf(tag, sizeof tag, "gr_read entry (n=%d hc=%d): wrapper vs the engine rule (double)", n_embd, hc);
+        verdict(tag, bad == 0 && norm_moves && sum_moves, bad + (norm_moves ? 0 : 1) + (sum_moves ? 0 : 1), n_embd, worst,
+                "mixed outside tolerance vs gr_parity's rule; margins: whole-stack RMS / SUM-over-streams must move it");
+        if (!norm_moves) std::printf("      FIXTURE: the whole-stack RMS does not move xn\n");
+        if (!sum_moves) std::printf("      FIXTURE: the SUM over streams does not move mixed\n");
+        for (Buf* b : {&bR, &bWN, &bXN, &bXQ, &bWD, &bLQ, &bWU, &bGT, &bMX, &bWI, &bINJ}) ctx.free(*b);
+    }
+}
+
+// #5 `router_top10` (layer.cpp:373) -> router_top10_f32.spv (the PORTABLE member; the target has no f64).  The
+// engine's own router rule (`router_top10.cu` / `router_host_row`) is the oracle; the shader path drives ONE
+// multi-token launch and the wrapper the SAME call, so the whole group compared is bitwise ids+weights.
+void case_router_top10_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "router_top10_f32.spv")) return;
+    const int NE = 512, K = 10, NT = 4;
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<float> logits((size_t) NT * NE);
+    for (int t = 0; t < NT; ++t)
+        for (int e = 0; e < NE; ++e) logits[(size_t) t * NE + e] = (t == 1) ? 0.5f : (t == 2 ? -1.0f : gauss(rng));
+    std::vector<int> r_ids((size_t) NT * K); std::vector<float> r_w((size_t) NT * K);
+    for (int t = 0; t < NT; ++t)
+        router_host_row(std::vector<float>(logits.begin() + (size_t) t * NE, logits.begin() + (size_t) (t + 1) * NE), NE, K, r_ids, r_w, t);
+
+    Buf bl = ctx.alloc(logits.size() * 4), bi = ctx.alloc((size_t) NT * K * 4), bw = ctx.alloc((size_t) NT * K * 4);
+    ctx.write(bl, logits.data(), logits.size() * 4);
+    { struct { int32_t n_tokens, n_expert, k; } pc{NT, NE, K}; VkPipeline p = ctx.pipeline(dir + "/router_top10_f32.spv", 3, (int) sizeof(pc)); ctx.dispatch(p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT); }
+    std::vector<int32_t> sf_ids((size_t) NT * K); std::vector<float> sf_w((size_t) NT * K);
+    ctx.read(bi, sf_ids.data(), sf_ids.size() * 4);
+    ctx.read(bw, sf_w.data(), sf_w.size() * 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) { verdict("router_top10 entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
+    float* dl = strata::vulkan::arena_alloc<float>(*s, logits.size());
+    int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * K);
+    float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K);
+    strata::vulkan::stream_write(*s, dl, logits.data(), logits.size() * 4);
+    strata::kernels::router_top10(dl, NT, NE, K, di, dw, s);   // THE ENGINE WRAPPER
+    std::vector<int32_t> g_ids((size_t) NT * K); std::vector<float> g_w((size_t) NT * K);
+    strata::vulkan::stream_read(*s, di, g_ids.data(), g_ids.size() * 4);
+    strata::vulkan::stream_read(*s, dw, g_w.data(), g_w.size() * 4);
+    strata::vulkan::stream_close(s);
+
+    int bad_bw = 0;
+    for (size_t i = 0; i < g_ids.size(); ++i) { if (g_ids[i] != sf_ids[i]) ++bad_bw; uint32_t a, b; std::memcpy(&a, &sf_w[i], 4); std::memcpy(&b, &g_w[i], 4); if (a != b) ++bad_bw; }
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "router_top10 entry (%d tokens): engine wrapper == shader path, bitwise", NT);
+    verdict(tag, bad_bw == 0, bad_bw, (int) (2 * g_ids.size()), 0.0, "ids/weights differ from the ported shader path");
+    int bad = 0; double worst = 0;
+    for (size_t i = 0; i < g_ids.size(); ++i) {
+        if (g_ids[i] != r_ids[i]) ++bad;
+        const double rel = std::fabs((double) g_w[i] - (double) r_w[i]) / (std::fabs((double) r_w[i]) + 1e-30);
+        worst = std::max(worst, rel);
+        if (!(rel <= 1e-5)) ++bad;
+    }
+    std::snprintf(tag, sizeof tag, "router_top10 entry (%d tokens): wrapper vs the engine rule (double)", NT);
+    verdict(tag, bad == 0, bad, (int) (2 * g_ids.size()), worst, "ids exact; weights relative vs router_top10.cu's rule (tol 1e-5)");
+    ctx.free(bl); ctx.free(bi); ctx.free(bw);
+}
+
+// #6 `native_moe_combine` (layer.cpp:463, the DEFAULT combine) -> native_moe_combine.spv.  The engine's NATIVE
+// f32 expression is the oracle (first term a PRODUCT, later terms mul-then-add, shared added PLAIN); the rival
+// "shared router-weighted" must MOVE the reference.
+void case_native_moe_combine_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_moe_combine.spv")) return;
+    struct Arm { int n_embd, k, shared; };
+    const Arm arms[] = {{2560, 10, 1}, {2560, 1, 0}, {37, 3, 1}};
+    for (const Arm& ar : arms) {
+        const int n_embd = ar.n_embd, k = ar.k;
+        std::vector<float> parts((size_t) k * n_embd), w(k), sh(n_embd);
+        for (auto& v : parts) v = rndf(1.0f);
+        for (auto& v : w) v = 0.1f * (1.0f + rndf(1.0f));
+        for (auto& v : sh) v = rndf(1.0f);
+        std::vector<float> want(n_embd), dbl(n_embd), rival_wsh(n_embd), r_firstsum(n_embd);
+        std::vector<double> mass(n_embd, 0.0);
+        for (int j = 0; j < n_embd; ++j) {
+            float s = parts[(size_t) j] * w[0];                       // first term a PRODUCT (no add rounds)
+            r_firstsum[j] = 0.0f; for (int e = 0; e < k; ++e) r_firstsum[j] += parts[(size_t) e * n_embd + j] * w[e];
+            for (int e = 1; e < k; ++e) s += parts[(size_t) e * n_embd + j] * w[e];
+            if (ar.shared) s += sh[j];
+            want[j] = s;
+            double acc = 0.0; for (int e = 0; e < k; ++e) acc += (double) w[e] * parts[(size_t) e * n_embd + j];
+            if (ar.shared) acc += (double) sh[j];
+            dbl[j] = (float) acc;
+            rival_wsh[j] = (float) (acc + (ar.shared ? 0.0 : 0.0));    // (placeholder; set below)
+            for (int e = 0; e < k; ++e) mass[j] += std::fabs((double) w[e] * parts[(size_t) e * n_embd + j]);
+            if (ar.shared) mass[j] += std::fabs((double) sh[j]);
+        }
+        // the "shared router-weighted" rival: shared multiplied by w[0] instead of added plain
+        for (int j = 0; j < n_embd; ++j) {
+            double acc = 0.0; for (int e = 0; e < k; ++e) acc += (double) w[e] * parts[(size_t) e * n_embd + j];
+            rival_wsh[j] = (float) (acc + (ar.shared ? w[0] * (double) sh[j] : 0.0));
+        }
+        const bool wsh_moves = ar.shared ? (rel_l1_f(rival_wsh, want) > 0.05) : false;
+        // The "first term as a sum" rival (0 + parts*w[0]) is GENUINELY INDISTINGUISHABLE from the product for
+        // k == 1: `0.0f + x == x` exactly, so no legal fixture can move it.  Stating that rather than asserting a
+        // decorative margin - the port's rule (an arm that cannot move under the wrong reading is not a margin).
+        const bool firstsum_moves = (k == 1) ? true : (rel_l1_f(r_firstsum, want) > 0.05);
+
+        Buf bp = ctx.alloc(parts.size() * 4), bw = ctx.alloc((size_t) k * 4), bs = ctx.alloc((size_t) n_embd * 4), by = ctx.alloc((size_t) n_embd * 4);
+        ctx.write(bp, parts.data(), parts.size() * 4);
+        ctx.write(bw, w.data(), (size_t) k * 4);
+        ctx.write(bs, sh.data(), (size_t) n_embd * 4);
+        { struct { int32_t n_embd, k, has_shared; } pc{n_embd, k, ar.shared}; VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, (int) sizeof(pc)); ctx.dispatch(p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), groups_for((uint64_t) n_embd)); }
+        std::vector<float> sf(n_embd); ctx.read(by, sf.data(), (size_t) n_embd * 4);
+
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) { verdict("native_moe_combine entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
+        float* dp = strata::vulkan::arena_alloc<float>(*s, parts.size());
+        float* dwf = strata::vulkan::arena_alloc<float>(*s, (size_t) k);
+        float* dsh = strata::vulkan::arena_alloc<float>(*s, (size_t) n_embd);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) n_embd);
+        strata::vulkan::stream_write(*s, dp, parts.data(), parts.size() * 4);
+        strata::vulkan::stream_write(*s, dwf, w.data(), (size_t) k * 4);
+        strata::vulkan::stream_write(*s, dsh, sh.data(), (size_t) n_embd * 4);
+        strata::kernels::native_moe_combine(dp, dwf, ar.shared ? dsh : nullptr, dout, n_embd, k, s);   // WRAPPER
+        std::vector<float> got(n_embd);
+        strata::vulkan::stream_read(*s, dout, got.data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (int j = 0; j < n_embd; ++j) { uint32_t a, b; std::memcpy(&a, &sf[j], 4); std::memcpy(&b, &got[j], 4); if (a != b) ++bad_bw; }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "native_moe_combine entry (n=%d k=%d shared=%d): engine wrapper == shader path, bitwise", n_embd, k, ar.shared);
+        verdict(tag, bad_bw == 0, bad_bw, n_embd, 0.0, "words differ - the wrapper's dispatch does not match the ported shader");
+        int bad = 0; double worst = 0;
+        for (int j = 0; j < n_embd; ++j) {
+            const double ratio = std::fabs((double) got[j] - (double) want[j]) / gemv_bound((double) want[j], mass[j], 1e-6);
+            worst = std::max(worst, ratio);
+            if (ratio > 1.0) ++bad;
+        }
+        const bool margins = firstsum_moves && (ar.shared ? wsh_moves : true);
+        std::snprintf(tag, sizeof tag, "native_moe_combine entry (n=%d k=%d shared=%d): wrapper vs the engine's native rule", n_embd, k, ar.shared);
+        verdict(tag, bad == 0 && margins, bad + (margins ? 0 : 1), n_embd, worst,
+                "outside the term-relative bound; margins: first-term-as-sum / shared-router-weighted must move it");
+        (void) dbl;
+        ctx.free(bp); ctx.free(bw); ctx.free(bs); ctx.free(by);
+    }
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -18139,6 +18809,15 @@ int main(int argc, char** argv) {
     case_qsa_gate_apply_f32_entry(ctx, dir);           // qsa_gate_apply_f32           -> qsa_gate_apply_f32.spv           (layer.cpp:1011)
     case_native_router_top10_entry(ctx, dir);          // native_router_top10          -> native_router_top10.spv          (layer.cpp:370)
     case_qsa_decode_attn(ctx, dir);                    // qsa_decode_attn_step         -> qsa_decode_attn.spv              (layer.cpp:980, the DEFAULT)
+    // THE PLE / GR SHARED STAGES AND THE MoE ROUTING ROWS (vulkan/src/kernels/ple_vk.cpp), in the order
+    // `block_layer_pre`/`block_layer_post` reach them.  APPENDED last for the same shared-RNG reason as every
+    // batch above.
+    case_gr_write_entry(ctx, dir);               // gr_write            -> gr_write.spv            (layer.cpp:1261/:1195/:1329)
+    case_ple_block_entry(ctx, dir);              // ple_block           -> q8_0+s2/bf16 + gnorm/gate/bcast/conv/add3 (layer.cpp:1208)
+    case_ple_history_advance_entry(ctx, dir);    // ple_history_advance -> ple_history_advance.spv (layer.cpp:1222)
+    case_gr_read_entry(ctx, dir);                // gr_read             -> gr_norm/gr_down/gr_gate/gr_mean/gr_inject (layer.cpp:1255)
+    case_router_top10_entry(ctx, dir);           // router_top10        -> router_top10_f32.spv     (layer.cpp:373)
+    case_native_moe_combine_entry(ctx, dir);     // native_moe_combine  -> native_moe_combine.spv  (layer.cpp:463, the DEFAULT combine)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

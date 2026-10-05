@@ -18,6 +18,10 @@
 #include "strata/kernels/native_gdn.hpp"            // native_gdn_step / native_gdn_enabled
 #include "strata/kernels/qsa.hpp"                  // QsaShapes (the KV-pool decode attention's geometry)
 #include "strata/kernels/qsa_decode_attn.hpp"      // qsa_decode_attn_step / qsa_decode_attn_scratch_floats
+#include "strata/kernels/gr.hpp"                  // PLE/GR: gr_write / gr_read / gr_workspace_init
+#include "strata/kernels/ple.hpp"                 // PLE/GR: ple_block / ple_history_advance / ple_block_scratch_bytes
+#include "strata/kernels/router_top10.hpp"        // PLE/GR: router_top10 (the generic MoE router)
+#include "strata/kernels/native_moe.hpp"          // PLE/GR: native_moe_combine
 #include "strata/kernels/bf16_bits.hpp"     // bf16_from_f32: the engine's own converter, included not transcribed
 #include "strata/kernels/f16_bits.hpp"      // f16_from_f32: ditto, for f32_to_f16_bulk
 #include "strata/vulkan/vk_backend.hpp"
@@ -909,6 +913,70 @@ int main(int argc, char** argv) {
         }
         std::printf("  qsa_decode_attn_step wrapper vs the engine's rule (double, worst rel %.3g)\n", worst);
         check("qsa_decode_attn_step", bad == 0);
+    }
+
+    {   // PLE / GR shared stages + the MoE routing rows (ple_vk.cpp).  THE NUMERIC PROOF IS THE GATE'S
+        // `case_*_entry` (bitwise vs the shader path AND vs the explicit oracle); this smoke RUNS each wrapper
+        // end to end on the engine stream.  Referencing ANY of the six pulls the whole TU into the link.
+        // gr_write: a ZERO injection is an EXACT plain residual add (2*sigmoid(0) == 1).
+        { const int ne = 64, hc = 3; std::vector<float> R((size_t) ne * hc), bo(ne), inj(hc, 0.0f);
+          for (size_t i = 0; i < R.size(); ++i) R[i] = 0.01f * (float) ((int) (i % 23) - 11);
+          for (int i = 0; i < ne; ++i) bo[i] = 0.02f * (float) (i % 17);
+          float* dR = strata::vulkan::arena_alloc<float>(*s, R.size());
+          float* dbo = strata::vulkan::arena_alloc<float>(*s, (size_t) ne);
+          float* dinj = strata::vulkan::arena_alloc<float>(*s, (size_t) hc);
+          strata::vulkan::stream_write(*s, dR, R.data(), R.size() * 4);
+          strata::vulkan::stream_write(*s, dbo, bo.data(), (size_t) ne * 4);
+          strata::vulkan::stream_write(*s, dinj, inj.data(), (size_t) hc * 4);
+          strata::kernels::GrShapes gs{}; gs.n_embd = ne; gs.hc = hc; gs.hc_lr = 1;
+          strata::kernels::gr_write(dR, dbo, dinj, gs, dR, s);
+          std::vector<float> got(R.size());
+          strata::vulkan::stream_read(*s, dR, got.data(), got.size() * 4);
+          int bad = 0; for (size_t i = 0; i < R.size(); ++i) if (got[i] != R[i] + bo[i % ne]) ++bad;
+          check("gr_write (zero inject = plain residual add)", bad == 0); }
+        // ple_history_advance: the row-fastest shift is a copy, so bit-exact.  The geometry is FIXED by the
+        // engine's contract (NG_HC_DIM x NG_HIST), so a tiny buffer is (correctly) REFUSED.
+        { const int channels = 10240, nhist = 9; std::vector<float> hist((size_t) nhist * channels), nrm(channels);
+          for (int c = 0; c < channels; ++c) { for (int r = 0; r < nhist; ++r) hist[(size_t) r + (size_t) nhist * c] = (float) (r + 1) + 0.1f * (float) (c % 7); nrm[c] = (float) c; }
+          float* dh = strata::vulkan::arena_alloc<float>(*s, hist.size());
+          float* dn = strata::vulkan::arena_alloc<float>(*s, (size_t) channels);
+          strata::vulkan::stream_write(*s, dh, hist.data(), hist.size() * 4);
+          strata::vulkan::stream_write(*s, dn, nrm.data(), (size_t) channels * 4);
+          strata::kernels::ple_history_advance(dh, dn, s);
+          std::vector<float> got(hist.size());
+          strata::vulkan::stream_read(*s, dh, got.data(), got.size() * 4);
+          int bad = 0;
+          for (int c = 0; c < channels; ++c) { for (int r = 0; r + 1 < nhist; ++r) if (got[(size_t) r + (size_t) nhist * c] != hist[(size_t) (r + 1) + (size_t) nhist * c]) ++bad; if (got[(size_t) (nhist - 1) + (size_t) nhist * c] != nrm[c]) ++bad; }
+          check("ple_history_advance (row-fastest, bit-exact)", bad == 0); }
+        // native_moe_combine k=1: out = parts*w[0] (the native first term is a product).
+        { const int ne = 37; std::vector<float> parts(ne), w(1, 0.75f);
+          for (int i = 0; i < ne; ++i) parts[i] = 0.01f * (float) (i % 13);
+          float* dp = strata::vulkan::arena_alloc<float>(*s, (size_t) ne);
+          float* dw = strata::vulkan::arena_alloc<float>(*s, 1);
+          float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) ne);
+          strata::vulkan::stream_write(*s, dp, parts.data(), (size_t) ne * 4);
+          strata::vulkan::stream_write(*s, dw, w.data(), 4);
+          strata::kernels::native_moe_combine(dp, dw, nullptr, dout, ne, 1, s);
+          std::vector<float> got(ne);
+          strata::vulkan::stream_read(*s, dout, got.data(), (size_t) ne * 4);
+          int bad = 0; for (int i = 0; i < ne; ++i) if (got[i] != parts[i] * 0.75f) ++bad;
+          check("native_moe_combine (k=1 = parts*w[0])", bad == 0); }
+        // router_top10: 512 experts, top-10 -> 10 DISTINCT ids in range, weights renormalised to sum ~1.
+        { const int NE = 512, K = 10; std::vector<float> lg(NE);
+          for (int e = 0; e < NE; ++e) lg[e] = 0.01f * (float) ((e * 37) % 211 - 105);
+          float* dl = strata::vulkan::arena_alloc<float>(*s, (size_t) NE);
+          int* di = strata::vulkan::arena_alloc<int>(*s, (size_t) K);
+          float* dwt = strata::vulkan::arena_alloc<float>(*s, (size_t) K);
+          strata::vulkan::stream_write(*s, dl, lg.data(), (size_t) NE * 4);
+          strata::kernels::router_top10(dl, 1, NE, K, di, dwt, s);
+          std::vector<int> ids(K); std::vector<float> wts(K);
+          strata::vulkan::stream_read(*s, di, ids.data(), (size_t) K * 4);
+          strata::vulkan::stream_read(*s, dwt, wts.data(), (size_t) K * 4);
+          int bad = 0; std::vector<int> seen(NE, 0);
+          for (int i = 0; i < K; ++i) { if (ids[i] < 0 || ids[i] >= NE || seen[ids[i]]) ++bad; seen[ids[i]] = 1; }
+          double sum = 0; for (int i = 0; i < K; ++i) sum += wts[i];
+          if (!(std::fabs(sum - 1.0) < 1e-3)) ++bad;
+          check("router_top10 (10 distinct in-range ids, weights sum 1)", bad == 0); }
     }
 
     strata::vulkan::stream_close(s);

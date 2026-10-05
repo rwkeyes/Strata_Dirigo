@@ -1,5 +1,112 @@
 # Start here next session
 
+## THE PLE / GR SHARED STAGES + THE MoE ROUTING ROWS — the next six entry points, and a WORKSPACE-LAYOUT DEFECT FOUND AND FIXED (2026-10-05, `vega`)
+
+**THE BAR (the running line): `91 → 75` undefined references / `33 → 25` distinct full-signature `strata::kernels::`
+symbols / `31 → 23` under the parent's name-only pattern.**  The attention / QSA / MoE / GR / PLE / rope group
+falls **25 → 17**; every other group is unchanged (glue 0, matvec/GEMV/KV 6, GDN mixer 0, other 2).  Measured with
+the CURRENT STANDARD recipe (`$HOME/vkbuild-vulkan` is a **Makefiles** build dir, so **never pass `-G Ninja`**;
+reconfigured + rebuilt from the current tree first):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 75   (was 91)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 25   (was 33)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 23   (was 31)
+
+**THE GROUP TABLE (the remaining 25 distinct full-signature symbols).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue** | **0** | all answered |
+| **matvec / GEMV / KV** | **6** | unchanged (`bf16_gemv_fp32_mmvf_cols`, `s_gemv_q8_0_split`, `s_gemv_q8k_split`, `kv_ring_table`, `kv_stream_reset`, `kv_stream_resolve`) |
+| **attention / QSA / MoE / GR / PLE / rope** | **17** | (was 25) the six device symbols + the two host rows below moved to answered |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **2** | `copy_i32_from_mapped`, `indexer_key_append` |
+
+**THE SIX, IN THE ORDER `block_layer_pre`/`block_layer_post` REACH THEM** (the plan's §3 list is not an order; the
+order is the SOURCE order of the call sites - within a native/legacy pair the branches are alternatives):
+
+| # | symbol | call site | shader(s) | TU |
+|---|---|---|---|---|
+| 1 | `gr_write` | layer.cpp:1261 (run2 unfused), :1195/:1329 | gr_write.spv | ple_vk.cpp |
+| 2 | `ple_block` | layer.cpp:1208 (layer 1) | quantize_q8_0 + s2_gemv_q8 + f32_to_bf16 + bf16_gemv + ple_gnorm/gate/bcast/conv + add3 | ple_vk.cpp |
+| 3 | `ple_history_advance` | layer.cpp:1222 | ple_history_advance.spv | ple_vk.cpp |
+| 4 | `gr_read` | layer.cpp:1255 (run0 unfused) | gr_norm + gr_down + gr_gate + gr_mean + gr_inject | ple_vk.cpp |
+| 5 | `router_top10` | layer.cpp:373 (`moe_route`'s generic router) | router_top10_f32.spv | ple_vk.cpp |
+| 6 | `native_moe_combine` | layer.cpp:463 (`moe_combine_parts`, the DEFAULT combine) | native_moe_combine.spv | ple_vk.cpp |
+
+New TU `vulkan/src/kernels/ple_vk.cpp` (added to the CMake kernel list and to `run_gate.sh`'s link line).  Engine
+headers unchanged.  The two `host` rows the TU answers (NOT a bare bind): `gr_workspace_init`
+(`block_buffers_init`, layer.cpp:1140) and `ple_block_scratch_bytes` (layer.cpp:1203/1316), both transcribed from
+`gr.cu` / `ple.cu`; plus the PLE/GR BRANCH POLICY (`ple_native_bf16_enabled`/`ple_native_postops_enabled` → FALSE,
+`gr_set_native_mmvf`/`gr_set_fp32_activations` → no-ops), the `native_gdn_enabled()` pattern: the backend reports
+what it implements, so a `--native` launch cannot route at a kernel this tree lacks.
+
+**EACH PROVED BY ITS CASE THROUGH THE ENGINE WRAPPER - BITWISE vs THE SHADER PATH AND vs THE ENGINE'S OWN RULE.**
+Six new `case_*_entry` in the port's gate, `EnginePin`-pinned.  Raw lines (vega, `intel_icd`/Arc B70):
+
+| # | symbol | wrapper == shader path (bitwise) | wrapper vs the engine's rule |
+|---|---|---|---|
+| 1 | `gr_write` | **10240/10240 + 192/192, w 0** | w 0.609 / 0.613 (gr.cu rule, double; zero-inject EXACT) |
+| 2 | `ple_block` | **key 10240, value 2560, gate 4, gated 10240, normalized 10240, conv 10240, result 10240 - all w 0** | w 6.58e-04 (ple.cu chain fed the device's key/value) |
+| 3 | `ple_history_advance` | **92160/92160, w 0** | bit-exact (a copy) |
+| 4 | `gr_read` | **66/66 + 19/19, w 0** | w 9.31e-03 / 2.43e-04 (gr_parity rule, double) |
+| 5 | `router_top10` | **80/80, w 0** | ids exact; w 1.44e-07 (router_top10.cu, tol 1e-5) |
+| 6 | `native_moe_combine` | **2560 + 2560 + 37, w 0** | w 9.25e-02 / 0 / 3.23e-02 (the native f32 expression, terms bound) |
+
+**WRITTEN SO A SHARED SHADER/ORACLE MISTAKE CANNOT PASS.**  Every oracle is a transcription of the engine's OWN
+rule (the `.cu` body), not of the shader, so a mistake shared with the shader would have to live in the RULE.  Each
+rival reading gets its OWN observable and a HOST-SIDE margin proving it MOVES the reference:
+* `gr_write`: drop-the-2, drop-the-`/hc`, and block_out read PER STACK ELEMENT (a distinct `bo_stack`) - three
+  rivals, three observables, all shown to move the output.
+* `ple_block`: the conv's row-MAJOR history (`hist[c + hc_dim*row]`) and `gated` (not `normalized`) as the conv
+  input - both shown to move the rule (the row-major rival by 1.02e+04 err/tol).
+* `ple_history_advance`: the flat-memmove (row-major) reading - shown to scramble the channels.
+* `gr_read`: whole-stack RMS (vs per-stream) and SUM-over-streams (vs MEAN) - both shown to move `mixed`.
+* `router_top10` / `native_moe_combine`: exact ties exercise the lowest-index rule; the shared row weighted vs
+  added-plain moves the combine.  **STATED, NOT ASSERTED:** for `native_moe_combine` `k == 1`, "first term as a
+  sum" (`0 + parts*w[0]`) is GENUINELY indistinguishable from the product (`0.0f + x == x`), so no legal fixture
+  can move it; the arm says so rather than asserting a decorative margin.
+
+**A CROSS-CUTTING DEFECT FOUND AND FIXED WHILE WIRING (the class the last two batches found).**  The port's GR
+shaders store the bf16 activations as **f32** - `gr_norm.comp` binding 3 is `float v[]` and it writes
+`bf16_round(x)` AS AN F32 ("bf16(xn) as f32"); `gr_down`/`gr_gate`/`gr_inject` read it the same way.  But the
+engine's `GrWorkspace` sizes `xq`/`lq` as **uint16** (`gr.cu`'s `gr_down_kernel<uint16_t>`), so wiring `gr_read`
+with the engine's own workspace made the shader write 4 bytes where the region held 2 - into `lq`.  `gr_workspace_init`
+now sizes `xq`/`lq` for f32 (which is legal: `GrWorkspace` is an opaque pointer struct, `gr_workspace_bytes` is the
+AUTHORITY `block_buffers_init` allocates by, and `gr_read` reads the same pointers), and the values are identical -
+only a byte-layout comparison against the CUDA would see a difference, and that is stated.  **The gate's first run
+caught it as `gr_read entry ... 0/66` on every device.**
+
+**THE STANDARD RECIPE, AND THE CASE BUGS THE BITWISE ARM CAUGHT.**  `ple_block`'s first wrapper wrote
+`gnorm(gated)` back ONTO `gated` (the port's `ple_gnorm` is in place) - clobbering it before `add3` and the export
+and leaving `d_norm` stale.  The bitwise arm read **0/10240 on every element** (a whole-region disagreement, not a
+tolerance), which is the signature of the wrong memory, and the fix is the copy-into-`d_norm`-first the CUDA's
+distinct-destination call implies.  Both were fixed at the source, not by loosening an arm.
+
+**RESULTS (vega).**  Gate: Arc (`intel_icd`) **639/0/0** (exit 0), llvmpipe **627/0/3**, Ryzen iGPU (`radeon_icd`)
+**630/0/2** - **+27 verdicts on every arm**, 0 failed.  `strata_vk_entry_smoke` builds + RUNS four of the six
+wrappers on the Arc (PASS, exit 0) and pulls the whole TU into the link.  `check_port_map.py` passes (`168 - 78
+kernel, 61 host, 29 todo; 112 shaders built, 93 claimed`); `make_port_map.py` regenerates `PORT-MAP.tsv`
+byte-identically.  **`z820b` is PENDING** (suspended, no WoL - no XTX/K620 number is claimed).  The CUDA graph API
+was NOT touched.
+
+**LEFT IN THE GROUP (17).**  Reported, NOT stubbed: `qsa_attend_step`, `qsa_index_step`, `qsa_step_fill`,
+`topk_512_step`, `native_qsa_indexer_append`, `native_flash_attn_short_step` (the diagnostic gathered-window
+branch) have NO shader in this tree; `fused_gr_read`/`fused_gr_supported` are the GR-fused alternative the
+`gr_set_native_mmvf(false)` contract removes; `build_rope_table`/`rope_table_set`/`ngram_rows`/`PleTable::{collect,
+is_open,issue}` are host rows the engine's own tables own; `shared_expert(+_scratch_bytes)` and `moe_combine` are
+the remaining MoE rows (`shared_expert` is on-path every layer; `moe_combine` is the off-path legacy combine,
+since `native_moe_combine_enabled()` answers true); `ple_block_projected` stays `todo`.
+
 ## AN INTERMITTENT, NON-DETERMINISTIC FAILURE ON THE Ryzen iGPU — CHARACTERISED, NOT FIXED (2026-10-05)
 
 **This is an OPEN DEFECT and it outranks the performance work below.** A green `run_gate.sh` on `vega` does

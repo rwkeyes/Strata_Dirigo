@@ -306,3 +306,29 @@ the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.c
   radeon iGPU 603/0/2.  `PORT-MAP.tsv` regenerates byte-identically (one row: `qsa_decode_attn_step -> qsa_decode_attn`).
   Bench (Arc): `qsa_decode_attn` 0.38 / 1.29 / **2.52 ms** at n_ids 256 / 1024 / 2048 - linear in the selection
   width, the honest cost of the correctness form.
+
+## What the PLE / GR batch adds (2026-10-05)
+
+* `vulkan/src/kernels/ple_vk.cpp` (new) - **the PLE / GR SHARED STAGES and the MoE ROUTING ROWS**: `gr_write`
+  (`layer.cpp:1261`, `:1195`/`:1329`), `ple_block` (`:1208`, layer 1), `ple_history_advance` (`:1222`),
+  `gr_read` (`:1255`), `router_top10` (`:373`, `moe_route`'s generic router) and `native_moe_combine` (`:463`,
+  the DEFAULT combine) - in the SOURCE order `block_layer_pre`/`block_layer_post` reach them.  Engine headers
+  unchanged.  The GR pair runs for EVERY layer; `ple_block` carries its own key/value PROJECTIONS
+  (`quantize_q8_0`+`s2_gemv_q8`, `f32_to_bf16`+`bf16_gemv`), which the port's four `ple_*` shaders alone do not.
+* **The two `host` rows:** `gr_workspace_init` (the GR workspace table, `block_buffers_init`, layer.cpp:1140) and
+  `ple_block_scratch_bytes` (layer.cpp:1203/1316), plus the PLE/GR branch policy (`ple_native_bf16_enabled` /
+  `ple_native_postops_enabled` -> FALSE; the two `gr_set_*` -> no-ops), the `native_gdn_enabled()` pattern.
+* **A LATENT DEFECT FOUND AND FIXED:** the port's GR shaders store the bf16 activations as **f32**
+  (`gr_norm.comp` binding 3 is `float v[]`, "bf16(xn) as f32") while the engine's `GrWorkspace` sizes `xq`/`lq`
+  as **uint16** - so `gr_read` with the engine's own workspace wrote 4 bytes into a 2-byte region.  `gr_workspace_init`
+  now sizes them for f32 (legal: the struct is opaque pointers and `gr_workspace_bytes` is the allocation authority).
+  The gate's first run caught it as `gr_read entry ... 0/66` on every device.  A second defect - `ple_block`'s
+  wrapper writing `gnorm(gated)` back onto `gated` - was caught as `0/10240` bitwise and fixed at the source.
+* **Each proved by a new `case_*_entry`** through the ENGINE WRAPPER, BITWISE against the port's shader path AND
+  against the case's explicit oracle (a transcription of the engine's `.cu` rule, not the shader), `EnginePin`-pinned.
+  Every rival reading has its OWN observable and a host-side margin proving it MOVES the reference.
+  `strata_vk_entry_smoke` RUNS four of the six wrappers on the Arc.
+* **THE LINK PROGRESS:** the one-layer-body link moved **91 -> 75** undefined references / **33 -> 25**
+  full-signature / **31 -> 23** name-only.  The attention/QSA/MoE/GR/PLE/rope group falls **25 -> 17**.
+  Gate on `vega`: Arc 639/0/0 (exit 0), llvmpipe 627/0/3, radeon iGPU 630/0/2.  **`z820b` PENDING.**
+

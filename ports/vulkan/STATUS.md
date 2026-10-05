@@ -1,5 +1,45 @@
 # Status — what is done, what is verified, what is not
 
+## THE PLE / GR SHARED STAGES + THE MoE ROUTING ROWS — the next six entry points, and a WORKSPACE-LAYOUT DEFECT FIXED (2026-10-05, `vega`)
+
+**The GR pair is the SHARED stage (every layer, 48 of 48); the PLE stage is layer-1; the two MoE rows complete the
+block.**  Wired in the new `vulkan/src/kernels/ple_vk.cpp`, in the SOURCE order the engine's body reaches them:
+`gr_write` (`layer.cpp:1261`/`:1195`/`:1329`), `ple_block` (`:1208`), `ple_history_advance` (`:1222`), `gr_read`
+(`:1255`), `router_top10` (`:373`, `moe_route`'s generic router) and `native_moe_combine` (`:463`, the DEFAULT
+combine - `native_moe_combine_enabled()` answers true).  Engine headers unchanged.  Plus the `host` rows
+`gr_workspace_init` and `ple_block_scratch_bytes`, and the PLE/GR branch policy (`ple_native_bf16_enabled` /
+`ple_native_postops_enabled` -> FALSE).  Each proved by a new `case_*_entry` through the ENGINE WRAPPER, BITWISE
+against the port's shader path AND against the engine's own `.cu` rule, `EnginePin`-pinned:
+
+| kernel | shader(s) | wrapper == shader (bitwise), worst | wrapper vs engine rule, worst |
+|---|---|---|---|
+| `gr_write` | gr_write | 10240/10240 + 192/192, w 0 | w 0.609 / 0.613 (zero-inject EXACT) |
+| `ple_block` | q8_0+s2 / bf16 + gnorm/gate/bcast/conv/add3 | all 7 exports w 0 (key 10240, result 10240) | w 6.58e-04 (ple.cu chain, device-fed) |
+| `ple_history_advance` | ple_history_advance | 92160/92160, w 0 | bit-exact (a copy) |
+| `gr_read` | gr_norm/gr_down/gr_gate/gr_mean/gr_inject | 66/66 + 19/19, w 0 | w 9.31e-03 / 2.43e-04 |
+| `router_top10` | router_top10_f32 | 80/80, w 0 | ids exact; w 1.44e-07 |
+| `native_moe_combine` | native_moe_combine | 2560+2560+37, w 0 | w 9.25e-02 / 0 / 3.23e-02 |
+
+**A CROSS-CUTTING (WORKSPACE-LAYOUT) DEFECT FOUND AND FIXED.**  The port's GR shaders store the bf16 activations
+as **f32** (`gr_norm.comp` binding 3 is `float v[]`) while the engine's `GrWorkspace` sizes `xq`/`lq` as **uint16**,
+so wiring `gr_read` made the shader write 4 bytes into a 2-byte region.  `gr_workspace_init` now sizes `xq`/`lq` for
+f32 (legal: `GrWorkspace` is an opaque pointer struct and `gr_workspace_bytes` is the allocation authority).  A
+second defect - `ple_block`'s wrapper writing `gnorm(gated)` back onto `gated` (the port's gnorm is in place) - was
+caught as a `0/10240` bitwise disagreement and fixed at the source.  **Every rival reading has a host-side margin
+proving it MOVES the reference**; `native_moe_combine`'s k=1 "first term as a sum" rival is stated as GENUINELY
+indistinguishable (`0.0f + x == x`) rather than asserted.
+
+**THE LINK PROGRESS - the one-layer-body link: `91 -> 75` undefined references / `33 -> 25` distinct full-signature
+`strata::kernels::` symbols / `31 -> 23` name-only.**  The attention/QSA/MoE/GR/PLE/rope group falls **25 -> 17**;
+glue 0, matvec/GEMV/KV 6, GDN mixer 0, other 2.  Measured with `$HOME/vkbuild-vulkan` reconfigured + rebuilt from
+the tree first (never `-G Ninja`).
+
+**RESULTS (vega).**  Gate: Arc (`intel_icd`) **639/0/0** (exit 0), llvmpipe **627/0/3**, Ryzen iGPU (`radeon_icd`)
+**630/0/2** - **+27 verdicts per arm**, 0 failed.  `strata_vk_entry_smoke` builds + RUNS four of the six wrappers
+(PASS, exit 0).  `check_port_map.py` passes (`168 - 78 kernel, 61 host, 29 todo; 112 shaders built, 93 claimed`);
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **`z820b` PENDING.**  CUDA graph API untouched.
+
+
 ## NOT DETERMINISTIC ON THE Ryzen iGPU — a characterised open defect (2026-10-05)
 
 **A green `run_gate.sh` on `vega` does not prove determinism.** The same commit, binary and fixture seed fails
