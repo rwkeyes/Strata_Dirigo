@@ -8642,6 +8642,167 @@ void case_embedding_gather(Ctx& ctx, const std::string& dir) {
             "a wrong packing order, group index, bias or fused rounding would land here");
 }
 
+// ===================================================================================================================
+// M-A: THE DECODE PATH'S REMAINING KERNELS - the three that carry no unported precondition, in the order the
+// decode path meets them: the per-layer control-vector apply, the MTP draft head's row gather, and the peer
+// expert row scatter.  Each is gated against the ENGINE's own contract (cvec_parity.cpp for the first; the
+// CUDA kernel's rule for the other two), with a stated expected value and a falsification in
+// gates/inject-verify.sh.
+// ===================================================================================================================
+
+// cvec_apply - the control-vector apply (src/kernels/cuda/cvec.cu, cvec_kernel; the contract is the engine's own
+// src/kernels/cvec_parity.cpp).  THE REDUCTION IS A WORKGROUP TREE here, so the two PROJECTION arms carry the
+// engine's own 1e-4 absolute tolerance against a double oracle, while the ADD and the two UNTOUCHED arms - no
+// reduction in any of them - are required BITWISE, exactly as the engine's parity test requires them.
+void case_cvec_apply(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "cvec_apply.spv")) return;
+    const int n = 512, hc = 4, T = 3, L = 48;
+    const int kLayer = 7, kOff = 3;                  // steered / not steered
+    const int64_t r_ld = (int64_t) hc * n;
+    struct Pc { int mode, layer, n, hc, r_ld, bo_ld, inj_ld, write; };
+    const VkPipeline p = ctx.pipeline(dir + "/cvec_apply.spv", 6, sizeof(Pc));
+
+    // a UNIT direction at kLayer (so h.v is O(sqrt(n)) and not an accident), zero at every other layer
+    std::vector<float> dirv((size_t) L * n, 0.0f), sl((size_t) L, 0.0f);
+    {
+        double nrm = 0.0;
+        std::vector<float> v((size_t) n);
+        for (auto& x : v) { x = rndf(1.0f); nrm += (double) x * x; }
+        nrm = std::sqrt(nrm);
+        for (int j = 0; j < n; ++j) dirv[(size_t) kLayer * n + j] = (float) (v[j] / nrm);
+    }
+    sl[kLayer] = 2.0f;                                // project (reflect) for the first arm
+
+    std::vector<float> R((size_t) T * r_ld);
+    for (auto& x : R) x = rndf(3.0f);
+    std::vector<float> bo((size_t) T * n);
+    for (auto& x : bo) x = rndf(1.0f);
+    std::vector<float> inj((size_t) T * hc, 0.0f);    // inj == 0 -> w == 2*sigmoid(0) == 1.0 EXACTLY
+
+    Buf bR = ctx.alloc(R.size() * 4), bDir = ctx.alloc(dirv.size() * 4), bSl = ctx.alloc(sl.size() * 4),
+        bOn = ctx.alloc(4), bBo = ctx.alloc(bo.size() * 4), bInj = ctx.alloc(inj.size() * 4);
+    ctx.write(bDir, dirv.data(), dirv.size() * 4);
+    ctx.write(bSl, sl.data(), sl.size() * 4);
+    ctx.write(bBo, bo.data(), bo.size() * 4);
+    ctx.write(bInj, inj.data(), inj.size() * 4);
+
+    Pc pc{};
+    pc.n = n; pc.hc = hc; pc.r_ld = (int) r_ld; pc.bo_ld = n; pc.inj_ld = hc;
+    std::vector<float> got(R.size());
+    int32_t onflag = 1;
+    auto run = [&]() {
+        ctx.write(bOn, &onflag, 4);
+        ctx.write(bR, R.data(), R.size() * 4);
+        ctx.dispatch(p, {&bR, &bDir, &bSl, &bOn, &bBo, &bInj}, &pc, sizeof(pc), (uint32_t) hc, (uint32_t) T);
+        ctx.read(bR, got.data(), got.size() * 4);
+    };
+    auto row = [&](std::vector<float>& buf, int t, int c, int j) -> float& {
+        return buf[(size_t) t * r_ld + (size_t) c * n + j];
+    };
+
+    // ---- arm 1: project, s = 2 (the component is REFLECTED) ---------------------------------------------
+    {
+        onflag = 1; pc.mode = 0; pc.layer = kLayer; pc.write = 0;
+        run();
+        double worst = 0.0, worst_dot = 0.0, min_abs_dot = 1e30, max_abs_dot = 0.0;
+        int bad = 0;
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < hc; ++c) {
+                double dot = 0.0;
+                for (int j = 0; j < n; ++j) dot += (double) row(R, t, c, j) * dirv[(size_t) kLayer * n + j];
+                double after = 0.0;
+                for (int j = 0; j < n; ++j) {
+                    const double want = (double) row(R, t, c, j) - 2.0 * dot * dirv[(size_t) kLayer * n + j];
+                    worst = std::fmax(worst, std::fabs(row(got, t, c, j) - want));
+                    after += (double) row(got, t, c, j) * dirv[(size_t) kLayer * n + j];
+                }
+                worst_dot = std::fmax(worst_dot, std::fabs(after + dot));   // s = 2 reflects h.v -> -h.v
+                min_abs_dot = std::fmin(min_abs_dot, std::fabs(dot));
+                max_abs_dot = std::fmax(max_abs_dot, std::fabs(dot));
+            }
+        // THE STATED EXPECTED VALUE, checked against the oracle: the fixture has a real component along v
+        // (some |h.v| > 1), so a stale fixture fails loudly instead of passing vacuously.  A SMALL row is not a
+        // defect - the oracle checks every row absolutely - so the claim is on the largest, not the smallest.
+        const bool fixture_ok = max_abs_dot > 1.0;
+        if (!fixture_ok) ++bad;
+        if (worst > 1e-4) ++bad;
+        if (worst_dot > 1e-3) ++bad;
+        std::printf("      project s=2: max |err| %.3g, max |h'.v + h.v| %.3g, min|max |h.v| %.3g/%.3g\n",
+                    worst, worst_dot, min_abs_dot, max_abs_dot);
+        verdict("cvec_apply: project removes s(h.v)v", bad == 0, bad, T * hc + 2, worst,
+                "worst absolute error vs a double oracle (engine's own 1e-4), the reflection, and the fixture");
+    }
+    // ---- arm 2: add, mode 1 - the engine's parity test requires this BITWISE ------------------------------
+    {
+        onflag = 1; pc.mode = 1; pc.layer = kLayer; pc.write = 0; sl[kLayer] = 1.0f;
+        ctx.write(bSl, sl.data(), sl.size() * 4);
+        run();
+        int bad = 0;
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < hc; ++c)
+                for (int j = 0; j < n; ++j)
+                    bad += (row(got, t, c, j) != row(R, t, c, j) + dirv[(size_t) kLayer * n + j]);
+        verdict("cvec_apply: add is h + d, bitwise", bad == 0, bad, T * hc * n, 0.0,
+                "a value that is not h + d in f32");
+    }
+    // ---- arm 3: a layer WITHOUT a direction is untouched, bitwise (the engine's own case) ----------------
+    {
+        onflag = 1; pc.mode = 0; pc.layer = kOff; pc.write = 0;
+        run();
+        const int bad = (std::memcmp(got.data(), R.data(), R.size() * 4) != 0);
+        verdict("cvec_apply: a layer without a direction is untouched", bad == 0, bad, 1, 0.0,
+                "a row that moved where s[layer] == 0");
+    }
+    // ---- arm 4: the switch OFF, no pending write: R bitwise unchanged ------------------------------------
+    {
+        onflag = 0; pc.mode = 0; pc.layer = kLayer; pc.write = 0;
+        run();
+        const int bad = (std::memcmp(got.data(), R.data(), R.size() * 4) != 0);
+        verdict("cvec_apply: switch off, no write: R unchanged", bad == 0, bad, 1, 0.0,
+                "a row that moved with the vector switched off and no pending write");
+    }
+    // ---- arm 5: the switch OFF with a pending write: fma(bo, w, h) with w == 1 exactly -------------------
+    {
+        onflag = 0; pc.mode = 0; pc.layer = kLayer; pc.write = 1;
+        run();
+        int bad = 0, moved = 0;
+        for (size_t i = 0; i < R.size(); ++i) {
+            const size_t bobase = (i / (size_t) r_ld) * (size_t) n;   // bo is per token, stride n; R's stride is r_ld
+            const float want = bo[bobase + (i % (size_t) n)] + R[i];   // w == 1 exactly, so the FOLD is fl(bo + h)
+            if (got[i] != want) ++bad;
+            if (got[i] != R[i]) ++moved;
+        }
+        if (moved == 0) ++bad;                                 // the write did not happen at all
+        std::printf("      write w=1: %d of %d values moved\n", moved, (int) R.size());
+        verdict("cvec_apply: switch off, pending write: w == 1 fold", bad == 0, bad, (int) R.size(), 0.0,
+                "a value that is not bitwise fma(bo, 1.0, h), or a write that did not happen");
+    }
+    // ---- arm 6: ON with the write: the write, THEN the projection ----------------------------------------
+    {
+        onflag = 1; pc.mode = 0; pc.layer = kLayer; pc.write = 1;
+        sl[kLayer] = 2.0f;                                  // arm 2 left it at 1.0; RESTORE the reflect factor
+        ctx.write(bSl, sl.data(), sl.size() * 4);
+        run();
+        std::vector<float> written(R.size());
+        for (size_t i = 0; i < R.size(); ++i)
+            written[i] = bo[(i / (size_t) r_ld) * (size_t) n + (i % (size_t) n)] + R[i];   // w == 1, the fold, bitwise
+        double worst = 0.0;
+        int bad = 0;
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < hc; ++c) {
+                double dot = 0.0;
+                for (int j = 0; j < n; ++j) dot += (double) row(written, t, c, j) * dirv[(size_t) kLayer * n + j];
+                for (int j = 0; j < n; ++j)
+                    worst = std::fmax(worst, std::fabs(row(got, t, c, j) -
+                                                       ((double) row(written, t, c, j) - 2.0 * dot * dirv[(size_t) kLayer * n + j])));
+            }
+        if (worst > 1e-4) ++bad;
+        verdict("cvec_apply: write then project", bad == 0, bad, T * hc, worst,
+                "worst absolute error vs the write-then-project oracle (engine's own 1e-4)");
+    }
+    ctx.free(bR); ctx.free(bDir); ctx.free(bSl); ctx.free(bOn); ctx.free(bBo); ctx.free(bInj);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -8776,6 +8937,7 @@ int main(int argc, char** argv) {
     case_sampler_greedy(ctx, dir);         // the greedy sampler: the first token this port emits
     case_sampler_kernel(ctx, dir);         // the general sampler: top-k, top-p, min-p, temperature, the draw
     case_embedding_gather(ctx, dir);       // the embedding gather: packed codes -> float rows
+    case_cvec_apply(ctx, dir);             // M-A: the control-vector apply (per-layer steering)
     run_conversion<uint16_t>(ctx, dir, "f32_to_bf16 (bit-exact)", "f32_to_bf16.spv", false, &bf16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "f32_to_f16 (bit-exact)", "f32_to_f16.spv", false, &f16_from_f32);
     run_conversion<uint16_t>(ctx, dir, "NEGCTRL f16 truncating", "f32_to_f16_trunc.spv", true, &f16_from_f32);

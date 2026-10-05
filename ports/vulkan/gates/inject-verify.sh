@@ -10,6 +10,12 @@
 #                                       -> must FAIL  "kv_q4 round trip: append (rotated) -> gather ..."
 #   inject-verify.sh q8-round-half-up   quantize_q8_0.comp  replace the ties-to-even rounding with half-toward-+inf
 #                                       -> must FAIL  "quantize_q8_0 (ggml bytes)"
+#   inject-verify.sh cvec-apply-drop-scale  cvec_apply.comp     drop the per-layer reflect factor s
+#                                       -> must FAIL  "cvec_apply: project removes s(h.v)v ..."
+#   inject-verify.sh gather-rows-identity   gather_rows.comp    ignore ids[r]: gather the row at the POSITION
+#                                       -> must FAIL  "gather_rows: 16-byte-aligned rows ..."
+#   inject-verify.sh scatter-rows-identity  scatter_rows_f32.comp  write dst row r instead of rows[r]
+#                                       -> must FAIL  "scatter_rows_f32: permutation ..."
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -31,6 +37,11 @@ case "$name" in
     old=$'        double q = fl + ((u - fl > 0.5) ? 1.0 : ((u - fl < 0.5) ? 0.0 : odd));'
     new=$'        double q = fl + ((u - fl >= 0.5) ? 1.0 : 0.0);   // INJECTION: round half toward +inf'
     want="FAIL  quantize_q8_0 (ggml bytes)" ;;
+  cvec-apply-drop-scale)
+    file="$SH/cvec_apply.comp"; spv="cvec_apply"
+    old=$'    if (steer && pc.mode == 0) dot = wg_sum(dot) * SL.v[pc.layer];'
+    new=$'    if (steer && pc.mode == 0) dot = wg_sum(dot);   // INJECTION: the per-layer scale s dropped'
+    want="FAIL  cvec_apply: project removes" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 

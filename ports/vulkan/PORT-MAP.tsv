@@ -11,7 +11,7 @@ copy_or_zero_from_mapped	host	a mapped-buffer copy
 coupled_draft_scratch_bytes	host	a size
 cpu	host	the engine ticks its own clock
 cvec	host	the table the cvec_apply kernel reads
-cvec_apply	todo	a vector-table apply, not ported
+cvec_apply	kernel	cvec_apply
 doorbell_publish	host	a host-device sync primitive
 doorbell_ring	host	a host-device sync primitive
 doorbell_wait	host	a host-device sync primitive

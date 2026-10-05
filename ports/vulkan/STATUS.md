@@ -11,8 +11,8 @@ Everything below is backed by a command that exits non-zero on failure. Re-run i
 was swapped for an Arc Pro B70 and after stages 3, 4, the prefill GEMM, the quantised multi-token arms, the
 short-step decode attention, the f16 KV gather, the QSA selection, the f16 KV append, the Q4_0 KV path (with its
 Walsh-Hadamard rotation), the hybrid K8V4 mode, descriptor OFFSETS and the first SAMPLER kernel landed, the box's GPU
-run was **272 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
-Vulkan 1.4.318, subgroup size 32) - 260 / 0 / 3 on llvmpipe and 263 / 0 / 2 on the radeon ICD, which now picks the AMD
+run was **278 passed / 0 failed / 0 skipped** on the Intel ICD (`Intel(R) Graphics (BMG G31)`, Mesa 25.2.8 / ANV,
+Vulkan 1.4.318, subgroup size 32) - 266 / 0 / 3 on llvmpipe and 269 / 0 / 2 on the radeon ICD, which now picks the AMD
 iGPU because the discrete card is gone (both
 skip cooperative matrix, whose driver does not advertise the extension, and the prefill SPLIT, which needs the M8
 tile).  **The Arc has no skips at all:** the last one (`gemm_coopmat`) was the port
@@ -32,9 +32,21 @@ the ``PASS`` LINE COUNT IS ONE LESS than the case total, because the transcenden
 counting as a pass; and one line ("gemm shape contract") covers seven cases. Neither is a discrepancy - but if the
 numbers ever stop reconciling this way, something is wrong with the harness rather than with a kernel.
 
+**M-A has started: the decode path's last kernels, in the order the decode path needs them (2026-10-04).**  The
+ten `todo` symbols were ordered by (a) where the decode step meets them and (b) what each depends on.  The three
+with NO unported precondition come first, in the order a decode step reaches them - `cvec_apply` (every layer,
+`block_layer_post`), `gather_rows` (the MTP draft head's token subset), `scatter_rows_f32` (the peer experts'
+write-back) - and **`cvec_apply`** is landed (1 of the ten).  `cvec_apply.comp` reproduces the engine's OWN test
+(`src/kernels/cvec_parity.cpp`) arm for arm: the projections at the engine's 1e-4 against a double oracle, the
+add and BOTH untouched cases bitwise, and the pending write bitwise by construction (`inj == 0` makes
+`2 sigmoid(0/hc) == 1.0` exactly, so the fold is `fl(bo + h)`).  Its SPIR-V carries the barrier tree's ops, so
+`run_gate.sh`'s census list gained `cvec_apply`.  Falsified by `gates/inject-verify.sh cvec-apply-drop-scale`
+(drop the per-layer factor `s`) -> `FAIL  cvec_apply: project removes s(h.v)v  12/14  worst 0.844`.  **Arc
+278/0/0** (272 + the increment's six verdicts); box `radeon_icd 274/0/1`, lvp 266/0/3, nvidia 269/0/2.
+
 **The 7900 XTX run's two failures are RESOLVED (2026-10-04).**  On `z820b` (RX 7900 XTX, RADV gfx1100, Mesa 26.0.8)
-the gate now reads **`radeon_icd 268 passed / 0 failed / 1 skipped`**, `lvp_icd 260/0/3`, `nvidia_icd (K620)
-263/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the
+the gate now reads **`radeon_icd 274 passed / 0 failed / 1 skipped`**, `lvp_icd 266/0/3`, `nvidia_icd (K620)
+269/0/2`.  Both failures were the cross-implementation arm earning its keep, and each went a different way: the
 `kv_q4 round trip` failure was the CASE's bound (`|d|/2`, wrong for a `d*[-8,+7]` code range whose +8 end clips -
 the shader was faithful, `dev-vs-rule mismatch 0`); the `quantize_q8_0 (ggml bytes)` failure was a lavapipe/Mesa
 26.0.8 bug (`roundEven(double)` rounds ties toward zero), so the CASE was right and the SHADER was changed to an

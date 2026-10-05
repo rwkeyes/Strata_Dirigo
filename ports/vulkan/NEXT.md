@@ -41,6 +41,67 @@ driver builtin.  The `quantize_q8_0_scaled` sibling was already independent of i
 rule), and this was the only f64 use of `roundEven` in the port.  **Honest limit:** this is a property of that
 Mesa build, measured here and not reproduced upstream; the shader no longer depends on it either way.
 
+## M-A: the decode path's last kernels - the ORDER, and 1/3: `cvec_apply`
+
+**The order, derived from the decode path (`src/core/`), not invented.** The ten `todo` symbols were ordered by
+two things: where the decode step meets them, and **what each one depends on**. Three carry NO unported
+precondition, and they come first, in the order a decode step reaches them:
+
+    1. cvec_apply         every layer, src/core/layer.cpp:1330-1336 (block_layer_post) - the steering vector
+    2. gather_rows        MtpDrafter::bind, src/core/mtp.cpp:450 - the MTP draft head's token subset
+    3. scatter_rows_f32   PeerExperts::run, src/core/peer_experts.cpp:241 - the peer experts' write-back
+
+then the pair that shares the primitive the port does NOT have - `iq_dequant_f32` -> `iq_embed_rows`, which need a
+standalone IQ/BF16 dequantiser where the port has only the FUSED `iq*_mmvq` form (the port map's own reason for
+that row) - then the head's matvec `native_q5_k_f32`, which needs a **Q5_K dot** the `iq*_mmvq` family does not
+contain (`native_q5_k_f32` = `quantize_q8_1` + `native_q5_k_mmvq`). The MoE half follows in the order the hit path
+issues it: `moe_hit_select` -> `moe_hit_grouped_s2` (with `moe_grouped_s2` its resident sibling) -> `moe_hit_add`.
+**The embedding kernels are first IN TIME in a token but are the largest single increment** - a dequantiser over
+the 15 `is_iq` types plus BF16 - and nothing else on the list depends on them; that, and not convenience, is why
+these three are the first increments.
+
+**What was ported.** `cvec_apply.comp`, from `cvec_kernel` (`src/kernels/cuda/cvec.cu:46`); the CONTRACT is the
+engine's own test, `src/kernels/cvec_parity.cpp`, and that is what the gate reproduces arm for arm:
+
+| arm | rule | required by |
+|---|---|---|
+| project (mode 0) | `h' = h - s (h.v) v`; s = 2 REFLECTS the component, s = 1 removes it | the engine: **1e-4 absolute** vs double |
+| add (mode 1) | `h' = h + d` | the engine: **BITWISE** |
+| a layer without a direction (s == 0) | R untouched | the engine: **BITWISE** |
+| switch off, no pending write | R untouched | the engine: **BITWISE** |
+| switch off, pending write | `h' = fma(bo, w, h)`, `w = 2 sigmoid(inj/hc)` | **BITWISE** at `inj == 0` |
+| on + write | the write, THEN the projection | **1e-4** vs the oracle |
+
+Two lessons from this port's own history are load-bearing here:
+
+* **The CUDA uses `fmaf` on both paths**, so the GLSL calls `fma()` and is deliberately **NOT `precise`**: the
+  fused op rounds ONCE where a separate multiply-and-add rounds twice, and `fmaf` is the engine's answer. (The
+  opposite of the embedding gather, where the engine wanted the TWO-rounding form and `precise` was the fix.)
+* **One workgroup per (stream, token), reduction by the barrier tree** (`common/wg_reduce.glsl`) - the port's
+  design rule, because the target is Intel where the driver picks the subgroup width per kernel. The tree's
+  summation ORDER is therefore the port's, which is exactly why the two PROJECTIONS cannot be bitwise and use the
+  engine's own 1e-4, while every arm without a reduction in it is bitwise. `run_gate.sh`'s barrier census list
+  gains `cvec_apply` (its SPIR-V carries the tree's barriers; a shader that lost them must fail).
+
+**The write arm is bitwise BY CONSTRUCTION, not by luck**: `inj == 0` makes `2 sigmoid(0/hc) == 1.0` exactly for
+any `hc`, so the fold is `fl(bo + h)` and the case demands it bitwise - and separately requires that the write
+actually MOVED values (`write w=1: 6144 of 6144 values moved`), so a no-op cannot pass.
+
+**Falsified.** `gates/inject-verify.sh cvec-apply-drop-scale` drops the per-layer factor `s` from the reduced dot
+(`dot = wg_sum(dot) * s` -> `dot = wg_sum(dot)`), and the named case fails:
+`FAIL  cvec_apply: project removes s(h.v)v  12/14  worst 0.844` (the correct form reads `worst 4.73e-07`).
+
+**Measured.** vega, this commit: **Intel Arc (BMG G31, default) 278 passed / 0 failed / 0 skipped**, intel_icd
+278/0/0, llvmpipe **266/0/3**, radeon-iGPU 269/0/2 (the iGPU's `budget: independent requery agrees` is the
+documented intermittent driver-figure drift - 2 fail / 1 pass in 3 consecutive runs of this binary, recorded, not
+a port defect). z820b (7900 XTX): **radeon_icd 274/0/1** (the 1 skip is the pre-existing M8 cooperative-matrix
+case), lvp 266/0/3, nvidia (K620) 269/0/2; the box's script exits 1 on that pre-existing skip, as it does at HEAD.
+
+**Honest limit.** The engine's `sigmoidf_` is `__expf`-based and the port's is the driver's `exp`, so with
+`inj != 0` the port's `w` differs from the CUDA's in the last bits. That is why no arm compares a non-zero-`inj`
+write bitwise: the rule (direction, magnitude, the `hc` division, the fold and its order) is gated; the last bits
+of `__expf` are not claimed.
+
 ## STAGE 3: recorded command buffers (the CUDA-graph replacement) - **DONE AND VERIFIED 2026-10-04**
 
 **Closed the same day the API was written.**  `case_recorded_step` (`harness/vk_gate.cpp`, six verdicts, one

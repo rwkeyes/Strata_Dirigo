@@ -1,0 +1,92 @@
+#version 450
+// ports/vulkan/shaders/cvec_apply.comp - THE CONTROL-VECTOR APPLY.
+//
+// Transcribed from `cvec_kernel` (src/kernels/cuda/cvec.cu:46) and its contract
+// (src/kernels/cvec_parity.cpp, which is the engine's OWN test for it):
+//
+//   project (mode 0):  h' = h - s (h . v) v        - the component along v is REFLECTED when s = 2 and
+//                                                    removed when s = 1
+//   add     (mode 1):  h' = h + d                  - and the parity test requires this BITWISE
+//   write   (pending): h' = fma(bo, w, h)          - the fused hyper-connection read's folded write, with
+//                                                    w = 2 * sigmoid(inj / hc); the parity test requires the
+//                                                    write-only pass to be BITWISE the fused read's own write
+//
+// ONE WORKGROUP PER (stream, token): grid = (hc, T), local_size_x = 256, and the per-stream reduction is a
+// WORKGROUP tree (common/wg_reduce.glsl), not a shuffle tree - the port's reduction rule, because the target is
+// Intel where the driver picks the subgroup width per kernel.  The reduction's summation ORDER is therefore this
+// port's and not the driver's, which is why the two projections are compared to 1e-4 against a double oracle
+// (exactly the tolerance the engine's own parity test uses) rather than bitwise - while the ADD arm, which has no
+// reduction in it at all, is required bitwise.
+//
+// WHAT IS DELIBERATELY *NOT* `precise`: the CUDA writes `fmaf(b[d], w, xv)` and `fmaf(-dot, v[d], xv)` - both
+// FUSED - so the port calls `fma()` and must let the driver emit the fused op.  Qualifying these `precise` would
+// force a separate multiply-and-add, which rounds twice where the engine rounds once.
+//
+// `steer = (on != 0) && (s[layer] != 0)`, and it is UNIFORM over the workgroup, which is what makes the barrier
+// reduction legal here.  The early return is the engine's own guard and is what makes "a layer without a
+// direction" and "the switch is off with no pending write" leave R BITWISE untouched.
+//
+// SHAPE: the engine's own `cvec_upload` refuses n_embd > 256*16 = 4096, which is the register tile below.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer Rb { float v[]; } R;
+layout(set = 0, binding = 1, std430) readonly buffer DIRb { float v[]; } DIR;
+layout(set = 0, binding = 2, std430) readonly buffer SLb { float v[]; } SL;
+layout(set = 0, binding = 3, std430) readonly buffer ONVb { int v[]; } ONV;
+layout(set = 0, binding = 4, std430) readonly buffer BOb { float v[]; } BO;
+layout(set = 0, binding = 5, std430) readonly buffer INJb { float v[]; } INJ;
+
+layout(push_constant) uniform Pc {
+    int mode;      // 0 = project (dot), 1 = add
+    int layer;
+    int n;         // n_embd
+    int hc;        // hyper-connection streams
+    int r_ld;      // floats per token in R (>= hc * n)
+    int bo_ld;     // floats per token in bo
+    int inj_ld;    // floats per token in inj
+    int write;     // 0/1: fold the pending write first
+} pc;
+
+#include "common/wg_reduce.glsl"
+
+const int MAXK = 16;   // 256 threads * 16 = 4096, the engine's own ceiling on n_embd
+
+void main() {
+    const int c = int(gl_WorkGroupID.x);          // the stream
+    const int t = int(gl_WorkGroupID.y);          // the token
+    const int n = pc.n;
+    const bool steer = (ONV.v[0] != 0) && (SL.v[pc.layer] != 0.0);
+    const bool write = (pc.write != 0);
+    if (!steer && !write) return;                 // UNIFORM: the reduction below is still reached by everyone
+
+    const int base = t * pc.r_ld + c * n;         // this (token, stream) row of R
+    const int vbase = pc.layer * n;               // the layer's direction
+    const int bbase = t * pc.bo_ld;
+    // the fused read's fold: 2 * sigmoid(inj / hc).  At inj == 0 this is EXACTLY 1.0 for every hc, which is what
+    // makes the gate's write arm bitwise.
+    const float w = write ? 2.0 * (1.0 / (1.0 + exp(-(INJ.v[t * pc.inj_ld + c] / float(pc.hc))))) : 0.0;
+
+    float x[MAXK];
+    float dot = 0.0;
+    for (int k = 0; k < MAXK; ++k) {
+        const int d = int(gl_LocalInvocationIndex) + k * 256;
+        if (d < n) {
+            float xv = R.v[base + d];
+            if (write) xv = fma(BO.v[bbase + d], w, xv);      // FUSED, as the CUDA's __fmaf_rn is
+            x[k] = xv;
+            if (steer && pc.mode == 0) dot = fma(xv, DIR.v[vbase + d], dot);
+        } else {
+            x[k] = 0.0;
+        }
+    }
+    if (steer && pc.mode == 0) dot = wg_sum(dot) * SL.v[pc.layer];
+
+    for (int k = 0; k < MAXK; ++k) {
+        const int d = int(gl_LocalInvocationIndex) + k * 256;
+        if (d < n) {
+            float xv = x[k];
+            if (steer) xv = (pc.mode == 0) ? fma(-dot, DIR.v[vbase + d], xv) : (xv + DIR.v[vbase + d]);
+            R.v[base + d] = xv;
+        }
+    }
+}
