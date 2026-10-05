@@ -163,11 +163,19 @@ TABLE = {
     'coupled_draft_stage':            ('host', "the coupled round's mapped staging (a copy; the coupled kernels read it)"),
     'cpu':                            ('host', 'the engine ticks its own clock'),
     'cvec':                           ('host', 'the table the cvec_apply kernel reads'),
-    'doorbell_publish':               ('host', 'a host-device sync primitive'),
-    'doorbell_publish_res':           ('host', 'a host-device sync primitive'),
-    'doorbell_publish_value':         ('host', 'a host-device sync primitive'),
-    'doorbell_ring':                  ('host', 'a host-device sync primitive'),
-    'doorbell_wait':                  ('host', 'a host-device sync primitive'),
+    # ---- the doorbell handshake: DEVICE work now, so `kernel`, except the one that submits nothing -------------
+    # The ring (`doorbell_ring` and the ring step of each publish) is a RECORDED DEVICE operation
+    # (`ports/vulkan/shaders/ring_inc.comp`, dispatched through `Ctx::dispatch`), and the payload copies are
+    # `copy.spv`.  The engine's own requirement (layer.cpp:383-389) is that the ring RE-READS its host copy, so
+    # the old `host` kind was the same mis-kind `copy_from_mapped` had: a CUDA body that is a DEVICE kernel
+    # (`elementwise.cu:209-212`) answered by a shader dispatch.  `doorbell_wait` is the exception - the host
+    # writes the answer, THEN submits the consumer, so it submits nothing and stays `host`.  See
+    # `case_doorbell_ring_replay` (a replayed block advances the ring every replay) and NEXT.md.
+    'doorbell_publish':               ('kernel', 'copy ring_inc'),
+    'doorbell_publish_res':           ('kernel', 'copy ring_inc'),
+    'doorbell_publish_value':         ('kernel', 'copy ring_inc'),
+    'doorbell_ring':                  ('kernel', 'ring_inc'),
+    'doorbell_wait':                  ('host', 'the host->device handoff boundary: the host writes the answer, then the consumer is submitted (no device node)'),
     'embed_type_supported':           ('host', 'a capability check'),
     'f16_from_f32':                   ('host', 'a type conversion helper'),
     'f32_from_f16':                   ('host', 'a type conversion helper'),

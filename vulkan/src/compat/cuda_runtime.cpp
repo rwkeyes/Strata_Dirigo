@@ -25,7 +25,12 @@ using strata::vulkan::Stream;
 // THE CURRENT STREAM - the shim's stand-in for CUDA's process-wide "current device".  A stream-less call
 // (cudaMalloc/cudaMemcpy/cudaDeviceSynchronize/cudaHostAlloc) uses it; a call carrying a stream also BINDS it
 // (the "most recently used stream" rule, documented in the header).
-Stream* g_current = nullptr;
+//
+// IT IS A REFERENCE TO THE DEVICE LAYER'S DEFAULT STREAM, not a second variable: CUDA treats a NULL
+// `cudaStream_t` as the default stream, and the engine passes NULL wherever it means "the current stream"
+// (generate.cpp:3893).  `stream_of(nullptr)` returns this same object (vk_arena.cpp), so the two can never
+// disagree - one storage, one meaning.
+Stream*& g_current = strata::vulkan::default_stream_ref();
 
 // THE SHIM'S OWN LAST ERROR.  Real, not a constant: every refusal below sets it, and cudaPeekAtLastError /
 // cudaGetLastError carry it (see the header).  thread_local, as CUDA's is per-thread.

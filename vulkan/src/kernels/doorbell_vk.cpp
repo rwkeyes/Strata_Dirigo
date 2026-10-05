@@ -33,16 +33,20 @@
 //       (PORT-PLAN 2.3): on the display card a hung compute kernel is a KMD timeout at best and a Battlemage
 //       wedge at worst.
 //
-// THE RING IS THE HOST'S OWN COUNT, and that is the design's choice rather than a shortcut: `sync.hpp` states
-// that in this synchronous backend "the fence is the ring" and the count "lives where it is read (the host)".
-// The CUDA ring had to be incremented on the DEVICE only because the graph is asynchronous and the host had to
-// POLL for the datum; here the wrapper's caller IS the host and the fenced submit has already completed when it
-// returns, so the host raises the ring itself.  When the recorded step becomes a genuinely asynchronous
-// re-submission (a later increment), the one place that changes is `sync_publish` - the seam was kept narrow
-// for exactly that swap.
+// THE RING IS A RECORDED DEVICE OPERATION, AND THAT IS THE ENGINE'S OWN REQUIREMENT.  `layer.cpp:383-389`
+// states it: the sequence value is READ FROM THE HOST COPY and incremented, "which is what makes the write
+// idempotent across replays of the same graph - a captured literal would ring the same number forever and the
+// host would never see a change."  `src/kernels/cuda/elementwise.cu:209-212` (`doorbell_ring_kernel`) is that
+// one-thread kernel.  The Vulkan form is `ring_inc.comp`, DISPATCHED through `Ctx::dispatch` so it RECORDS
+// while a capture is active and submits-and-waits otherwise: one definition, no second mechanism.  A host-side
+// read-modify-write would have been exactly the stale literal the engine warns about (it would raise the ring
+// once, at capture, and the recorded block would never move it again).  THE FENCE still orders the payload
+// copies (each is its own `sync_copy_fenced` dispatch); the ring DISPATCH is what makes the count advance per
+// replay.
 //
 // THE PAYLOAD COPY IS `sync_copy_fenced` - the SAME fenced copy `sync_publish`/`sync_consume` use, exposed from
-// `sync.*` so the two directions of the handshake have ONE definition and not two that can drift.
+// `sync.*` so the two directions of the handshake have ONE definition and not two that can drift.  It ends in
+// `Ctx::dispatch`, so it too is RECORDED under capture (a captured publish re-copies live bytes each replay).
 #if !defined(STRATA_ENABLE_VULKAN)
 #error "doorbell_vk.cpp is the Vulkan backend: compile it only in a -DSTRATA_ENABLE_VULKAN=1 build"
 #endif
@@ -87,15 +91,12 @@ Buf view_of(Stream& s, const void* p, uint64_t bytes, const char* what) {
     std::exit(2);
 }
 
-// Read/write THROUGH the resolution above.  `strata::vulkan::stream_read/write` only accept arena pointers;
-// the ring (`d_seq`) and the answer flag (`d_flag`) are mapped host memory, so they need these.
+// Read THROUGH the resolution above.  `strata::vulkan::stream_read` only accepts arena pointers; the answer
+// flag (`d_flag`) is mapped host memory, so it needs this.  (The ring no longer uses a host read here: see
+// `ring_raise`.)
 void read_at(Stream& s, const void* p, void* host, uint64_t bytes, const char* what) {
     Buf v = view_of(s, p, bytes, what);
     s.ctx->read(v, host, bytes, v.offset);
-}
-void write_at(Stream& s, void* p, const void* host, uint64_t bytes, const char* what) {
-    Buf v = view_of(s, p, bytes, what);
-    s.ctx->write(v, host, bytes, v.offset);
 }
 
 void copy(Stream& s, const void* src, const void* dst, uint64_t bytes, const char* what) {
@@ -103,15 +104,22 @@ void copy(Stream& s, const void* src, const void* dst, uint64_t bytes, const cha
     sync_copy_fenced(*s.ctx, s.spv_dir, view_of(s, src, bytes, what), view_of(s, dst, bytes, what), bytes, what);
 }
 
-// THE RING.  In the synchronous backend the fenced submit above already ordered the payload; this records the
-// publication count where the host reads it (see the file header).  `store` selects the `_value` variant.
-uint32_t ring_raise(Stream& s, uint32_t* d_seq, bool store, uint32_t value, const char* what) {
-    if (d_seq == nullptr) return 0;
-    uint32_t cur = 0;
-    read_at(s, d_seq, &cur, sizeof(uint32_t), what);          // refuse a ring outside the arena, like every bind
-    const uint32_t next = store ? value : cur + 1u;
-    write_at(s, d_seq, &next, sizeof(uint32_t), what);
-    return next;
+// THE RING, AS A RECORDED DEVICE OPERATION (see `ring_inc.comp` and the file header's DELIVERABLE-A note).
+//
+// The engine's requirement is that the ring RE-READS the host copy and increments it, so a captured block
+// advances it on EVERY replay - a captured literal would ring the same number forever.  So this DISPATCHES
+// `ring_inc.spv` through `Ctx::dispatch`, which RECORDS while a capture is active and submits-and-waits
+// otherwise.  One definition covers both, and there is no second mechanism.
+//
+// `store` selects the `_value` variant (STORE the caller's constant - the P6/HIP STRATA_DOORBELL_STORE form,
+// whose CUDA body stores a kernel argument by design).  `view_of` still refuses a ring that is neither in the
+// arena nor a live mapped region, so a wrong handle is a loud exit(2), never a bind of a wrong view.
+void ring_raise(Stream& s, uint32_t* d_seq, bool store, uint32_t value, const char* what) {
+    if (d_seq == nullptr) return;
+    Buf v = view_of(s, d_seq, sizeof(uint32_t), what);
+    struct Push { uint32_t value; uint32_t store; } pc{value, store ? 1u : 0u};
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/ring_inc.spv", 1, (uint32_t) sizeof(pc));
+    s.ctx->dispatch(p, {&v}, &pc, (uint32_t) sizeof(pc), /*groups=*/1);
 }
 
 }  // namespace
@@ -127,6 +135,9 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
     // DEVICE -> HOST: the payload copy.  Each `copy` ends in a fenced submit, so the host may read x_out/ids_out/
     // weights_out the moment this returns.  THAT is the handshake, not a ring the device spins to raise.
+    // UNDER CAPTURE each `copy` RECORDS a dispatch, and the ring below RECORDS an increment: the recorded block
+    // re-copies the live payload and re-rings on every replay (the engine's own requirement - a captured
+    // literal would publish once and never again).
     strata::vulkan::copy(*s, x, x_out, (uint64_t) n * sizeof(float), "doorbell_publish/x");
     strata::vulkan::copy(*s, ids, ids_out, (uint64_t) k * sizeof(int32_t), "doorbell_publish/ids");
     strata::vulkan::copy(*s, weights, weights_out, (uint64_t) k * sizeof(float), "doorbell_publish/weights");
@@ -171,7 +182,9 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
 }
 
 // elementwise.hpp: the ring alone, the fallback when the fused publish is off (the payload is copied by other
-// nodes).  In this backend the fence already ordered any preceding copy, so this only records the publication.
+// nodes).  THE ENGINE'S OWN REQUIREMENT (`layer.cpp:383-389`) is that it re-reads the host copy and increments
+// it, so this RECORDS a `ring_inc.spv` dispatch under capture (replayed -> rings again) and submits-and-waits
+// outside it (the host sees the new value on return).  One definition, no capture-time literal.
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;                       // the CUDA form returns on null
     strata::vulkan::Stream* s = strata::vulkan::require_stream(stream, "doorbell_ring");
@@ -182,13 +195,20 @@ void doorbell_ring(uint32_t* d_seq, void* stream) {
 // submission: the host writes its answer BEFORE this is called, and the consumer that follows is a later,
 // fenced submission - so this call submits NOTHING and no kernel ever waits.
 //
-// It is not an empty stub.  It is the handoff BOUNDARY, and it enforces the one ordering the replacement
-// requires: the host must have served the ring (the answer flag has reached the ring value) before the consumer
-// is submitted.  An un-answered handoff is a LOUD REFUSAL - never a hang, because a hang on the display card is
-// the exact failure this design exists to remove.
+// UNDER CAPTURE THIS IS A NO-OP.  The engine's contract is "the host writes the answer, THEN submits the
+// consumer"; a capture is not a submission and the host has not answered yet, so there is nothing to wait for
+// and no device node may be recorded for it.  A recorded waiting kernel is exactly what this backend forbids
+// (PORT-PLAN 2.3).  The check is placed BEFORE any read, so the capture path touches no buffer and records no
+// node.
+//
+// OUTSIDE capture it is not an empty stub: it is the handoff BOUNDARY, and it enforces the one ordering the
+// replacement requires - the host must have served the ring (the answer flag has reached the ring value) before
+// the consumer is submitted.  An un-answered handoff is a LOUD REFUSAL - never a hang, because a hang on the
+// display card is the exact failure this design exists to remove.
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) {
     if (d_flag == nullptr || d_seq == nullptr) return;  // the CUDA form returns on null
     strata::vulkan::Stream* s = strata::vulkan::require_stream(stream, "doorbell_wait");
+    if (s->ctx->capturing()) return;                    // no node, no read, no refusal: the host answers later
     uint32_t flag = 0, ring = 0;
     strata::vulkan::read_at(*s, d_flag, &flag, sizeof(uint32_t), "doorbell_wait/flag");
     strata::vulkan::read_at(*s, d_seq, &ring, sizeof(uint32_t), "doorbell_wait/seq");

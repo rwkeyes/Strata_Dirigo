@@ -37,11 +37,11 @@ coupled_draft_stage	refused	the coupled round's mapped staging (a copy; the coup
 cpu	host	the engine ticks its own clock
 cvec	host	the table the cvec_apply kernel reads
 cvec_apply	kernel	cvec_apply
-doorbell_publish	host	a host-device sync primitive
-doorbell_publish_res	host	a host-device sync primitive
-doorbell_publish_value	host	a host-device sync primitive
-doorbell_ring	host	a host-device sync primitive
-doorbell_wait	host	a host-device sync primitive
+doorbell_publish	kernel	copy ring_inc
+doorbell_publish_res	kernel	copy ring_inc
+doorbell_publish_value	kernel	copy ring_inc
+doorbell_ring	kernel	ring_inc
+doorbell_wait	host	the host->device handoff boundary: the host writes the answer, then the consumer is submitted (no device node)
 embed_type_supported	host	a capability check
 embedding_gather	kernel	embedding_gather
 embedding_gather_dev	refused	embedding_gather

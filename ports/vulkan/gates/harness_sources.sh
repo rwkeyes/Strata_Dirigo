@@ -10,6 +10,20 @@
 # the compiler.
 #
 # The caller must set ROOT (ports/vulkan), TREE (the engine root) and GATE (the output binary path).
+#
+# ...BUT IT NO LONGER HAS TO, AND THAT IS DELIBERATE.  `ROOT=... TREE=... GATE=$ROOT/...` on ONE line is a
+# silent trap: the shell expands EVERY word before ANY assignment takes effect, so `$ROOT` in the GATE word is
+# the OLD (usually empty) value and `build_harness` links toward `/harness/build/vk_gate`.  That is the same
+# class of defect this file exists to prevent - an instrument that quietly does the wrong thing - so ROOT, TREE
+# and GATE are DERIVED here from this file's OWN location and cannot be mis-set by a caller.  `build_harness`
+# additionally REFUSES when any of them is empty or GATE's directory does not exist.
+
+# This file is `<engine>/ports/vulkan/gates/harness_sources.sh`; derive the three paths from it.
+_hs_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"     # .../ports/vulkan/gates
+ROOT="$(cd "$_hs_self/.." && pwd)"                           # ports/vulkan
+TREE="$(cd "$ROOT/../.." && pwd)"                            # the engine root
+GATE="$ROOT/harness/build/vk_gate"
+unset _hs_self
 
 # Print the harness source list, one path per line.  The harness's own TUs (its private `portvk` namespace) plus
 # EVERY `vulkan/src/**/*.cpp` plus the engine host TUs the harness links.
@@ -24,6 +38,18 @@ harness_sources() {
 # if a backend TU is not handed to the compiler the build silently tests a stale backend.
 build_harness() {
   local list n_disk n_list
+  # THE ENVIRONMENT GUARD, so an empty ROOT cannot make this link into `/harness/...` and report a link error
+  # that reads like a port defect.  Derived paths above make this unreachable from the two shipped callers; it
+  # still fires when the file is sourced in a way that yields no usable BASH_SOURCE.
+  if [ -z "${ROOT:-}" ] || [ -z "${TREE:-}" ] || [ -z "${GATE:-}" ]; then
+    printf 'build_harness: ROOT/TREE/GATE are not all set (ROOT=%q TREE=%q GATE=%q) - REFUSING (an unset path builds in the wrong place)\n' \
+      "${ROOT:-}" "${TREE:-}" "${GATE:-}" >&2
+    return 1
+  fi
+  if [ ! -d "$(dirname "$GATE")" ]; then
+    printf 'build_harness: the output directory %q does not exist - REFUSING (GATE=%q)\n' "$(dirname "$GATE")" "$GATE" >&2
+    return 1
+  fi
   list="$(harness_sources)"
   n_disk="$(find "$TREE/vulkan/src" -name '*.cpp' | wc -l)"
   n_list="$(printf '%s\n' "$list" | grep -c "^$TREE/vulkan/src/")"

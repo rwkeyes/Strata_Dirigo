@@ -28,7 +28,22 @@ struct Stream;
 /// Resolve the engine's opaque stream handle to the backend's device, or null when `stream` is not a Vulkan
 /// stream - so a wrong handle fails loudly instead of dereferencing garbage (the port's rule: refuse, never
 /// degrade).
+///
+/// **A NULL HANDLE IS CUDA'S DEFAULT STREAM, NOT AN ERROR.**  The engine passes `nullptr` wherever it means "the
+/// current stream" - `src/program/generate.cpp:3893` is `void* token_stream = o.stream_token ? main_cs : nullptr`
+/// (so the DEFAULT single-token path reaches `embed_row` -> `embedding_gather` with a null stream), and the same
+/// shape recurs at every op that does not take an explicit stream.  Under CUDA a null `cudaStream_t` is the
+/// legacy default stream; this backend has ONE stream per device, so the shim publishes it as the DEFAULT STREAM
+/// below and `stream_of(nullptr)` returns it.  Refusing a null handle here would refuse the engine's own decode
+/// at its FIRST op - and then at each op after it, which is why the resolution is fixed here once rather than
+/// per symbol.
 Stream* stream_of(void* stream);
+
+/// The backend's DEFAULT stream: the shim's own "current stream" (`cuda_compat_set_stream` / the stream its
+/// `cudaStreamCreate` handed out), stored in the device layer so a null handle and the shim's current stream
+/// cannot be two different things.  One storage; `cuda_runtime.cpp`'s `g_current` IS this object.
+Stream*& default_stream_ref();
+Stream* default_stream();
 
 // ---- ENTRY POINTS IMPLEMENTED BY THE BACKEND ----------------------------------------------------------------
 // One function per engine `kernels::` symbol whose body is GPU work.  The first is the skeleton's proof; the

@@ -1,5 +1,37 @@
 # Status — what is done, what is verified, what is not
 
+## FIRST TOKEN FROM THE INTEL ARC PRO B70 — the doorbell RING is a recorded device op, the STREAM SEAM is fixed, and the synthetic ZERO pack emits token 0 (2026-10-05, `vega`)
+
+**A TOKEN CAME OUT OF THE B70.**  `strata_vulkan` on `strata-synth-pack-zero` (synthetic, all weight MATRICES
+zero) ran the whole 48-layer decode and `sample_tokens` (greedy argmax) emitted **token id `0`**, exit 0,
+**5.11 tok/s**, in 195.6 ms decode.  The token graph captured and launched (48 layers, one launch per token)
+and the engine's own 248320-logit isfinite scan PASSED.  **BOUNDS: zero weights -> the CONTENT is trivial and
+meaningless (zero logits, argmax index 0); this certifies the PIPELINE, not the model, and nothing about layer
+numerics.  PLE off, CPU pool unused, prefill bypassed, expert streaming not exercised.  The real model is NOT
+this run.**
+
+**TWO BLOCKERS FIXED, both at the seam.**  (A) `doorbell_ring`/`doorbell_publish` raised the ring with a
+capture-time HOST read-modify-write, so a recorded token graph replayed a stale literal and `session_run_token`
+would have spun forever; the ring is now a RECORDED DISPATCH (`ring_inc.comp` via `Ctx::dispatch`, one
+definition for the whole family).  (B) the DEFAULT decode passes `stream = nullptr` (generate.cpp:3893) and
+CUDA resolves NULL to the default stream; `stream_of(nullptr)` now returns the device layer's default stream
+(the shim's `g_current`, the SAME object), fixed ONCE for all 13 kernel TUs.  (C) `doorbell_wait` is a NO-OP
+under capture with its loud refusal intact outside it.
+
+**THE FIXTURE LIMIT, reported as such.**  The ORIGINAL random pack now runs the whole decode and stops at
+`248320 of 248320 logits are not finite at position 0`.  Zeros are FINITE, so the composed 48-layer chain is
+arithmetically SOUND and the divergence is the fixture.  A `--weight-scale 0.02` pack (MEASURED: quant scales
+50x smaller, mean 2.97e-4 vs 1.49e-2) STILL diverges - random weights of any nonzero magnitude overflow this
+architecture.  **No synthetic run certifies layer numerics either way.**  Real weights need the native-expert
+path (`coder-iq1_m`: no pack experts.bin; 25.1 GB from the GGUF shards) - the next item.
+
+**RESULTS:** gate `intel_icd` **750 passed / 0 failed / 0 skipped** (exit 0; the 9 doorbell arms stay green,
++7 ring +2 stream); **4 new injections all `FALSIFIED`** (2 ring-literal, 1 wait-records-node, 1
+stream-null-not-default); map `168 = 78 kernel + 0 shader + 43 host + 0 todo + 47 refused` (the four doorbell
+device ops `host -> kernel`); `check_port_map.py` passes, `make_port_map.py` byte-identical.  **ENGINE BAR: 0
+remaining engine-API undefineds (0 `strata::kernels::`, 0 `cuda*`) - 0 BY CONSTRUCTION (the refusals DEFINE
+the unported symbols), NOT a porting gain.**
+
 ## `copy_from_mapped` WIRED + the PUBLISH HANDSHAKE; THE PROGRAM LINKS; the `refused` MAP KIND (2026-10-05, `vega`)
 
 **THE ENGINE BAR: `134` raw / `55` distinct / `41` `strata::kernels::` / `0` cuda → `0` / `0` / `0` / `0`** (the

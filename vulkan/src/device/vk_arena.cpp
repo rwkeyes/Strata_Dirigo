@@ -46,10 +46,21 @@ void registry_remove(Stream* s) {
 
 const uint64_t kSpvDefaultArena = 64ull * 1024 * 1024;   // a small arena: I1 needs bytes, not a model
 
+// THE DEFAULT STREAM's storage (see vk_backend.hpp).  The compat shim's `g_current` IS a reference to this
+// object, so "the shim's current stream" and "the stream a null handle resolves to" cannot drift apart.
+Stream* g_default_stream = nullptr;
+
 }  // namespace
 
+Stream*& default_stream_ref() { return g_default_stream; }
+Stream* default_stream() { return g_default_stream; }
+
 Stream* stream_of(void* stream) {
-    if (stream == nullptr) return nullptr;
+    // CUDA'S DEFAULT STREAM.  A null handle is not an error and not garbage: it is the legacy default stream,
+    // which on this one-stream-per-device backend is the shim's current stream (see vk_backend.hpp, and
+    // generate.cpp:3893 where the engine passes exactly this).  Resolved HERE, once, so no per-symbol wrapper
+    // has to remember it and so a null stream cannot mean two things.
+    if (stream == nullptr) return default_stream();
     std::lock_guard<std::mutex> lk(registry_mutex());
     for (Stream* s : registry()) {
         if (s == stream) return s;

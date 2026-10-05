@@ -144,8 +144,19 @@
 #                                       (temperature 0)"
 #   inject-verify.sh coupled-draft-counter-off-by-one  coupled_sample.comp  drop the +1 of
 #                                       `coupled_draft_counter` -> must FAIL  "coupled_draft: the counter"
-#   inject-verify.sh coupled-draft-window-start  coupled_penalize.comp  drop the draft index j from the
+#   inject-verify.sh coupled-draft-window-start    coupled_penalize.comp  drop the draft index j from the
 #                                       window start -> must FAIL  "coupled_draft: the window"
+#
+#   (THE DOORBELL RING AT REPLAY - the engine's own requirement that the ring re-reads its host copy and
+#    increments, so a replayed block rings again rather than replaying a stale literal)
+#   inject-verify.sh doorbell-ring-captured-literal  vulkan/src/kernels/doorbell_vk.cpp  raise the ring on the
+#                                       HOST at capture (the port's old defect) -> must FAIL  "doorbell ring:
+#                                       capture records, does not run"
+#   inject-verify.sh doorbell-ring-shader-literal  ring_inc.comp  store the push-constant instead of the
+#                                       re-read increment -> must FAIL  "doorbell ring: direct increments the ring"
+#   inject-verify.sh doorbell-wait-records-node  vulkan/src/kernels/doorbell_vk.cpp  record a device node under
+#                                       capture where the wait must submit nothing (a waiting kernel in a
+#                                       captured block) -> must FAIL  "doorbell_wait: records NOTHING under capture"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -634,6 +645,41 @@ case "$name" in
     old=$'    if (exec->cb != VK_NULL_HANDLE && exec->owner != nullptr)\n        exec->owner->destroy_owned(exec->cb, exec->fence);\n    delete exec;'
     new=$'    // INJECTION: the instantiation is leaked (its recording is never destroyed)\n    delete exec;'
     want="FAIL  cuda graph: no instantiation left live" ;;
+  doorbell-ring-captured-literal)
+    # THE ENGINE'S OWN REQUIREMENT (layer.cpp:383-389): the ring must RE-READ its host copy, because "a captured
+    # literal would ring the same number forever and the host would never see a change".  This injection restores
+    # the capture-time HOST raise (the port's old defect): the ring moves during capture and the recorded block
+    # never moves it again.  The case's "capture records, does not run" arm must see the ring already != 0.
+    file="$TREE/vulkan/src/kernels/doorbell_vk.cpp"
+    old=$'    s.ctx->dispatch(p, {&v}, &pc, (uint32_t) sizeof(pc), /*groups=*/1);'
+    new=$'    if (s.ctx->capturing()) {   // INJECTION: the ring raised on the HOST at capture - a captured literal\n        uint32_t cur = 0;\n        s.ctx->read(v, &cur, sizeof(uint32_t), v.offset);\n        const uint32_t next = store ? value : cur + 1u;\n        s.ctx->write(v, &next, sizeof(uint32_t), v.offset);\n        return;\n    }\n    s.ctx->dispatch(p, {&v}, &pc, (uint32_t) sizeof(pc), /*groups=*/1);'
+    want="FAIL  doorbell ring: capture records, does not run" ;;
+  doorbell-ring-shader-literal)
+    # THE SHADER side of the same lie: the increment becomes a STORE of the push-constant (a captured literal),
+    # so the ring reads 0 forever.  This bites on the DIRECT arm first - the recorded arms below cannot pass if
+    # the shader cannot count at all.
+    file="$SH/ring_inc.comp"; spv="ring_inc"
+    old=$'        ring.seq = (pc.store != 0u) ? pc.value : (ring.seq + 1u);'
+    new=$'        ring.seq = pc.value;   // INJECTION: a captured literal, not the re-read increment'
+    want="FAIL  doorbell ring: direct increments the ring" ;;
+  doorbell-wait-records-node)
+    # THE OTHER FORBIDDEN THING: a WAITING KERNEL inside a captured block.  The contract is that the host writes
+    # the answer, THEN submits the consumer, so `doorbell_wait` must record NOTHING under capture.  This
+    # injection makes it record a device node there; the case's "records NOTHING under capture" arm must fail
+    # (a capture holding only the wait then produces a graph instead of refusing).
+    file="$TREE/vulkan/src/kernels/doorbell_vk.cpp"
+    old=$'    if (s->ctx->capturing()) return;                    // no node, no read, no refusal: the host answers later'
+    new=$'    if (s->ctx->capturing()) { strata::vulkan::ring_raise(*s, const_cast<uint32_t*>(d_seq), false, 0, "doorbell_wait/INJECTION"); return; }   // INJECTION: a recorded device node where the wait must submit nothing'
+    want="FAIL  doorbell_wait: records NOTHING under capture" ;;
+  stream-null-not-default)
+    # THE STREAM SEAM (generate.cpp:3893): a NULL handle is CUDA's default stream, and the engine passes it on the
+    # DEFAULT single-token path.  This injection restores the old refusal, so the whole decode refuses at its
+    # first op.  The case runs the null-handle call in a CHILD (a refusal exits 2), so this FAILS the verdict
+    # rather than aborting the gate.
+    file="$TREE/vulkan/src/device/vk_arena.cpp"
+    old=$'    if (stream == nullptr) return default_stream();'
+    new=$'    if (stream == nullptr) return nullptr;   // INJECTION: a null handle refused instead of resolving to the default stream'
+    want="FAIL  null stream: cuda's nullptr IS the default stream" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

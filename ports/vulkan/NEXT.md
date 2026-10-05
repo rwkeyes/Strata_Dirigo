@@ -1,5 +1,97 @@
 # Start here next session
 
+## THE FIRST TOKEN from the Intel Arc Pro B70: the DOORBELL RING is a recorded device op, `doorbell_wait` is a no-op under capture, and the STREAM SEAM (a NULL handle is CUDA's default stream) is fixed once (2026-10-05, `vega`)
+
+**A TOKEN CAME OUT.  `strata_vulkan` --pack <synthetic ZERO-weight pack> ran the whole 48-layer decode ON THE
+INTEL ARC PRO B70 and the sampler emitted token id `0`, exit 0, 5.11 tok/s.**  Raw tail (run 1, exact command in
+`RUN-ON-B70.md` and below):
+
+```
+strata generate: token graph captured (48 layers, one launch per token)
+strata generate: position 0, token 1 (prompt)
+prompt  : 1
+output  : 0
+decode                   1 tokens in 195.6 ms  ->  5.11 tok/s
+RUN_RC=0
+```
+
+**THE WEIGHTS ARE ZERO, SO THE TOKEN IS CONTENT-FREE** - zero in gives a finite zero logits vector and the
+greedy argmax is index 0.  **What the token certifies is the PIPELINE** (open -> load -> capture -> one launch
+-> sample), not a working model: nothing about layer numerics is certified by it (the 750 gate cases are), PLE
+is off, the CPU pool is unused, and prefill is bypassed.
+
+### DELIVERABLE A - the DOORBELL RING is a RECORDED DEVICE operation
+
+`src/core/layer.cpp:383-389` states the requirement: the sequence value is read from the HOST copy and
+incremented, "which is what makes the write idempotent across replays of the same graph - a captured literal
+would ring the same number forever and the host would never see a change."  The port's ring was a capture-time
+HOST read-modify-write, so a captured block replayed a stale literal and `session_run_token` would have spun on
+`h_seq` forever.  **Fixed**: `ports/vulkan/shaders/ring_inc.comp` (one lane, `ring.seq = store ? value :
+ring.seq + 1`), DISPATCHED through `Ctx::dispatch` in `vulkan/src/kernels/doorbell_vk.cpp::ring_raise` - which
+RECORDS while a capture is active and submits-and-waits otherwise.  One definition; the whole `doorbell_*`
+family (`publish`, `_res`, `_value`, `ring`) flows through it, and the payload copies were already recorded
+dispatches (`sync_copy_fenced` -> `Ctx::dispatch`).  The map RE-KINDS the family `host -> kernel`
+(`doorbell_wait` stays `host`: it submits nothing).
+
+### DELIVERABLE B - `doorbell_wait` is a NO-OP under capture
+
+`if (s->ctx->capturing()) return;` sits BEFORE any read, so a capture records no node, touches no buffer and
+refuses nothing - the host answers later, per the engine's contract.  The LOUD REFUSAL (flag < ring, exit 2)
+is UNCHANGED for the genuinely-unanswered non-capture case, and `case_doorbell_ring_replay`'s child proves it
+still exits 2 with the message.
+
+### DELIVERABLE C - PROOF + FALSIFICATION (all on Arc `intel_icd`)
+
+`case_doorbell_ring_replay` (7 verdicts) proves the ring ADVANCES ON EVERY REPLAY: direct 1 then 2; a capture of
+3 `doorbell_ring` calls leaves the ring at 0 and holds 3 nodes; three replays read 3, 6, 9; a captured
+`[doorbell_wait, copy_from_mapped]` block reads the host's NEW answer on each replay; and `doorbell_wait` alone
+records nothing (the capture refuses).  **Four injections BITE** (`gates/inject-verify.sh`, all `FALSIFIED`):
+`doorbell-ring-captured-literal` (host raise at capture -> "capture records, does not run" FAILS),
+`doorbell-ring-shader-literal` (store instead of increment -> "direct increments" FAILS),
+`doorbell-wait-records-node` (a device node where the wait must submit nothing -> "records NOTHING" FAILS).
+
+### THE NEW STOPPING POINT THE RING FIX REVEALED - the STREAM SEAM
+
+With the ring fixed, the run captured the token graph and stopped at `embedding_gather: the stream handle is not
+a live Vulkan stream`.  **Root cause is the seam, not the symbol**: `src/program/generate.cpp:3893` is
+`void* token_stream = o.stream_token ? main_cs : nullptr`, so the DEFAULT path reaches `embed_row ->
+embedding_gather` with a NULL stream, and CUDA resolves NULL to the legacy DEFAULT stream.  Every one of the 13
+kernel TUs refused it.  **Fixed ONCE at resolution**: `vk_arena.cpp::stream_of(nullptr)` now returns the device
+layer's DEFAULT STREAM, which is the compat shim's `g_current` (a REFERENCE to the same object, so a null handle
+and the shim's current stream cannot disagree).  `case_null_stream_default` proves a null handle runs and equals
+the explicit handle BITWISE (child), and that a BOGUS non-null handle is STILL refused (child exit 2); the
+injection `stream-null-not-default` makes it FAIL.
+
+### DELIVERABLE D - THE RUN, AND WHAT IT FOUND
+
+**Run 1 (synthetic ZERO pack) -> TOKEN 0, exit 0** (above).  **Run 2 (the ORIGINAL random pack)**: the ring fix
+and the seam fix carried it all the way to `248320 of 248320 logits are not finite at position 0` - the decode
+EXECUTED (48-layer token graph captured, logits computed) and the engine's own isfinite scan refused.  **The
+zeros run discriminates the cause**: a zero pack gives a FINITE zero logits vector, so **the composed 48-layer
+chain is arithmetically SOUND - the non-finiteness is the FIXTURE, not a port defect.**  A `--weight-scale 0.02`
+pack (measured: its quant scales are 50x smaller, mean 2.97e-4 vs 1.49e-2, so the scale DID reach the quant
+planes) STILL diverges - random weights of any nonzero magnitude overflow this 48-layer architecture (48 layers
+of residual accumulation with hc mixing and a delta-rule recurrence).  **THIS IS AN UNRESOLVED FIXTURE LIMIT,
+reported as such**: the synth pack cannot produce finite NONZERO logits, and no synthetic run certifies layer
+numerics either way.
+
+### NEXT ITEM - THE REAL PACK NEEDS THE EXPERT PATH
+
+`/media/bob/.../public/strata-gguf/strata-packs/` holds four PRODUCTION packs; `coder-iq1_m` (dense 1407 MB,
+`native_experts.txt`: n_expert 256, 25.1 GB) has **NO experts.bin** - its experts are read from the original
+GGUF shards at runtime, a path this port has NOT exercised (`--mmap-experts` reads a pack `experts.bin`).  25.1
+GB + 1.4 GB against 27.6 GiB usable MAY fit resident, but **whether it fits is a measurement for the next
+batch, not a conclusion.**  That is the road to a token from REAL weights.
+
+### RESULTS (vega)
+
+Gate (`intel_icd`): **750 passed, 0 failed, 0 skipped** (exit 0; was 741 - the 9 doorbell arms stay green, +7
+ring +2 stream).  Map: `168 = 78 kernel + 0 shader + 43 host + 0 todo + 47 refused` (the four doorbell device
+ops moved `host -> kernel`; `refused` is NOT a capability); `check_port_map.py` passes and `make_port_map.py`
+regenerates byte-identically.  Engine bar: 0 remaining engine-API undefined symbols (0 `strata::kernels::`, 0
+`cuda*`); the 210 left are libc/libstdc++ - **0 BY CONSTRUCTION because the refusals define the unported
+symbols, not a porting gain.**  `z820b` untouched (no XTX/K620 number claimed).
+
 ## `copy_from_mapped` WIRED (THE LAST REACHED SYMBOL) + THE PUBLISH HANDSHAKE; THE PROGRAM LINKS (0 undefined); THE MAP GAINS A `refused` KIND (2026-10-05, `vega`)
 
 **THE ENGINE BAR MOVED `134` raw / `55` distinct / `41` `strata::kernels::` / `0` cuda → `0` / `0` / `0` / `0`.**

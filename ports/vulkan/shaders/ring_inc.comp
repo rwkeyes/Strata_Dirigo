@@ -1,0 +1,35 @@
+#version 450
+// ports/vulkan/shaders/ring_inc.comp - THE DOORBELL RING, AS A RECORDED DEVICE OPERATION.
+// ============================================================================================================
+// The engine's own requirement, quoted from `src/core/layer.cpp:383-389`:
+//
+//   "THE RING LIVES IN A .cu ... The sequence value is read from the HOST copy and incremented, which is what
+//    makes the write idempotent across replays of the same graph - a captured literal would ring the same
+//    number forever and the host would never see a change."
+//
+// `src/kernels/cuda/elementwise.cu:209-212` (`doorbell_ring_kernel`) is a one-thread kernel that does exactly
+// this.  Its Vulkan form is this shader: the ring lives in a HOST_VISIBLE | HOST_COHERENT region (the shim's
+// `cudaHostAlloc` maps a device block, so the host's `h_seq` and the device's buffer are ONE allocation), and
+// the increment RE-READS it, so a captured-then-replayed block advances the ring on every replay instead of
+// replaying a stale literal.
+//
+// WHY THE DISPATCH IS WHAT MAKES IT RIGHT: the host path (`Ctx::dispatch`) RECORDS while a stream capture is
+// active and submits-and-waits otherwise (`vk_compute.cpp`).  So one definition of the ring serves both the
+// direct case (a fenced submit: the host sees the new value on return) and the captured-block case (a recorded
+// node: re-executed - and re-read - by every replay).
+//
+// ONE PUSH CONSTANT SELECTS THE TWO ENGINE VARIANTS:
+//   store == 0  -> the read-modify-write INCREMENT (`doorbell_publish` / `doorbell_ring` / `_res`), the
+//                  forward-path ring.
+//   store != 0  -> STORE `value` (`doorbell_publish_value`, the HIP STRATA_DOORBELL_STORE=1 / P6-verifier
+//                  variant whose CUDA form stores a kernel argument - a capture-time constant by design, and
+//                  NOT on the forward path).
+// A single lane writes; the workgroup size matches the host's `kLocalSize` (every dispatch this backend issues
+// is sized from it, and the gate checks the agreement).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint value; uint store; } pc;
+layout(set = 0, binding = 0, std430) buffer Seq { uint seq; } ring;
+void main() {
+    if (gl_GlobalInvocationID.x == 0u)
+        ring.seq = (pc.store != 0u) ? pc.value : (ring.seq + 1u);
+}

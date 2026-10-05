@@ -79,3 +79,59 @@ The port's own estimate stands: the remaining kernel waves are a grind at a meas
 ~40 minutes end to end including gating), the sampler is a session on its own, and M1 is the piece with unknown
 corners because it is the first code in this tree that the *engine* drives.  M4 (a token on llvmpipe) is the first
 milestone worth showing; M5 is a hardware window after that.
+
+## M5 REACHED, MEASURED (2026-10-05, `vega`)
+
+**A token came out of the Intel Arc Pro B70.**  This is M5 on a SYNTHETIC pack, not on the real model (M3/M4's
+real-artifact path is still open - see below).
+
+Exact command (run 1):
+
+```
+STRATA_VK_SPV_DIR=/home/bob/strata-vulkan-wt/ports/vulkan/shaders \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json STRATA_VK_ARENA_GIB=16 \
+  ~/bin/memguard 40G ~/vkbuild-vulkan/vulkan/strata_vulkan \
+  --pack /media/bob/3d651e2c-e9a4-4758-ba77-863725fe3731/strata-synth-pack-zero \
+  --tokens "1" --max-new 1 --no-pool --mmap-experts --no-ple --max-context 8
+```
+
+Raw output (the tail; the load prints ~900 upload progress lines first, ~9.5 min):
+
+```
+strata generate: 5890 MiB of weights loaded from .../strata-synth-pack-zero (0 canonical tensors skipped: served natively)
+strata generate: GPU 0: Intel(R) Graphics (BMG G31), compute capability 0.0
+strata generate: session is up (engine 0.1.39)
+strata generate: sampling greedy
+strata generate: token graph captured (48 layers, one launch per token)
+strata generate: position 0, token 1 (prompt)
+prompt  : 1
+output  : 0
+decode                   1 tokens in 195.6 ms  ->  5.11 tok/s
+RUN_RC=0
+```
+
+- **Device / ICD:** Intel Arc Pro B70 (`Intel(R) Graphics (BMG G31)`), `intel_icd.json`, Mesa 25.2.8, kernel
+  7.0.0-34.
+- **Sampler path:** `sample_tokens` (generate.cpp:7742) with `sp.greedy = true` (the DEFAULT; no `--seed`) -> the
+  greedy argmax shader `sampler_greedy.spv`.  The log line `sampling greedy` is that choice.
+- **Pack geometry:** synthetic, the engine's canonical geometry (48 layers, n_embd 2560, 512 experts); dense.bin
+  6.448 GiB + embd.bin 0.666 GiB + `experts.bin` SYMLINKED (never read under `--no-pool --mmap-experts`);
+  `index.txt` 1073 tensors, engine pool 5.752 GiB.  **Its weight MATRICES are ALL ZERO** (`make_synth_pack.py
+  --zero`): zero in -> finite zero logits -> the greedy argmax is index 0.
+- **BOUNDS, in the same breath:** the weights are zero, so the token's CONTENT is meaningless and trivial; this
+  certifies the PIPELINE (open -> load -> capture -> one launch -> sample), NOT the model, and NOTHING about
+  layer numerics (the gate's 750 per-kernel cases are the only numeric evidence).  PLE is OFF (`--no-ple`), the
+  CPU expert pool is UNUSED (`--no-pool`), prefill is BYPASSED (`--prefill` defaults to 0; the prompt is one
+  token fed through the decode path), the expert streaming tier is NOT exercised (`--mmap-experts` on a symlink
+  that is never read), multi-GPU/speculative/verify are off, and the `iq3`/`iq1_m` quant families are not on
+  this pack (it is Q8_0/BF16/F32 only).
+
+**Two runs are recorded**: the ZERO pack (token 0, above; a second identical run repeats token 0 exactly), and
+the ORIGINAL random pack, which now runs the whole decode and stops at the engine's own
+`248320 of 248320 logits are not finite at position 0`.  The zeros run DISCRIMINATES that: a zero pack is
+finite, so the composed 48-layer chain is arithmetically sound and the non-finiteness is the FIXTURE (random
+weights overflow this architecture).  A `--weight-scale 0.02` pack - measured to have quant scales 50x smaller,
+mean 2.97e-4 vs 1.49e-2 - STILL diverges: **an unresolved FIXTURE LIMIT, not a port defect.**  The real model
+(`coder-iq1_m`, 1.4 GB dense + 25.1 GB experts read from the GGUF shards, NO pack `experts.bin`) needs the
+native-expert path this port has not exercised; that is the next item.
+

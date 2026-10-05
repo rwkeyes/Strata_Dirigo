@@ -13703,6 +13703,12 @@ void case_sync_handoff(Ctx& ctx, const std::string& dir) {
         float* dw_out = strata::vulkan::arena_alloc<float>(*s, KD);
         uint32_t* dseq = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
         uint32_t* dflag = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+        // THE RING NOW RE-READS ITS HOST COPY (a recorded `ring_inc` dispatch), so its starting value must be
+        // KNOWN rather than whatever the arena happened to hold: zero it, the way `doorbell_reset` does in the
+        // engine (layer.cpp:428).  Without this the "reads 1 after one publish" arm would depend on arena luck.
+        { const uint32_t z = 0;
+          strata::vulkan::stream_write(*s, dseq, &z, sizeof(uint32_t));
+          strata::vulkan::stream_write(*s, dflag, &z, sizeof(uint32_t)); }
 
         std::vector<float> x(ND), w(KD);
         std::vector<int32_t> ids(KD);
@@ -13822,6 +13828,227 @@ void case_sync_handoff(Ctx& ctx, const std::string& dir) {
     ectx.free(out);
     strata::vulkan::stream_close(s);
 }
+
+// ============================================================================================================
+// THIS BATCH - THE DOORBELL RING AT REPLAY (`layer.cpp:383-389`, session.cpp:873-876).
+// ============================================================================================================
+// The engine's requirement, quoted at the ring's own call site: "The sequence value is read from the HOST copy
+// and incremented, which is what makes the write idempotent across replays of the same graph - a captured
+// literal would ring the same number forever and the host would never see a change."  The port's ring used to
+// be a capture-time HOST read-modify-write, so a captured block replayed a stale literal; it is now a RECORDED
+// DISPATCH (`ring_inc.spv` via `Ctx::dispatch`).  This case tests that directly:
+//
+//   (A) DIRECT: `doorbell_ring` advances the ring by one per call (the fenced-submit path).
+//   (B) A CAPTURE RECORDS, IT DOES NOT RUN: three `doorbell_ring` calls inside a capture leave the mapped ring
+//       untouched - the arm a capture-time host raise FAILS.
+//   (C) A REPLAYED BLOCK ADVANCES THE RING EVERY REPLAY: three replays of three increments read 3, 6, 9 - the
+//       engine's own requirement, tested rather than paraphrased.  A captured literal reads 3 forever.
+//   (D) A CONSUMER SEES THE HOST'S ANSWER ACROSS A REPLAY: a captured [doorbell_wait, copy_from_mapped] block,
+//       with the host writing its answer BEFORE each launch, reads the NEW answer on each replay.
+//   (E) `doorbell_wait` RECORDS NOTHING under capture: a capture holding only the wait records no node and
+//       `cudaStreamEndCapture` refuses.  A recorded waiting kernel - the thing this backend forbids - fails it.
+//   (F) THE UN-ANSWERED HANDOFF IS STILL REFUSED (a child process): flag < ring OUTSIDE capture exits 2 loudly.
+//
+// The ring and the flag are MAPPED PINNED HOST memory, allocated the way `doorbell_init` does (layer.cpp:1023),
+// so this exercises the mapped-resolution path the engine actually uses, not just the arena.
+void case_doorbell_ring_replay(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "ring_inc.spv") || !have(dir, "copy.spv")) return;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("doorbell ring at replay", false, 1, 1, 0, "the backend could not open a stream");
+        return;
+    }
+    strata::vulkan::cuda_compat_set_stream(s);
+    const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+
+    // THE ENGINE'S OWN SHAPE: the ring, the flag and the answer are MAPPED PINNED HOST memory; the ring's
+    // DEVICE view is the same address (cudaHostGetDevicePointer), exactly as doorbell_init sets it up.
+    uint32_t* h_ring = nullptr; uint32_t* d_ring = nullptr;
+    uint32_t* h_flag = nullptr; uint32_t* d_flag = nullptr;
+    float* h_answer = nullptr; float* d_answer = nullptr;
+    const int64_t AN = 256;
+    const bool allocd = cudaHostAlloc((void**) &h_ring, sizeof(uint32_t), cudaHostAllocMapped) == cudaSuccess &&
+                        cudaHostAlloc((void**) &h_flag, sizeof(uint32_t), cudaHostAllocMapped) == cudaSuccess &&
+                        cudaHostAlloc((void**) &h_answer, (size_t) AN * 4, cudaHostAllocMapped) == cudaSuccess;
+    if (!allocd || h_ring == nullptr || h_flag == nullptr || h_answer == nullptr) {
+        strata::vulkan::cuda_compat_set_stream(nullptr);
+        strata::vulkan::stream_close(s);
+        verdict("doorbell ring at replay", false, 1, 1, 0, "cudaHostAlloc failed");
+        return;
+    }
+    if (cudaHostGetDevicePointer((void**) &d_ring, h_ring, 0) != cudaSuccess) d_ring = h_ring;
+    if (cudaHostGetDevicePointer((void**) &d_flag, h_flag, 0) != cudaSuccess) d_flag = h_flag;
+    if (cudaHostGetDevicePointer((void**) &d_answer, h_answer, 0) != cudaSuccess) d_answer = h_answer;
+    float* dst = nullptr;
+    cudaMalloc((void**) &dst, (size_t) AN * 4);
+
+    // ---- (A) DIRECT: one increment per call, and the host reads the new value on return ---------------------
+    *h_ring = 0;
+    strata::kernels::doorbell_ring(d_ring, (void*) cs);
+    const uint32_t a1 = *h_ring;
+    strata::kernels::doorbell_ring(d_ring, (void*) cs);
+    const uint32_t a2 = *h_ring;
+    verdict("doorbell ring: direct increments the ring", a1 == 1u && a2 == 2u, (a1 == 1u && a2 == 2u) ? 0 : 2,
+            2, 0.0, "the ring did not read 1 then 2");
+
+    // ---- (B) A CAPTURE RECORDS, IT DOES NOT RUN ----------------------------------------------------------------
+    *h_ring = 0;
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ex = nullptr;
+    size_t nodes = 0;
+    bool captured = false;
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        for (int k = 0; k < 3; ++k) strata::kernels::doorbell_ring(d_ring, (void*) cs);
+        captured = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != nullptr;
+    }
+    if (captured && g != nullptr) cudaGraphGetNodes(g, nullptr, &nodes);
+    if (captured) { cudaGraphInstantiate(&ex, g, 0); cudaGraphDestroy(g); }
+    verdict("doorbell ring: capture records, does not run", captured && *h_ring == 0u,
+            (captured && *h_ring == 0u) ? 0 : 1, 1, 0.0,
+            "the ring moved during the capture (a capture-time raise, not a recorded node)");
+    verdict("doorbell ring: the block holds 3 ring nodes", nodes == 3u, nodes == 3u ? 0 : 1, 3, (double) nodes,
+            "nodes");
+
+    // ---- (C) A REPLAYED BLOCK ADVANCES THE RING EVERY REPLAY ----------------------------------------------------
+    uint32_t r1 = 0, r2 = 0, r3 = 0;
+    if (ex != nullptr) {
+        cudaGraphLaunch(ex, cs); r1 = *h_ring;
+        cudaGraphLaunch(ex, cs); r2 = *h_ring;
+        cudaGraphLaunch(ex, cs); r3 = *h_ring;
+    }
+    const bool advance = (r1 == 3u && r2 == 6u && r3 == 9u);
+    verdict("doorbell ring: a replayed block advances the ring each replay", advance, advance ? 0 : 3, 3, 0.0,
+            "the ring did not read 3, 6, 9 - a replayed block is ringing a stale literal");
+
+    // ---- (D) A CONSUMER SEES THE HOST'S ANSWER ACROSS A REPLAY ---------------------------------------------------
+    // The engine's consumer is `copy_from_mapped(parts_dev, y_miss_host)` AFTER `doorbell_wait` (session.cpp:873-
+    // 875): the host writes the pool's answer BEFORE the launch, and a captured block must read the LIVE answer.
+    {
+        std::vector<float> ansA(AN), ansB(AN);
+        for (int64_t i = 0; i < AN; ++i) { ansA[(size_t) i] = 100.0f + (float) i; ansB[(size_t) i] = -7.0f - (float) i; }
+        cudaGraph_t g2 = nullptr; cudaGraphExec_t e2 = nullptr; bool cap2 = false;
+        if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+            strata::kernels::doorbell_wait(d_flag, d_ring, (void*) cs);            // no-op under capture
+            strata::kernels::copy_from_mapped(dst, d_answer, AN, (void*) cs);      // RECORDS; the host store is live
+            cap2 = cudaStreamEndCapture(cs, &g2) == cudaSuccess && g2 != nullptr;
+        }
+        if (cap2) { cudaGraphInstantiate(&e2, g2, 0); cudaGraphDestroy(g2); }
+        int badA = (int) AN, badB = (int) AN;
+        if (e2 != nullptr) {
+            std::memcpy(h_answer, ansA.data(), (size_t) AN * 4);   // the publish, before the launch (the contract)
+            cudaGraphLaunch(e2, cs);
+            std::vector<float> got((size_t) AN, 0.0f);
+            cudaMemcpy(got.data(), dst, (size_t) AN * 4, cudaMemcpyDeviceToHost);
+            badA = 0; for (int64_t i = 0; i < AN; ++i) if (got[(size_t) i] != ansA[(size_t) i]) ++badA;
+            std::memcpy(h_answer, ansB.data(), (size_t) AN * 4);   // a DIFFERENT answer, the same block
+            cudaGraphLaunch(e2, cs);
+            std::vector<float> got2((size_t) AN, 0.0f);
+            cudaMemcpy(got2.data(), dst, (size_t) AN * 4, cudaMemcpyDeviceToHost);
+            badB = 0; for (int64_t i = 0; i < AN; ++i) if (got2[(size_t) i] != ansB[(size_t) i]) ++badB;
+            cudaGraphExecDestroy(e2);
+        }
+        verdict("doorbell ring: a consumer sees the host's answer across a replay", badA == 0 && badB == 0,
+                badA + badB, (int) (2 * AN), 0.0,
+                "the captured consumer did not read the live host answer (a stale capture-time block)");
+    }
+
+    // ---- (E) `doorbell_wait` RECORDS NOTHING UNDER CAPTURE -------------------------------------------------------
+    {
+        cudaGraph_t g3 = nullptr;
+        cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal);
+        strata::kernels::doorbell_wait(d_flag, d_ring, (void*) cs);
+        const cudaError_t xe = cudaStreamEndCapture(cs, &g3);
+        const bool nothing = (xe == cudaErrorStreamCaptureUnsupported) && (g3 == nullptr);
+        verdict("doorbell_wait: records NOTHING under capture", nothing, nothing ? 0 : 1, 1, 0.0,
+                "the wait recorded a node (or produced a graph) inside a captured block - a waiting kernel");
+    }
+
+    if (ex != nullptr) cudaGraphExecDestroy(ex);
+    cudaFree(dst);
+    cudaFreeHost(h_answer);
+    cudaFreeHost(h_flag);
+    cudaFreeHost(h_ring);
+    strata::vulkan::cuda_compat_set_stream(nullptr);
+    strata::vulkan::stream_close(s);
+
+    // ---- (F) THE UN-ANSWERED HANDOFF IS STILL REFUSED LOUDLY (a child process, since it exits) -------------------
+    {
+        char self[4096];
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (n > 0) {
+            self[n] = '\0';
+            const std::string cmd = std::string(self) + " --expect-doorbell-wait-refusal --spv-dir " + dir + " 2>&1";
+            FILE* f = popen(cmd.c_str(), "r");
+            std::string out;
+            if (f != nullptr) {
+                char line[512];
+                while (std::fgets(line, sizeof line, f)) out += line;
+                const int st = pclose(f);
+                const int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                const bool refused = (code == 2) && (out.find("the host has not answered") != std::string::npos);
+                verdict("doorbell_wait: the un-answered handoff is REFUSED", refused, refused ? 0 : 1, 1,
+                        (double) code, "child exit status");
+            } else {
+                skip("doorbell_wait: the un-answered handoff is REFUSED", "could not spawn the child process");
+            }
+        } else {
+            skip("doorbell_wait: the un-answered handoff is REFUSED", "cannot resolve /proc/self/exe");
+        }
+    }
+}
+
+// ============================================================================================================
+// THE STREAM SEAM: a NULL handle is CUDA's DEFAULT stream (`generate.cpp:3893`
+// `token_stream = o.stream_token ? main_cs : nullptr`), and it resolves to the shim's current stream in
+// `stream_of` (vk_arena.cpp).  Every engine entry point takes `void* stream`, so this is the seam the WHOLE
+// decode crosses - refusing a null here refuses the engine's own decode at its first op and at every op after.
+// The arm runs in a CHILD process (a NULL handle that is refused exits 2) so the wrong rule FAILS the case
+// rather than aborting the gate, and it also proves a BOGUS non-null handle is still refused (the liveness
+// check must not be weakened to make the null case pass).
+// ============================================================================================================
+void case_null_stream_default(Ctx& ctx, const std::string& dir) {
+    (void) ctx;
+    if (!have(dir, "silu_f32.spv")) return;
+    char self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) {
+        skip("null stream: cuda's nullptr IS the default stream", "cannot resolve /proc/self/exe");
+        return;
+    }
+    self[n] = '\0';
+    {
+        const std::string cmd = std::string(self) + " --expect-null-stream-default --spv-dir " + dir + " 2>&1";
+        FILE* f = popen(cmd.c_str(), "r");
+        std::string out;
+        int code = -1;
+        if (f != nullptr) {
+            char line[512];
+            while (std::fgets(line, sizeof line, f)) out += line;
+            const int st = pclose(f);
+            code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        }
+        const bool ok = (code == 0) && (out.find("NULL_STREAM_OK") != std::string::npos);
+        verdict("null stream: cuda's nullptr IS the default stream", ok, ok ? 0 : 1, 1, (double) code,
+                "child exit status (a refused null handle exits 2)");
+    }
+    {
+        const std::string cmd = std::string(self) + " --expect-bad-stream-refusal --spv-dir " + dir + " 2>&1";
+        FILE* f = popen(cmd.c_str(), "r");
+        std::string out;
+        int code = -1;
+        if (f != nullptr) {
+            char line[512];
+            while (std::fgets(line, sizeof line, f)) out += line;
+            const int st = pclose(f);
+            code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        }
+        const bool ok = (code == 2) && (out.find("not a live Vulkan stream") != std::string::npos);
+        verdict("null stream: a BOGUS handle is still REFUSED", ok, ok ? 0 : 1, 1, (double) code,
+                "child exit status (a non-handle must still exit 2)");
+    }
+}
+
 
 // I2, the three glue entry points.  Each is proved the way case_fwht256_entry proves the rotation: (A) run the
 // port's shader path, (B) run the ENGINE WRAPPER through the backend's arena, (C) require the two to agree
@@ -20768,6 +20995,9 @@ int main(int argc, char** argv) {
     bool expect_ledger_refuse = false, expect_ledger_ok = false;
     bool expect_rope_table = false;
     bool expect_copy_refusal = false;
+    bool expect_doorbell_wait_refusal = false;
+    bool expect_null_stream_default = false;
+    bool expect_bad_stream_refusal = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--list") list = true;
@@ -20776,6 +21006,9 @@ int main(int argc, char** argv) {
         else if (a == "--selftest") { /* accepted: the suite is the test */ }
         else if (a == "--expect-refusal") expect_refusal = true;   // the refusal case's child modes
         else if (a == "--expect-copy-refusal") expect_copy_refusal = true;   // copy_from_mapped's refusal child
+        else if (a == "--expect-doorbell-wait-refusal") expect_doorbell_wait_refusal = true;  // doorbell_wait's
+        else if (a == "--expect-null-stream-default") expect_null_stream_default = true;      // the stream seam
+        else if (a == "--expect-bad-stream-refusal") expect_bad_stream_refusal = true;
         else if (a == "--expect-ledger-refuse") expect_ledger_refuse = true;
         else if (a == "--expect-ledger-ok") expect_ledger_ok = true;
         else if (a == "--expect-rope-table") expect_rope_table = true;   // case_rope_table_set_entry's child
@@ -20859,6 +21092,62 @@ int main(int argc, char** argv) {
         std::vector<float> junk(64, 1.0f);                        // not a cudaHostAlloc mapping
         strata::kernels::copy_from_mapped(dst, junk.data(), 64, (void*) cs);   // must exit(2)
         return 5;   // reached only if the wrapper did NOT refuse
+    }
+    if (expect_doorbell_wait_refusal) {
+        // The child for `case_doorbell_ring_replay`'s refusal arm: OUTSIDE capture, an un-answered handoff
+        // (flag < ring) must make the boundary REFUSE (exit 2) rather than submit a waiting consumer.  The
+        // refusal is the design, and this keeps it proven - a no-op under capture does NOT weaken this.
+        strata::vulkan::Stream* s = strata::vulkan::stream_open(1ull << 20, dir);
+        if (s == nullptr) return 7;
+        strata::vulkan::cuda_compat_set_stream(s);
+        const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+        uint32_t* dring = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+        uint32_t* dflag = strata::vulkan::arena_alloc<uint32_t>(*s, 1);
+        const uint32_t one = 1, zero = 0;
+        strata::vulkan::stream_write(*s, dring, &one, sizeof(uint32_t));     // the device rang
+        strata::vulkan::stream_write(*s, dflag, &zero, sizeof(uint32_t));    // the host has not answered
+        strata::kernels::doorbell_wait(dflag, dring, (void*) cs);            // must exit(2)
+        return 5;   // reached only if the boundary did NOT refuse
+    }
+    if (expect_null_stream_default) {
+        // A NULL stream is CUDA's default stream (generate.cpp:3893).  Bind the shim's stream, run `silu_inplace`
+        // with a null handle, and require BITWISE equality with the SAME call on the EXPLICIT handle - plus that
+        // the output MOVED, so a wrapper that wrote nothing cannot pass.  A null handle that is refused exits 2,
+        // which is the injection's failure mode (see gates/inject-verify.sh stream-null-not-default).
+        strata::vulkan::Stream* s = strata::vulkan::stream_open(1ull << 20, dir);
+        if (s == nullptr) return 7;
+        strata::vulkan::cuda_compat_set_stream(s);
+        const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+        const int N = 256;
+        float* a = strata::vulkan::arena_alloc<float>(*s, N);
+        float* b = strata::vulkan::arena_alloc<float>(*s, N);
+        std::vector<float> x((size_t) N);
+        for (int i = 0; i < N; ++i) x[(size_t) i] = -3.0f + 0.02f * (float) i;
+        strata::vulkan::stream_write(*s, a, x.data(), (size_t) N * 4);
+        strata::vulkan::stream_write(*s, b, x.data(), (size_t) N * 4);
+        strata::kernels::silu_inplace(a, N, (void*) cs);     // the explicit handle
+        strata::kernels::silu_inplace(b, N, nullptr);        // NULL = the default stream
+        std::vector<float> ga((size_t) N), gb((size_t) N);
+        strata::vulkan::stream_read(*s, a, ga.data(), (size_t) N * 4);
+        strata::vulkan::stream_read(*s, b, gb.data(), (size_t) N * 4);
+        int bad = 0, moved = 0;
+        for (int i = 0; i < N; ++i) {
+            if (ga[(size_t) i] != gb[(size_t) i]) ++bad;
+            if (gb[(size_t) i] != x[(size_t) i]) ++moved;
+        }
+        if (bad == 0 && moved > 0) { std::printf("NULL_STREAM_OK\n"); return 0; }
+        std::fprintf(stderr, "child: null-vs-explicit differ=%d moved=%d\n", bad, moved);
+        return 8;
+    }
+    if (expect_bad_stream_refusal) {
+        // The liveness check must NOT be weakened to make the null case pass: a non-null handle that is not a
+        // live Vulkan stream still exits 2.
+        strata::vulkan::Stream* s = strata::vulkan::stream_open(1ull << 20, dir);
+        if (s == nullptr) return 7;
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* d = strata::vulkan::arena_alloc<float>(*s, 64);
+        strata::kernels::silu_inplace(d, 64, (void*) (uintptr_t) 0x1234);   // not live: must exit(2)
+        return 5;   // reached only if a bogus handle was NOT refused
     }
 
     Ctx ctx(dev, false);
@@ -21118,6 +21407,13 @@ int main(int argc, char** argv) {
     // THIS BATCH: `sample_tokens` - the step that PRODUCES A TOKEN, the last kernels-namespace symbol a plain
     // single-token decode reaches.  APPENDED last for the shared-RNG reason every batch above names.
     case_sample_tokens_entry(ctx, dir);
+    // THIS BATCH: THE DOORBELL RING AT REPLAY - the recorded device ring (layer.cpp:383-389) and the
+    // host-side `doorbell_wait` boundary (session.cpp:873).  APPENDED last for the shared-RNG reason every
+    // batch above names.
+    case_doorbell_ring_replay(ctx, dir);
+    // THE STREAM SEAM: a NULL handle is CUDA's default stream (generate.cpp:3893).  APPENDED last for the
+    // shared-RNG reason every batch above names.
+    case_null_stream_default(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

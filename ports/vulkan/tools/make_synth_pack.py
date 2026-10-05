@@ -57,12 +57,21 @@ def align_up(n: int) -> int:
 
 
 class Builder:
-    """One output .bin, written streaming so a 6 GB pack never sits in RAM."""
+    """One output .bin, written streaming so a 6 GB pack never sits in RAM.
 
-    def __init__(self, path: pathlib.Path):
+    `zero` writes a pack whose MATRICES are all zero (codes 0x80 -> (128-128)*scale = 0; bf16 0): the clean
+    invariant for "is the composed 48-layer chain arithmetically SOUND?" - a zero in must give a finite zero
+    out, and a non-finite answer from a zero pack is a PORT DEFECT, not a degenerate fixture.
+    `weight_scale` multiplies the quant scales and the bf16 values (the projection/embedding matrices) so a
+    random pack can be given SANE magnitudes for this architecture; the f32 rows (norms, biases, `ssm_a`) are
+    left alone - they are constants, not data-driven weight matrices."""
+
+    def __init__(self, path: pathlib.Path, zero: bool = False, weight_scale: float = 1.0):
         self.path = path
         self.fh = open(path, "wb")
         self.pos = 0
+        self.zero = zero
+        self.weight_scale = weight_scale
         self.entries: dict[str, dict] = {}
 
     def _align(self) -> None:
@@ -98,7 +107,17 @@ class Builder:
         }
 
     def _put_codes(self, n: int) -> None:
-        # random bytes, drawn in chunks; code byte b decodes as (b - 128) * scale
+        # random bytes, drawn in chunks; code byte b decodes as (b - 128) * scale.
+        # ZERO mode writes 0x80: (128 - 128) * scale = 0 for every code, whatever the scale is.
+        if self.zero:
+            left = n
+            z = b"\x80" * (1 << 24)
+            while left:
+                k = min(left, 1 << 24)
+                self.fh.write(z[:k])
+                self.pos += k
+                left -= k
+            return
         rng = np.random.default_rng(0x5EED1234 ^ self.pos)
         left = n
         while left:
@@ -114,6 +133,8 @@ class Builder:
         while left:
             k = min(left, 1 << 22)
             s = (rng.random(k, dtype=np.float32) * 0.02 + 0.005).astype("<f4")
+            if self.weight_scale != 1.0:
+                s = (s * np.float32(self.weight_scale)).astype("<f4")
             self.fh.write(s.tobytes())
             self.pos += 4 * k
             left -= k
@@ -134,7 +155,14 @@ class Builder:
         left = n
         while left:
             k = min(left, 1 << 22)
+            if self.zero:
+                self.fh.write(b"\0" * (4 * k))
+                self.pos += 4 * k
+                left -= k
+                continue
             v = (rng.random(k, dtype=np.float32) - 0.5) * 0.4          # ~[-0.2, 0.2)
+            if self.weight_scale != 1.0:
+                v = v * np.float32(self.weight_scale)
             u = v.view(np.uint32)
             u = (u & np.uint32(0xFFFF0000))                            # zero the low half: exact bf16
             self.fh.write(u.astype("<u4").tobytes())
@@ -171,12 +199,16 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--pack-index", default=None, help="path to tools/pack_index.py")
     ap.add_argument("--experts", action="store_true", help="also create the sparse experts.bin")
+    ap.add_argument("--zero", action="store_true",
+                    help="all weight matrices ZERO (the arithmetic-soundness invariant: a finite zero out)")
+    ap.add_argument("--weight-scale", type=float, default=1.0,
+                    help="multiply the quant scales and bf16 values (sane magnitudes for the architecture)")
     args = ap.parse_args()
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    dense = Builder(out / "dense.bin")
-    embd = Builder(out / "embd.bin")
+    dense = Builder(out / "dense.bin", zero=args.zero, weight_scale=args.weight_scale)
+    embd = Builder(out / "embd.bin", zero=args.zero, weight_scale=args.weight_scale)
 
     # ---- the per-layer set, exactly the names src/core/layer.cpp resolves and check_layer shapes --------
     for l in range(G["n_layers"]):
@@ -236,9 +268,12 @@ def main() -> int:
     tensors.update(dense.entries)
     tensors.update(embd.entries)
 
+    mode = "ZERO weight matrices (the arithmetic-soundness invariant)" if args.zero else \
+           (f"random weights, weight-scale {args.weight_scale}" if args.weight_scale != 1.0 else
+            "random weights")
     man = {
         "format": "strata-pack", "format_version": FORMAT_VERSION,
-        "source": {"shard1": "(synthetic: random weights, no GGUF source)", "shard2": None},
+        "source": {"shard1": f"(synthetic: {mode}, no GGUF source)", "shard2": None},
         "n_layers": G["n_layers"], "align": ALIGN,
         "codebooks": {"IQ4NL": []},
         "tensors": tensors, "experts": {}, "n_experts_per_layer": G["n_expert"],
