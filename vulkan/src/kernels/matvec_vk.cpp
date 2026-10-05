@@ -397,6 +397,20 @@ void bf16_gemv_fp32_mmvf(Stream& s, const float* x, const uint16_t* w, float* y,
     s.ctx->dispatch(pipe, {&xv, &wv, &yv}, &pc, sizeof(pc), (uint32_t) n_out);
 }
 
+// ---- `bf16_gemv_fp32_mmvf_cols` -> the SAME shader, one dispatch per COLUMN.  The CUDA's `_cols`
+//        (native_bf16.cu:187) is the BATCHED form of `bf16_gemv_fp32_mmvf`: it walks `ncols` in blocks of 8,
+//        calls the single-row entry point for a block of one, and otherwise the multi (up to 8 rows per launch,
+//        the weight read once).  Its OWN contract (`bf16_gemv.hpp`) is that "each column [is] bitwise equal to a
+//        `bf16_gemv_fp32_mmvf` call on it", and the CUDA comment states the multi kernel's "each output [is]
+//        bitwise its one-row call" - so the port renders the whole entry point as ncols SINGLE-COLUMN dispatches:
+//        the batching is a strategy, the per-column rule is the contract.  x is [ncols][n_in], y is [ncols][n_out].
+void bf16_gemv_fp32_mmvf_cols(Stream& s, const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
+                              int ncols) {
+    if (n_in <= 0 || n_out <= 0 || ncols <= 0) return;
+    for (int c = 0; c < ncols; ++c)
+        bf16_gemv_fp32_mmvf(s, x + (size_t) c * (size_t) n_in, w, y + (size_t) c * (size_t) n_out, n_in, n_out);
+}
+
 // ---- 4 `s2_gemv_q8` -> s2_gemv_q8.spv (ACT q8_0, CODES, SCALES, Y; push {int n_in; int n_out}; ONE WORKGROUP
 //        PER ROW).  The S2 (Q2_0) weight against a Q8_0 activation - the same parallelism decision as
 //        bf16_gemv_split, so `threads_per_row` is dropped too.
@@ -736,6 +750,13 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y, int64_t n_
     if (n_in <= 0 || n_out <= 0) return;
     strata::vulkan::bf16_gemv_fp32_mmvf(strata::vulkan::stream_for("bf16_gemv_fp32_mmvf", stream), x, w, y, n_in,
                                         n_out);
+}
+// `bf16_gemv_fp32_mmvf_cols` (bf16_gemv.hpp): the batched router projection, `ncols` activation rows at once.
+void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int ncols,
+                              void* stream) {
+    if (n_in <= 0 || n_out <= 0 || ncols <= 0) return;
+    strata::vulkan::bf16_gemv_fp32_mmvf_cols(strata::vulkan::stream_for("bf16_gemv_fp32_mmvf_cols", stream), x, w, y,
+                                             n_in, n_out, ncols);
 }
 void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, float* y, int64_t n_in, int64_t n_out,
                 int threads_per_row, void* stream) {

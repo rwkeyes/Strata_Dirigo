@@ -587,35 +587,8 @@ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
 
 // ngram.hpp: `void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c,
 //     uint32_t* out);`  (a `host` row: `ple_issue_token`, `layer.cpp:1293`).  THE PLE HASH - pure host, no
-//     shader; on a CUDA build `src/kernels/ngram.cpp` (a HOST TU) defines it, and a Vulkan build compiles no
-//     `src/` TU, so it is transcribed here verbatim.  The four silent-plausible rivals are named in
-//     `ngram.hpp`: XOR not sum, `% vocab` not `& (vocab-1)`, the EOS cut FORWARD, and `prev` read NEWEST
-//     first.  `ngram_rows_entry` gives each its own observable.
-static uint64_t ngram_mixed_local(const int64_t* ctx, const uint64_t* mult, int n) {
-    uint64_t mixed = (uint64_t) ctx[0] * mult[0];
-    for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * mult[j];
-    return mixed;
-}
-void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c, uint32_t* out) {
-    const int n_prev = NGRAM_SIZE - 1;
-    for (int i = 0; i < n_tokens; ++i) {
-        int64_t ctx[NGRAM_SIZE];
-        ctx[0] = tokens[i];
-        bool cut = false;
-        for (int s = 1; s < NGRAM_SIZE; ++s) {
-            const int32_t t = cut ? TOKEN_NULL : prev[i * n_prev + (n_prev - s)];
-            cut = cut || t < 0 || t == PLE_EOS_TOKEN_ID;
-            ctx[s] = cut ? PLE_EOS_TOKEN_ID : t;
-        }
-        for (int n = 2; n <= NGRAM_SIZE; ++n) {
-            const uint64_t mixed = ngram_mixed_local(ctx, c.mult, n);
-            const int base = (n - 2) * HEADS_PER_NGRAM;
-            for (int g = 0; g < HEADS_PER_NGRAM; ++g) {
-                const int h = base + g;
-                out[i * PLE_N_HEADS + h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
-            }
-        }
-    }
-}
+//     shader.  It USED to be transcribed here verbatim because a Vulkan build compiled no `src/` TU; the
+//     PleTable wiring below now links the engine's OWN `src/kernels/ngram.cpp`, so the hash is the engine's
+//     definition, not a second copy, and this TU no longer defines it (a duplicate would be a link error).
 
 }  // namespace strata::kernels

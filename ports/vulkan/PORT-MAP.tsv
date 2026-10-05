@@ -15,7 +15,7 @@ add_inplace	kernel	add
 add_streams_broadcast	todo	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 bf16_gemv	kernel	bf16_gemv
 bf16_gemv_fp32_mmvf	kernel	bf16_mmvf_f32
-bf16_gemv_fp32_mmvf_cols	shader	bf16_mmvf_f32
+bf16_gemv_fp32_mmvf_cols	kernel	bf16_mmvf_f32
 bf16_gemv_fp32_mmvf_multi	shader	bf16_mmvf_f32_multi
 bf16_gemv_split	kernel	bf16_gemv
 broadcast_streams	todo	no shader in this tree yet

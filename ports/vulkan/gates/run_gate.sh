@@ -219,7 +219,10 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$TREE/include" \
     "$TREE/vulkan/src/kernels/elementwise_vk.cpp" "$TREE/vulkan/src/kernels/doorbell_vk.cpp" \
     "$TREE/vulkan/src/kernels/gdn_vk.cpp" "$TREE/vulkan/src/kernels/matvec_vk.cpp" \
     "$TREE/vulkan/src/kernels/qsa_vk.cpp" "$TREE/vulkan/src/kernels/ple_vk.cpp" \
-    "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" -lvulkan || exit 1
+    "$TREE/vulkan/src/kernels/shared_expert_vk.cpp" "$TREE/vulkan/src/kernels/refusals_vk.cpp" \
+    "$TREE/vulkan/src/kernels/rope_vk.cpp" \
+    "$TREE/src/kernels/ngram.cpp" "$TREE/src/ngram/ple_reader.cpp" "$TREE/src/platform/direct_file.cpp" \
+    -lpthread -lvulkan || exit 1
 
 echo "== numeric gate"
 # The gate needs a few MiB of buffers, so it runs with the reserve and its floor at 0: this box's resident local

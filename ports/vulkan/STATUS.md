@@ -1,5 +1,36 @@
 # Status — what is done, what is verified, what is not
 
+## THE LAST FIVE NAMES, THE LINK's kernels PART AT ZERO, and M-B RUNS (2026-10-05, `vega`)
+
+**THE BAR MOVED `41 → 18` raw / `7 → 0` distinct full-signature `strata::kernels::` symbols / `5 → 0`
+name-only.**  The five names are wired with real definitions and gate cases: `bf16_gemv_fp32_mmvf_cols`
+(`matvec_vk.cpp`), `build_rope_table` + `rope_table_set` (+`_release`/`_for`/the mrope pair) in the new
+`rope_vk.cpp`, `copy_i32_from_mapped` (`elementwise_vk.cpp`), and `PleTable::{collect,is_open,issue}` - the
+engine's OWN `src/kernels/ngram.cpp` (+ `ple_reader.cpp` + `direct_file.cpp`) is now linked into
+`strata_vulkan_kernels` (`ple_vk.cpp`'s transcribed `ngram_rows` deleted, so the engine's definition is the
+ONE).  **The residual 18 raw references are NOT the five names and NOT kernels-namespace:** they are the
+engine's own `strata::core::` cross-TU symbols `layer.cpp` references (`LayerView::name`, `WeightTable::find`,
+`native_embed`, `NativeEmbed::gather_one`) plus `main`, whose homes are `layout.cpp`/`weights.cpp`/
+`native_head.cpp`/an engine executable.
+
+**A LATENT DEFECT FOUND AND FIXED WHILE WIRING:** the port's `native_rope_apply` IGNORED the rope table
+`layer.cpp:698` registers, so under `STRATA_ROPE_TABLE=1` it would have silently differed from the engine's
+table path (~0.0014 rad at 32K).  It now REFUSES loudly in exactly that configuration; the default is
+bit-for-bit the engine's `<false>` branch.
+
+**M-B RUNS.**  The new `strata_vk_layer_smoke` target (`vulkan/tests/layer_smoke.cpp`, EXCLUDE_FROM_ALL) links
+`layer.cpp` + `layout.cpp`/`weights.cpp`/`native_head.cpp` + the backend with `--gc-sections` (dropping
+`native_head`'s unwired `iq_embed_rows`/`iq_dequant_f32`), writes a synthetic RANDOM-weight pack, loads it
+through the engine's own `WeightTable::load`, and runs the GDN mixer `gdn_layer` on the Arc.  Evidence: out
+256/256 finite, range `[-131.279, 148.152]`, variance `3178.08`, a different activation moves 256/256 elements,
+two runs from a re-zeroed state are 256/256 bitwise equal.  **It does NOT prove numerical correctness** (no
+cheap whole-layer reference exists); per-kernel correctness is the gate's job.
+
+**Verified on `vega`:** gate Arc **682/0/0** (exit 0), llvmpipe **670/0/3** (documented skips), Ryzen iGPU
+**673/0/2**; `check_port_map.py` passes (`168 — 66 kernel, 14 shader, 61 host, 27 todo`); `make_port_map.py`
+regenerates `PORT-MAP.tsv` byte-identically (one row: `bf16_gemv_fp32_mmvf_cols` shader → kernel);
+`strata_vk_layer_smoke` builds + RUNS.  **`z820b` PENDING** (suspended, no WoL).  Full detail in `NEXT.md`.
+
 ## THE TWO SPLIT GEMVs + `shared_expert`, NINE REACHABILITY VERDICTS, and THE INSTRUMENT FIX (2026-10-05, `vega`)
 
 **THE BAR MOVED `64 → 41` raw / `19 → 7` full-signature / `17 → 5` name-only.**  Landed: `s_gemv_q8k_split` and

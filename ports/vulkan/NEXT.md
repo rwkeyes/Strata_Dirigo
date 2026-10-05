@@ -1,5 +1,113 @@
 # Start here next session
 
+## THE LAST FIVE NAMES, THE LINK's kernels PART AT ZERO, and M-B RUNS (2026-10-05, `vega`)
+
+**THE BAR (the running line): `41 → 18` raw / `7 → 0` distinct full-signature `strata::kernels::` symbols /
+`5 → 0` under the parent's name-only pattern.**  The five names are WIRED (below).  **The residual 18 raw
+references are NOT the five names and NOT kernels-namespace:** they are the engine's own `strata::core::`
+cross-TU symbols that `layer.cpp` references - `LayerView::name` (8 refs + 1 "more undefined references" line),
+`WeightTable::find` (6), `native_embed`, `NativeEmbed::gather_one` - plus `main`; their homes are the engine's
+`layout.cpp` / `weights.cpp` / `native_head.cpp` and an engine executable, none of which is a backend symbol.
+Measured with the CURRENT STANDARD recipe (`$HOME/vkbuild-vulkan` is a **Makefiles** build dir, so **never pass
+`-G Ninja`**; reconfigured + rebuilt from the current tree first).  **The recipe now also needs `-lpthread`** (the
+engine's `ngram.cpp` / `ple_reader.cpp` / `direct_file.cpp` are in the kernels lib - see `PleTable`):
+
+    cmake -S . -B "$HOME/vkbuild-vulkan" -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$HOME/vkbuild-vulkan" --target strata_vulkan_kernels strata_vulkan_cudart -j"$(nproc)"
+    g++ -std=c++20 -O0 -Iinclude -Ivulkan/include/cuda_compat -Ivulkan/include -Ivulkan/src/device \
+        -DSTRATA_ENABLE_VULKAN=1 -c src/core/layer.cpp -o /tmp/layer.o
+    g++ /tmp/layer.o "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_cudart.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_kernels.a" \
+        "$HOME/vkbuild-vulkan/vulkan/libstrata_vulkan_device.a" -lpthread -lvulkan -o /tmp/layer-link 2> /tmp/link.log ; true
+    grep -c "undefined reference" /tmp/link.log                                      # -> 18   (was 41)
+    grep -oP "undefined reference to \`\K[^']+" /tmp/link.log | grep "strata::kernels::" \
+        | sed 's/strata::kernels:://' | sort -u | wc -l                               # -> 0    (was 7)
+    grep -oP "undefined reference to \`\Kstrata::kernels::[A-Za-z_0-9]+" /tmp/link.log \
+        | sort -u | wc -l                                                             # -> 0    (was 5)
+
+**THE GROUP TABLE (the kernels-namespace symbols remaining: none).**
+
+| subsystem | n | symbols |
+|---|---:|---|
+| **glue** | **0** | all answered |
+| **matvec / GEMV / KV** | **0** | `bf16_gemv_fp32_mmvf_cols` WIRED (was the last) |
+| **attention / QSA / MoE / GR / PLE / rope** | **0** | `build_rope_table`, `rope_table_set`, `PleTable::{collect,is_open,issue}` WIRED |
+| **GDN / DeltaNet mixer** | **0** | COMPLETE |
+| **other** | **0** | `copy_i32_from_mapped` WIRED |
+
+## DELIVERABLE A — the five names, each with its proof
+
+| # | symbol | where | proof (gate case, `vega` Arc) |
+|---|---|---|---|
+| 1 | `bf16_gemv_fp32_mmvf_cols` | `matvec_vk.cpp` | `case_bf16_gemv_fp32_mmvf_cols_entry`: n_in=2560 n_out=48 **ncols=13** (crosses the CUDA's block-of-8) wrapper == shader path **2496/2496 bitwise**, vs the terms-bound oracle 624/624 w 0.0103; the wrong column stride **MOVES** (1.18e+05) |
+| 2 | `build_rope_table` | `rope_vk.cpp` (new) | `case_build_rope_table_entry`: table == an **exp/log float64 transcription** (different arithmetization) 512/512 w 2.96e-08; == the port's **DEVICE `native_rope_apply` shader** (an independent implementation) 192/192 abs w 2.26e-05; YaRN arm 512/512 w 5.96e-08; rivals (halved exponent / cos-sin swap) MOVE (1.43) |
+| 3 | `rope_table_set` (+`_release`/`_for`/mrope) | `rope_vk.cpp` | `case_rope_table_set_entry`: the default arm (opt-in off) returns NO table even when registered; the enabled arm runs in a **CHILD process** (`--expect-rope-table`, the env is read once) and proves store + scaling-match + release-clears (`ROPE_TABLE_OK`, exit 0) |
+| 4 | `copy_i32_from_mapped` | `elementwise_vk.cpp` | `case_copy_i32_from_mapped_entry`: the mapped host image arrives bitwise 216/216, the sentinel past `n` intact, and a one-element source shift MOVES 200/200 |
+| 5 | `PleTable::{collect,is_open,issue}` | `src/kernels/ngram.cpp` (engine, LINKED) | `case_ple_table_entry`: `is_open` false on a fresh table, `collect` before `issue` refused (`"without issue"`), `issue` arms, `collect` consumes (zero-filled), a second `collect` refused. The DATA path needs a GGUF pack (`ple_parity`'s job); this proves the state machine `layer.cpp:1294/1300` drives and that the SYMBOL resolves in the Vulkan link |
+
+**`PleTable` IS THE ENGINE'S OWN CODE, not a reimplementation.**  `vulkan/CMakeLists.txt` now resolves
+`src/kernels/ngram.cpp`, `src/ngram/ple_reader.cpp` and `src/platform/direct_file.cpp` into
+`strata_vulkan_kernels`; `ple_vk.cpp`'s transcribed `ngram_rows` was DELETED (the engine's `ngram.cpp` defines
+it; keeping both was a duplicate-symbol link error).  `ngram_rows`'s gate case is unchanged and still passes
+against the external `ref/ngram.py` oracle.
+
+**A LATENT DEFECT FOUND AND FIXED WHILE WIRING (the "a setting silently ignored" class).**  The port's
+`native_rope_apply` (`qsa_vk.cpp`) computes the angle ON DEVICE from `theta_scale`/`rope_scaled_angle` and
+IGNORED the table `layer.cpp:698` registers, so under `STRATA_ROPE_TABLE=1` it would have produced the analytic
+angle the engine's table path is documented to differ from (~0.0014 rad at 32K) - silently.  It now REFUSES
+loudly when `rope_table_for(scaling)` is non-empty (the `native_mmvq_supported` discipline: a backend with no
+table-reading shader must own that answer in code).  The DEFAULT (opt-in unset) is bit-for-bit the engine's
+`<false>` branch.
+
+## DELIVERABLE B — M-B: ONE LAYER BODY, RANDOM WEIGHTS, ON THE ARC
+
+`vulkan/tests/layer_smoke.cpp` → the new **`strata_vk_layer_smoke`** target (EXCLUDE_FROM_ALL, built by name).
+It links `layer.cpp` + the three cross-TU homes (`layout.cpp`/`weights.cpp`/`native_head.cpp`) + the backend,
+with `-ffunction-sections -Wl,--gc-sections` so `native_head`'s unwired `iq_embed_rows`/`iq_dequant_f32` deps
+are DROPPED (it is a LAYER-BODY link, not the whole engine).  It:
+
+1. opens the engine stream (device + arena) and sets the shim's "current stream" (`cuda_compat_set_stream` - the
+   stand-in for CUDA's current device, which the loader's `cudaHostAlloc` needs);
+2. writes a **SYNTHETIC RANDOM PACK** (`dense.bin` + `index.txt`) for exactly the nine tensors `gdn_layer`
+   resolves and loads it through the engine's OWN `WeightTable::load`.  `WeightTable`'s storage is private and
+   its only public constructor needs a pack, so the loader's own format IS the mechanism for "random weights, no
+   model"; the loader's segment check refuses a mis-sized plane rather than loading a wrong offset;
+3. carves `GdnBuffers` (from `gdn_buffers_bytes`) and zeroes the recurrent + conv state;
+4. calls `strata::core::gdn_layer(...)`.
+
+**IT RUNS (Arc, `intel_icd`).**  Geometry `n_embd=256 C=1024 S=128 h_k=2 h_v=4 V=512`; pool 611,328 B; 9
+tensors loaded; `gdn_layer` returned 1 (success) with `err=""`.  Evidence:
+
+| check | result |
+|---|---|
+| shape | out = 256 floats = n_embd |
+| finiteness | **256/256 finite** |
+| non-degenerate | range `[-131.279, 148.152]`, mean `-2.45868`, variance `3178.08` (> 0) |
+| input dependence | a DIFFERENT activation moves **256/256** output elements |
+| repeatability | two runs from a re-zeroed state are **256/256 bitwise equal** |
+
+**WHAT IT DOES NOT PROVE: numerical correctness of the layer.**  It executed and produced finite,
+non-degenerate, repeatable output of the right shape; there is **NO reference comparison** (no cheap whole-layer
+oracle exists here, and a restatement of the implementation would not be one), so agreement with the engine's
+CPU/CUDA path is NOT established.  Per-kernel numerical correctness remains the gate's job.
+
+## WHAT THE ATTEMPT MET (the stopping points that were cleared, and the one that remains)
+
+* **Cleared:** link (`--gc-sections` keeps the layer-body closure); the shim's current-stream seam
+  (`cuda_compat_set_stream`); the Q8_K block contract (n_embd must be a multiple of 256, because `gdn_layer`
+  always builds `x_q8k`); finite fixture values (raw random BYTES make NaN/Inf f32 scales, and a positive
+  `ssm_a` overflows the recurrence's `exp` - both are FIXTURE bugs, not kernel ones).
+* **Remains:** `WeightTable` has no public insertion API, so "random weights" MUST go through `load()` and a
+  pack-format file.  That is the design, not a defect - but it means M-B is not a "no filesystem writes" test.
+
+## RESULTS (vega)
+
+Gate (see the totals line at the top of `STATUS.md`): Arc `682/0/0` (exit 0), llvmpipe `670/0/3`, Ryzen iGPU
+`673/0/2`; `check_port_map.py` passes (`168 — 66 kernel, 14 shader, 61 host, 27 todo`); `make_port_map.py`
+regenerates `PORT-MAP.tsv` byte-identically (one row: `bf16_gemv_fp32_mmvf_cols` shader → kernel);
+`strata_vk_layer_smoke` builds + RUNS.  **`z820b` is PENDING** (suspended, no WoL).  The CUDA graph API was NOT
+touched.
+
 ## THE TWO SPLIT GEMVs + `shared_expert`, THE NINE SETTLED REACHABILITY VERDICTS, and THE INSTRUMENT FIX (2026-10-05, `vega`)
 
 **THE BAR (the running line): `64 → 41` undefined references / `19 → 7` distinct full-signature

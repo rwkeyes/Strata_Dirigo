@@ -77,6 +77,7 @@
 #include "strata/kernels/native_qsa.hpp"     // native_qsa_rms_norm_weighted / native_qsa_gate_apply
 #include "strata/kernels/native_rope.hpp"    // native_rope_apply
 #include "strata/kernels/rope.hpp"           // rope_neox_apply
+#include "strata/kernels/mrope.hpp"          // rope_table_for (the STRATA_ROPE_TABLE guard in native_rope_apply)
 #include "strata/kernels/rope_scaling.hpp"   // RopeScaling / rope_scaling / rope_scaling_set
 #include "strata/kernels/qsa.hpp"            // QsaShapes / qsa_step_fill / kStepCount
 #include "strata/kernels/qsa_select.hpp"     // qsa_block_scores / qsa_block_topk
@@ -155,6 +156,14 @@ void native_qsa_rms_norm_weighted(Stream& s, const float* input, const float* ga
 void native_rope_apply(Stream& s, const float* x, float* out, int rows, int head_dim, int n_rot,
                        const strata::kernels::RopeScaling& scaling, const int* positions) {
     if (rows <= 0 || head_dim <= 0 || n_rot <= 0) return;
+    // STRATA_ROPE_TABLE=1 with a table built for THIS scaling: the engine's <true> rope path would rotate by the
+    // table's exact float64 angles.  This backend has no table-reading rope shader (native_rope_apply.spv
+    // computes the angle on device; see rope_vk.cpp), so the analytic arithmetic below would SILENTLY differ from
+    // the engine by ~0.0014 rad at 32K.  Refuse the one configuration the port cannot honour rather than diverge;
+    // the default (no table) is bit-for-bit the engine's <false> branch.
+    if (strata::kernels::rope_table_for(scaling).cos != nullptr)
+        refuse("native_rope_apply", "STRATA_ROPE_TABLE=1 with a matching table: this backend has no table-reading "
+                                    "rope shader (the analytic path would silently differ from the engine's)");
     const uint64_t n = (uint64_t) rows * (uint64_t) head_dim;
     Buf xv{}, ov{}, pv{}, mv{};
     if (!arena_resolve(s, x, n * 4, xv) || !arena_resolve(s, out, n * 4, ov) ||

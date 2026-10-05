@@ -363,3 +363,32 @@ the top-level `CMakeLists.txt` (each `return()`s), which is what let `generate.c
 The link progress moved the one-layer-body link **64 -> 41** undefined references / **19 -> 7** full-signature /
 **17 -> 5** name-only.  Gate on `vega`: Arc 669/0/0, llvmpipe 657/0/3, Ryzen iGPU 659/1/2 (the open requery flake).
 **`z820b` PENDING.**
+
+## What the last-five-names batch adds, and M-B RUNS (2026-10-05)
+
+* **THE ONE-LAYER-BODY LINK'S kernels-namespace part is now ZERO: `41 -> 18` raw / `7 -> 0` full-signature /
+  `5 -> 0` name-only.**  The five names wired (each a real definition + a gate case):
+  * `bf16_gemv_fp32_mmvf_cols` (`matvec_vk.cpp`) - the CUDA's batched router projection; the port renders it as
+    one `bf16_mmvf_f32.spv` dispatch per column, which its own contract says is bitwise the single-column call.
+  * `build_rope_table` + `rope_table_set` (+ `_release` / `_for` / the mrope pair) in a new `rope_vk.cpp` - the
+    engine's rope host rows (rope.cu / native_rope.cu), transcribed because those are CUDA TUs.
+  * `copy_i32_from_mapped` (`elementwise_vk.cpp`) - the QSA step/positions upload; Vulkan cannot dereference a
+    mapped host pointer from a shader, so the port STAGES the same host->device copy (the layer's compute stays
+    on the device).
+  * `PleTable::{collect,is_open,issue}` - the engine's OWN `src/kernels/ngram.cpp` (+ `ple_reader.cpp` +
+    `direct_file.cpp`) is now linked into `strata_vulkan_kernels`; `ple_vk.cpp`'s transcribed `ngram_rows` was
+    removed so the engine's definition is the ONE (a duplicate would be a link error).
+  * **THE RESIDUAL 18 RAW REFERENCES ARE NOT THE FIVE NAMES:** they are the engine's own `strata::core::`
+    cross-TU symbols (`LayerView::name` x8 + 1 "more" line, `WeightTable::find` x6, `native_embed`,
+    `NativeEmbed::gather_one`) and `main`; the kernels-namespace counts are 0.
+* **A LATENT DEFECT FOUND AND FIXED WHILE WIRING (the "a setting silently ignored" class):** the port's
+  `native_rope_apply` computes the angle analytically and IGNORED the table `layer.cpp:698` registers, so under
+  `STRATA_ROPE_TABLE=1` it would silently differ from the engine's table path (~0.0014 rad at 32K).  It now
+  REFUSES loudly in exactly that configuration (the default is bit-for-bit the engine's `<false>` branch).
+* **M-B RUNS.**  `vulkan/tests/layer_smoke.cpp` -> the new `strata_vk_layer_smoke` target instantiates the GDN
+  mixer `gdn_layer` with RANDOM weights (a synthetic pack the test writes, loaded through the engine's own
+  `WeightTable::load` - no model, no tokeniser, no prompt) and executes it on the Arc.  Evidence: out 256/256
+  finite, range `[-131.279, 148.152]`, variance `3178.08`, a DIFFERENT activation moves 256/256 elements, and
+  two runs from a re-zeroed state are 256/256 bitwise equal.  **It does NOT prove numerical correctness** (no
+  cheap whole-layer reference exists); per-kernel correctness is the gate's job.  See `ports/vulkan/NEXT.md`.
+

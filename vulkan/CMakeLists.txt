@@ -20,6 +20,7 @@
 
 cmake_minimum_required(VERSION 3.24)
 find_package(Vulkan REQUIRED)
+find_package(Threads REQUIRED)   # the engine's host sources below (ple_reader/direct_file) use std::thread
 
 set(STRATA_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
@@ -64,10 +65,20 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/qsa_vk.cpp
   src/kernels/ple_vk.cpp
   src/kernels/shared_expert_vk.cpp
+  src/kernels/rope_vk.cpp                     # the RoPE host rows: build_rope_table + rope_table_set/_for/_release
   src/kernels/refusals_vk.cpp)  # shared_expert (the MoE shared stage) + the LOUD REFUSALS (unreachable symbols)
                             # + the PLE/GR shared stages and the MoE routing rows (ple_vk.cpp)
-add_library(strata_vulkan_kernels STATIC ${_kernels})
-target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device)
+# THE ENGINE'S OWN HOST SOURCES the layer body crosses for the PLE table: `PleTable` (collect/is_open/issue)
+# is a pure host class whose ONE definition is `src/kernels/ngram.cpp` (with its `ple_reader.cpp` +
+# `direct_file.cpp` deps).  The port LINKS THE ENGINE'S OWN CODE rather than writing a second implementation
+# (ngram_rows, whose definition this moved, is now the engine's too).  Resolved through the same function, so a
+# migrated copy under vulkan/ would win if one is ever added.
+strata_vulkan_resolve(_host
+  src/kernels/ngram.cpp
+  src/ngram/ple_reader.cpp
+  src/platform/direct_file.cpp)
+add_library(strata_vulkan_kernels STATIC ${_kernels} ${_host})
+target_link_libraries(strata_vulkan_kernels PUBLIC strata_vulkan_device Threads::Threads)
 
 # --- the engine-side target: build + run the entry point through the engine's OWN wrapper --------------------
 # This is the "something that links the device layer + the Vulkan TU against the engine's own code and exercises
@@ -164,3 +175,25 @@ target_link_libraries(strata_vulkan PRIVATE strata_vulkan_engine strata_vulkan_s
 message(STATUS "Strata: Vulkan engine targets (deliverable B) - strata_vulkan_core / strata_vulkan_engine / "
                "strata_vulkan_spec / strata_vulkan_kernels_cpu / strata_vulkan (executable) + the CUDA-runtime "
                "shim strata_vulkan_cudart + strata_vk_cudart_smoke")
+
+# ============================================================================================================
+# M-B - THE FIRST ENGINE-LINKED TARGET THAT RUNS ONE LAYER BODY (the plan's milestone M-B)
+# ============================================================================================================
+# `strata_vk_layer_smoke` instantiates the GDN / DeltaNet mixer `gdn_layer` with RANDOM weights (a synthetic
+# pack written by the test, then loaded through the engine's OWN `WeightTable::load`) and runs it on the Vulkan
+# backend.  It links exactly the engine TUs one layer body needs - `layer.cpp` plus the three cross-TU homes
+# (`layout.cpp`, `weights.cpp`, `native_head.cpp`) - and NOT the graph/session/verify TUs that need the deferred
+# CUDA graph API.  `-ffunction-sections -Wl,--gc-sections` keeps only the functions reachable from `main`, so
+# `native_head.cpp`'s `iq_embed_rows`/`iq_dequant_f32` deps (unwired, kind `shader`) are dropped rather than
+# forced: the target is a LAYER-BODY link, not the whole engine.  EXCLUDE_FROM_ALL: it is the M-B measurement,
+# built by name.
+strata_vulkan_resolve(_lsmoke
+  src/core/layer.cpp src/core/layout.cpp src/core/weights.cpp src/core/native_head.cpp)
+add_executable(strata_vk_layer_smoke EXCLUDE_FROM_ALL tests/layer_smoke.cpp ${_lsmoke})
+target_link_libraries(strata_vk_layer_smoke PRIVATE strata_vulkan_kernels strata_vulkan_cudart)
+if(NOT MSVC)
+  target_compile_options(strata_vk_layer_smoke PRIVATE -ffunction-sections -fdata-sections)
+  target_link_options(strata_vk_layer_smoke PRIVATE -Wl,--gc-sections)
+endif()
+
+message(STATUS "Strata: M-B target - strata_vk_layer_smoke (one GDN layer body, random weights, Vulkan backend)")

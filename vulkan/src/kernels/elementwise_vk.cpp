@@ -325,6 +325,30 @@ void add_inplace(Stream& s, float* dst, const float* src, int64_t n) {
     s.ctx->dispatch(pipe, {&dv, &sv}, &pc, sizeof(pc), groups_for((uint64_t) n));
 }
 
+// `copy_i32_from_mapped` (elementwise.hpp:126) - the QSA per-token step/positions upload, `layer.cpp:913/914`.
+// The CUDA launches `copy_i32_from_mapped_kernel` (elementwise.cu:369), one block that reads the SOURCE through
+// a `const volatile int32_t*` - because the source is MAPPED, PINNED HOST memory: the layer obtains it with
+// `cudaHostGetDevicePointer` (layer.cpp:911), and the kernel carries it into device memory from INSIDE the layer.
+// Vulkan cannot dereference a host pointer from a shader (vk_backend.hpp's mapped-memory note; the shim's
+// `cudaHostGetDevicePointer` returns the host address, and there is no device address space for host memory in
+// this layer), so the backend renders the SAME transfer as a STAGED host->device copy: the source bytes are read
+// on the host and the arena buffer bound at `dst` receives them.  `dst[0..n)` still becomes the mapped image's
+// `n` int32 and the layer's compute stays on the device - the staging is the transfer, not a CPU shortcut.
+void copy_i32_from_mapped(Stream& s, int32_t* dst, const int32_t* src, int64_t n) {
+    if (n <= 0) return;
+    if (src == nullptr) {
+        std::fprintf(stderr, "strata::vulkan::copy_i32_from_mapped: a null mapped source\n");
+        std::exit(2);
+    }
+    Buf dv{};
+    if (!arena_resolve(s, dst, (uint64_t) n * 4, dv)) {
+        std::fprintf(stderr, "strata::vulkan::copy_i32_from_mapped: dst is not inside this stream's arena (n=%lld) - "
+                             "refusing rather than binding a wrong view\n", (long long) n);
+        std::exit(2);
+    }
+    stream_write(s, dst, src, (uint64_t) n * 4);
+}
+
 // `y[i] = f16(x[i])` (shader f32_to_f16.spv: X float[] read, Y uint16_t[] write, push {int n}) - the F16
 // sibling of f32_to_bf16_bulk below, a SEPARATE entry point (5 vs 8 exponent bits; a wrong pick is a plausible
 // tensor at the wrong precision).
@@ -594,6 +618,20 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
         std::exit(2);
     }
     strata::vulkan::add_inplace(*s, dst, src, n);
+}
+
+// elementwise.hpp: `void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);`
+// The host->device arm of the QSA step/positions upload (layer.cpp:913/914) - the very arm the layer takes
+// (`g_publish_kernel` defaults TRUE, layer.cpp:42, and the shim's `cudaHostGetDevicePointer` succeeds for a
+// `cudaHostAlloc`'d region, so the `else` memcpy branch is NOT the one reached).  See the backend note above
+// for why the port stages it rather than launching a kernel.
+void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
+    strata::vulkan::Stream* s = strata::vulkan::stream_of(stream);
+    if (s == nullptr) {
+        std::fprintf(stderr, "copy_i32_from_mapped: the stream handle is not a live Vulkan stream; refusing\n");
+        std::exit(2);
+    }
+    strata::vulkan::copy_i32_from_mapped(*s, dst, src, n);
 }
 
 // elementwise.hpp: `void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);`

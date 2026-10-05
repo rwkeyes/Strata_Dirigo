@@ -48,6 +48,8 @@
 #include "strata/kernels/qsa.hpp"            // I4: kv_append_step / kv_gather_step (the fp16 KV cache)
 #include "strata/kernels/qsa_select.hpp"     // QSA/attention batch: qsa_block_scores / qsa_block_topk
 #include "strata/kernels/rope.hpp"           // QSA/attention batch: rope_neox_apply
+#include "strata/kernels/mrope.hpp"          // RoPE host rows: rope_table_set/_for/_release + RopeTab
+#include "strata/kernels/rope_scaling.hpp"   // RopeScaling / RopeScalingType (the rope host-row case)
 #include "strata/kernels/gr.hpp"             // PLE/GR batch: gr_read / gr_write / gr_workspace_init
 #include "strata/kernels/ple.hpp"            // PLE/GR batch: ple_block / ple_history_advance / ple_block_scratch_bytes
 #include "strata/kernels/ngram.hpp"          // MoE/PLE batch: ngram_rows (the PLE hash) + the artifact hash constants
@@ -19304,6 +19306,313 @@ static void case_shared_expert_entry(Ctx& ctx, const std::string& dir) {
             "each rival must change the oracle on this fixture (SILU-on-up / no scalar gate)");
 }
 
+// ============================================================================================================
+// THE FIVE NAMES THAT CLOSED THE ONE-LAYER-BODY LINK (native_bf16.cu / rope.cu / native_rope.cu /
+// elementwise.cu / ngram.cpp).  Each entry case drives the ENGINE WRAPPER (or the backend definition) on its
+// own EnginePin-pinned stream, compared against the port's own shader path where one exists AND against an
+// explicit oracle, with every rival given its own observable and a host-side margin proving it MOVES.
+// APPENDED at the end of main() for the shared-RNG reason every batch above names.
+// ============================================================================================================
+
+// 1. `bf16_gemv_fp32_mmvf_cols` (bf16_gemv.hpp; layer.cpp:414, `moe_route_window`).  The CUDA batches up to 8
+//    columns per launch and contracts that "each output [is] bitwise its one-row call"; the port renders it as
+//    one `bf16_mmvf_f32.spv` dispatch per column.  ncols=13 crosses the CUDA's block-of-8 boundary, so both
+//    block shapes are exercised.  Rival: the WRONG column stride (`x + c*n_out` instead of `x + c*n_in`).
+void case_bf16_gemv_fp32_mmvf_cols_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "bf16_mmvf_f32.spv")) return;
+    const int n_in = 2560, n_out = 48, ncols = 13;
+    std::vector<uint16_t> xw, ww;
+    bf16_gemv_fixture(n_in, n_out, xw, ww);            // ww = random bf16 [n_out][n_in]; xw unused here
+    std::vector<float> xf((size_t) ncols * n_in);
+    for (int c = 0; c < ncols; ++c)
+        for (int i = 0; i < n_in; ++i) xf[(size_t) c * n_in + i] = rndf(1.0f);
+    std::vector<double> want((size_t) ncols * n_out), terms((size_t) ncols * n_out);
+    for (int c = 0; c < ncols; ++c) {
+        std::vector<float> xc(xf.begin() + (size_t) c * n_in, xf.begin() + (size_t) (c + 1) * n_in);
+        for (int o = 0; o < n_out; ++o)
+            want[(size_t) c * n_out + o] = bf16_mmvf_host_row(xc, ww, o, n_in, &terms[(size_t) c * n_out + o]);
+    }
+    // (A) THE SHADER PATH: ncols single-column dispatches into per-column outputs.
+    const size_t ybytes = (size_t) ncols * n_out * 4;
+    const size_t ypad = (size_t) n_out * 4 + 64;
+    Buf bx = ctx.alloc((size_t) n_in * 4), bw = ctx.alloc((size_t) n_out * n_in * 2), byc = ctx.alloc(ypad);
+    ctx.write(bw, ww.data(), (size_t) n_out * n_in * 2);
+    struct { int32_t n_in; int32_t n_out; } pc{n_in, n_out};
+    VkPipeline p = ctx.pipeline(dir + "/bf16_mmvf_f32.spv", 3, (int) sizeof(pc));
+    std::vector<uint8_t> ref(ybytes);
+    std::vector<uint8_t> sink(ypad, 0x5E);
+    for (int c = 0; c < ncols; ++c) {
+        ctx.write(bx, xf.data() + (size_t) c * n_in, (size_t) n_in * 4);
+        ctx.write(byc, sink.data(), sink.size());
+        ctx.dispatch(p, {&bx, &bw, &byc}, &pc, sizeof(pc), (uint32_t) n_out);
+        ctx.read(byc, ref.data() + (size_t) c * n_out * 4, (size_t) n_out * 4);
+    }
+    // (B) THE ENGINE WRAPPER on its own engine stream.
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("bf16_gemv_fp32_mmvf_cols entry", false, 1, 1, 0, "the engine stream did not open");
+        ctx.free(bx); ctx.free(bw); ctx.free(byc);
+        return;
+    }
+    float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) ncols * n_in);
+    uint16_t* dw = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) n_out * n_in);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, (size_t) ncols * n_out);
+    strata::vulkan::stream_write(*s, dx, xf.data(), (size_t) ncols * n_in * 4);
+    strata::vulkan::stream_write(*s, dw, ww.data(), (size_t) n_out * n_in * 2);
+    strata::kernels::bf16_gemv_fp32_mmvf_cols(dx, dw, dy, n_in, n_out, ncols, s);
+    std::vector<uint8_t> got(ybytes);
+    strata::vulkan::stream_read(*s, dy, got.data(), got.size());
+    strata::vulkan::stream_close(s);
+    int bad_bw = 0;
+    for (size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++bad_bw;
+    char tag[192];
+    std::snprintf(tag, sizeof tag, "bf16_gemv_fp32_mmvf_cols entry (n_in=%d n_out=%d ncols=%d): wrapper == shader path, bitwise",
+                  n_in, n_out, ncols);
+    verdict(tag, bad_bw == 0, bad_bw, (int) got.size(), 0.0, "output bytes differ - column stride / view / dispatch mismatch");
+    int bad = 0;
+    double worst = 0;
+    const float* y = reinterpret_cast<const float*>(got.data());
+    for (int c = 0; c < ncols; ++c)
+        for (int o = 0; o < n_out; ++o) {
+            const size_t k = (size_t) c * n_out + o;
+            const double ratio = std::fabs((double) y[k] - want[k]) / gemv_bound(want[k], terms[k], 1e-6);
+            worst = std::max(worst, ratio);
+            if (!(ratio <= 1.0)) ++bad;
+        }
+    verdict("bf16_gemv_fp32_mmvf_cols entry: wrapper vs the explicit oracle (terms bound)", bad == 0, bad,
+            ncols * n_out, worst, "rows outside the terms-derived bound");
+    // (C) RIVAL: the wrong column stride.  Its own observable: the shifted activation's oracle, which must
+    //     differ from the correct one on this fixture - otherwise the comparison above is blind to the stride.
+    double rival_max = 0;
+    for (int c = 0; c < ncols; ++c) {
+        const size_t off = (size_t) c * n_out;
+        std::vector<float> xc((size_t) n_in);
+        for (int i = 0; i < n_in; ++i) xc[(size_t) i] = (off + (size_t) i < xf.size()) ? xf[off + (size_t) i] : 0.0f;
+        for (int o = 0; o < n_out; ++o) {
+            const double wr = bf16_mmvf_host_row(xc, ww, o, n_in, nullptr);
+            rival_max = std::max(rival_max, std::fabs(wr - want[(size_t) c * n_out + o]));
+        }
+    }
+    verdict("bf16_gemv_fp32_mmvf_cols entry: the wrong column stride MOVES the reference",
+            rival_max > 1e-3, 0, 1, rival_max, "the shifted-activation oracle must differ from the correct one");
+    ctx.free(bx); ctx.free(bw); ctx.free(byc);
+}
+
+// 2. `build_rope_table` (rope.hpp; layer.cpp:692).  A PURE HOST float64 table build.  Two comparisons:
+//    (i) against a float64 oracle of the same rule computed through a DIFFERENT arithmetization
+//        (`exp(-2i/n*log theta)` rather than `pow(theta, -2i/n)`), so a mistake in one code path cannot hide
+//        in the other; (ii) against the port's DEVICE `native_rope_apply.spv`, which computes the same angles
+//        with f32 `powf`/`cosf` ON THE DEVICE - a second, independent implementation.  Rivals: the halved
+//        exponent and a cos/sin swap must each MOVE the table.
+void case_build_rope_table_entry(Ctx& ctx, const std::string& dir) {
+    const int n_rot = 64, half = n_rot / 2, max_pos = 8;
+    const double theta = 1e7;
+    const strata::kernels::RopeScaling none;   // None, freq_base 1e7 - the engine's default
+    std::vector<float> cos_t((size_t) max_pos * half), sin_t((size_t) max_pos * half);
+    strata::kernels::build_rope_table(n_rot, none, max_pos, cos_t.data(), sin_t.data());
+    // (i) the exp/log float64 oracle (a different code path to the same angles).
+    int bad = 0;
+    double worst = 0;
+    for (int p = 0; p < max_pos; ++p)
+        for (int i = 0; i < half; ++i) {
+            const double ang = (double) p * std::exp(-2.0 * (double) i / (double) n_rot * std::log(theta));
+            const double cw = std::cos(ang), sw = std::sin(ang);
+            const double dc = std::fabs((double) cos_t[(size_t) p * half + i] - cw);
+            const double ds = std::fabs((double) sin_t[(size_t) p * half + i] - sw);
+            worst = std::max(worst, std::max(dc, ds));
+            if (!(dc <= 1e-6) || !(ds <= 1e-6)) ++bad;
+        }
+    verdict("build_rope_table entry: the table == a float64 exp/log transcription (different arithmetization)",
+            bad == 0, bad, max_pos * half * 2, worst, "table entries differing from the oracle beyond 1e-6");
+    // (ii) THE DEVICE CROSS-CHECK.  native_rope_apply rotates a 128-wide row: pair i takes x[i] and x[i+32],
+    //      so x[i]=1 (i<32), x[i+32]=0 makes out[i]=cos and out[i+32]=sin of that position's angle.
+    if (have(dir, "native_rope_apply.spv")) {
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+        if (s != nullptr) {
+            const int hd = 128, rows = 3;
+            const int posv[3] = {0, 1, 7};
+            std::vector<float> x((size_t) rows * hd, 0.0f);
+            for (int r = 0; r < rows; ++r)
+                for (int i = 0; i < half; ++i) x[(size_t) r * hd + i] = 1.0f;
+            float* dx = strata::vulkan::arena_alloc<float>(*s, x.size());
+            float* dout = strata::vulkan::arena_alloc<float>(*s, x.size());
+            int* dp = strata::vulkan::arena_alloc<int>(*s, rows);
+            strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 4);
+            strata::vulkan::stream_write(*s, dp, posv, (size_t) rows * 4);
+            strata::kernels::native_rope_apply(dx, dout, rows, hd, n_rot, none, dp, s);
+            std::vector<float> got(x.size());
+            strata::vulkan::stream_read(*s, dout, got.data(), got.size() * 4);
+            strata::vulkan::stream_close(s);
+            int dev_bad = 0;
+            double dev_worst = 0;
+            for (int r = 0; r < rows; ++r) {
+                const int p = posv[r];
+                for (int i = 0; i < half; ++i) {
+                    const double c_ref = cos_t[(size_t) p * half + i], s_ref = sin_t[(size_t) p * half + i];
+                    const double cg = got[(size_t) r * hd + i], sg = got[(size_t) r * hd + half + i];
+                    // The device rotates with FAST-MATH `pow`/`cos`/`sin`; rope_parity.cpp pins this shader to
+                    // the table path at 3e-3 relative to the row MAGNITUDE (here ~1 for a unit vector), and the
+                    // fp32 range reduction is where that comes from.  An ABSOLUTE bar of 5e-3 is the honest one
+                    // for a second implementation: a wrong exponent or pairing differs by O(1) (the rival arm
+                    // above measures 1.43), so this still catches every structural error.
+                    const double dc = std::fabs(cg - c_ref), ds = std::fabs(sg - s_ref);
+                    dev_worst = std::max(dev_worst, std::max(dc, ds));
+                    if (!(dc <= 5e-3) || !(ds <= 5e-3)) ++dev_bad;
+                }
+            }
+            verdict("build_rope_table entry: table == the DEVICE native_rope_apply shader's own angles (independent impl)",
+                    dev_bad == 0, dev_bad, rows * half * 2, dev_worst,
+                    "shader cos/sin vs the table (absolute, fast-math bar 5e-3)");
+        }
+    }
+    // (iii) RIVALS: the halved exponent and the cos/sin swap must each move the table.
+    double exp_moves = 0, swap_moves = 0;
+    for (int p = 0; p < max_pos; ++p)
+        for (int i = 0; i < half; ++i) {
+            const double ang = (double) p * std::pow(theta, -1.0 * (double) i / (double) n_rot);   // the halved exponent
+            exp_moves = std::max(exp_moves, std::fabs(std::cos(ang) - (double) cos_t[(size_t) p * half + i]));
+        }
+    for (int p = 0; p < max_pos; ++p)
+        for (int i = 0; i < half; ++i)
+            swap_moves = std::max(swap_moves, std::fabs((double) cos_t[(size_t) p * half + i] - (double) sin_t[(size_t) p * half + i]));
+    verdict("build_rope_table entry: rivals MOVE the table (halved exponent / cos-sin swap)",
+            exp_moves > 1e-3 && swap_moves > 1e-3, 0, 2, std::max(exp_moves, swap_moves),
+            "each rival must differ on this fixture or it is decorative");
+    // (iv) THE YaRN ARM: build with a scaling that exercises the ramp and the mscale fold, against a float64
+    //      transcription of rope.cu's scaled loop.
+    strata::kernels::RopeScaling yarn;
+    yarn.type = strata::kernels::RopeScalingType::YaRN;
+    yarn.factor = 4.0;
+    yarn.orig_ctx = 4096;
+    yarn.ext_factor = 1.0;
+    std::vector<float> yc((size_t) max_pos * half), ys((size_t) max_pos * half);
+    strata::kernels::build_rope_table(n_rot, yarn, max_pos, yc.data(), ys.data());
+    const double fs = yarn.freq_scale(), ms = yarn.mscale();
+    double cd[2];
+    yarn.corr_dims(n_rot, cd);
+    int ybad = 0;
+    double yworst = 0;
+    for (int p = 0; p < max_pos; ++p)
+        for (int i = 0; i < half; ++i) {
+            const double inv = std::pow(yarn.freq_base, -2.0 * (double) i / (double) n_rot);
+            const double extrap = (double) p * inv, interp = fs * extrap;
+            const double ramp = (double) strata::kernels::rope_yarn_ramp((float) cd[0], (float) cd[1], i) * yarn.ext_factor;
+            const double ang = interp * (1.0 - ramp) + extrap * ramp;
+            const double dc = std::fabs((double) yc[(size_t) p * half + i] - std::cos(ang) * ms);
+            const double ds = std::fabs((double) ys[(size_t) p * half + i] - std::sin(ang) * ms);
+            yworst = std::max(yworst, std::max(dc, ds));
+            if (!(dc <= 1e-6) || !(ds <= 1e-6)) ++ybad;
+        }
+    verdict("build_rope_table entry: YaRN scaling (ramp + mscale) vs its float64 transcription", ybad == 0, ybad,
+            max_pos * half * 2, yworst, "scaled table entries differing from the rule beyond 1e-6");
+}
+
+// 3. `rope_table_set` / `_release` / `_for` (mrope.hpp; layer.cpp:698).  The engine's rule: the table is
+//    returned ONLY when STRATA_ROPE_TABLE=1 AND the registered scaling matches.  The env is read ONCE, so the
+//    enabled arm runs in a CHILD process (a fresh image sees the env before the one-time read); the parent
+//    proves the default arm (opt-in off => no table even when registered).
+void case_rope_table_set_entry(Ctx& ctx, const std::string& dir) {
+    (void) ctx; (void) dir;
+    strata::kernels::RopeScaling lin;
+    lin.type = strata::kernels::RopeScalingType::Linear;
+    lin.factor = 2.0;
+    const strata::kernels::RopeScaling none;
+    std::vector<float> c((size_t) 2 * 32), s((size_t) 2 * 32, 0.0f);
+    strata::kernels::build_rope_table(64, lin, 2, c.data(), s.data());
+    strata::kernels::rope_table_set(c.data(), s.data(), 2, lin);
+    const strata::kernels::RopeTab fa = strata::kernels::rope_table_for(lin);
+    const strata::kernels::RopeTab fb = strata::kernels::rope_table_for(none);
+    const bool default_gate = fa.cos == nullptr && fb.cos == nullptr;
+    verdict("rope_table_set entry: STRATA_ROPE_TABLE unset => no table returned, even for the registered scaling",
+            default_gate, default_gate ? 0 : 1, 1, 0.0, "a table was returned with the opt-in off");
+    strata::kernels::rope_table_release(c.data());
+    char self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) {
+        skip("rope_table_set entry: the enabled arm (child)", "cannot resolve /proc/self/exe");
+        return;
+    }
+    self[n] = '\0';
+    const std::string cmd = std::string(self) + " --expect-rope-table 2>&1";
+    FILE* f = popen(cmd.c_str(), "r");
+    if (f == nullptr) {
+        skip("rope_table_set entry: the enabled arm (child)", "could not spawn the child process");
+        return;
+    }
+    std::string out;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) out += line;
+    const int st = pclose(f);
+    const int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    const bool ok = code == 0 && out.find("ROPE_TABLE_OK") != std::string::npos;
+    if (!ok) std::printf("      child exit=%d, output: %s\n", code, out.c_str());
+    verdict("rope_table_set entry: STRATA_ROPE_TABLE=1 (child) stores + matches scaling + release clears",
+            ok, ok ? 0 : 1, 1, (double) code, "child exit status / ROPE_TABLE_OK");
+}
+
+// 4. `copy_i32_from_mapped` (elementwise.hpp:126; layer.cpp:913/914).  The mapped host image must land in the
+//    arena, element for element, and ONLY n elements (a sentinel past n must survive).  Rival: a one-element
+//    source shift must move the observable.
+void case_copy_i32_from_mapped_entry(Ctx& ctx, const std::string& dir) {
+    const int n = 200;
+    std::vector<int32_t> src(n);
+    for (int i = 0; i < n; ++i) src[i] = (int32_t) ((uint32_t) i * 2654435761u) ^ 0x5A5A;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("copy_i32_from_mapped entry", false, 1, 1, 0, "the engine stream did not open");
+        return;
+    }
+    int32_t* dst = strata::vulkan::arena_alloc<int32_t>(*s, n + 16);
+    std::vector<int32_t> guard(16, 0x7F7F7F7F);
+    strata::vulkan::stream_write(*s, dst + n, guard.data(), (size_t) 16 * 4);
+    strata::kernels::copy_i32_from_mapped(dst, src.data(), n, s);
+    std::vector<int32_t> got(n), got_guard(16);
+    strata::vulkan::stream_read(*s, dst, got.data(), (size_t) n * 4);
+    strata::vulkan::stream_read(*s, dst + n, got_guard.data(), (size_t) 16 * 4);
+    strata::vulkan::stream_close(s);
+    int bad = 0, gbad = 0;
+    for (int i = 0; i < n; ++i) if (got[i] != src[i]) ++bad;
+    for (int i = 0; i < 16; ++i) if (got_guard[i] != 0x7F7F7F7F) ++gbad;
+    verdict("copy_i32_from_mapped entry: the mapped host image arrives bitwise, n elements, sentinel intact",
+            bad == 0 && gbad == 0, bad + gbad, n + 16, (double) (bad + gbad),
+            "int32 differing from the host image / sentinel overrun");
+    int moved = 0;
+    for (int i = 0; i < n; ++i) if (src[(i + 1) % n] != src[i]) ++moved;
+    verdict("copy_i32_from_mapped entry: a one-element source shift MOVES the observable", moved > 0, 0, 1,
+            (double) moved, "elements that change under the rival source (must be > 0)");
+}
+
+// 5. `PleTable::{is_open,issue,collect}` (ngram.hpp; layer.cpp:1294/1300).  The port LINKS the engine's OWN
+//    `src/kernels/ngram.cpp` (see vulkan/CMakeLists.txt), so this proves the SYMBOL resolves in the Vulkan link
+//    and behaves to contract.  Without a GGUF-backed table the DATA path cannot be exercised (that is the
+//    engine's own `ple_parity` job); what IS exercised is the state machine layer.cpp drives.
+void case_ple_table_entry(Ctx& ctx, const std::string& dir) {
+    (void) ctx; (void) dir;
+    strata::kernels::PleTable t;
+    const bool open0 = t.is_open();                                    // fresh: no mapping, no reader
+    std::string err;
+    std::vector<float> out((size_t) 2560, -1.0f);
+    const bool coll0 = t.collect(out.data(), err);                     // before any issue
+    const bool msg0 = err.find("without issue") != std::string::npos;
+    std::vector<uint32_t> rows(16);
+    for (int i = 0; i < 16; ++i) rows[i] = (uint32_t) i;
+    const bool iss0 = t.issue(rows.data());                            // arms the pending token (Mmap mode)
+    const bool coll1 = t.collect(out.data(), err);                     // consumes it; no mapping => zero-filled
+    int zeros = 0;
+    for (float v : out) if (v == 0.0f) ++zeros;
+    const bool coll2 = t.collect(out.data(), err);                     // a second collect has nothing pending
+    const bool msg2 = err.find("without issue") != std::string::npos;
+    const bool state = !open0 && !coll0 && msg0 && iss0 && coll1 && zeros == 2560 && !coll2 && msg2;
+    verdict("PleTable entry: is_open false / collect-before-issue refused / issue arms / collect consumes / second refused",
+            state, state ? 0 : 1, 1, 0.0,
+            "the engine's PleTable state machine (layer.cpp:1294/1300) diverged");
+    verdict("PleTable entry: rivals are observably wrong (is_open hardwired true / collect always true)",
+            !open0 && !coll0, 0, 2, 0.0, "each rival reading must be contradicted by the state machine");
+}
+
 
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
@@ -19314,6 +19623,7 @@ int main(int argc, char** argv) {
     bool list = false;
     bool expect_refusal = false;
     bool expect_ledger_refuse = false, expect_ledger_ok = false;
+    bool expect_rope_table = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--list") list = true;
@@ -19323,6 +19633,7 @@ int main(int argc, char** argv) {
         else if (a == "--expect-refusal") expect_refusal = true;   // the refusal case's child modes
         else if (a == "--expect-ledger-refuse") expect_ledger_refuse = true;
         else if (a == "--expect-ledger-ok") expect_ledger_ok = true;
+        else if (a == "--expect-rope-table") expect_rope_table = true;   // case_rope_table_set_entry's child
         else { std::fprintf(stderr, "usage: vk_gate [--spv-dir D] [--device N] [--list]\n"); return 2; }
     }
     if (list) {
@@ -19365,6 +19676,30 @@ int main(int argc, char** argv) {
         }
         child.alloc(1u << 20);
         return 5;   // only reached if the allocation was NOT refused
+    }
+    if (expect_rope_table) {
+        // A FRESH PROCESS, so the opt-in is set BEFORE rope_table_for's one-time env read; the parent gate's
+        // process has already read it as off.
+        setenv("STRATA_ROPE_TABLE", "1", 1);
+        strata::kernels::RopeScaling lin;
+        lin.type = strata::kernels::RopeScalingType::Linear;
+        lin.factor = 2.0;
+        const strata::kernels::RopeScaling none;
+        std::vector<float> c((size_t) 2 * 32), s((size_t) 2 * 32, 0.5f);
+        strata::kernels::build_rope_table(64, lin, 2, c.data(), s.data());
+        strata::kernels::rope_table_set(c.data(), s.data(), 2, lin);
+        const strata::kernels::RopeTab fa = strata::kernels::rope_table_for(lin);
+        const strata::kernels::RopeTab fb = strata::kernels::rope_table_for(none);
+        const bool stored = fa.cos == c.data() && fa.sin == s.data() && fa.max_pos == 2;
+        const bool matched = fb.cos == nullptr;                   // a DIFFERENT scaling is NOT returned
+        strata::kernels::rope_table_release(c.data());
+        const bool cleared = strata::kernels::rope_table_for(lin).cos == nullptr;
+        if (stored && matched && cleared) {
+            std::printf("ROPE_TABLE_OK\n");
+            return 0;
+        }
+        std::fprintf(stderr, "child: stored=%d matched=%d cleared=%d\n", (int) stored, (int) matched, (int) cleared);
+        return 1;
     }
 
     Ctx ctx(dev, false);
@@ -19600,6 +19935,13 @@ int main(int argc, char** argv) {
     case_s_gemv_q8k_split_entry(ctx, dir);           // s_gemv_q8k_split   -> s_gemv_q8_split.spv (shared_expert gate/up)
     case_s_gemv_q8_0_split_entry(ctx, dir);          // s_gemv_q8_0_split  -> s_gemv_q8_split.spv (shared_expert gate/up/down)
     case_shared_expert_entry(ctx, dir);              // shared_expert      -> the whole MoE shared chain (layer.cpp:417)
+    // THIS BATCH: the five names that CLOSE the one-layer-body link (the last wrappable symbols `layer.cpp`
+    // still referenced).  APPENDED last for the shared-RNG reason every batch above names.
+    case_bf16_gemv_fp32_mmvf_cols_entry(ctx, dir);   // bf16_gemv_fp32_mmvf_cols -> bf16_mmvf_f32.spv (layer.cpp:414)
+    case_build_rope_table_entry(ctx, dir);           // build_rope_table         (layer.cpp:692, PURE HOST)
+    case_rope_table_set_entry(ctx, dir);             // rope_table_set           (layer.cpp:698, the table registry)
+    case_copy_i32_from_mapped_entry(ctx, dir);       // copy_i32_from_mapped     (layer.cpp:913/914, the mapped copy)
+    case_ple_table_entry(ctx, dir);                  // PleTable::{is_open,issue,collect} (layer.cpp:1294/1300)
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

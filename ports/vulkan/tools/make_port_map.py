@@ -23,7 +23,7 @@ TABLE = {
     # ---- ported: the GPU work has a shader in this tree ----
     'add_inplace':                    ('kernel', 'add'),
     'bf16_gemv_fp32_mmvf':            ('kernel', 'bf16_mmvf_f32'),
-    'bf16_gemv_fp32_mmvf_cols':       ('shader', 'bf16_mmvf_f32'),
+    'bf16_gemv_fp32_mmvf_cols':       ('kernel', 'bf16_mmvf_f32'),
     'bf16_gemv_fp32_mmvf_multi':      ('shader', 'bf16_mmvf_f32_multi'),
     # THE BF16-PROJECTION PAIR, the OTHER side of the `native_bf16_projections` setting (layer.cpp:91, default
     # FALSE; set by `--native`/`--native-bf16`).  `project_bf16` (layer.cpp:94-100) reaches them when the
