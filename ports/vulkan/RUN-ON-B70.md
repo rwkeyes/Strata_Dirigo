@@ -15,7 +15,7 @@ expert streaming path, and a first run cannot be a "load it all into VRAM" run.
 |---|---|---|---|
 | **M0** | This plan + the two inventories below | the engine's own call surface, the port's shader list | done (this file) |
 | **M1** | The port is the engine's **backend**: a `vulkan` option in `setup.py`/CMake and an implementation of the kernel API the decode path calls | `setup.py` builds per backend today (`--backend hip`, CUDA via nvcc, `-DSTRATA_*` flags); there is no `STRATA_ENABLE_VULKAN` | the engine links and starts, **on llvmpipe first** |
-| **M2** | The **decode path** is complete: the sampler, the embedding gather, `cvec_apply`, and the shape variants the model actually uses | the inventory below | a decode step produces a token, on llvmpipe |
+| **M2** | The **decode path** is complete: the sampler, the embedding gather, `cvec_apply`, and the shape variants the model actually uses | the inventory below; **the sampler's first kernel is done** (`sampler_greedy.comp`, the `--temp 0` path, 253 verdicts green on the Arc) - `sampler_kernel` (temperature/top-k/top-p with the Philox draw) is the remainder, and with the greedy path the port can already turn logits into a token | a decode step produces a token, on llvmpipe |
 | **M3** | The **expert tier streams** the 58 GB model from NVMe | the engine's resident/file-tier modes; the port has the primitives (device-local + staging + `plan_fit`, stage 4) but not the engine's expert cache management (host-side) | the model loads and a layer mixes experts |
 | **M4** | **First token on llvmpipe** with the real model | M1–M3 | tokens in stdout, no GPU |
 | **M5** | **First token on the B70**, then measure | M4 + a GPU-visible run | tokens/s on the Arc, no xe wedge |
