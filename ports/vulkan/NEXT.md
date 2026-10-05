@@ -697,6 +697,34 @@ write, and the case skips (not passes) on a device without fp64.
 **WHAT THE SAMPLER STILL NEEDS.**  The split-warp and coupled/draft-staging variants (speculative decoding), and
 `sample_tokens`, which picks between the paths - plus that f32 sibling.
 
+## THE PORT MAP: the decode path's remaining work, as a CHECKED LIST
+
+**What it is.**  `PORT-MAP.tsv` classifies **every** `kernels::` symbol `src/core/` calls - the decode path - as
+`kernel` (GPU work with a shader in this tree), `host` (the engine's own host side: a size, a capability check, a
+table, a sync primitive) or `todo` (GPU work this port has NOT done).  `tools/make_port_map.py` writes it and
+`tools/check_port_map.py` - run by `gates/run_gate.sh` on every gate - fails on an invented symbol, on a `kernel` row
+naming a shader that is not built, and on any `src/core/` symbol the table does not mention.  Falsified three ways:
+an added row for a name the engine does not contain, a dropped row for a symbol `src/core/` calls, and a `kernel` row
+pointing at a shader that does not exist.
+
+**WHAT IT SAYS, which is the useful part: 77 symbols - 17 kernel, 50 host, 10 todo.**  Half the surface a reader
+might assume needs porting is the engine's own host side, and the decode path's real remaining GPU work is ten
+kernels, not the ~250 KB of prefill and fused-MoE code:
+
+    cvec_apply  embedding_gather  gather_rows  scatter_rows_f32  iq_dequant_f32
+    native_q5_k_f32  moe_grouped_s2  moe_hit_add  moe_hit_select  moe_hit_grouped_s2
+
+`penalty_rows` is the eleventh thing that looks like a hole and is not: this port applies the penalties INSIDE the two
+samplers, which is why it is classified `host` with that reason rather than `todo`.  `native_mmvq` is covered by the
+seven `iq*_mmvq` shaders, and the `moe_hit_grouped_s2` pair by the `s2expert_*` / `moe_combine_*` / `scalar_gate_*`
+set.
+
+**The BACKEND SEAM, recorded here because it decides the shape of the integration.**  The engine selects backends by
+COMPILE-TIME macros - `STRATA_ENABLE_CUDA`, `STRATA_ENABLE_HIP`, `STRATA_ENABLE_SYCL`, and no `STRATA_ENABLE_VULKAN`
+- and each GPU entry point is a thin wrapper in a header whose body calls the backend's implementation
+(`kv_q4.hpp`: `fwht256_inplace_cuda(...) { fwht256_cuda(...); }`).  A Vulkan backend therefore plugs in the same way:
+a `_vulkan` body per wrapper, selected by a new macro, dispatching through this port's device layer.
+
 ## RESUME HERE (state as of the last commit)
 
 **THE QUANTIZED-EXPERT WAVE IS DONE: ALL SIX FORMATS AND THE GROUPED PAIR.** 66 kernels, 18 shared includes, one

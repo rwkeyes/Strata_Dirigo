@@ -1,0 +1,82 @@
+# ports/vulkan/PORT-MAP.tsv - the DECODE PATH's kernels:: symbols (every one src/core/ calls), classified.
+# kernel = GPU work with a shader in this tree; host = the engine's own host side; todo = GPU work not ported.
+# gates/run_gate.sh checks this file against the engine's sources and the built shaders: an invented
+# symbol, a shader that is not built, an unclaimed shader or an unlisted src/core/ symbol all fail.
+# symbol	kind	shader(s) or reason
+add_inplace	kernel	add
+build_rope_table	host	the engine builds the table; rope_neox is the kernel that reads it
+copy_from_mapped	host	a mapped-buffer copy
+copy_i32_from_mapped	host	a mapped-buffer copy
+copy_or_zero_from_mapped	host	a mapped-buffer copy
+coupled_draft_scratch_bytes	host	a size
+cpu	host	the engine ticks its own clock
+cvec	host	the table the cvec_apply kernel reads
+cvec_apply	todo	a vector-table apply, not ported
+doorbell_publish	host	a host-device sync primitive
+doorbell_ring	host	a host-device sync primitive
+doorbell_wait	host	a host-device sync primitive
+embed_type_supported	host	a capability check
+embedding_gather	todo	the embedding gather, not ported
+f16_from_f32	host	a type conversion helper
+f32_from_f16	host	a type conversion helper
+fused_gr_check	host	a capability check
+fused_gr_read	host	a workspace read
+fused_gr_supported	host	a capability check
+fwht256_inplace_cuda	kernel	fwht256
+gather_rows	todo	a row gather, not ported
+gr_read	host	a workspace read
+gr_workspace_bytes	host	a size
+gr_workspace_init	host	a workspace hand-out
+iq_dequant_f32	todo	a standalone IQ dequantiser (this port has the FUSED iq*_mmvq)
+iq_embed_rows	host	host-side row bookkeeping
+iq_row_bytes	host	a size
+k	host	a constant
+kv_append_q4_step	kernel	kv_q4_append
+kv_block_bytes	host	a size
+kv_gather_q4_step	kernel	kv_q4_gather
+kv_q4_bytes_per_cell	host	a size
+kv_q4_bytes_per_head	host	a size
+kv_q8_bytes_per_cell	host	a size
+kv_ring_restore	host	ring bookkeeping
+kv_ring_table	host	ring bookkeeping
+kv_stream_map_bytes	host	the expert file tier: a size
+kv_stream_reset	host	the expert file tier: bookkeeping
+kv_stream_resolve	host	the expert file tier: whether a row is resident
+moe_grouped_s2	todo	the grouped S2 MoE, not ported
+moe_hit_add	todo	the hit accumulator, not ported
+moe_hit_grouped_s2	todo	the grouped S2 MoE entry, not ported
+moe_hit_grouped_s2_cpu_order	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
+moe_hit_grouped_s2_dev	kernel	s2_gemv_q8 scalar_gate_f32 scalar_gate_f64 moe_combine_f32 moe_combine_f64
+moe_hit_grouped_scratch_bytes	host	a size
+moe_hit_select	todo	the hit selection, not ported
+native_expert_grouped	kernel	native_gu_iq2s native_down_iq4nl s2expert_gu s2expert_down s2expert_swiglu
+native_expert_layout	host	a layout description
+native_expert_scratch_bytes	host	a size
+native_gdn_enabled	host	a capability check
+native_mmvq	kernel	iq1m_mmvq iq2s_mmvq iq3s_mmvq iq3xxs_mmvq iq4nl_mmvq iq4xs_mmvq
+native_mmvq_supported	host	a capability check
+native_mmvq_weight_bytes	host	a size
+native_q5_k_f32	todo	Q5_K matvec, not ported
+native_q8_1_bytes	host	a size
+native_qsa_indexer_enabled	host	a capability check
+native_quantize_q8_1	kernel	quantize_q8_1
+ngram_rows	host	host-side row bookkeeping
+penalty_rows	host	folded into the samplers in this port: see sampler_greedy/sampler_kernel
+ple_block	kernel	ple_bcast ple_conv ple_gate ple_gnorm
+ple_block_scratch_bytes	host	a size
+ple_history_advance	kernel	ple_history_advance
+qsa_decode_attn_scratch_floats	host	a size
+qsa_decode_attn_step	kernel	attn_decode_short
+qsa_real_shapes	host	a shape description
+qsa_selection_width	host	a shape description
+qsa_step_bytes	host	a size
+quantize_q8_	kernel	quantize_q8_0 quantize_q8_1 quantize_q8_K quantize_q8_0_scaled
+quantize_q8_0_scaled	kernel	quantize_q8_0_scaled
+quantize_q8_1_rows	kernel	quantize_q8_1
+rope_scaling	host	a table parameter
+rope_table_release	host	table bookkeeping
+rope_table_set	host	table bookkeeping
+s_gemv_split_async	kernel	s_gemv_q8_split
+sample_tokens	kernel	sampler_greedy sampler_kernel
+scatter_rows_f32	todo	a row scatter, not ported
+shared_expert_scratch_bytes	host	a size

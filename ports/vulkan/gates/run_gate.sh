@@ -126,6 +126,19 @@ else
   echo "  note: python3 absent - the generated IQ grid tables were NOT checked against the engine"
 fi
 
+# THE PORT MAP MUST BE TRUE.  PORT-MAP.tsv classifies every `kernels::` symbol src/core/ (the decode path) calls as
+# kernel / host / todo, so "not ported yet" is something this tree KNOWS rather than something a reader has to
+# reconstruct.  tools/check_port_map.py fails on an invented symbol, on a `kernel` row naming a shader that is not
+# built, and - the rule that keeps it honest - on any src/core/ symbol the map does not mention.  The 35 shaders no
+# decode-path row claims are reported, not failed: they are the prefill path and the primitives kernels are built
+# from.  Like the table check above, a missing python3 is reported rather than waved through.
+if command -v python3 >/dev/null; then
+  if ! python3 "$ROOT/tools/check_port_map.py"; then
+    fail "PORT-MAP.tsv no longer describes the decode path - regenerate with tools/make_port_map.py"
+    echo "== port-map check FAILED"; exit 1
+  fi
+fi
+
 # -----------------------------------------------------------------------------------------------------------
 # TOOLCHAIN PROBES.  These do not decide whether the port RUNS - they decide what it CAN do, and every one of
 # them is a property of a tool version rather than of this code, so they will change under us.  Two matter:
