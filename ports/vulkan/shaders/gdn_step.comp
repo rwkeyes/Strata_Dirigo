@@ -1,0 +1,74 @@
+#version 450
+// ports/vulkan/shaders/gdn_step.comp - the LEGACY GDN (delta-rule) state update, in place.
+//
+// Transcribed from `gdn_step_kernel` / `gdn_step` (src/kernels/cuda/gdn.cu:43-95, :153-172); the contract is
+// include/strata/kernels/gdn.hpp:44-57 and the rule is re-pinned by src/kernels/gdn_parity.cpp section 1.
+//
+// THE RULE (one thread per (h, j) COLUMN of the state, no barrier anywhere - every line touches only that column):
+//
+//     dec      = exp(gate[h])
+//     st       = state * dec                                    (decay applied BEFORE the update - PROPERTY 5)
+//     sk[h,j]  = sum_i st[i,j,h] * k[src*S + i]
+//     d[h,j]   = (v[h*S + j] - sk[h,j]) * beta[h]
+//     st[i,j,h] += k[src*S + i] * d[h,j]                        (the rank-1 update)
+//     o[h*S + j] = sum_i st[i,j,h] * q[src*S + i]               (readout against the UPDATED state)
+//
+//   * `src = h % h_k` is MODULO head pairing, NOT `h / (h_v / h_k)` (INTERLEAVE).  Both produce a full-rank
+//     state of the right shape, so a paraphrase is silent - gdn_parity.cpp's first trap, and the gate's fixture
+//     checks host-side that the interleave reading moves its output before judging the kernel.
+//   * the DECAY IS BEFORE the rank-1 update; moving it after is a one-line change that keeps every shape and
+//     every magnitude (gdn_parity.cpp's second trap).
+//   * the STATE LAYOUT is (S, h_v, S) with j fastest - `state[(i*h_v + h)*S + j]` - deliberately NOT the
+//     reference's (S, S, h_v).  The two index the same three numbers, so a mismatch is silent; the gate's state
+//     fixture encodes its own coordinates so a layout mix-up is an O(1) error.
+//
+// THE BRANCH POLICY this kernel belongs to.  `gdn_layer` (src/core/layer.cpp:306-313) takes `native_gdn_step`
+// when `native_gdn_enabled()`, else THIS legacy kernel; the `fused_gdn_step_norm` path is gated on
+// `g_fused_gdn && native_gdn_enabled() && ssm_state_size == 128` (`layer.cpp:306`).  The Vulkan backend answers
+// `native_gdn_enabled() == false` (the policy in NEXT.md), so the layer runs THIS kernel and both the native
+// sibling and the fused path are off the forward path.  No CPU fallback is involved.
+//
+// DESIGN vs THE CUDA.  The CUDA stages `k[src]`/`q[src]` into shared memory once per block and syncs; that is a
+// redundant-global-load optimisation, not the rule (within a warp `h` is constant and the row is a broadcast).
+// Here each invocation reads the q/k row straight from global memory - same arithmetic, no shared memory and no
+// `__syncthreads()`, which is why this shader carries no barrier census.  The accumulation order is i ascending
+// in both, and the CUDA accumulates `sk`/`dot` in f32 (as the state is f32), so the arithmetic matches.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;    // (S, h_v, S), j fastest, in place
+layout(set = 0, binding = 1, std430) readonly buffer Q { float v[]; } qb;  // (h_k, S)
+layout(set = 0, binding = 2, std430) readonly buffer K { float v[]; } kb;  // (h_k, S)
+layout(set = 0, binding = 3, std430) readonly buffer V { float v[]; } vb;  // (h_v, S)
+layout(set = 0, binding = 4, std430) readonly buffer G { float v[]; } gb;  // (h_v,) pre-exp gate
+layout(set = 0, binding = 5, std430) readonly buffer B { float v[]; } bb;  // (h_v,)
+layout(set = 0, binding = 6, std430) buffer O { float v[]; } ob;           // (h_v, S)
+layout(push_constant, std430) uniform PC { int S; int h_k; int h_v; } pc;
+
+void main() {
+    const uint S = uint(pc.S), hv = uint(pc.h_v);
+    const uint col = gl_GlobalInvocationID.x;            // j fastest, then h: col = h*S + j
+    if (col >= S * hv) return;
+    const uint h = col / S;
+    const uint j = col % S;
+    const uint src = h % uint(pc.h_k);                   // MODULO head pairing (not h / (h_v/h_k))
+    const float dec = exp(gb.v[h]);
+    const float b = bb.v[h];
+
+    // pass 1: decay the column, then contract it against k[src].  Decay BEFORE the update.
+    float sk = 0.0f;
+    for (uint i = 0u; i < S; ++i) {
+        const uint idx = (i * hv + h) * S + j;
+        const float s = state.v[idx] * dec;
+        state.v[idx] = s;
+        sk += s * kb.v[src * S + i];
+    }
+    const float d = (vb.v[h * S + j] - sk) * b;
+    // pass 2: the rank-1 update, then the readout against q[src] using the UPDATED state.
+    float dot = 0.0f;
+    for (uint i = 0u; i < S; ++i) {
+        const uint idx = (i * hv + h) * S + j;
+        const float s = state.v[idx] + kb.v[src * S + i] * d;
+        state.v[idx] = s;
+        dot += s * qb.v[src * S + i];
+    }
+    ob.v[h * S + j] = dot;
+}

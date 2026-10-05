@@ -1,0 +1,58 @@
+#version 450
+// ports/vulkan/shaders/gdn_out_norm.comp - the LEGACY GDN closing norm.
+//
+// Transcribed from `gdn_out_norm_kernel` / `gdn_out_norm` (src/kernels/cuda/gdn.cu:132-149, :235-246); the
+// contract is include/strata/kernels/gdn.hpp:90-95 and the rule is re-pinned by src/kernels/gdn_parity.cpp
+// section 4.  Call site src/core/layer.cpp:325.
+//
+// THE RULE, one RMS per HEAD (i.e. per ROW of (h_v, S), over the last axis):
+//
+//     inv    = 1 / sqrt( mean_i(o[h][i]^2) + eps )        // NOTE the /S: this is the RMS, eps on the MEAN
+//     y[h][i] = o[h][i] * inv * ssm_norm[i] * sigmoid(z[h][i])
+//
+//   * the SIGMOID is not SiLU.  qwen3.5's mixer used SiLU; this artifact does NOT, and gdn_parity.cpp section 4
+//     asserts the two are distinguishable before it judges the kernel.
+//   * the `+ eps` sits on the MEAN here (`sum/S + eps`), which is the OPPOSITE convention to `gdn_l2_norm`'s
+//     `sum + eps` on the SQUARED NORM - the same two-file trap, read from this file's own source each time.
+//   * the norm is PER HEAD, not over the whole (h_v, S) tensor: one RMS per row.
+//
+// THE BRANCH POLICY.  `gdn_layer` (src/core/layer.cpp:307-326) takes `native_gdn_out_norm` when
+// `native_gdn_enabled()`, else THIS legacy kernel; the fused `fused_gdn_step_norm` is gated on the same flag.
+// The Vulkan backend answers `native_gdn_enabled() == false` (see NEXT.md), so the layer runs THIS kernel.
+//
+// WHAT DIFFERS FROM THE CUDA, and why:
+//  * the CUDA reduces with a 32-lane `__shfl_down_sync` tournament and hardcodes the width; that is a lane
+//    width, not the rule.  Here it is the workgroup barrier tree in common/wg_reduce.glsl, ONE WORKGROUP PER
+//    HEAD (so the dispatch is exactly `h_v` groups and the driver's per-kernel subgroup width cannot size a grid
+//    wrongly - the `rms_norm` lesson).
+//  * the CUDA accumulates the sum of squares in DOUBLE.  The target device has no shaderFloat64, so this port
+//    accumulates in F32 and the gate MEASURES the gap against the engine's own double oracle instead of claiming
+//    bit-exactness - the same honest form as gdn_l2_norm / silu_inplace.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer O { float v[]; } ob;   // (h_v, S)
+layout(set = 0, binding = 1, std430) readonly buffer Z { float v[]; } zb;   // (h_v, S)
+layout(set = 0, binding = 2, std430) readonly buffer SN { float v[]; } snb; // (S,)  ssm_norm.weight
+layout(set = 0, binding = 3, std430) buffer Y { float v[]; } yb;            // (h_v, S)
+layout(push_constant, std430) uniform PC { int h_v; int S; float eps; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    if (h >= uint(pc.h_v)) return;   // workgroup-uniform, so every barrier below is reached by everyone
+    const uint S = uint(pc.S);
+    const uint base = h * S;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint i = lid; i < S; i += gl_WorkGroupSize.x) {
+        const float t = ob.v[base + i];
+        acc += t * t;
+    }
+    // RMS: the eps is on the MEAN (`sum/S + eps`), unlike gdn_l2_norm's eps on the sum.
+    const float inv = inversesqrt(wg_sum(acc) / float(S) + pc.eps);
+    for (uint i = lid; i < S; i += gl_WorkGroupSize.x) {
+        const float t = ob.v[base + i];
+        yb.v[base + i] = t * inv * snb.v[i] * (1.0f / (1.0f + exp(-zb.v[base + i])));
+    }
+}

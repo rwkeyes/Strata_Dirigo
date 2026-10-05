@@ -1,5 +1,78 @@
 # Start here next session
 
+## THE GDN MIXER CHAIN IS COMPLETE, plus the first QSA gate member — class A #4-6 — **DONE 2026-10-05**
+
+The previous increment landed the mixer's first three kernels (`gdn_conv_step`, `gdn_l2_norm`, `gdn_beta_gate`)
+under the branch policy `native_gdn_enabled() == false`. This one lands the next two — **`gdn_step`** (the
+delta-rule state update) and **`gdn_out_norm`** (the closing norm) — which **complete the GDN / DeltaNet mixer
+chain**, plus one member of the QSA gate pair, **`qsa_gate_apply_f32`**. All three are class A of
+`plan/DECODE-PATH-TRIAGE.md`.
+
+**THE GDN CHAIN IS COMPLETE UNDER THE CONTRACT — checked symbol by symbol, not assumed.** `gdn_layer`
+(`src/core/layer.cpp:244-327`) runs `conv -> l2_norm -> scale -> beta/gate -> step -> out_norm`. With
+`native_gdn_enabled() == false` the layer takes the legacy `else` of every pair, and the three fused paths
+(`fused_gdn_conv_l2` `:250`, `fused_gdn_ab` `:287`, `fused_gdn_step_norm` `:322`) are gated on
+`g_fused_gdn && native_gdn_enabled() && …` (`:247`, `:306`), so they leave the forward path. Every GDN-namespace
+symbol the chain then reaches has a shader: `gdn_conv_step`, `gdn_l2_norm`, `gdn_beta_gate`, `gdn_gate`,
+`gdn_step`, `gdn_out_norm` — all `kernel` rows. The chain's remaining calls are the SHARED primitives
+`silu_inplace` (`silu_f32`), `scale_inplace` (`scale`), `f32_to_bf16_bulk` (`f32_to_bf16`) and
+`quantize_q8_0` / `quantize_q8_K`, already `kernel` rows. **No further GDN symbol is reachable while the
+fused/`_multi` variants are off:** the `_multi` / `gdn_conv_commit` family (`gdn_ab_multi`, `gdn_conv_commit`,
+`gdn_conv_l2_multi`, `gdn_step_norm_multi`) is class D, reached only from `verify.cpp`, and `gdn_gate` is the
+pair member the port already had.
+
+**THE BRANCH POLICY FOR THE QSA PICK — its own decision, stated.** `qsa_gate_apply_f32` is the legacy member of
+the QSA GATE pair: `qsa_layer` (`layer.cpp:1009-1012`) calls `native_qsa_gate_apply` when `native_qsa_enabled()`,
+else THIS kernel, and the native sibling is equally unported. The backend answers **`native_qsa_enabled() ==
+false`** — the same shape as the GDN contract, and that flag also gates the class-B `native_qsa_rms_norm_weighted`
+dodge. The QSA INDEXER pair (`native_qsa_indexer_append` / `indexer_key_append`) has its OWN capability check
+(`native_qsa_indexer_enabled()`) and is a separate increment; it stays class-A `todo`. `layer_verify_compatible()`
+(`layer.cpp:476-486`) demands `native_gdn && g_fused_gdn` and `native_qsa_indexer_enabled()`, so answering these
+off disables the P6 verifier (class D) and a `--spec 0` run is unaffected.
+
+**THE THREE, each with its oracle from the engine's own rule** (shaders + cases; no invented definition):
+
+* **`gdn_step`** — the delta-rule state update, one thread per `(h, j)` column, in place, no barrier. Rule
+  `gdn.cu:78-93`; contract `gdn.hpp:44-57`. Oracle: the engine's own `ref_step` (`gdn_parity.cpp` §1),
+  transcribed into the **DEVICE** layout `(S, h_v, S)` in double. Case `case_gdn_step`, 3 arms
+  `S/h_k/h_v = 128/16/48`, `16/4/8`, `8/2/4`; pins the two named traps host-side (MODULO vs INTERLEAVE head
+  pairing; decay BEFORE vs after the update) and the state layout (the fixture encodes each cell's coordinates).
+  **Measured: PASS 792576/792576 worst err/tol 0.00733, 2176/2176 w 0.00112, 288/288 w 0.000345** (bound
+  2e-4 rel + 1e-5 abs). Falsified by `gates/inject-verify.sh gdn-step-head-pairing` (INTERLEAVE) →
+  `FAIL gdn_step S=128 h_k=16 h_v=48 66887/792576 worst 6.13e+04`.
+* **`gdn_out_norm`** — `y = rms_norm(o) * ssm_norm * sigmoid(z)`, ONE RMS per head. Rule `gdn.cu:132-149`; contract
+  `gdn.hpp:90-95`. Oracle: `gdn_parity.cpp` §4, double. Shader `shaders/gdn_out_norm.comp` (one workgroup per
+  head, the barrier-tree reduction in `common/wg_reduce.glsl`; added to `run_gate.sh`'s barrier-census whitelist).
+  Case `case_gdn_out_norm`, 3 arms `h_v/S = 48/128`, `4/16`, `3/8`; pins SIGMOID vs SiLU and the eps on the
+  **MEAN** (`sum/S + eps`, the OPPOSITE convention to `gdn_l2_norm`) — its distinguishing rule, read from this
+  file's own source; a NaN-padded tail + two surplus groups make a missing row guard DETECTED. **HONEST LIMIT:**
+  the CUDA sums `o²` in DOUBLE; the target has no `shaderFloat64`, so the port sums in F32 and the case MEASURES
+  the gap (the `gdn_l2_norm` form). **Measured: PASS 6400/6400 worst 8.2e-07, 96/96 w 2.41e-07, 40/40 w 2.18e-07.**
+  Falsified by `gdn-out-norm-eps-on-sum` → `FAIL gdn_out_norm h_v=48 S=128 2321/6400 worst 0.912`.
+* **`qsa_gate_apply_f32`** — `out = attn * sigmoid(q_full[h*2*head_dim + head_dim + d])`. Rule `qsa.cu:793-810`;
+  contract `qsa.hpp:314-324`. Oracle: the engine's own `ref_gate` (`qsa_parity.cpp`), double. Case
+  `case_qsa_gate_apply_f32`, 3 arms `n_head/head_dim = 24/256`, `4/12`, `2/8`; pins the gate from the **SECOND**
+  half (not the first — the split is not element-interleaved) and SIGMOID vs SiLU, both checked host-side to move
+  the fixture. **HONEST LIMIT:** the CUDA forms the product and the sigmoid in DOUBLE; the port in F32, gap
+  measured. **Measured: PASS 6152/6152 worst 7.88e-07, 56/56 w 7.64e-07, 24/24 w 7.42e-07.** Falsified by
+  `qsa-gate-first-half` → `FAIL qsa_gate_apply_f32 n_head=24 head_dim=256 8/6152 worst 4.18e+10`.
+
+**THE MAP DROPS BY THREE.** `PORT-MAP.tsv` moved `168 — 56 kernel, 63 host, 49 todo` → **`168 — 59 kernel, 63
+host, 46 todo`** (the three symbols are now `kernel` rows naming their shaders); `check_port_map.py` passes and
+`make_port_map.py` regenerates the file BYTE-IDENTICALLY (`diff -q` against a copy).
+
+**GATE TOTALS, after the change. vega:** intel_icd (Arc B70) **376 / 0 / 0**, llvmpipe **364 / 0 / 3**,
+radeon_icd (Ryzen iGPU) **367 / 0 / 2** — the 3 / 2 skips are pre-existing (coopmat + the M8 prefill split), and
+the intermittent `budget: independent requery agrees` flake did not fire this run. The increment adds **+9
+verdicts** (3 `gdn_step` + 3 `gdn_out_norm` + 3 `qsa_gate_apply_f32`) on each implementation. `run_gate.sh` exits
+**0** here. **Box (`z820b`):** radeon_icd (RX 7900 XTX) **372 / 0 / 1**, llvmpipe **364 / 0 / 3**, nvidia_icd
+(Quadro K620) **367 / 0 / 2** — +9 on each arm too, and `run_gate.sh` exits **1** there because of the
+pre-existing M8 `prefill split` skip (a skipped case is not a passing one).
+
+**REMAINING CLASS-A.** Of the triage's 9 kernel implementations, 7 are landed (6 GDN legacy incl. the already-
+ported `gdn_gate`, 1 QSA). **2 remain: `indexer_key_append`** (the QSA indexer pair's legacy member,
+`native_qsa_indexer_enabled() == false`) **and `gr_write`** (unconditional, the hyper-connection write).
+
 ## THE GDN (DeltaNet) MIXER'S FIRST THREE KERNELS — class A of the decode-path triage — **DONE 2026-10-05**
 
 The corrected map (`plan/DECODE-PATH-TRIAGE.md`) puts **19 class-A symbols** on the shipped model's forward path

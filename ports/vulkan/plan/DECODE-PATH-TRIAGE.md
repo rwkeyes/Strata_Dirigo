@@ -120,15 +120,20 @@ on `native_gdn_enabled() && …`, `layer.cpp:247, 306`). So the 19 symbols need 
 | 2 | `gdn_l2_norm` | legacy | **LANDED 2026-10-05** |
 | 3 | `gdn_beta_gate` | legacy | **LANDED 2026-10-05** |
 | 4 | `gdn_gate` | legacy | already ported (`gdn_gate.comp`) |
-| 5 | `gdn_step` | legacy | todo |
-| 6 | `gdn_out_norm` | legacy | todo |
-| 7 | `qsa_gate_apply_f32` | legacy | todo |
+| 5 | `gdn_step` | legacy | **LANDED 2026-10-05** |
+| 6 | `gdn_out_norm` | legacy | **LANDED 2026-10-05** |
+| 7 | `qsa_gate_apply_f32` | legacy | **LANDED 2026-10-05** |
 | 8 | `indexer_key_append` | legacy | todo |
 | 9 | `gr_write` | unconditional | todo |
 
-**8 remain** (3 of them now landed). Contract this puts on the backend's capability checks: `native_gdn_enabled()`
-must answer **false** on Vulkan, and (when the QSA increment lands) `native_qsa_enabled()` and
-`native_qsa_indexer_enabled()` must too. `layer_verify_compatible()` (`src/core/layer.cpp:476-486`) requires the
+**8 to write; 6 are now landed** (the second batch of three — `gdn_step`, `gdn_out_norm`, `qsa_gate_apply_f32` —
+is recorded in `NEXT.md`'s top section). **2 remain:** `indexer_key_append` (QSA indexer pair; its own check
+`native_qsa_indexer_enabled() == false`) and `gr_write` (unconditional). With `gdn_step` and `gdn_out_norm` the
+**GDN / DeltaNet mixer chain is complete under the contract** — the six legacy GDN members all have shaders and
+nothing else in the chain is reachable while the fused/`_multi` variants are off (the `_multi` /
+`gdn_conv_commit` family is class D, `verify.cpp` only). Contract this puts on the backend's capability checks:
+`native_gdn_enabled()` must answer **false** on Vulkan, and (when the QSA increments land) `native_qsa_enabled()`
+and `native_qsa_indexer_enabled()` must too. `layer_verify_compatible()` (`src/core/layer.cpp:476-486`) requires the
 native GDN and the native QSA indexer, so answering them off disables the P6 verify window — speculative
 verification only; a `--spec 0` run is unaffected.
 

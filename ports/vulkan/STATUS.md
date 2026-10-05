@@ -1,5 +1,32 @@
 # Status — what is done, what is verified, what is not
 
+## THE GDN MIXER CHAIN IS COMPLETE, plus the first QSA gate member — class A #4-6 (2026-10-05)
+
+This increment lands the next three class-A forward-path kernels: **`gdn_step`** (the delta-rule state update),
+**`gdn_out_norm`** (the closing norm) — together **completing the GDN / DeltaNet mixer chain** for the 36 GDN
+layers — and **`qsa_gate_apply_f32`**, the legacy member of the QSA gate pair. All under the branch policy
+`native_gdn_enabled() == false` / `native_qsa_enabled() == false` (see `NEXT.md`'s top section for the full
+reasoning and the per-symbol completeness check).
+
+| case | rule | oracle | measured (vega Arc) | falsified by |
+|---|---|---|---|---|
+| `gdn_step` (3 arms 128/16/48, 16/4/8, 8/2/4) | `dec=exp(gate)`; decay, contract vs k, `d=(v−sk)·β`, rank-1 update, readout vs q; `src=h%h_k` | `gdn_parity.cpp` §1 `ref_step`, transcribed to the DEVICE layout (S,h_v,S) in double | **792576/792576 err/tol 0.00733**, 2176/2176 w 0.00112, 288/288 w 0.000345 | `gdn-step-head-pairing` → FAIL 66887/792576 w 6.13e+04 |
+| `gdn_out_norm` (3 arms 48/128, 4/16, 3/8) | `y = rms_norm(o)·ssm_norm·sigmoid(z)`, ONE RMS per head (`sum/S + eps`) | `gdn_parity.cpp` §4, double | **6400/6400 w 8.2e-07**, 96/96 w 2.41e-07, 40/40 w 2.18e-07 | `gdn-out-norm-eps-on-sum` → FAIL 2321/6400 w 0.912 |
+| `qsa_gate_apply_f32` (3 arms 24/256, 4/12, 2/8) | `attn · sigmoid(q_full[h·2·head_dim + head_dim + d])` (SECOND half) | `qsa_parity.cpp` `ref_gate`, double | **6152/6152 w 7.88e-07**, 56/56 w 7.64e-07, 24/24 w 7.42e-07 | `qsa-gate-first-half` → FAIL 8/6152 w 4.18e+10 |
+
+Each case pins its rule's named traps host-side (modulo-vs-interleave head pairing and decay-order for
+`gdn_step`; sigmoid-vs-SiLU and eps-on-the-mean for `gdn_out_norm`; second-half and sigmoid-vs-SiLU for
+`qsa_gate_apply_f32`), and a NaN-padded tail + surplus dispatched groups make a missing guard DETECTED.
+**HONEST PARITY GAPS (measured, not hidden):** the target device has no `shaderFloat64`, so `gdn_out_norm`
+sums `o²` in **f32** where the CUDA sums in double (measured gap 8.2e-07), and `qsa_gate_apply_f32` forms the
+product and the sigmoid in **f32** where the CUDA uses double (gap 7.88e-07). `gdn_step`'s CUDA already
+accumulates in f32 (as the state is f32); its gap is against the double oracle only.
+
+**The map dropped by three:** `PORT-MAP.tsv` `168 — 56 kernel, 63 host, 49 todo` → **`168 — 59 kernel, 63 host,
+46 todo`**; `check_port_map.py` passes and `make_port_map.py` regenerates it byte-identically.
+**Measured: vega Arc 376/0/0, llvmpipe 364/0/3, radeon-iGPU 367/0/2, exit 0; box XTX 372/0/1, lvp 364/0/3,
+nvidia K620 367/0/2, exit 1 (the M8 skip)** — +9 verdicts on every arm. Full detail in `NEXT.md`'s top section.
+
 ## THE GDN (DeltaNet) MIXER'S FIRST THREE KERNELS LANDED — class A of the decode-path triage (2026-10-05)
 
 The corrected map's **19 class-A forward-path holes** are dominated by the **GDN / DeltaNet mixer**, which runs

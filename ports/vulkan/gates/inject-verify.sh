@@ -45,6 +45,12 @@
 #                                       -> must FAIL  "gdn_l2_norm"
 #   inject-verify.sh gdn-beta-gate-drop-sigmoid  gdn_beta_gate.comp  drop the sigmoid (the raw projection)
 #                                       -> must FAIL  "gdn_beta_gate"
+#   inject-verify.sh gdn-step-head-pairing  gdn_step.comp  INTERLEAVE head pairing instead of MODULO (h/(h_v/h_k))
+#                                       -> must FAIL  "gdn_step"
+#   inject-verify.sh gdn-out-norm-eps-on-sum  gdn_out_norm.comp  put eps on the SUM (the gdn_l2_norm convention)
+#                                       instead of the MEAN -> must FAIL  "gdn_out_norm"
+#   inject-verify.sh qsa-gate-first-half   qsa_gate_apply_f32.comp  take the gate from the FIRST half of the
+#                                       2*head_dim block -> must FAIL  "qsa_gate_apply_f32"
 #
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
@@ -246,6 +252,29 @@ case "$name" in
     old=$'    b.v[i] = 1.0f / (1.0f + exp(-b.v[i]));'
     new=$'    b.v[i] = b.v[i];   // INJECTION: the sigmoid dropped - the raw projection handed to the recurrence'
     want="FAIL  gdn_beta_gate" ;;
+  gdn-step-head-pairing)
+    # `gdn_step`'s rule is `src = h % h_k` (MODULO).  The INTERLEAVE reading `h / (h_v/h_k)` is the plausible
+    # wrong rule: both produce a full-rank state of the right shape (gdn_parity.cpp section 1's first trap).  The
+    # fixture promises this moves the output host-side; here it must move the DEVICE output too.
+    file="$SH/gdn_step.comp"; spv="gdn_step"
+    old=$'    const uint src = h % uint(pc.h_k);                   // MODULO head pairing (not h / (h_v/h_k))'
+    new=$'    const uint src = h / (hv / uint(pc.h_k));   // INJECTION: INTERLEAVE head pairing'
+    want="FAIL  gdn_step" ;;
+  gdn-out-norm-eps-on-sum)
+    # The kernel's distinguishing rule vs its neighbour `gdn_l2_norm`: here the eps sits on the MEAN
+    # (`sum/S + eps`).  Taking the gdn_l2_norm convention drops the /S and scales every output by sqrt(S).
+    file="$SH/gdn_out_norm.comp"; spv="gdn_out_norm"
+    old=$'    const float inv = inversesqrt(wg_sum(acc) / float(S) + pc.eps);'
+    new=$'    const float inv = inversesqrt(wg_sum(acc) + pc.eps);   // INJECTION: eps on the SUM, not the mean'
+    want="FAIL  gdn_out_norm" ;;
+  qsa-gate-first-half)
+    # The gate is the SECOND half of each head's 2*head_dim block (qsa_parity.cpp PROPERTY 10 / its
+    # `gate_second_half` rival).  Reading the FIRST half is the plausible wrong layout - and the fixture's first
+    # half is built so its sigmoid differs from the second's.
+    file="$SH/qsa_gate_apply_f32.comp"; spv="qsa_gate_apply_f32"
+    old=$'    const float g = qfull.v[h * 2u * hd + hd + d];   // the SECOND half of the 2*head_dim block'
+    new=$'    const float g = qfull.v[h * 2u * hd + d];   // INJECTION: the gate read from the FIRST half'
+    want="FAIL  qsa_gate_apply_f32" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target
