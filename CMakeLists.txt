@@ -13,11 +13,25 @@ project(strata VERSION 0.1.39 LANGUAGES CXX)
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
 if(STRATA_ENABLE_SYCL)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-    message(FATAL_ERROR "STRATA_ENABLE_SYCL is a separate backend; leave STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP off")
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_VULKAN)
+    message(FATAL_ERROR "STRATA_ENABLE_SYCL is a separate backend; leave STRATA_ENABLE_CUDA, STRATA_ENABLE_HIP and STRATA_ENABLE_VULKAN off")
   endif()
   message(WARNING "STRATA_ENABLE_SYCL: the Intel Arc engine is experimental (community port, docs/INTEL_ARC.md)")
   add_subdirectory(sycl)
+  return()
+endif()
+# EXPERIMENTAL: the engine over Vulkan (Mesa ANV on Intel Arc first; the port is ports/vulkan/).  A SEPARATE
+# backend TREE like sycl/, not a branch of the CUDA tree: the port's kernels are GLSL, its device layer is
+# VkDeviceMemory over a command buffer, and nothing in src/kernels/cuda/ is compiled.  The kernel work is done
+# and gated; this option is the engine-side integration, planned in ports/vulkan/plan/BACKEND-INTEGRATION.md.
+# Same mutual exclusion as the SYCL block above, for the same reason: one backend per binary.
+option(STRATA_ENABLE_VULKAN "EXPERIMENTAL: build the Vulkan engine from vulkan/ - ports/vulkan/plan/BACKEND-INTEGRATION.md" OFF)
+if(STRATA_ENABLE_VULKAN)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
+    message(FATAL_ERROR "STRATA_ENABLE_VULKAN is a separate backend; leave STRATA_ENABLE_CUDA, STRATA_ENABLE_HIP and STRATA_ENABLE_SYCL off")
+  endif()
+  message(WARNING "STRATA_ENABLE_VULKAN: the Vulkan backend is experimental (ports/vulkan/plan/BACKEND-INTEGRATION.md)")
+  add_subdirectory(vulkan)
   return()
 endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
