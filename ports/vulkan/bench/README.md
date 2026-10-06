@@ -86,6 +86,45 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
   (as a pure function) and `case_memory_budget` (the live driver figures) — the escape hatch does not weaken
   it.
 
+## THE ARM LEDGER, AND WHY A SWEEP MUST NAME WHAT IT DID NOT RUN
+
+`vk_bench` runs its arms through a ledger.  Each arm prints `-- arm <name> ...` to stderr (flushed) BEFORE it
+runs and `-- arm <name> OK (<rows>, <bytes>)` after; an arm that **printed nothing** is a named FAILURE, not an
+absence; the run ends with `== arms: R ran | S skipped | F failed` and exits 1 if anything failed.  `--only
+<name>` runs exactly one arm — an unknown name lists the valid ones and exits 2, because an unknown name is an
+error and never a silent no-op.
+
+**This exists because the harness failed silently once.** Against a hand-built `.spv` dir it printed 62 rows and
+then `cannot open .../gemm_prefill_f16_m8_staged.spv` among the output and exited 1 — the message named a FILE,
+not the arm, and a reader looking at the tail saw a truncated sweep.  A missing row is otherwise
+indistinguishable from a pass.
+
+**And the ledger's first version was itself wrong**: it counted only `ROW` lines, so it called
+`gdn_rec_batch_sweep` (which emits `SWEEP` lines) an empty arm.  A check that fails on a good arm is as bad as
+one that cannot fail, so evidence is now **bytes on stdout** (`ftell`, with the ROW delta as the fallback).
+Both failure paths are demonstrated rather than asserted: an unknown `--only` exits 2 with the list, and a
+missing `.spv` leaves `-- arm gemm_prefill ...` as the last line before `cannot open`.
+
+## QUOTE A ROW AT THE ENGINE'S BATCH, OR SAY WHICH BATCH IT IS
+
+The engine submits live dispatches in batches of `kLiveBatchMax` = **128 dispatches**
+(`vulkan/src/device/vk_compute.cpp`).  A row measured at a different batch is a row about the probe, and for
+the GDN recurrence chain the difference is large — `SWEEP gdn_rec pair` (step + closing norm, `batch` = PAIRS):
+
+| batch (pairs) | dispatches/replay | chain ms/pair | ms/dispatch | fused ms/pair | fused/chain |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 0.1069 | 0.0534 | 0.1028 | 0.962 |
+| 8 | 16 | 0.0472 | 0.0236 | 0.0438 | 0.928 |
+| 32 | 64 | 0.0407 | 0.0204 | 0.0373 | 0.916 |
+| **64** | **128** | **0.0398** | **0.0199** | **0.0363** | **0.912** |
+| 128 | 256 | 0.0393 | 0.0197 | 0.0359 | 0.913 |
+| 199 | 398 | 0.0390 | 0.0195 | 0.0355 | 0.912 |
+
+The per-dispatch cost FALLS with the batch and flattens near the engine's unit: **a batch-8 GDN chain row is
+19% pessimistic and a batch-1 row 2.7x**.  The batch-8 rows elsewhere in this file are not wrong — they are
+per-dispatch costs for comparing two kernels — but a claim about the engine must be made at (or corrected to)
+the engine's batch, and the row's own `batch` column is the thing to read first.
+
 ## What is measured
 
 | kernel (shader) | shape | unit |

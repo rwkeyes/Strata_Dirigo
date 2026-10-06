@@ -24699,6 +24699,264 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// =========================================================================================================
+// `prefill::gdn_recurrence` - THE PHASE THAT CARRIES THE LARGEST PORT-SIDE SHARE OF THE PREFILL, and until
+// this case it had NO gate arm at all: the wrapper (`vulkan/src/kernels/prefill_vk.cpp`) is a per-token loop
+// of the already-gated `native_gdn_step` + `native_gdn_out_norm`, and a 199-token prompt spends ~27% of its
+// wall clock in it.  An absence that looks like a pass, in the one wrapper that carries the most.
+//
+// The switch this case exists for: `STRATA_PF_GDN_REC_FUSED=1` selects the port's already-gated FUSED
+// `fused_gdn_step_norm` (ONE dispatch per token) in place of the two-dispatch pair; the SHIPPED DEFAULT is the
+// chain, because the A/B's phase win (~100 ms) is one the end-to-end prefill cannot resolve.  The wrapper reads
+// the variable on every call (deliberately: a static cache would make the two modes untestable inside one
+// process), so this case drives BOTH and compares them to each other rather than to a remembered value.
+// Five arms:
+//   * the two modes' STATES are BITWISE IDENTICAL.  Both shaders apply `s = g*state + k*delta` in the same
+//     order and the closing norm does not touch the state, so a difference here is a real defect in one of
+//     them - and this is the property the token ids depend on (the state carries to the next token).
+//   * the STATE trajectory agrees with the native RULE transcribed in double.
+//   * each mode's `y` agrees with the same RULE, BOUNDED rather than equal: the fused kernel's closing-norm
+//     reduction TREE differs from the one-workgroup-per-row form, so an equality claim would be false.
+//   * the fixture MOVES: a rival with the head pairing INTERLEAVED must fail the same comparison, so the
+//     passing arms cannot all be passing on a fixture that sees nothing.
+//   * a call with the variable UNSET is the CHAIN, the SHIPPED path, BYTE FOR BYTE - "the default is a claim"
+//     made falsifiable, because a default that silently moved to the fused path would leave the rest green.
+//
+// TWO FIXTURE FACTS THIS CASE HAD TO LEARN, both recorded at the cause rather than papered over: (a) the q and
+// k heads must be L2-NORMALISED as the engine's own conv+L2 stage produces them, or the rank-1 update's
+// eigenvalue `g*(1 - beta*||k||^2)` is ~ -19 per token and the recurrence is CHAOTIC - no bounded double
+// reference can exist for it; and (b) the operand SLICES must be taken from this wrapper's own offsets
+// (q = h, k = h + HK*S, v = h + 2*HK*S), because the separate-buffer oracle this was transcribed from swaps
+// q and k silently - every value stays finite and plausible, and only the double reference catches it.
+void case_prefill_gdn_recurrence(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "native_gdn_step.spv") || !have(dir, "native_gdn_out_norm.spv") ||
+        !have(dir, "fused_gdn_step_norm.spv"))
+        return;
+    const int S = 128, HK = 16, HV = 48, NT = 3;
+    const int C = 2 * S * HK + S * HV;               // the q|k|v row the wrapper walks: 2*128*16 + 128*48 = 10240
+    const int ZV = S * HV;                           // 6144 - the readout / z row per token
+    const size_t SN = (size_t) S * HV * S;           // the (S, HV, S) state: 786,432 floats = 3 MiB
+    const float EPS = 1e-6f;
+    const float DEADF = 1.0e30f;
+    std::vector<float> hh((size_t) NT * C), gate((size_t) NT * HV), beta((size_t) NT * HV), z((size_t) NT * ZV),
+        gamma((size_t) S), st0(SN);
+    for (auto& v : hh) v = rndf(1.0f);
+    // THE OPERANDS MUST HAVE THE SHAPE THE OPERATOR IS USED WITH, OR THE COMPARISON IS MEANINGLESS.  The
+    // engine's own conv+L2 stage (`prefill::gdn_conv`) L2-NORMALISES each of the q and k heads before the
+    // recurrence, so `||k||^2 ~ 1` and the update `s <- g*s + b*k*(v - g*k^T s)` is CONTRACTIVE (its eigenvalue
+    // along k is `g*(1 - beta*||k||^2)`, magnitude < 1 for the model's beta).  A raw N(0,1) head has
+    // `||k||^2 ~ 128`, which makes that eigenvalue ~ -19 PER TOKEN: the recurrence is then chaotic, any f32
+    // rounding difference is amplified by |lambda|^T across the tokens (measured here: the state diverged from
+    // a DOUBLE oracle by ~6e3x over three tokens while the two shader paths agreed bitwise), and a bounded
+    // double reference cannot exist.  This is a FIXTURE defect, not a kernel or bound defect - the first
+    // version of this case failed 1 element of `y` for exactly this reason.  Normalise as the engine does.
+    for (int t = 0; t < NT; ++t) {
+        for (int hd = 0; hd < 2 * HK; ++hd) {   // [q 16*128 | k 16*128] = 2*HK heads of 128
+            float* row = &hh[(size_t) t * C + (size_t) hd * S];
+            double ss2 = 0;
+            for (int d = 0; d < S; ++d) ss2 += (double) row[d] * (double) row[d];
+            const float inv = (float) (1.0 / std::sqrt(ss2 + 1e-6));
+            for (int d = 0; d < S; ++d) row[d] = row[d] * inv;
+        }
+    }
+    for (auto& v : gate) v = -0.5f + 0.1f * rndf(1.0f);          // a deep decay, as the model's is
+    for (auto& v : beta) v = 0.25f + 0.25f * rndf(1.0f);
+    for (auto& v : z) v = rndf(1.0f);
+    for (auto& v : gamma) v = 1.0f + 0.1f * rndf(1.0f);
+    for (auto& v : st0) v = 0.5f * rndf(1.0f);
+
+    // THE ORACLE: the native rule in double, in the device layout (S, HV, S) with j fastest.  The per-token
+    // block is the DECODE step's rule; the closing norm is applied to the 128 readouts of ONE (t,h) row once
+    // the row is complete, which is the shape both shaders have.
+    auto rule = [&](bool interleave, std::vector<double>& sto, std::vector<float>& yy) {
+        sto.assign(st0.begin(), st0.end());
+        yy.assign((size_t) NT * ZV, 0.0f);
+        const size_t stride = (size_t) HV * S;
+        std::vector<double> oc((size_t) S);
+        for (int t = 0; t < NT; ++t) {
+            const float* ht = &hh[(size_t) t * C];
+            for (int h = 0; h < HV; ++h) {
+                const int src = interleave ? (h / (HV / HK)) : (h % HK);
+                const double g = std::exp((double) gate[(size_t) t * HV + h]);
+                const double b = (double) beta[(size_t) t * HV + h];
+                for (int j = 0; j < S; ++j) {
+                    double* col = &sto[(size_t) h * S + j];
+                    double kv = 0;                                       // UNDECAYED state dotted with k
+                    // THE OPERAND SLICES, FROM THE WRAPPER'S OWN OFFSETS, NOT FROM THE SEPARATE-BUFFER
+                    // CASE THIS ORACLE WAS TRANSCRIBED FROM.  `gdn_recurrence` passes q = ht, k = ht + HK*S,
+                    // v = ht + 2*HK*S, so the `kv` dot and the rank-1 update read the K slice (offset HK*S)
+                    // and the readout reads the Q slice (offset 0).  The first version of this case read them
+                    // THE OTHER WAY ROUND: every value stayed finite and plausible, both shader paths agreed
+                    // with each other bitwise, and only the double reference caught it - the tenth time on
+                    // this port that a failing arm was the ORACLE while the kernel was right.
+                    for (int i = 0; i < S; ++i) kv += col[(size_t) i * stride] * (double) ht[S * HK + src * S + i];
+                    const double delta = ((double) ht[2 * S * HK + h * S + j] - g * kv) * b;
+                    double attn = 0;
+                    for (int i = 0; i < S; ++i) {
+                        col[(size_t) i * stride] =
+                            g * col[(size_t) i * stride] + (double) ht[S * HK + src * S + i] * delta;
+                        attn += col[(size_t) i * stride] * (double) ht[src * S + i];
+                    }
+                    oc[(size_t) j] = attn / std::sqrt((double) S);       // the folded 1/sqrt(S) readout scale
+                }
+                double ss = 0;
+                for (int j = 0; j < S; ++j) ss += oc[(size_t) j] * oc[(size_t) j];
+                const double scale = 1.0 / std::sqrt(ss / (double) S + (double) EPS);   // eps on the MEAN
+                for (int j = 0; j < S; ++j) {
+                    const double zg = (double) z[(size_t) t * ZV + h * S + j];
+                    yy[(size_t) t * ZV + h * S + j] =
+                        (float) ((scale * oc[(size_t) j]) * (double) gamma[(size_t) j] * (1.0 / (1.0 + std::exp(-zg))));
+                }
+            }
+        }
+    };
+    std::vector<double> want_st, rival_st;
+    std::vector<float> want_y, rival_y;
+    rule(false, want_st, want_y);
+    rule(true, rival_st, rival_y);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("prefill gdn_recurrence", false, 0, 1, 0, "the backend could not open a stream");
+        return;
+    }
+    strata::vulkan::cuda_compat_set_stream(s);
+
+    float* dstate = strata::vulkan::arena_alloc<float>(*s, SN);
+    float* dstate2 = strata::vulkan::arena_alloc<float>(*s, SN);
+    float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * C);
+    float* dgate = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+    float* dbeta = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+    float* dz = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * ZV);
+    float* dgamma = strata::vulkan::arena_alloc<float>(*s, (size_t) S);
+    float* dy = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * ZV);
+    float* dy2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * ZV);
+    for (float* p : {dstate, dstate2}) strata::vulkan::stream_write(*s, p, st0.data(), SN * 4);
+    strata::vulkan::stream_write(*s, dh, hh.data(), hh.size() * 4);
+    strata::vulkan::stream_write(*s, dgate, gate.data(), gate.size() * 4);
+    strata::vulkan::stream_write(*s, dbeta, beta.data(), beta.size() * 4);
+    strata::vulkan::stream_write(*s, dz, z.data(), z.size() * 4);
+    strata::vulkan::stream_write(*s, dgamma, gamma.data(), gamma.size() * 4);
+    {
+        std::vector<float> dead((size_t) NT * ZV, DEADF);
+        for (float* p : {dy, dy2}) strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+    }
+
+    // arm 1: the CHAIN, forced on with the escape hatch the shipping default carries.
+    setenv("STRATA_PF_GDN_REC_FUSED", "0", 1);
+    strata::prefill::gdn_recurrence(dstate, dh, dgate, dbeta, dz, dgamma, EPS, dy, nullptr, NT, s);
+    // arm 2: the FUSED path.
+    setenv("STRATA_PF_GDN_REC_FUSED", "1", 1);
+    strata::prefill::gdn_recurrence(dstate2, dh, dgate, dbeta, dz, dgamma, EPS, dy2, nullptr, NT, s);
+    unsetenv("STRATA_PF_GDN_REC_FUSED");
+
+    std::vector<float> y1((size_t) NT * ZV), y2((size_t) NT * ZV), gs1(SN), gs2(SN);
+    strata::vulkan::stream_read(*s, dy, y1.data(), y1.size() * 4);
+    strata::vulkan::stream_read(*s, dy2, y2.data(), y2.size() * 4);
+    strata::vulkan::stream_read(*s, dstate, gs1.data(), SN * 4);
+    strata::vulkan::stream_read(*s, dstate2, gs2.data(), SN * 4);
+
+    {   // (i) the two modes leave a BITWISE IDENTICAL state
+        int bad = 0;
+        for (size_t i = 0; i < SN; ++i)
+            if (gs1[i] != gs2[i]) ++bad;
+        verdict("prefill gdn_recurrence: chain and fused leave a BITWISE identical STATE", bad == 0, bad, (int) SN, 0,
+                "state elements differ between the two modes (this state carries to the next token)");
+    }
+    {   // (ii) the STATE trajectory against the RULE.  This is the direct guard on the thing that CARRIES to the
+        // next token, and it is where the first version of this case failed (my oracle read the q slice where
+        // the kernel reads k - see the operand-offset note above).
+        size_t worst_i = 0;
+        double worst_sc = 0;
+        int out_of_bound = 0;
+        for (size_t i = 0; i < SN; ++i) {
+            if (!close_enough(gs1[i], want_st[i], 2e-4, 1e-5)) ++out_of_bound;
+            const double sc = std::fabs((double) gs1[i] - want_st[i]) /
+                              (2e-4 * std::fabs(want_st[i]) + 1e-5);
+            if (sc > worst_sc) { worst_sc = sc; worst_i = i; }
+        }
+        char tag[160];
+        std::snprintf(tag, sizeof tag, "prefill gdn_recurrence: STATE after %d tokens vs the native rule (double)",
+                      NT);
+        verdict(tag, out_of_bound == 0, out_of_bound, (int) SN, worst_sc,
+                "out-of-bound state elements (this state carries to the next token)");
+        if (out_of_bound > 0) {   // a failing element must NAME itself: index and BOTH values
+            const size_t st_stride = (size_t) HV * S;
+            std::fprintf(stderr, "      worst i=%zu (i=%d h=%d j=%d): got=%.9g want=%.9g\n", worst_i,
+                         (int) (worst_i / st_stride), (int) ((worst_i % st_stride) / S), (int) (worst_i % S),
+                         (double) gs1[worst_i], (double) want_st[worst_i]);
+        }
+    }
+    for (int mode = 0; mode < 2; ++mode) {   // (ii) each mode's y vs the rule, and every element written
+        const std::vector<float>& got = mode ? y2 : y1;
+        int bad = 0, written = 0;
+        double worst = 0;
+        size_t worst_i = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i] != DEADF) ++written;
+            if (!close_enough(got[i], (double) want_y[i], 2e-4, 1e-5)) ++bad;
+            const double sc = std::fabs((double) got[i] - (double) want_y[i]) /
+                              (2e-4 * std::fabs((double) want_y[i]) + 1e-5);
+            if (sc > worst) { worst = sc; worst_i = i; }
+        }
+        // A FAILING ELEMENT MUST NAME ITSELF.  The port has had ten wrong oracles against kernels that were
+        // right, so when an arm here disagrees the next reader gets the index and BOTH values - and on a green
+        // run these lines say nothing at all.
+        const int miss = (int) got.size() - written;
+        if (bad > 0 || miss > 0) {
+            const int wt = (int) (worst_i / (size_t) ZV), wh = (int) ((worst_i % (size_t) ZV) / (size_t) S),
+                      wj = (int) (worst_i % (size_t) S);
+            const double zj = (double) z[(size_t) wt * ZV + wh * S + wj];
+            const double gsig = (double) gamma[(size_t) wj] * (1.0 / (1.0 + std::exp(-zj)));
+            std::fprintf(stderr,
+                         "  [gdn_recurrence %s] worst i=%zu (t=%d h=%d j=%d): got=%.9g want=%.9g |d|=%.3g  "
+                         "scaled=%.3g  | kernel scale*oc=%.9g oracle=%.9g ratio=%.6g\n",
+                         mode ? "FUSED" : "CHAIN", worst_i, wt, wh, wj, (double) got[worst_i],
+                         (double) want_y[worst_i], std::fabs((double) got[worst_i] - (double) want_y[worst_i]),
+                         worst, (double) got[worst_i] / gsig, (double) want_y[worst_i] / gsig,
+                         (double) got[worst_i] / (double) want_y[worst_i]);
+        }
+        char tag[128];
+        std::snprintf(tag, sizeof tag, "prefill gdn_recurrence: %s y vs the native rule (double)",
+                      mode ? "FUSED fused_gdn_step_norm" : "CHAIN step+out_norm");
+        verdict(tag, bad == 0 && miss == 0, bad > 0 ? bad : miss, (int) got.size(), worst,
+                "out-of-bound elements / unwritten elements");
+    }
+    {   // (iii) the fixture MOVES - the interleaved head pairing must fail the same comparison
+        const double rl = rel_l1_f(rival_y, want_y);
+        char tag[160];
+        std::snprintf(tag, sizeof tag,
+                      "prefill gdn_recurrence: the fixture MOVES (the INTERLEAVED head pairing differs, rel-L1 %.3g)",
+                      rl);
+        verdict(tag, rl > 0.05, rl > 0.05 ? 0 : 1, 1, rl,
+                "the rival did not move the output - the arms above would pass on a fixture that sees nothing");
+    }
+    // (iv) THE DEFAULT IS A CLAIM AND IT IS CHECKED HERE: a call with the variable UNSET must be the CHAIN -
+    // the SHIPPED two-dispatch path - byte for byte, not merely "the same as something".  A default that
+    // silently moved to the fused path would leave every arm above green, so this arm is the one that makes
+    // the shipped default falsifiable in the direction that matters.
+    {
+        std::vector<float> st_reset = st0;
+        strata::vulkan::stream_write(*s, dstate, st_reset.data(), SN * 4);
+        std::vector<float> dead((size_t) NT * ZV, DEADF);
+        strata::vulkan::stream_write(*s, dy, dead.data(), dead.size() * 4);
+        unsetenv("STRATA_PF_GDN_REC_FUSED");
+        strata::prefill::gdn_recurrence(dstate, dh, dgate, dbeta, dz, dgamma, EPS, dy, nullptr, NT, s);
+        std::vector<float> gs3(SN), y3((size_t) NT * ZV);
+        strata::vulkan::stream_read(*s, dstate, gs3.data(), SN * 4);
+        strata::vulkan::stream_read(*s, dy, y3.data(), y3.size() * 4);
+        int bad = 0;
+        for (size_t i = 0; i < SN; ++i)
+            if (gs3[i] != gs1[i]) ++bad;
+        for (size_t i = 0; i < y3.size(); ++i)
+            if (y3[i] != y1[i]) ++bad;
+        verdict("prefill gdn_recurrence: the UNSET DEFAULT is the CHAIN path, byte for byte", bad == 0, bad,
+                (int) (SN + y3.size()), 0, "elements differ from an explicit STRATA_PF_GDN_REC_FUSED=0 call");
+    }
+    strata::vulkan::stream_close(s);
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -25177,6 +25435,10 @@ int main(int argc, char** argv) {
     case_blob_stage_entry(ctx, dir);                 // fetch_blobs / rebase_ptrs (the P6 PCIe staging) + the window split
     case_resident_plan_entry(ctx, dir);              // THE LAST UNPORTED SYMBOL: resident_plan (the all-resident per-group plan)
     case_verify_window_entry(ctx, dir);
+    // THIS BATCH: `prefill::gdn_recurrence` - the wrapper that carries ~27% of a 199-token prompt's wall clock
+    // and had NO gate arm at all, plus the `STRATA_PF_GDN_REC_FUSED` switch between its two-dispatch chain and
+    // the port's fused `fused_gdn_step_norm`.  APPENDED last for the shared-RNG reason every batch above names.
+    case_prefill_gdn_recurrence(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

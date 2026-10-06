@@ -1,5 +1,48 @@
 # Status — what is done, what is verified, what is not
 
+## THE `gdn recurrence` PHASE, MEASURED — AND THE MEASUREMENT FALSIFIED THE OBVIOUS FIX (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) **The phase measured, not assumed.** `gdn recurrence` is **2,675 ms = 27.3%** of a 9,786 ms GPU
+timeline — the largest phase this port owns — and it is `native_gdn_step` 7,164 + `native_gdn_out_norm` 7,164
+dispatches (199 tokens x 36 GDN layers) plus `f32_to_f16` 3,644, proved by the run's own histogram. It is **not
+host blocking**: the flush fence-wait charged to batches whose trigger sits inside `prefill::gdn_recurrence` is
+**2,651 ms of that phase over 15,616 dispatches**, against ~55 ms of encode and 15 ms of submit for the WHOLE
+prefill. It is **latency-bound, not throughput-bound**: a strict serial chain (state[t] <- state[t-1]) of
+24-workgroup dispatches, the step's own row at 55 GMAC/s. (2) **The obvious fix was built and A/B'd, and the A/B
+FALSIFIED the hypothesis**: fusing the pair into the port's already-gated `fused_gdn_step_norm` (2 dispatches ->
+1, 14,328 -> 7,164) moved the phase **2,674 -> 2,574 ms** (n=3 per arm, medians, ranges DISJOINT, ids
+`56a0b28d2de6` in all six arms) — **3.7% of the phase, not the ~50% a dispatch-count-bound phase would owe**,
+because `native_gdn_step` carries ~90% of the pair. So `STRATA_PF_GDN_REC_FUSED=1` ships **opt-in**, the chain
+stays the shipped default, and a separate session's plain arms (fused 10,126.2 / 9,829.1 ms against chain
+10,046.6 ms) confirm the end-to-end cannot resolve the 100 ms. **The real target is now named: the step
+kernel's own serial walk** — not attempted, and the bench cannot justify it (its 3 MiB state is L2-hot on
+replay), so it needs an engine A/B first. (3) **The wrapper had NO gate arm at all** — it is the one carrying
+27% of the prompt. Now `case_prefill_gdn_recurrence` holds the two modes' state BITWISE, the state and `y`
+against a double rule, the fixture's ability to move, and **the UNSET default == the CHAIN path byte for
+byte**; the new injection `fused-gdn-step-norm-head-pairing` falsifies it
+(`FAIL ... BITWISE identical STATE 65536/786432`). (4) **Two fixture defects found at the cause** (a chaotic
+un-normalised fixture — the engine L2-normalises the q/k heads — and q/k operand slices swapped when the oracle
+was transcribed from a separate-buffer case); the bound was not widened. (5) **The bench got an arm ledger**
+because it had failed silently first: every arm is named, an arm that prints nothing is a FAILURE,
+`--only <name>` bisects, and the run ends with `== arms: 36 ran | 0 skipped | 0 failed`.
+
+**VERIFIED.** Arc `intel_icd` **895 passed / 0 failed / 0 skipped** (889 -> 895: this case's six arms; nothing
+removed, nothing skipped, no bound widened); `lvp_icd` 879/0/4; `radeon_icd` 882/2/2 with **both** failures in the
+documented RADV moving-failing-set family (`bf16_gemv entry (n_in=2560 n_out=128)` 511/512,
+`bf16_gemv_fp32_mmvf_cols entry (n_in=2560 n_out=48 ncols=13)` 2493/2496 — neither is a case this batch
+touches); smoke 60/0/0. **Task 4, from the shipped source: a run with NO environment variable takes the
+coopmat GEMM AND the two-dispatch chain** (histogram `gemm_prefill_f16_m8` 3,850 + `native_gdn_step` 7,164 +
+`native_gdn_out_norm` 7,164, NO `fused_gdn_step_norm`; 9,880.4 ms / 20.14 tok/s; ids `56a0b28d2de6`), and
+`STRATA_PF_GDN_REC_FUSED=1` takes the fused kernel with the same ids. Ids `56a0b28d2de6` in all six A/B arms.
+`check_port_map.py` passes, `make_port_map.py` regenerates byte-identically.
+
+**NOT DONE.** The taller-row-block staged GEMM (Target 2) and the T-threshold rule (Target 3) were **NOT
+REACHED** and are not claimed. The step kernel's serial walk is the named next target. The engine's per-dispatch
+cost is **8.5x** the bench's in-stream marginal at the same batch and that gap is **unexplained**. The 0.169
+ms/dispatch figure is an attribution via the flush trigger site, not a device timestamp. The A/B is n=3 per arm.
+Logs: `/tmp/gdn/r1_full.log`, `/tmp/gdn/bench_full.log`, `/tmp/gdn/c{1,2,3}.log`, `/tmp/gdn/f{1,2,3}.log`,
+`/tmp/gdn/v{1,2,3}.log`, `/tmp/gdn/gate_final.log`.
+
 ## THE PREFILL GEMM: COOPMAT CONFIRMED FASTER (n=5 A/B, EACH ARM PROVING ITS OWN CONFIG) AND NOW THE DEFAULT; THE REFERENCE'S SHARED-MEMORY STAGING IS A MEASURED LOSS AT THIS TILE (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** (1) A **clean repeated A/B** of the two prefill GEMM paths, n=5 per arm, `--spec 2 --prefill 256` on the

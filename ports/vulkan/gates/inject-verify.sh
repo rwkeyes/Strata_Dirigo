@@ -102,6 +102,9 @@
 #                                       -> must FAIL  "fused_gdn_ab"
 #   inject-verify.sh fused-gdn-step-norm-silu-not-sigmoid  fused_gdn_step_norm.comp  SiLU instead of sigmoid
 #                                       -> must FAIL  "fused_gdn_step_norm"
+#   inject-verify.sh fused-gdn-step-norm-head-pairing  fused_gdn_step_norm.comp  INTERLEAVE the head pairing
+#                                       -> must FAIL  "prefill gdn_recurrence: chain and fused leave a BITWISE
+#                                          identical STATE"
 #
 #   (the BF16-projection pair: `bf16_gemv` / `bf16_gemv_split`, ONE shared shader, the DEFAULT side of
 #    `native_bf16_projections`)
@@ -1073,6 +1076,16 @@ case "$name" in
     old=$'                coopMatLoad(amat, xs, kk, XST, gl_CooperativeMatrixLayoutRowMajor);'
     new=$'                coopMatLoad(amat, xs, 0u, XST, gl_CooperativeMatrixLayoutRowMajor);'
     want=$'FAIL  prefill_cma_staged' ;;
+  fused-gdn-step-norm-head-pairing)
+    # THE FUSED RECURRENCE'S HEAD PAIRING, the port's own long-standing trap (`gdn-step-head-pairing` exists for
+    # the legacy and native kernels).  `src` selects which k/q head a v head pairs with; INTERLEAVING it changes
+    # the `kv` contract, the rank-1 update AND the readout, so the state trajectory moves - which is exactly what
+    # `case_prefill_gdn_recurrence`'s two STATE arms and its FUSED y arm exist to catch.  The CHAIN path (the
+    # other two shaders) is untouched, so the arm that bites first is the chain-vs-fused STATE bitwise one.
+    file="$SH/fused_gdn_step_norm.comp"; spv="fused_gdn_step_norm"
+    old=$'        const uint src = head % uint(pc.h_k);            // MODULO head pairing (not h / (h_v/h_k))'
+    new=$'        const uint src = head / (hv / uint(pc.h_k));     // INJECTION: INTERLEAVE head pairing'
+    want=$'FAIL  prefill gdn_recurrence: chain and fused leave a BITWISE identical STATE' ;;
   cudart-stream-query-nofix)
     # THE CUDA-RUNTIME SMOKE'S OWN GUARD, IN THE FAILING DIRECTION.  `strata_vk_cudart_smoke` was a CMake target
     # that NOTHING ran, so the shipped `cudaStreamQuery` fix was unguarded.  Its UNFIXED answer is reachable in

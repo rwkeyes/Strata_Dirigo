@@ -49,6 +49,7 @@
 #include "strata/kernels/router_top10.hpp"  // router_top10
 #include "strata/kernels/qsa_select.hpp"    // qsa_block_scores_tc
 #include "strata/kernels/native_gdn.hpp"            // native_gdn_step (the DECODE recurrence, reused)
+#include "strata/kernels/fused_gdn.hpp"              // fused_gdn_step_norm (the FUSED step+norm, one dispatch)
 #include "strata/kernels/native_gdn_preprocess.hpp" // native_gdn_out_norm (the DECODE closing norm, reused)
 #include "strata/kernels/native_rope.hpp"           // native_rope_apply (the DECODE rotation, reused)
 #include "strata/kernels/qsa_decode_attn.hpp"       // QsaAttnPools (the qsa_prompt_attn_batch signature)
@@ -724,11 +725,42 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     Stream* s = need(strata::vulkan::stream_of(stream), "prefill::gdn_recurrence");
     const strata::kernels::GdnShapes sh{kS, kHK, kHV};
     float* o = (float*) xf32(*s, (uint64_t) kHV * kS * 4).p;
+    // THE DISPATCH COUNT IS A CHOICE, AND IT IS MEASURED RATHER THAN ASSUMED.  This wrapper issues TWO
+    // dispatches per token per layer (the step, then the closing norm) - 2*T per layer, 14,328 on a 199-token
+    // prompt - and the port ALREADY has the fused form of exactly this pair (`fused_gdn_step_norm`, gate case
+    // `case_fused_gdn_step_norm`), so the pair CAN be one dispatch.  `STRATA_PF_GDN_REC_FUSED=1` selects it.
+    //
+    // IT IS NOT THE DEFAULT, AND THE MEASUREMENT IS WHY.  An engine A/B (n=3 per arm, `--spec 2 --prefill 256`,
+    // 199-token prompt, interleaved, one config per invocation, ids checked in every arm) says the FUSED path
+    // is better on the phase this batch targets - `gdn recurrence` 2,674 ms median (2,668 / 2,674 / 2,965)
+    // against 2,574 ms (2,574 / 2,574 / 2,581), ranges DISJOINT, ids `56a0b28d2de6` in all six - but the
+    // saving is ~100 ms of a 2,675 ms phase, i.e. 3.7% of the phase and ~1% of the prefill, and the
+    // END-TO-END prefill does NOT resolve it: that session's medians were 10,208.0 -> 9,834.7 ms with one chain
+    // arm (9,891.7) inside the fused band, and a SEPARATE session's plain arms are 10,126.2 and 9,829.1 ms on
+    // the fused default against 10,046.6 ms on the chain - overlapping.  A 3.7%-of-the-phase win that the
+    // end-to-end cannot resolve does not get to move a default, so it stays opt-in and the chain stays
+    // shipped, exactly as `STRATA_VK_PREFILL_TILED` did.  (The honest reading of the A/B is in fact a
+    // FALSIFICATION: halving the recurrence's dispatch count bought 3.7% of the phase, so the phase is NOT
+    // dispatch-count-bound - it is carried by `native_gdn_step` itself, ~90% of the pair's bench cost.)
+    //
+    // The two shaders' STATE UPDATE is the same expression in the same order (`s = g*state + k*delta`, delta
+    // from the undecayed contract), so the STATE trajectory is bitwise identical between the two paths - which
+    // is the property the ids depend on.  What differs is the closing norm's reduction TREE (a 256-lane
+    // barrier tree vs a 128-lane half-workgroup halving tree), i.e. a different association in the mean-square,
+    // which is why `case_prefill_gdn_recurrence` holds the state to BITWISE and only bounds `y` against the rule.
+    const char* rec_env = std::getenv("STRATA_PF_GDN_REC_FUSED");
+    const bool rec_fused = rec_env != nullptr && rec_env[0] != '0';
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * kC;
-        strata::kernels::native_gdn_step(state, ht, ht + kHK * kS, ht + 2 * kHK * kS, gate + t * kHV,
-                                         beta + t * kHV, o, sh, stream);
-        strata::kernels::native_gdn_out_norm(o, z + t * kHV * kS, gamma, y + t * kHV * kS, kHV, kS, eps, stream);
+        if (rec_fused) {
+            strata::kernels::fused_gdn_step_norm(state, ht, ht + kHK * kS, ht + 2 * kHK * kS, gate + t * kHV,
+                                                 beta + t * kHV, z + t * kHV * kS, gamma, eps, y + t * kHV * kS,
+                                                 (int) kHK, (int) kHV, stream);
+        } else {
+            strata::kernels::native_gdn_step(state, ht, ht + kHK * kS, ht + 2 * kHK * kS, gate + t * kHV,
+                                             beta + t * kHV, o, sh, stream);
+            strata::kernels::native_gdn_out_norm(o, z + t * kHV * kS, gamma, y + t * kHV * kS, kHV, kS, eps, stream);
+        }
     }
     if (y16 != nullptr) to_f16(y, y16, T * kHV * kS, stream);
 }

@@ -1,5 +1,80 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE `gdn recurrence` PHASE, MEASURED, AND THE MEASUREMENT FALSIFIED THE OBVIOUS FIX: it is GPU-bound and LATENCY-bound, but it is NOT dispatch-count-bound — so the port's own fused kernel stays an OPT-IN 3.7%-of-the-phase win, and the wrapper finally has a gate arm (2026-10-06, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH.** The phase was measured before it was touched, and it is **2,675 ms = 27.3% of a 9,786 ms GPU timeline** — the largest phase this port owns — made of **`native_gdn_step` 7,164 + `native_gdn_out_norm` 7,164 dispatches** (199 tokens x 36 GDN layers) plus `f32_to_f16` 3,644. It is **NOT host blocking**: the fence wait charged to the flush batches whose trigger sits inside `prefill::gdn_recurrence` is **2,651 ms of that phase over 15,616 dispatches**, while the host's ENTIRE prefill costs ~55 ms of encode and 15 ms of submit. It is **latency-bound, not throughput-bound** — a strict serial chain (state[t] <- state[t-1]) of 24-workgroup dispatches whose own bench row is 55 GMAC/s. So the obvious fix is FEWER DEPENDENT DISPATCHES, and the port already had the fused form of exactly this pair. **It was built, A/B'd in the engine, and the A/B falsified the hypothesis**: fusing the pair (2 dispatches -> 1, 14,328 -> 7,164) moved the phase **2,674 -> 2,574 ms (medians, ranges disjoint, ids identical in all six arms)** — **3.7% of the phase, not the ~50% a dispatch-count-bound phase would owe** — because `native_gdn_step` carries ~90% of the pair's cost and the fusion removes the other kernel. The end-to-end prefill cannot even resolve that much: a separate session's plain arms are **10,126.2 / 9,829.1 ms** on the fused path against **10,046.6 ms** on the chain. So `STRATA_PF_GDN_REC_FUSED=1` ships as **opt-in**, the chain stays the default exactly as `STRATA_VK_PREFILL_TILED` did, and the real target is now named: the step kernel's own serial walk, which the bench cannot justify changing.
+
+### 1. WHAT THE PHASE IS MADE OF (before touching it)
+
+199-token arm, `--spec 2 --prefill 256`, one config per invocation, `STRATA_PREFILL_TIMING=1` + `STRATA_VK_FLUSH_STAT=1` + `STRATA_VK_DISP_STAT=1` in the same run (`/tmp/gdn/r1_full.log`):
+
+```
+strata prefill timing: 199 tokens, GPU timeline 9786 ms, wall 9810 ms, host staging 326 ms:
+  ... dequant 1890 (19.3%) | gemm gate/up 715 (7.3%) | gemm down 633 (6.5%) | host grouping 1922 (19.6%) |
+  gdn recurrence 2675 (27.3%) | ...
+vk flush stat: 3030 live-batch flushes, 59870 dispatches, submit 15 ms, wait 9300 ms
+```
+
+* **Which kernels.** The histogram is the proof, not a reading of the source: `native_gdn_step.spv 7164`, `native_gdn_out_norm.spv 7164`, `f32_to_f16.spv 3644`. One pair per token per GDN layer.
+* **The phase is the GPU, and the flush `wait` is the number that says so.** The flush-site backtraces are raw addresses in this build (the executable exports no dynamic symbols), so `addr2line` names them: the two sites whose trigger chain runs through `prefill::gdn_recurrence` carry **n=71 disp=9088 wait=1546 ms** and **n=51 disp=6528 wait=1105 ms** — **2,651 ms of the 9,300 ms total flush wait, over 15,616 dispatches.** The host's share of the whole prefill is **15 ms of submit and ~55 ms of encode**.
+* **The kernels' own in-stream cost, from the bench, AT THE ENGINE'S OWN BATCH.** Every other GDN row in `bench/` is measured at ONE batch; `kLiveBatchMax` is 128 dispatches = 64 pairs. The new `gdn_rec_batch_sweep` arm (`/tmp/gdn/bench_full.log`) sweeps it:
+
+| batch (pairs) | dispatches/replay | chain ms/pair | ms/dispatch | fused ms/pair | fused/chain |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 0.1069 | 0.0534 | 0.1028 | 0.962 |
+| 8 | 16 | 0.0472 | 0.0236 | 0.0438 | 0.928 |
+| 32 | 64 | 0.0407 | 0.0204 | 0.0373 | 0.916 |
+| **64** | **128** | **0.0398** | **0.0199** | **0.0363** | **0.912** |
+| 128 | 256 | 0.0393 | 0.0197 | 0.0359 | 0.913 |
+| 199 | 398 | 0.0390 | 0.0195 | 0.0355 | 0.912 |
+
+  Two things fall out. (a) **The port's batch-8 rows were 19% pessimistic and its batch-1 rows 2.7x** — a batch-8 row does NOT represent the engine's unit, and `bench/README.md` now says so. (b) **At the engine's batch the fused pair is 8.8% cheaper per token-layer**, worth ~42 ms of in-stream work (7,164 x 0.0059) — so the fusion could never have been the lever the phase's 2,675 ms suggests.
+* **The step kernel is LATENCY-bound, not throughput-bound, and that is where the phase actually lives.** `groups_for(h_v*S)` = **24 workgroups for 6,144 threads**, each thread walking S=128 rows twice with a dependent load->FMA chain whose trip count comes from a push constant (so the backend cannot unroll it). Its own row: 3 MiB read twice and written once in 0.043 ms, **143 Melem/s / 55 GMAC/s** — a small-grid latency figure, not a bandwidth one. The fused pair (0.0363 ms) against the step alone (0.0428 ms, batch 8) says the norm is ~12% of the pair and the step ~90%.
+* **And the engine's per-dispatch cost is 8.5x the bench's in-stream marginal at the same batch** (2,641 ms / 15,616 = 0.169 ms against 0.0199). That is NOT resolved here: the bench replays L2-hot harness-owned buffers and the engine runs one-shot against a 27 GiB arena. It is why the engine A/B, not the bench, was the decider.
+
+### 2. THE A/B, AND ITS HONEST READING: A FALSIFICATION, NOT A WIN
+
+`vulkan/src/kernels/prefill_vk.cpp::gdn_recurrence` gained a switch: `STRATA_PF_GDN_REC_FUSED=1` dispatches `fused_gdn_step_norm` (ONE dispatch per token) instead of the step + closing norm pair; the chain stays the DEFAULT. Both shaders' STATE update is `s = g*state + k*delta` in the same order and the closing norm does not touch the state, so the state trajectory is **bitwise identical** between the paths — which is what the ids depend on. What differs is the closing norm's reduction TREE, a different association in the mean-square; that is why the ids (and the new gate case's bounded `y` arm) are the guards.
+
+199-token prompt, `--spec 2 --prefill 256`, n=3 per arm, interleaved, one config per invocation, `setsid nohup` + poll, EVERY arm logging its own `env | grep -iE 'strata_(vk|prefill|pf)'`, the sha256 of the four shaders it depends on and its own histogram (`/tmp/gdn/c{1,2,3}.log`, `/tmp/gdn/f{1,2,3}.log`):
+
+| arm | mode | prefill ms | tok/s | `gdn recurrence` ms | recurrence histogram | ids md5 |
+|---|---|---:|---:|---:|---|---|
+| `c1` | chain (default) | 10,280.6 | 19.36 | 2,965 | step 7,164 + out_norm 7,164 | `56a0b28d2de6` |
+| `c2` | chain | 10,208.0 | 19.49 | 2,668 | 7,164 + 7,164 | `56a0b28d2de6` |
+| `c3` | chain | 9,891.7 | 20.12 | 2,674 | 7,164 + 7,164 | `56a0b28d2de6` |
+| `f1` | fused | 9,834.7 | 20.23 | 2,574 | `fused_gdn_step_norm` 7,164 | `56a0b28d2de6` |
+| `f2` | fused | 9,888.9 | 20.12 | 2,581 | 7,164 | `56a0b28d2de6` |
+| `f3` | fused | 9,832.7 | 20.24 | 2,574 | 7,164 | `56a0b28d2de6` |
+
+* **The phase: 2,674 -> 2,574 ms median, ranges DO NOT OVERLAP** (chain 2,668 / 2,674 / 2,965 against fused 2,574 / 2,574 / 2,581; the fused band is 0.3% wide, the chain band 11%). **The saving is 100 ms = 3.7% of the phase.**
+* **THAT IS THE FALSIFICATION.** A phase bound by the NUMBER of dependent dispatches would have nearly halved when the dispatch count halved (14,328 -> 7,164). It moved 3.7%, which is what removing a kernel worth ~12% of the pair predicts. **The phase is carried by `native_gdn_step` itself, and no dispatch-count change will reach it.**
+* **The end-to-end cannot resolve the 100 ms.** In the A/B session the prefill medians were 10,208.0 -> 9,834.7 ms (one chain arm, 9,891.7, landed inside the fused band); in a SEPARATE session the plain arms are **10,126.2 / 9,829.1 ms** on the fused path against **10,046.6 ms** on the chain — overlapping bands both times.
+* **So the fusion stays OPT-IN and the chain stays shipped.** A 3.7%-of-the-phase win that the end-to-end prefill cannot resolve does not move a default; that is the same call `STRATA_VK_PREFILL_TILED` got. The ids are identical in all six arms, and each arm's own histogram is what makes its label evidence rather than an assumption.
+
+### 3. THE WRAPPER HAD NO GATE ARM AT ALL — NOW IT HAS FIVE
+
+`case_prefill_gdn_recurrence` (`ports/vulkan/harness/vk_gate.cpp`, appended last for the shared-RNG reason every batch names) drives `strata::prefill::gdn_recurrence` at the real geometry (S=128, HK=16, HV=48, T=3, the 3 MiB state) in BOTH modes — the wrapper reads `STRATA_PF_GDN_REC_FUSED` on every call precisely so one process can exercise both — and asserts five things: the two modes' **STATE is BITWISE identical**; the **STATE trajectory matches the native rule transcribed in double**; each mode's **`y` matches the same rule, bounded**; the fixture **MOVES** (an INTERLEAVED head-pairing rival changes `y` by rel-L1 1.29, so the passing arms are not passing on a blind fixture); and **a call with the variable UNSET is the CHAIN, the shipped path, BYTE FOR BYTE** (804,864/804,864) — "the default is a claim" made falsifiable, in the direction that matters now that the chain is shipped.
+
+**FALSIFICATION.** The new registered injection `fused-gdn-step-norm-head-pairing` (INTERLEAVE the fused kernel's head pairing) bites: `FALSIFIED (fused-gdn-step-norm-head-pairing): FAIL prefill gdn_recurrence: chain and fused leave a BITWISE identical STATE 65536/786432`. The tree is restored on every exit path.
+
+### 4. TWO FIXTURE DEFECTS FOUND AT THE CAUSE, WHICH IS WHERE THEY WERE FIXED
+
+The case was RED twice before it was green, and both times the ORACLE was wrong and the kernel was right — the tenth and eleventh instances of the port's most-repeated finding:
+
+1. **The fixture was CHAOTIC.** With raw N(0,1) k heads, `||k||^2 ~ 128`, so the rank-1 update's eigenvalue `g*(1 - beta*||k||^2)` is about **-19 per token** and the recurrence amplifies any rounding difference by `|lambda|^T`. The state diverged ~6e3x from a double oracle across three tokens while the two shader paths agreed with each other BITWISE. **The engine's own conv+L2 stage L2-NORMALISES the q and k heads before the recurrence**; the fixture now does the same and the double reference is meaningful. The bound was NOT widened.
+2. **The operand slices were SWAPPED.** The oracle was transcribed from `case_native_gdn_step`, where q, k and v are separate buffers. Here they are three slices of one row — `q = h`, `k = h + HK*S`, `v = h + 2*HK*S` — and the first version read the **q** slice where the kernel reads **k** and vice versa. Every value stayed finite and plausible, both kernels agreed with each other, and only the double reference caught it (it failed 1 element of `y` at `t=1 h=24 j=33`: kernel `1.83692908`, oracle `0.00525862537`). Fixed at the cause with the arithmetic in the comment; a failing element now NAMES ITSELF (index and both values) on any red run and prints nothing when green.
+
+### 5. THE BENCH INSTRUMENT: THE ARM LEDGER, AND WHY IT EXISTS
+
+The bench that measured this phase is the one that DIED silently first: against a hand-built `.spv` dir it printed 62 rows, then `cannot open .../gemm_prefill_f16_m8_staged.spv` among the output, and exited 1. The message named a FILE, not the arm, and it was invisible in a tail. `vk_bench` now has an **arm ledger**: every arm is named, prints `-- arm <name> ...` (flushed) before it runs and `-- arm <name> OK (<rows>, <bytes>)` after, an arm that **printed nothing** is a named FAILURE, the run ends with `== arms: R ran | S skipped | F failed` and exits 1 if anything failed, and `--only <name>` runs exactly one arm (an unknown name lists the arms and exits 2). **The ledger's own first version counted only `ROW` lines and therefore called `gdn_rec_batch_sweep` an empty arm** — a check that fails on a good arm is as bad as one that cannot fail — so evidence is now **bytes on stdout** (`ftell`, ROW delta as fallback). Both new failure paths are DEMONSTRATED, not asserted: an unknown `--only` exits 2 with the list, and a missing `.spv` leaves `-- arm gemm_prefill ...` as the last line before `cannot open`. The arm count is part of the record: **36 arms ran, 0 skipped, 0 failed, 95 ROW + 6 SWEEP + 30 XPAIR lines.**
+
+### 6. GATE, IDS, MAP, PATHS.
+
+Arc `intel_icd` **895 passed / 0 failed / 0 skipped** — **the count RISES by exactly six (889 -> 895)**, the six being this case's arms; nothing removed, nothing skipped, no bound widened. `lvp_icd` **879/0/4** (the same four documented skips). `radeon_icd` **882/2/2**, with **BOTH** failures in the documented RADV moving-failing-set family and **neither** a case this batch touches: `bf16_gemv entry (n_in=2560 n_out=128)` 511/512 and `bf16_gemv_fp32_mmvf_cols entry (n_in=2560 n_out=48 ncols=13)` 2493/2496 — the one-row-of-512 intermittent W26 characterised. Smoke 60/0/0. Ids **`56a0b28d2de6`** (199-token) in all six A/B arms. `check_port_map.py` passes and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (no symbol was added: `fused_gdn_step_norm` and `gdn_recurrence` are both existing rows). Logs, exact: `/tmp/gdn/r1_full.log` (the phase measurement), `/tmp/gdn/bench_full.log` (the ledgered bench, 36 arms), `/tmp/gdn/bench_sweep.log` (the first, truncated run — kept as the record of the instrument failure), `/tmp/gdn/c{1,2,3}.log` + `/tmp/gdn/f{1,2,3}.log` (the A/B), `/tmp/gdn/ab_driver.log` (the sequencing), `/tmp/gdn/gate_final.log` (the gate), `/tmp/gdn/gate_probe.log` (the Arc-only case loop while the oracle was being fixed).
+
+**NOT DONE / DELIBERATELY LEFT.** (i) **The taller-row-block staged coopmat GEMM (the named Target 2) and the T-threshold rule (Target 3) were NOT REACHED** — the batch's budget went to the measurement, the switch and its A/B, the gate case that had to exist, and two fixture defects; neither was attempted and neither is claimed. (ii) **The step kernel's serial walk is now the named target and is NOT attempted**: the bench cannot justify changing it (its 3 MiB state is L2-hot on replay, so a register-carrying redesign would look WORSE in the harness than in the engine), so it needs an engine A/B first. (iii) The engine's per-dispatch cost being **8.5x** the bench's in-stream marginal at the same batch is **unexplained** — no measurement here separates the L2-hot harness buffers from the engine's one-shot arena access. (iv) The 0.169 ms/dispatch figure is an attribution via the flush trigger site, not a device timestamp. (v) `f32_to_f16` (3,644 dispatches) sits inside the same phase and was not separated. (vi) The A/B is **n=3 per arm**.
+
 ## THE PREFILL GEMM: COOPMAT IS 17.4% FASTER (n=5 A/B, EACH ARM PROVING ITS OWN CONFIG) AND IS NOW THE DEFAULT; THE SHARED-MEMORY STAGING IS A 2.5-3.2x LOSS PER DISPATCH AND 1.62x END TO END (later, same day, `vega`, Arc Pro B70)
 
 **THE A/B, AND WHY THE LABELS ARE NOW EVIDENCE.** Ten sequential engine arms, 199-token prompt,

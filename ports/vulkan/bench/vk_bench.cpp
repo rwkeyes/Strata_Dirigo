@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -164,7 +165,11 @@ Timing time_chain(Ctx& ctx, const std::vector<ChainStep>& steps, int batch, int 
 
 // The one row format.  `elems` is the number of logical output elements the dispatch produces; `macs` is the
 // multiply-accumulate count it performs (0 where the kernel does no reduction, and then the unit is elems/s).
+// `g_rows` counts them: it is the EVIDENCE an arm produced, and the arm ledger below turns "an arm printed
+// nothing" into a named failure instead of an absence that reads as a pass.
+uint64_t g_rows = 0;
 void report(const char* kernel, const std::string& shape, const Timing& t, double elems, double macs) {
+    ++g_rows;
     const double elem_s = elems * 1000.0 / t.med;
     const double mac_s = macs * 1000.0 / t.med;
     char macbuf[40];
@@ -1247,6 +1252,59 @@ void bench_fused_gdn_step_norm_pair(Ctx& ctx, const std::string& dir, int reps, 
 }
 
 // =========================================================================================================
+// THE RECURRENCE'S BATCH SWEEP.  Every other GDN row in this file is measured at ONE batch size, and a row
+// measured at batch 8 cannot say what the SAME chain costs per dispatch at the batch the engine actually
+// submits: `kLiveBatchMax` = 128 dispatches per command buffer (`vulkan/src/device/vk_compute.cpp`), i.e. 64
+// `native_gdn_step` + `native_gdn_out_norm` pairs.  `time_chain` divides by the batch, so its figure is the
+// per-ITERATION (per pair) cost; this sweeps the batch with the identical fixture and the identical
+// `encode_dispatch` path, and prints the per-DISPATCH cost beside it.  The claim it can FALSIFY: "a batch-8
+// row is representative".  If the per-dispatch cost is flat in the batch, it is; if it falls as the batch
+// grows, the small-batch rows under-measure the engine's units and a dispatch-count change is worth more than
+// the small-batch ratio suggests.
+void bench_gdn_rec_batch_sweep(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int S = 128, h_k = 16, h_v = 48;                   // the native wrapper requires S == 128
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st = floats(nstate), q = floats((size_t) h_k * S), k = floats((size_t) h_k * S),
+                        v = floats(no), gate = floats((size_t) h_v), beta = floats((size_t) h_v), z = floats(no),
+                        gamma = floats((size_t) S);
+    for (auto& g : gate) g = -std::fabs(g) - 0.5f;
+    Buf bst = alloc(ctx, nstate * 4), bq = alloc(ctx, (size_t) h_k * S * 4), bk = alloc(ctx, (size_t) h_k * S * 4),
+        bv = alloc(ctx, no * 4), bg = alloc(ctx, (size_t) h_v * 4), bb2 = alloc(ctx, (size_t) h_v * 4),
+        bo = alloc(ctx, no * 4), bz = alloc(ctx, no * 4), bgm = alloc(ctx, (size_t) S * 4), by = alloc(ctx, no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    ctx.write(bz, z.data(), no * 4);
+    ctx.write(bgm, gamma.data(), (size_t) S * 4);
+    const uint32_t sg = (uint32_t) ((no + 255) / 256);
+    const float scale = 1.0f / std::sqrt((float) S);
+    struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pcs{S, h_k, h_v, scale};
+    struct { int32_t heads; int32_t S; float eps; } pcn{h_v, S, 1e-6f};
+    struct { int32_t S; int32_t h_k; int32_t h_v; float eps; } pcf{S, h_k, h_v, 1e-6f};
+    VkPipeline ps_ = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+    VkPipeline pn_ = ctx.pipeline(dir + "/native_gdn_out_norm.spv", 4, 12);
+    VkPipeline pf_ = ctx.pipeline(dir + "/fused_gdn_step_norm.spv", 9, 16);
+    // 64 pairs = 128 dispatches = exactly `kLiveBatchMax`, the engine's own submission unit.
+    const int batches[] = {1, 8, 32, 64, 128, 199};
+    for (int b : batches) {
+        const Timing tc = time_chain(ctx,
+                                     {{ps_, {&bst, &bq, &bk, &bv, &bg, &bb2, &bo}, &pcs, sizeof(pcs), sg, 1},
+                                      {pn_, {&bo, &bz, &bgm, &by}, &pcn, sizeof(pcn), (uint32_t) h_v, 1}},
+                                     b, reps, warmups);
+        const Timing tf = time_kernel(ctx, pf_, {&bst, &bq, &bk, &bv, &bg, &bb2, &bz, &bgm, &by}, &pcf,
+                                      sizeof(pcf), sg, 1, b, reps, warmups);
+        std::printf("SWEEP gdn_rec pair batch=%-4d (%3d dispatches/replay) | step+out_norm %8.4f ms/pair "
+                    "(%8.4f ms/dispatch) | fused %8.4f ms/pair (%8.4f ms/dispatch) | fused/chain %.3f\n",
+                    b, 2 * b, tc.med, tc.med / 2.0, tf.med, tf.med, tf.med / tc.med);
+    }
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2);
+    ctx.free(bo); ctx.free(bz); ctx.free(bgm); ctx.free(by);
+}
+
+// =========================================================================================================
 // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`, ONE shared shader) - the DEFAULT side of the
 // `native_bf16_projections` setting, ported so the setting cannot route the engine at an unported symbol.  There
 // is NO legacy sibling to compare against (this IS the non-native branch), so the pair is measured against the
@@ -1299,6 +1357,7 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("STRATA_VK_SPV_DIR")) dir = e;
     int dev = -1, reps = 9, warmups = 3, sampler_vocab = 248320;
     bool list = false;
+    std::string only;              // --only <arm>: run exactly one named arm (see the ledger in main)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--list") list = true;
@@ -1306,8 +1365,9 @@ int main(int argc, char** argv) {
         else if (a == "--device" && i + 1 < argc) dev = std::atoi(argv[++i]);
         else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
         else if (a == "--warmups" && i + 1 < argc) warmups = std::atoi(argv[++i]);
+        else if (a == "--only" && i + 1 < argc) only = argv[++i];
         else if (a == "--sampler-vocab" && i + 1 < argc) sampler_vocab = std::atoi(argv[++i]);
-        else { std::fprintf(stderr, "usage: vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N] [--list]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--only ARM] [--sampler-vocab N] [--list]\n"); return 2; }
     }
     if (list) {
         for (auto& d : Ctx::list_devices()) {
@@ -1337,78 +1397,144 @@ int main(int argc, char** argv) {
                 "kernel", "shape", "median", "min", "max", "reps", "batch", "work", "elems/s", "macs/s");
     std::fflush(stdout);
 
-    bench_gdn_conv_step(ctx, dir, reps, warmups);
-    bench_gdn_l2_norm(ctx, dir, reps, warmups);
-    bench_gdn_beta_gate(ctx, dir, reps, warmups);
-    bench_gdn_gate(ctx, dir, reps, warmups);
-    bench_gdn_step(ctx, dir, reps, warmups);
-    bench_gdn_out_norm(ctx, dir, reps, warmups);
+    // ---- THE ARM LEDGER -----------------------------------------------------------------------------------
+    // A sweep that dies mid-way must NAME the arm it died in, and an arm that cannot run must be a NAMED skip
+    // rather than a silent return - otherwise a missing row is indistinguishable from a pass.  Each arm prints
+    // `-- arm <name>` to stderr (flushed) BEFORE it runs and `-- arm <name> OK (<n> rows)` after; an arm that
+    // produces no ROW is a named failure, not an absence.  The run ends with a ledger line and exits 1 if any
+    // arm failed or was empty.  `--only <name>` runs exactly one arm so a failure is bisected without a
+    // 60-row sweep; an unknown name lists the arms and exits 2.
+    size_t ran = 0, skipped = 0, norow = 0;
+    bool matched = false;
+    auto arm = [&](const char* name, bool needs_8bit, const std::function<void()>& fn) {
+        if (!only.empty() && only != name) return;
+        matched = true;
+        if (needs_8bit && !ctx.info().storage_buffer_8bit) {
+            std::printf("SKIP %-22s | device lacks storageBuffer8BitAccess\n", name);
+            ++skipped;
+            return;
+        }
+        const uint64_t rows_before = g_rows;
+        std::fflush(stdout);
+        const long pos_before = std::ftell(stdout);
+        std::fprintf(stderr, "-- arm %s ...\n", name);
+        std::fflush(stderr);
+        fn();
+        std::fflush(stdout);
+        const long pos_after = std::ftell(stdout);
+        const uint64_t got = g_rows - rows_before;
+        // EVIDENCE = BYTES ON STDOUT, not ROW count.  The first version of this ledger counted only `report()`
+        // rows and therefore called `gdn_rec_batch_sweep` (which emits SWEEP lines) an empty arm - a check that
+        // fails on a good arm is as bad as one that cannot fail.  ftell is only meaningful when stdout is a
+        // regular file or a pipe; on a terminal it returns -1 and the ROW delta is the fallback.
+        const bool measured = pos_before >= 0 && pos_after >= 0;
+        const long bytes = measured ? (pos_after - pos_before) : -1;
+        const bool printed = measured ? (bytes > 0) : (got > 0);
+        if (!printed) {
+            std::fprintf(stderr, "ARM %s FAILED: it printed nothing at all (a missing .spv, a device the shape "
+                                 "rejects, or an allocation failure - re-run with --only %s for the detail)\n",
+                         name, name);
+            ++norow;
+        } else if (measured && bytes > 0 && bytes < 8) {
+            // A single SKIP line is evidence that the arm NAMED its own reason; anything shorter than a line is
+            // not.  Counted as run, but the byte count is printed so a skip-only arm cannot hide.
+            std::fprintf(stderr, "-- arm %s OK (%llu rows, %ld bytes - short: a named skip?)\n", name,
+                         (unsigned long long) got, bytes);
+            ++ran;
+        } else {
+            std::fprintf(stderr, "-- arm %s OK (%llu rows, %ld bytes)\n", name, (unsigned long long) got, bytes);
+            ++ran;
+        }
+        std::fflush(stderr);
+    };
 
-    if (ctx.info().storage_buffer_8bit) {
-        bench_iq_dequant(ctx, dir, 30, "BF16", 2, 256, reps, warmups);
-        bench_iq_dequant(ctx, dir, 20, "IQ4_NL", 18, 256, reps, warmups);
-        bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 256, reps, warmups);
-        bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 1024, reps, warmups);   // the SIZE-SCALING arm (4x)
-        // THE ENGINE'S OWN SHAPE: one expert's gate/up (or down) projection is n_ff*n_embd / 256 = 1280*2560/256
-        // = 12,800 superblocks per `iq_dequant_f32` call, 3 such calls per expert (gate, up, down).  The 256/1024
-        // arms above are DISPATCH-BOUND (fixed per-launch cost dominates), so they cannot see an occupancy change;
-        // this arm is where the port's dequant work actually lives.
-        bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 12800, reps, warmups);  // the engine's gate/up|down shape
-        bench_iq_dequant(ctx, dir, 20, "IQ4_NL", 18, 12800, reps, warmups); // the engine's down shape (pack's type)
-    } else {
-        std::printf("SKIP iq_dequant_f32            | device lacks storageBuffer8BitAccess\n");
-    }
+    arm("gdn_conv_step", false, [&] { bench_gdn_conv_step(ctx, dir, reps, warmups); });
+    arm("gdn_l2_norm", false, [&] { bench_gdn_l2_norm(ctx, dir, reps, warmups); });
+    arm("gdn_beta_gate", false, [&] { bench_gdn_beta_gate(ctx, dir, reps, warmups); });
+    arm("gdn_gate", false, [&] { bench_gdn_gate(ctx, dir, reps, warmups); });
+    arm("gdn_step", false, [&] { bench_gdn_step(ctx, dir, reps, warmups); });
+    arm("gdn_out_norm", false, [&] { bench_gdn_out_norm(ctx, dir, reps, warmups); });
 
-    if (ctx.info().storage_buffer_8bit) {
-        bench_iq2s(ctx, dir, 512, reps, warmups);
-        bench_iq2s(ctx, dir, 2048, reps, warmups);                         // the SIZE-SCALING arm (4x)
-    } else {
-        std::printf("SKIP iq2s_mmvq                 | device lacks storageBuffer8BitAccess\n");
-    }
+    arm("iq_dequant_bf16_256", true, [&] { bench_iq_dequant(ctx, dir, 30, "BF16", 2, 256, reps, warmups); });
+    arm("iq_dequant_iq4nl_256", true, [&] { bench_iq_dequant(ctx, dir, 20, "IQ4_NL", 18, 256, reps, warmups); });
+    arm("iq_dequant_iq2s_256", true, [&] { bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 256, reps, warmups); });
+    // the SIZE-SCALING arm (4x)
+    arm("iq_dequant_iq2s_1024", true, [&] { bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 1024, reps, warmups); });
+    // THE ENGINE'S OWN SHAPE: one expert's gate/up (or down) projection is n_ff*n_embd / 256 = 1280*2560/256
+    // = 12,800 superblocks per `iq_dequant_f32` call, 3 such calls per expert (gate, up, down).  The 256/1024
+    // arms above are DISPATCH-BOUND (fixed per-launch cost dominates), so they cannot see an occupancy change;
+    // these are where the port's dequant work actually lives.
+    arm("iq_dequant_iq2s_12800", true, [&] { bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 12800, reps, warmups); });
+    arm("iq_dequant_iq4nl_12800", true, [&] { bench_iq_dequant(ctx, dir, 20, "IQ4_NL", 18, 12800, reps, warmups); });
 
-    bench_quantize_q8_0(ctx, dir, reps, warmups);
-    if (ctx.info().storage_buffer_8bit) {
-        bench_quantize_q8_1(ctx, dir, reps, warmups);
-    } else {
-        std::printf("SKIP quantize_q8_1             | device lacks storageBuffer8BitAccess\n");
-    }
-    bench_quantize_q8_K(ctx, dir, reps, warmups);
-    bench_s_gemv_q8_split(ctx, dir, reps, warmups);   // this batch: the shared expert's split-GEMV pair
+    arm("iq2s_mmvq_512", true, [&] { bench_iq2s(ctx, dir, 512, reps, warmups); });
+    // the SIZE-SCALING arm (4x)
+    arm("iq2s_mmvq_2048", true, [&] { bench_iq2s(ctx, dir, 2048, reps, warmups); });
+
+    arm("quantize_q8_0", false, [&] { bench_quantize_q8_0(ctx, dir, reps, warmups); });
+    arm("quantize_q8_1", true, [&] { bench_quantize_q8_1(ctx, dir, reps, warmups); });
+    arm("quantize_q8_K", false, [&] { bench_quantize_q8_K(ctx, dir, reps, warmups); });
+    // this batch: the shared expert's split-GEMV pair
+    arm("s_gemv_q8_split", false, [&] { bench_s_gemv_q8_split(ctx, dir, reps, warmups); });
 
     // THE PERFORMANCE TIER, class B: native vs legacy, same shape, same device (a native/legacy ratio < 1 is
     // faster).  Before the sampler, which is the heavy one.
-    bench_rope_pair(ctx, dir, reps, warmups);
-    bench_router_pair(ctx, dir, reps, warmups);
-    bench_moe_combine_pair(ctx, dir, reps, warmups);
-    bench_rms_norm_pair(ctx, dir, reps, warmups);
-    bench_qsa_gate_pair(ctx, dir, reps, warmups);   // class B: native_qsa_gate_apply <- qsa_gate_apply_f32
-    bench_qsa_decode_attn(ctx, dir, reps, warmups); // the DEFAULT QSA decode attention (qsa_decode_attn_step)
+    arm("rope_pair", false, [&] { bench_rope_pair(ctx, dir, reps, warmups); });
+    arm("router_pair", false, [&] { bench_router_pair(ctx, dir, reps, warmups); });
+    arm("moe_combine_pair", false, [&] { bench_moe_combine_pair(ctx, dir, reps, warmups); });
+    arm("rms_norm_pair", false, [&] { bench_rms_norm_pair(ctx, dir, reps, warmups); });
+    // class B: native_qsa_gate_apply <- qsa_gate_apply_f32
+    arm("qsa_gate_pair", false, [&] { bench_qsa_gate_pair(ctx, dir, reps, warmups); });
+    // the DEFAULT QSA decode attention (qsa_decode_attn_step)
+    arm("qsa_decode_attn", false, [&] { bench_qsa_decode_attn(ctx, dir, reps, warmups); });
     // batch 2: the native GDN / DeltaNet mixer kernels (conv+SiLU, l2_norm, beta_gate).
-    bench_gdn_conv_silu_pair(ctx, dir, reps, warmups);
-    bench_gdn_l2_norm_pair(ctx, dir, reps, warmups);
-    bench_gdn_beta_gate_pair(ctx, dir, reps, warmups);
+    arm("gdn_conv_silu_pair", false, [&] { bench_gdn_conv_silu_pair(ctx, dir, reps, warmups); });
+    arm("gdn_l2_norm_pair", false, [&] { bench_gdn_l2_norm_pair(ctx, dir, reps, warmups); });
+    arm("gdn_beta_gate_pair", false, [&] { bench_gdn_beta_gate_pair(ctx, dir, reps, warmups); });
     // batch 3: the remaining three native GDN / DeltaNet mixer kernels (gate, out_norm, step).
-    bench_gdn_gate_pair(ctx, dir, reps, warmups);
-    bench_gdn_out_norm_pair(ctx, dir, reps, warmups);
-    bench_gdn_step_pair(ctx, dir, reps, warmups);
+    arm("gdn_gate_pair", false, [&] { bench_gdn_gate_pair(ctx, dir, reps, warmups); });
+    arm("gdn_out_norm_pair", false, [&] { bench_gdn_out_norm_pair(ctx, dir, reps, warmups); });
+    arm("gdn_step_pair", false, [&] { bench_gdn_step_pair(ctx, dir, reps, warmups); });
     // PERFORMANCE TIER, batch 4: the THREE FUSED GDN PATHS, each against the multi-dispatch chain it replaces and
     // against the non-fused native kernel(s) where a comparison exists.
-    bench_fused_gdn_conv_l2_pair(ctx, dir, reps, warmups);
-    bench_fused_gdn_ab_pair(ctx, dir, reps, warmups);
-    bench_fused_gdn_step_norm_pair(ctx, dir, reps, warmups);
+    arm("fused_gdn_conv_l2_pair", false, [&] { bench_fused_gdn_conv_l2_pair(ctx, dir, reps, warmups); });
+    arm("fused_gdn_ab_pair", false, [&] { bench_fused_gdn_ab_pair(ctx, dir, reps, warmups); });
+    arm("fused_gdn_step_norm_pair", false, [&] { bench_fused_gdn_step_norm_pair(ctx, dir, reps, warmups); });
+    // THE RECURRENCE'S BATCH SWEEP - see the function's header for why a batch-8 row cannot answer it.
+    arm("gdn_rec_batch_sweep", false, [&] { bench_gdn_rec_batch_sweep(ctx, dir, reps, warmups); });
     // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`): the DEFAULT side of `native_bf16_projections`.
-    bench_bf16_gemv_pair(ctx, dir, reps, warmups);
+    arm("bf16_gemv_pair", false, [&] { bench_bf16_gemv_pair(ctx, dir, reps, warmups); });
     // THE PREFILL GEMM: the prompt path's own deep kernel, both cooperative-matrix schedules and both FMA
     // paths, at the engine's shapes.
-    bench_gemm_prefill(ctx, dir, reps, warmups);
+    arm("gemm_prefill", false, [&] { bench_gemm_prefill(ctx, dir, reps, warmups); });
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a
     // driver "hard recovery" (context lost).  Running it last means a driver reset on one ICD loses only the
     // sampler there, and the rows above are already printed.  --sampler-vocab bounds the row for a weaker
     // device; the default is the artifact's real vocabulary.
-    bench_sampler(ctx, dir, sampler_vocab, reps, warmups);
+    arm("sampler", false, [&] { bench_sampler(ctx, dir, sampler_vocab, reps, warmups); });
 
+    if (!only.empty() && !matched) {
+        std::fprintf(stderr, "vk_bench: --only '%s' names no arm.  If it is not in the list below, it does not "
+                             "exist - an unknown name is an error, never a silent no-op.\n", only.c_str());
+        std::fprintf(stderr, "  valid --only names: gdn_conv_step gdn_l2_norm gdn_beta_gate gdn_gate gdn_step "
+                             "gdn_out_norm iq_dequant_bf16_256 iq_dequant_iq4nl_256 iq_dequant_iq2s_256 "
+                             "iq_dequant_iq2s_1024 iq_dequant_iq2s_12800 iq_dequant_iq4nl_12800 iq2s_mmvq_512 "
+                             "iq2s_mmvq_2048 quantize_q8_0 quantize_q8_1 quantize_q8_K s_gemv_q8_split rope_pair "
+                             "router_pair moe_combine_pair rms_norm_pair qsa_gate_pair qsa_decode_attn "
+                             "gdn_conv_silu_pair gdn_l2_norm_pair gdn_beta_gate_pair gdn_gate_pair "
+                             "gdn_out_norm_pair gdn_step_pair fused_gdn_conv_l2_pair fused_gdn_ab_pair "
+                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep bf16_gemv_pair gemm_prefill sampler\n");
+        return 2;
+    }
+
+    std::printf("== arms: %zu ran | %zu skipped | %zu failed (produced no row) | %llu rows total\n", ran, skipped,
+                norow, (unsigned long long) g_rows);
+    if (norow > 0) {
+        std::printf("== vk_bench FAILED: %zu arm(s) printed nothing - the sweep is INCOMPLETE, not a pass\n", norow);
+        return 1;
+    }
     std::printf("== vk_bench done\n");
     return 0;
 }
