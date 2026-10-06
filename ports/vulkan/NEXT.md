@@ -1,5 +1,132 @@
 # Start here next session
 
+## THE PREFILL'S `dequant` PHASE IS NOT THE DEQUANT KERNEL, AND THE +3,172 DISPATCHES WERE A GEMM CHOICE — the idle-lane fix is real, measured, and does not move the prefill; the default GEMM arm is ~12% slower than coopmat (2026-10-06, `vega`, Arc Pro B70)
+
+**BOTH OF THE BRIEF'S TARGET-1 NUMBERS ARE PRICED FROM INSTRUMENTS THAT DO NOT MEASURE THE KERNEL, AND A THIRD THAT DOES SETTLES IT.** Target 1 was "cut the dequant cost" on the strength of (a) a 2,054 ms `dequant` phase and (b) "`iq_dequant_f32` costs ~0.55 ms/dispatch over 10,833 dispatches". Reconciled against the port's own throughput harness (`ports/vulkan/bench/`), the kernel is **~0.30-0.60 s, i.e. ~3-5% of the prefill**, and (b) is the SUBMISSION layer's per-call cost, not the kernel's. The lane mapping was exactly as diagnosed, the fix was written and measured, and it buys **6.5-8.7% of the kernel on the Arc** (and 2.4-3.1x on llvmpipe / 2.45x on the Ryzen iGPU) with **no end-to-end prefill change** — so it is **reverted, with the patch and every number recorded below** rather than shipped as an unmeasured claim. The target MOVED: the default untiled GEMM is ~12% slower end-to-end than the coopmat arm, and that is where the next measurement should go.
+
+### 1. THE LANE MAPPING IS EXACTLY AS DIAGNOSED (verified in the source, not taken on report)
+
+`ports/vulkan/shaders/iq_dequant_f32.comp:13` declares `layout(local_size_x = 256)`; `:31` is
+`if (gl_LocalInvocationID.x >= 32u) return;`; `:33` is
+`iq_dq_256(pc.ty, 0u, i, gl_LocalInvocationID.x, i * 256u)` with `i = gl_WorkGroupID.x`. So **one 256-value
+superblock is decoded by lanes 0..31 of a 256-lane workgroup and 224 lanes exit at the first instruction** — the
+claim was correct, and it is deliberate (the engine's `dq_dispatch` maps a superblock onto exactly 32 threads; the
+port keeps that mapping rather than re-deriving an element -> byte map). The wrapper dispatches `n/256` workgroups
+(`vulkan/src/kernels/iq_vk.cpp:96-108`), so the grid is one workgroup per superblock.
+
+### 2. THE OCCUPANCY FIX: MEASURED ON THE PORT'S OWN BENCH, AND IT IS NOT THE LEVER
+
+The patch (written, measured, **reverted**): slice `s = gl_LocalInvocationID.x / 32u` decodes superblock
+`gl_WorkGroupID.x * 8u + s` with `tid = gl_LocalInvocationID.x % 32u`, a push constant `{int ty; int n_sb;}`
+guards the ragged tail, and the grid becomes `ceil(n_sb/8)`. Per superblock the arithmetic is unchanged (same
+`tid`, same byte offsets, same output positions); no barrier, no subgroup op, no shared memory is added.
+
+`ports/vulkan/bench/` gained **the engine's own shape as an arm** (see `bench/README.md`): one expert's gate/up or
+down projection is `n_ff*n_embd/256 = 1280*2560/256 = 12,800` superblocks per `iq_dequant_f32` call, 3 such calls
+per expert (3,611 experts x 3 = the 10,833 dispatches the histogram shows). The pre-existing 256/1024-superblock
+arms are **dispatch-bound** (fixed per-launch cost dominates: 4x the work costs 1.09x the time) and therefore
+CANNOT see an occupancy change — which is why the first measurement looked like noise.
+
+| `iq_dequant_f32` arm, medians of 9 reps | before | after | delta |
+|---|---:|---:|---:|
+| BF16, 256 superblocks | 0.0128 ms | 0.0127 ms | -0.8% |
+| IQ4_NL, 256 | 0.0131 | 0.0128 | -2.3% |
+| IQ2_S, 256 | 0.0146 | 0.0145 | -0.7% |
+| IQ2_S, 1024 | 0.0157 | 0.0161 | +2.5% |
+| **IQ2_S, 12800 (the engine's shape)** | **0.0554** | **0.0518** | **-6.5%** |
+| **IQ4_NL, 12800 (the pack's down type)** | **0.0298** | **0.0272** | **-8.7%** |
+| llvmpipe, BF16 / IQ2_S 1024 / IQ4_NL 256 | 0.1496 / 0.5919 / 0.1658 | 0.0532 / 0.1907 / 0.0605 | **2.81x / 3.10x / 2.74x** |
+| radeon iGPU, IQ2_S 1024 / IQ4_NL 256 | 0.1506 / 0.0225 | 0.0615 / 0.0187 | **2.45x / 1.20x** |
+
+**So the idle lanes are real, and on the Arc they are worth ~7% at the size that matters** — the kernel is not 8x
+off, and it is not occupancy-starved at the engine's shape. End-to-end, one binary against itself, 199-token arm,
+`--spec 2 --prefill 256`, default (untiled) GEMM, ids `56a0b28d2de6` in BOTH: **HEAD 11,429.9 ms / 17.32 tok/s vs
+the patch 11,534.4 ms / 17.17 tok/s — a wash inside this box's spread, in the wrong direction.** By this port's own
+precedent (the tiled GEMM was 6.2x in isolation, a wash end to end, and was NOT made the default) the patch was not
+shipped. Logs: `/tmp/meas2/bench2_before.log`, `/tmp/meas2/bench2_after.log`, `/tmp/meas2/before_def_199.log`,
+`/tmp/meas2/deq8_199.log`.
+
+### 3. RECONCILIATION: THE KERNEL IS ~3-5% OF THE PREFILL, AND THE 2,054 ms PHASE IS HOST WAITING
+
+**(a) The kernel's own cost.** At the engine's shape the bench charges 0.0518-0.0554 ms (IQ2_S) and 0.0272-0.0298
+ms (IQ4_NL) per dispatch; x 10,833 dispatches = **~0.30-0.60 s**, i.e. 2.6-5.3% of the arm's 11,274 ms prefill
+timeline. Its own DRAM floor agrees: 10,833 x 13.1 MB of f32 output = **142 GB written** (+11 GB of packed reads)
+against a ~456 GB/s class card = **0.31 s**. Two independent routes, same ballpark.
+
+**(b) The phase table is host wall-clock and it charges the kernel for someone else's work.** The SAME dequant
+work — 10,833 `iq_dequant_f32` dispatches, 3 per expert, same prompt — is charged **28 ms** on the default-GEMM arm
+and **2,059 ms** on the coopmat arm, one binary, one session each. A phase that charges identical work 73x
+differently is measuring **where the host ran out of enqueue work and blocked on the fence**, not the kernel. On the
+default arm that waiting lands in `gemm gate/up` (4,041 ms) instead. The brief's own method note says exactly this;
+this is the measurement that settles which of the two readings is right.
+
+**(c) "~0.55 ms/dispatch" is the submission layer's figure.** `STRATA_VK_DISP_STAT` prints `ms/dispatch` over every
+live dispatch of a whole run — measured here **0.6800 / 0.7377 / 0.7758 ms** across three runs — and **~76-80% of
+that total is `wait`** (33,246 of 43,807 ms on the clean arm), the fence wait for the GPU as a whole. Multiplying
+it by the dequant dispatch count double-counts every other kernel's GPU work; it is not a kernel measurement.
+
+**(d) Mapped buffers on that path: none on the Arc.** The six IQ grids are `alloc_device` (last batch's fix) and the
+flush stat is **3,021 flushes** (down from 13,619), with `submit` 16-32 ms. On llvmpipe every buffer is mapped, as
+documented, and the flush rule fires — that asymmetry is not new.
+
+### 4. TARGET 2 RESOLVED: THE +3,172 LIVE DISPATCHES ARE THE COOPMAT GEMM SPLIT, NOT A NEW SITE AND NOT A REGRESSION
+
+By-shader histogram (`STRATA_VK_DISP_STAT=1`), 199-token arm, same prompt, **same binary family**:
+
+| run (199-token, default vs coopmat) | live dispatches | `gemm_prefill_f16_m8` | `gemm_prefill_fma_small` | `iq_dequant_f32` | experts |
+|---|---:|---:|---:|---:|---:|
+| **HEAD, `STRATA_VK_PREFILL_COOPMAT=1`** | **59,640** | **3,840** | 7,166 | 10,767 | 3,589 |
+| HEAD, default | **56,468** | 0 | 7,702 | 10,833 | 3,611 |
+| HEAD + the occupancy patch, default | **56,468** | 0 | 7,702 | 10,833 | 3,611 |
+
+`+3,840 - 536 = +3,304` from the GEMM path, LESS `132` from the expert count (the coopmat run routed 22 fewer
+experts x 6 dispatches per expert: 3 dequant + 1 `f32_to_f16` + 1 `pf_gu_interleave_f16` + 1 `pf_swiglu16`) =
+**exactly the +3,172**. The
+coopmat path has no ragged edge, so each GEMM is split into a CM part **and an FMA remainder** — one GEMM becomes
+two dispatches. The mix-up is the environment: **`STRATA_VK_PREFILL_COOPMAT=1` was inherited by the runs that
+reported 59,640 and unset in the runs that reported 56,468**, so "the narrowed binary 59,640 vs before 56,468"
+compared two GEMM settings, not two binaries. Proven both ways on ONE binary (the clean HEAD): default -> 56,468,
+coopmat -> 59,640, and the occupancy patch does not move the count at all. Logs:
+`/tmp/meas2/base_hist_199.log` (coopmat), `/tmp/meas2/before_def_199.log`, `/tmp/meas2/deq8_199.log`.
+
+### 5. WHAT MOVED — AND IT IS ~100x BIGGER THAN THE DEQUANT KERNEL: THE DEFAULT GEMM ARM IS ~12% SLOWER THAN COOPMAT
+
+Every run in the last batch's record that reported 59,640 also had `STRATA_VK_PREFILL_COOPMAT=1` in its
+environment, **so its arm LABELS are wrong**: the numbers recorded as "untiled (n=2) 19.55/19.92" and "tiled (n=3)
+19.08/20.01/19.46" are coopmat runs. Measured cleanly (default GEMM, no env leak):
+
+| 199-token arm, `--spec 2 --prefill 256` | prefill ms | tok/s | n |
+|---|---:|---:|---:|
+| default (untiled `gemm_prefill_fma_small`) | 11,429.9 / 11,534.4 | 17.32 / 17.17 | 2 |
+| `STRATA_VK_PREFILL_COOPMAT=1` | 9,895.8 - 10,375.3 (`/tmp/meas2/coopmat*.log`, `def199*.log`, `untiled3_199.log`, `base_hist_199.log`) | 19.46 - 20.14 | 5 |
+
+i.e. **coopmat looks ~12% faster end to end on this card**, and the batch's headline "19.74 untiled" was a coopmat
+number. It needs a clean repeated A/B before the default moves (a default is a claim), which is the named next
+lever; the dequant kernel, even if made free, cannot buy more than its ~3-5%.
+
+### 6. GATE, IDS, MAP, PATHS
+
+Gate on the Arc (`intel_icd`) **886 passed / 0 failed / 0 skipped** — the count has NOT fallen, nothing is skipped,
+no bound was widened — with lvp `872/0/4` (the four documented skips) and radeon `876/1/2`, the one failure being
+the documented moving-failing-set intermittent `bf16_gemv_fp32_mmvf_cols entry (n_in=2560 n_out=48 ncols=13)`
+2492/2496; smoke `60/0/0` (20/0/0 per ICD). `run_gate.sh` exits 1 because of the radeon arm, the Arc read being
+the port's green. Ids: 199-token **`56a0b28d2de6`** (`198 1 198 1 ...`) in every run of this batch (the clean-HEAD
+default arm, the patched arm and the coopmat arm); 8-token **`3aed108cceee`**. `check_port_map.py` passes;
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (no `kernels::` symbol changed — the tree diff is
+`ports/vulkan/bench/vk_bench.cpp` only: two measurement arms plus a comment). Logs:
+`/tmp/meas2/gate_after.log`, plus the harness/ICD logs under `ports/vulkan/harness/build/icd-*.log`.
+
+**NOT DONE / DELIBERATELY LEFT.** The occupancy patch is reverted, not shipped and not stashed: the exact diff is
+the shader's `main`, the wrapper's push constant/grid and the two gate dispatch sites, all of which are described
+above so the change can be reapplied and re-measured in minutes (the bench arms it needs are now permanent). The
+`iq_embed_rows` shader has the SAME 32-of-256 shape and was NOT changed (its phase, `embed+steps`, measured 19-193
+ms). The coopmat-vs-default A/B is n=2 vs n=5 with the coopmat side taken on earlier builds - a clean repeated A/B
+on one binary is the next increment. The bench's own rows are NOT bandwidth measurements: they are per-dispatch
+medians over `reps` timed replays of a BATCH of 8 dispatches into one command buffer with one fence per batch, the
+same destination rewritten 8 times, in the harness's host-coherent (mapped) memory type - a 13.1 MB / 0.0272 ms =
+482 GB/s reading is arithmetically impossible as sustained DRAM traffic and must not be quoted as a bandwidth
+figure.
+
 ## THE PREFILL'S EXPERT-PATH FLUSH WAS A MAPPED GRID — 13,619 FLUSHES → 3,021, PREFILL 16.02 → 19.74 tok/s, AND THE TILED GEMM'S 1.49x WAS THAT FLUSH (2026-10-06, `vega`, Arc Pro B70)
 
 **WHAT LANDED (correctness-neutral; it removes a forced submit+wait per dequant dispatch).** The IQ grid tables are

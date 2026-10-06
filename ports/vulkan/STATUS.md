@@ -1,5 +1,46 @@
 # Status — what is done, what is verified, what is not
 
+## THE `dequant` PHASE IS NOT THE DEQUANT KERNEL, AND THE +3,172 DISPATCHES WERE A GEMM CHOICE (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** Two open items from the last batch are closed with measurements, and one target was falsified rather than
+served. (1) The lane mapping the brief named was verified in the source and the fix was written and measured: the
+shader really decodes one 256-value superblock with lanes 0..31 of a 256-lane workgroup
+(`shaders/iq_dequant_f32.comp:13/:31/:33`), and spreading it to 8 superblocks per workgroup (one per 32-lane slice,
+`n_sb` guarding the tail) buys **-6.5% (IQ2_S) / -8.7% (IQ4_NL) at the engine's own 12,800-superblock shape on the
+Arc** and **2.4-3.1x on llvmpipe / 2.45x on the Ryzen iGPU**, with the per-superblock arithmetic unchanged. It is
+**REVERTED, not shipped**: end-to-end on the target card it is a wash (HEAD 11,429.9 ms / 17.32 tok/s vs the patch
+11,534.4 ms / 17.17 tok/s, ids identical), and this port does not ship an isolated win that does not show up end to
+end. (2) The **+3,172 live dispatches are resolved**: they are the **coopmat GEMM split** (+3,840
+`gemm_prefill_f16_m8` dispatches, -536 `gemm_prefill_fma_small`, less 132 from the coopmat run's 22-fewer-expert
+routing at 6 dispatches per expert = exactly 3,172), i.e. the two counts were taken with different GEMM settings
+because `STRATA_VK_PREFILL_COOPMAT=1` was inherited by the runs that reported 59,640. Not a new dispatch site, not
+a regression, and not a widened bound. (3) The reconciliation the brief asked for: the dequant kernel is
+**~0.30-0.60 s, ~3-5% of the
+prefill** (bench, at the engine's shape; its own DRAM floor, 142 GB of f32 writes at ~456 GB/s, is 0.31 s), while
+the phase table charges the SAME dequant work 28 ms on the default-GEMM arm and 2,059 ms on the coopmat arm - so
+the phase is **host wall-clock absorbing waiting for other kernels**, and the brief's "~0.55 ms/dispatch" is
+`STRATA_VK_DISP_STAT`'s submission-layer `ms/dispatch` (measured 0.6800-0.7758 here, 76-80% of it `wait`), not a
+kernel figure.
+
+**VERIFIED.** Gate on the Arc `intel_icd` **886 passed / 0 failed / 0 skipped** - the count has NOT fallen, nothing
+is skipped, no bound was widened; lvp `872/0/4` (the four documented skips) and radeon `876/1/2` (the one failure is
+the documented moving-failing-set intermittent `bf16_gemv_fp32_mmvf_cols entry` 2492/2496); smoke `60/0/0`.
+Ids: 199-token **`56a0b28d2de6`** in every run of this batch and 8-token **`3aed108cceee`**. `check_port_map.py`
+passes; `make_port_map.py` regenerates byte-identically. Bench logs: `/tmp/meas2/bench2_before.log`,
+`/tmp/meas2/bench2_after.log`. Engine logs: `/tmp/meas2/before_def_199.log`, `/tmp/meas2/deq8_199.log`,
+`/tmp/meas2/base_hist_199.log`, `/tmp/meas2/eight_def_8.log`. Gate: `/tmp/meas2/gate_after.log`.
+
+**WHAT MOVED (the next lever, and ~100x larger than the dequant kernel).** Every record of a 59,640-dispatch run in
+the last batch carried `STRATA_VK_PREFILL_COOPMAT=1`, so its arm LABELS are wrong; measured cleanly, the default
+(untiled) GEMM arm is **11,429.9-11,534.4 ms (17.17-17.32 tok/s, n=2)** against coopmat's **9,895.8-10,375.3 ms
+(19.46-20.14 tok/s, n=5 from the earlier logs)** - coopmat looks **~12% faster end to end**, and the batch's
+headline "19.74 untiled" was a coopmat number. A clean repeated A/B on one binary is the next increment.
+
+**WHAT IS NOT.** The occupancy patch is reverted (the exact diff is described in `NEXT.md`); the coopmat-vs-default
+A/B is n=2 vs n=5 taken on different builds; the bench's rows are per-dispatch medians of a batch of 8 dispatches
+with one fence per batch in host-coherent memory, and are NOT bandwidth figures; `iq_embed_rows` keeps the same
+32-of-256 shape (unchanged, its phase measured 19-193 ms); `z820b` untouched.
+
 ## THE PREFILL'S EXPERT-PATH FLUSH WAS A MAPPED GRID, NOT A KERNEL (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** The IQ grid tables are now placed with `Ctx::alloc_device` instead of `Ctx::alloc`:

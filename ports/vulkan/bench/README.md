@@ -62,6 +62,15 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
   4×-work sizing arms scale ~1× on the Arc and the XTX (both sizes sit near the floor) while they scale ~3.5×
   on llvmpipe and the K620 (both sizes are work-bound).  A device-timestamp version is the natural next step;
   it is not available from this device layer today.
+* **A ROW IS NOT A BANDWIDTH FIGURE — DO NOT QUOTE ONE AS SUCH.**  Two properties of the method make any
+  bytes/second reading from a row wrong: (a) all `K` dispatches in a batch write the SAME destination buffer, so
+  DRAM writeback is amortised over the batch (the L2 absorbs the repeats) and the traffic per dispatch is not the
+  buffer's size; and (b) the operands are allocated by the harness (`Ctx::alloc`), whose type is
+  HOST_VISIBLE|HOST_COHERENT preferring a device-local heap - the BAR-mapped VRAM type on the Arc - not the
+  engine's device-local arena.  Worked example from the 12,800-superblock row: 3,276,800 f32 outputs = 13.1 MB in
+  0.0272 ms is 482 GB/s "apparent", which is ABOVE this class of card's bandwidth and is therefore not sustained
+  DRAM traffic.  The row is a marginal in-stream cost, good for comparing two kernels with each other and not for a
+  bandwidth claim.
 * **The ICD/device per run.**  `run_bench.sh` runs the binary once per ICD, so each row is measured on the
   device named in that log's `== device` line (printed with vendor id, subgroup size and the storage/fp64
   features).  A single-ICD run is not a cross-device proof and `run_bench.sh` says so.
@@ -87,7 +96,7 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `gdn_gate` | h_v=48 n_tokens=64 | elements/s |
 | `gdn_step` | S=128 h_k=16 h_v=48 (3 MiB state) | GMAC/s (3·S MACs per output) |
 | `gdn_out_norm` | h_v=48 S=128 | elements/s |
-| `iq_dequant_f32` BF16 / IQ4_NL / IQ2_S | 256 superblocks (65536 floats); IQ2_S also at 1024 (262144) | elements/s |
+| `iq_dequant_f32` BF16 / IQ4_NL / IQ2_S | 256 superblocks (65536 floats); IQ2_S also at 1024 (262144); **IQ2_S and IQ4_NL also at 12,800 - ONE EXPERT'S PROJECTION (3,276,800 floats), the shape the engine actually dispatches** | elements/s |
 | `iq2s_mmvq` | n_in=2560 n_out=512 and 2048, ncols=1 | GMAC/s (n_in MACs per output) |
 | `sampler_kernel_f32` (the ONE-BLOCK fallback) | vocab=248320, n_tokens=1 | elements/s (logits scanned) |
 | `sampler_split` (the engine's DEFAULT) | vocab=248320, n_tokens=1 and 64 | elements/s (logits scanned) |
@@ -135,6 +144,8 @@ at the engine's 64-row bound.
 | `iq_dequant_f32` IQ4_NL | 0.0133 | 0.0220 | 0.1456 |
 | `iq_dequant_f32` IQ2_S @256 | 0.0145 | 0.0458 | 0.1712 |
 | `iq_dequant_f32` IQ2_S @1024 | 0.0158 | 0.1483 | 0.5946 |
+| `iq_dequant_f32` IQ2_S @12800 | 0.0554 | 1.8197 | 6.7747 |
+| `iq_dequant_f32` IQ4_NL @12800 | 0.0298 | 0.5709 | 6.0915 |
 | `iq2s_mmvq` n_out=512 | 0.0224 | 0.2502 | 1.9112 |
 | `iq2s_mmvq` n_out=2048 | 0.0464 | 0.9762 | 6.2754 |
 | `quantize_q8_0` | 0.0265 | 0.0573 | 0.0693 |

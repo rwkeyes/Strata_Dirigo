@@ -290,7 +290,8 @@ void bench_gdn_out_norm(Ctx& ctx, const std::string& dir, int reps, int warmups)
 
 // =========================================================================================================
 // THE IQ / BF16 DEQUANTISER (shaders/iq_dequant_f32.comp, dq_dispatch).  One workgroup per 256-element
-// superblock; the grid is the superblock count.  bf16 (ty 30), IQ4_NL (ty 20) and IQ2_S (ty 11, the format
+// superblock (32 of its 256 lanes active - the engine's own thread mapping); the grid is the superblock
+// count.  bf16 (ty 30), IQ4_NL (ty 20) and IQ2_S (ty 11, the format
 // 20 of the resident model's 48 layers store their gate/up experts in) are measured.
 // =========================================================================================================
 
@@ -1261,6 +1262,12 @@ int main(int argc, char** argv) {
         bench_iq_dequant(ctx, dir, 20, "IQ4_NL", 18, 256, reps, warmups);
         bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 256, reps, warmups);
         bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 1024, reps, warmups);   // the SIZE-SCALING arm (4x)
+        // THE ENGINE'S OWN SHAPE: one expert's gate/up (or down) projection is n_ff*n_embd / 256 = 1280*2560/256
+        // = 12,800 superblocks per `iq_dequant_f32` call, 3 such calls per expert (gate, up, down).  The 256/1024
+        // arms above are DISPATCH-BOUND (fixed per-launch cost dominates), so they cannot see an occupancy change;
+        // this arm is where the port's dequant work actually lives.
+        bench_iq_dequant(ctx, dir, 11, "IQ2_S", 82, 12800, reps, warmups);  // the engine's gate/up|down shape
+        bench_iq_dequant(ctx, dir, 20, "IQ4_NL", 18, 12800, reps, warmups); // the engine's down shape (pack's type)
     } else {
         std::printf("SKIP iq_dequant_f32            | device lacks storageBuffer8BitAccess\n");
     }

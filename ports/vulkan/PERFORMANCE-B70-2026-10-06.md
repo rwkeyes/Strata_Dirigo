@@ -1,5 +1,69 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE DEQUANT PHASE IS NOT THE DEQUANT KERNEL — the idle-lane fix is worth ~7% of the kernel and 0% of the prefill, and the default GEMM arm is ~12% slower than coopmat (later, same day, `vega`, Arc Pro B70)
+
+**THIS SECTION FALSIFIES THE PREMISE OF THE PREVIOUS ONE, WITH THE PORT'S OWN BENCH.** The previous section's
+timeline put `dequant` at 2,054 ms (21%) and named `iq_dequant_f32` as the cost at "~0.55 ms per dispatch". The
+kernel's own benchmark (`ports/vulkan/bench/`, which times a kernel in a stream of dispatches, not a phase of a
+wall clock) says the kernel is **~0.30-0.60 s end to end for the whole prompt, ~3-5% of an 11.3 s prefill**:
+
+| `iq_dequant_f32`, intel ICD, median of 9 reps | unmodified | idle lanes fixed | delta |
+|---|---:|---:|---:|
+| BF16, 256 superblocks | 0.0128 ms | 0.0127 ms | -0.8% |
+| IQ4_NL, 256 | 0.0131 | 0.0128 | -2.3% |
+| IQ2_S, 256 | 0.0146 | 0.0145 | -0.7% |
+| IQ2_S, 1024 | 0.0157 | 0.0161 | +2.5% |
+| **IQ2_S, 12,800 (one expert's projection)** | **0.0554** | **0.0518** | **-6.5%** |
+| **IQ4_NL, 12,800 (the pack's down type)** | **0.0298** | **0.0272** | **-8.7%** |
+
+The two small arms are **dispatch-bound** (4x the work costs 1.09x the time), so they cannot see an occupancy
+change at all; the 12,800-superblock arms are the engine's own shape (`n_ff*n_embd/256 = 1280*2560/256`, three such
+calls per expert = the 10,833 dispatches the histogram counts) and are what was added to the bench this batch. On
+the other two implementations the same change is large - **llvmpipe 2.81x / 3.10x / 2.74x** and the **Ryzen iGPU
+2.45x / 1.20x** - which is exactly the signature of idle lanes costing real work where lanes are real work.
+
+**THE ENGINE, ONE BINARY AGAINST ITSELF, 199-token arm, `--spec 2 --prefill 256`, default (untiled) GEMM:**
+
+| | prefill ms | tok/s | live dispatches | `dequant` phase | `gemm gate/up` phase | ids md5 |
+|---|---:|---:|---:|---:|---:|---|
+| HEAD (no change) | 11,429.9 | 17.32 | 56,468 | 28 ms | 4,041 ms | `56a0b28d2de6` |
+| + the idle-lane fix | 11,534.4 | 17.17 | 56,468 | 143 ms | 4,015 ms | `56a0b28d2de6` |
+| HEAD, `STRATA_VK_PREFILL_COOPMAT=1` | 10,046.7 | 19.71 | 59,640 | 2,059 ms | 591 ms | `56a0b28d2de6` |
+
+**A wash, in the wrong direction, and the fix was reverted.** The one number worth keeping from that table is the
+`dequant` phase itself: **the identical dequant work (10,833 dispatches, 3 per expert) is charged 28 ms on the
+default-GEMM arm and 2,059 ms on the coopmat arm.** A phase that charges the same work 73x differently is a phase
+that is measuring **where the host ran out of enqueue work and blocked on the fence** - the phase marks are host
+wall-clock on this shim - not the kernel. On the default arm that waiting lands in `gemm gate/up` instead, which is
+why the two arms' phase tables look inverted.
+
+**TWO MORE NUMBERS RECONCILED, AND BOTH NAMED.** "~0.55 ms per dispatch" is `STRATA_VK_DISP_STAT`'s own
+`ms/dispatch` for the SUBMISSION layer over a whole run (measured **0.6800 / 0.7377 / 0.7758** here), and **76-80%
+of that total is `wait`** (33,246 of 43,807 ms on the clean arm); multiplying it by one kernel's dispatch count
+double-counts every other kernel's GPU work. And the kernel's own traffic floor agrees with the bench: 10,833 x
+13.1 MB of f32 output = **142 GB written** (+11 GB of packed reads) against a ~456 GB/s class card = **0.31 s**.
+No mapped buffer is on that path any more on the Arc (the six IQ grids are `alloc_device`; the flush stat is 3,021,
+down from 13,619).
+
+**THE +3,172 LIVE DISPATCHES: THE COOPMAT GEMM SPLIT, NOT A REGRESSION.** `STRATA_VK_DISP_STAT=1` by shader, same
+prompt, same binary family: the 59,640-dispatch runs are the ones with `gemm_prefill_f16_m8` **3,840** in the
+histogram and `gemm_prefill_fma_small` 7,166; the 56,468-dispatch runs have **0** `f16_m8` and 7,702 `fma_small`.
+`+3,840 - 536 = +3,304`, LESS `132` = the coopmat run's 22-fewer-expert routing difference (6 dispatches per
+expert) = **exactly +3,172**. Coopmat has no ragged edge, so each GEMM is split into a CM part and an FMA
+remainder - one GEMM becomes two dispatches. The reason the two counts were ever compared: **`STRATA_VK_PREFILL_COOPMAT=1` was inherited by the
+"after" runs of the previous batch**, so its `untiled` / `tiled` label rows are coopmat rows.
+
+**WHICH IS THE MOVED TARGET, AND IT IS ~100x LARGER THAN THE DEQUANT KERNEL.** With the environment controlled, the
+default untiled GEMM arm measures **11,429.9 / 11,534.4 ms (17.32 / 17.17 tok/s, n=2)** against coopmat's
+**9,895.8-10,375.3 ms (19.46-20.14 tok/s, n=5, from the earlier logs)** - **~12% in coopmat's favour**, with the
+same ids. That needs a clean repeated A/B on one binary before the default moves; a default is a claim.
+
+**GATE + IDS.** Arc `intel_icd` **886 passed / 0 failed / 0 skipped** (lvp `872/0/4`, radeon `876/1/2` - the one
+failure is the documented `bf16_gemv_fp32_mmvf_cols` intermittent; smoke 60/0/0). Ids `56a0b28d2de6` (199-token) in
+every run above and `3aed108cceee` (8-token). The tree diff this batch is `ports/vulkan/bench/vk_bench.cpp` only
+(two measurement arms). Logs: `/tmp/meas2/bench2_{before,after}.log`, `/tmp/meas2/{before_def_199,deq8_199,base_hist_199}.log`,
+`/tmp/meas2/gate_after.log`.
+
 ## THE EXPERT PATH'S `dequant` WAS A MAPPED GRID, NOT A KERNEL — 13,619 FLUSHES → 3,021, PREFILL 16.02 → 19.74 tok/s, AND THE TILED GEMM'S 1.49x WAS THAT FLUSH (later, same day, `vega`)
 
 **THE MEASUREMENT THAT FOUND IT.** `STRATA_VK_FLUSH_STAT=1` on the 199-token arm at the merged HEAD printed
