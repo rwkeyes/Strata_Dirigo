@@ -163,17 +163,16 @@ void bf16_to_f16(Stream& s, const uint16_t* x, uint16_t* y, int64_t n) {
 // THE PREFILL GEMM, the layout the engine's `Gemm::f16` calls: Y[T x ldy] = X[T x K] . W[N x K]^T.
 //
 // THREE KERNELS, ALL THE SAME ARITHMETIC (f16 operands, f32 accumulate, k in increasing order); the choice is a
-// MEMORY SCHEDULE, and which one runs is decided by measured shape - but ONLY WITHIN THE OPT-IN PATH, because
-// the end-to-end measurement did not confirm the isolated one (read the block above `prefill_fma`):
+// MEMORY SCHEDULE, and which one runs is decided by measured shape (the numbers are in `prefill_fma` below):
 //
 //   * `gemm_prefill_fma_small.comp` (the untiled, one-invocation-per-output kernel) - THE DEFAULT, for every T.
-//     It is the behaviour this backend shipped before this change, so the default engine run is unchanged.
+//     It is the behaviour this backend shipped before tiling, and after the flush narrowing (iq_vk.cpp's
+//     `iq_grids`) it measures the SAME as the tiled kernel end to end (19.74 tok/s against 19.52, n=2 vs n=3).
 //   * `gemm_prefill_fma.comp` (tiled, shared-memory FMA) - reachable with STRATA_VK_PREFILL_TILED=1, for T >= 16.
 //     A workgroup stages W[TN x TK] once and reuses it for TM token rows, so a weight byte is read from global
-//     once per 16-row tile instead of once per output element and the loads coalesce along K.  In isolation on
-//     the Arc Pro B70 it is 6.2x faster at T = 199 (1.05 ms against 6.43 ms gate/up) and 1.2x slower at T = 8;
-//     end to end at a 199-token chunk it did not beat the untiled kernel (5.81 tok/s untiled against 3.88 and
-//     3.25 tok/s tiled), so it is not the default - see the note above `prefill_fma` for the numbers.
+//     once per 16-row tile instead of once per output element and the loads coalesce along K.  In isolation it is
+//     6.2x faster at T = 199; END TO END it is not - see `prefill_fma` for the full before/after and for why the
+//     1.49x it once showed was the flush serialisation, not the tile.
 //   * `gemm_prefill_f16_m8.spv` (cooperative matrix / XMX) - reachable with STRATA_VK_PREFILL_COOPMAT=1.  It is
 //     NOT dispatched by default because it MEASURED SLOWER than the tiled FMA kernel at EVERY shape tried on
 //     this card (gate/up T=8: 0.398 vs 0.234 ms; T=199: 3.33 vs 1.05 ms; down T=199: 1.60 vs 0.48 ms): this
@@ -188,17 +187,25 @@ uint32_t groups_for_(uint64_t n) { return (uint32_t) ((n + kLocal - 1) / kLocal)
 
 // Dispatch an FMA-class kernel over rows [0, t) of the operands it is given (views are the caller's).
 //
-// THE TILED PATH IS OPT-IN, AND THAT IS A MEASUREMENT, NOT CAUTION.  In ISOLATION (the port's own probe, Arc
-// Pro B70, /tmp/gemm_sweep.log) the tiled kernel is 6.2x faster per dispatch at T = 199 (1.05 ms against
-// 6.43 ms, gate/up) and 6.9x on the down projection, and it is 1.2x SLOWER at T = 8 (0.234 against 0.190 ms)
-// because a tile that small has too few independent workgroups to hide its barrier-chained K latency.  END TO
-// END, on the engine's real per-expert shapes at a 199-token chunk, it did NOT improve the prefill: same
-// session, same card, same flags, 198 prefilled tokens - untiled 5.81 tok/s (34069 ms) against tiled 3.88 and
-// 3.25 tok/s in two runs (/tmp/perf_before_199.log, /tmp/perf_after_199.log, /tmp/perf_after2_199.log).  The
-// engine's per-expert T distribution is not instrumented, so WHY the isolated win does not transfer is an open
-// question rather than a settled one - and until it is answered, the shipped default is the behaviour this
-// backend already had.  `STRATA_VK_PREFILL_TILED=1` selects the tiled path for T >= 16 so the claim stays
-// testable; it is not a default.
+// THE TILED PATH IS STILL OPT-IN, AND THE RE-TEST IS WHY (not the original reason - that one is dead).
+// When tiling landed (ee69697) it was 6.2x faster PER DISPATCH in isolation (T=199 gate/up: 1.05 ms against
+// 6.43 ms; T=8 1.2x slower) and yet SLOWER end to end (5.81 tok/s untiled against 3.88/3.25 tiled), because
+// every dispatch was then its own command buffer, fence, submit AND wait, and the tiled path's extra
+// dispatches cost ~46-54 us each.  The dispatch layer has since been batched, and the live-batch path now
+// costs 4.6-5.4 us per dispatch, so that reason no longer holds - which is exactly why this was re-measured.
+// RE-MEASURED on the Arc Pro B70, 199-token arm, STRATA_PREFILL_TIMING=1 (logs in /tmp/meas2/, this batch):
+//   pre-grid-fix binary   untiled 12,359.3 ms / 16.02 tok/s   tiled  8,294.1 ms / 23.87 tok/s   -> 1.49x
+//   grid-fixed binary     untiled 10,128.6 / 9,939.4 ms (19.55 / 19.92 tok/s)   tiled 10,375.3 / 9,895.8 /
+//                         10,177.0 ms (19.08 / 20.01 / 19.46)   -> TILED LOSES THE WIN, and the 1.49x was
+//                         the FLUSH, not the tile: with a mapped IQ grid bound, every iq_dequant dispatch
+//                         flushed the batch, so each following GEMM dispatch was swept into a ~5-dispatch
+//                         batch and paid a submit+wait; the untiled kernel issues ~7,700 GEMM dispatches per
+//                         chunk against the tiled kernel's few hundred, so it paid that cost 15x more often.
+//                         Narrowing the flush (see iq_vk.cpp's iq_grids) removed the serialisation and with it
+//                         the whole gap: 19.74 tok/s untiled (n=2) against 19.52 tiled (n=3).
+// So the default stays the untiled kernel: the tiled one is not slower, but it is not measurably faster
+// either, and a default is a claim.  `STRATA_VK_PREFILL_TILED=1` selects the tiled path for T >= 16 so the
+// claim stays testable; the same binary, same prompt, same flags, ids identical (`56a0b28d2de6`) in every arm.
 void prefill_fma(Stream& s, const Buf& xv, const Buf& wv, const Buf& yv, int64_t t, int64_t n, int64_t k,
                  int64_t ldy) {
     static const bool tiled_env = [] {

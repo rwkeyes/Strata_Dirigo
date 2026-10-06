@@ -47,29 +47,43 @@ static Stream& stream_for(const char* who, void* stream) {
 }
 
 // THE SIX GRIDS, placed on the stream on first use (the dequant shaders bind all six regardless of the format).
+//
+// THEY ARE `alloc_device`, NOT `alloc`, AND THAT IS THE HOST-VISIBLE RULE BEING NARROWED RATHER THAN WEAKENED.
+// `Ctx::alloc` picks its memory type from `mem_type_`, which is HOST_VISIBLE | HOST_COHERENT and PREFERS a
+// device-local heap - on the Arc Pro B70 that is the BAR-mapped VRAM type, so every `alloc` buffer comes back
+// MAPPED.  The port's documented contract is "a dispatch touching a host-visible mapped region completes when
+// `dispatch()` returns", because the engine and the gate read those regions DIRECTLY - and that rule is right.
+// What was wrong is the CLASSIFICATION: a grid table is a shader-READ constant the host writes ONCE through
+// `Ctx::write` and never reads back, so it has no reason to be mapped, and being mapped made every
+// `iq_dequant_f32` dispatch flush the live batch.  Measured on the Arc Pro B70, 199-token arm, untiled default
+// (`/tmp/meas2/base199.log`, STRATA_VK_FLUSH_STAT=1): 13,619 flushes with the iq_dequant call sites carrying
+// 10,737 of them (~4.9 dispatches per flush - they are the flush, not the batch limit).  A device-local grid
+// keeps the rule exactly as documented (nothing about the mapped-region contract changes, and on a device whose
+// only heap is device-local AND mappable - llvmpipe - `alloc_device` lands in that same mapped type, so its
+// behaviour is unchanged) while removing a buffer from the rule's reach that never needed to be in it.
 static void iq_grids(Stream& s, Buf& g1, Buf& g2, Buf& g3, Buf& g4, Buf& g5, Buf& g6) {
     if (s.iq_grids.iq1s.buffer == VK_NULL_HANDLE) {
-        s.iq_grids.iq1s = s.ctx->alloc(sizeof(strata::vkport::kIq1sGrid));
+        s.iq_grids.iq1s = s.ctx->alloc_device(sizeof(strata::vkport::kIq1sGrid));
         s.ctx->write(s.iq_grids.iq1s, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
     }
     if (s.iq_grids.iq2s.buffer == VK_NULL_HANDLE) {
-        s.iq_grids.iq2s = s.ctx->alloc(sizeof(strata::vkport::kIq2sGrid));
+        s.iq_grids.iq2s = s.ctx->alloc_device(sizeof(strata::vkport::kIq2sGrid));
         s.ctx->write(s.iq_grids.iq2s, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
     }
     if (s.iq_grids.iq3s.buffer == VK_NULL_HANDLE) {
-        s.iq_grids.iq3s = s.ctx->alloc(sizeof(strata::vkport::kIq3sGrid));
+        s.iq_grids.iq3s = s.ctx->alloc_device(sizeof(strata::vkport::kIq3sGrid));
         s.ctx->write(s.iq_grids.iq3s, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
     }
     if (s.iq_grids.iq3xxs.buffer == VK_NULL_HANDLE) {
-        s.iq_grids.iq3xxs = s.ctx->alloc(sizeof(strata::vkport::kIq3xxsGrid));
+        s.iq_grids.iq3xxs = s.ctx->alloc_device(sizeof(strata::vkport::kIq3xxsGrid));
         s.ctx->write(s.iq_grids.iq3xxs, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
     }
     if (s.iq_grids.iq2xxs.buffer == VK_NULL_HANDLE) {
-        s.iq_grids.iq2xxs = s.ctx->alloc(sizeof(strata::vkport::kIq2xxsGrid));
+        s.iq_grids.iq2xxs = s.ctx->alloc_device(sizeof(strata::vkport::kIq2xxsGrid));
         s.ctx->write(s.iq_grids.iq2xxs, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
     }
     if (s.iq_grids.iq2xs.buffer == VK_NULL_HANDLE) {
-        s.iq_grids.iq2xs = s.ctx->alloc(sizeof(strata::vkport::kIq2xsGrid));
+        s.iq_grids.iq2xs = s.ctx->alloc_device(sizeof(strata::vkport::kIq2xsGrid));
         s.ctx->write(s.iq_grids.iq2xs, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
     }
     g1 = s.iq_grids.iq1s; g2 = s.iq_grids.iq2s; g3 = s.iq_grids.iq3xxs;

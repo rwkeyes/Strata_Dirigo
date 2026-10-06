@@ -1,5 +1,53 @@
 # Status — what is done, what is verified, what is not
 
+## THE PREFILL'S EXPERT-PATH FLUSH WAS A MAPPED GRID, NOT A KERNEL (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** The IQ grid tables are now placed with `Ctx::alloc_device` instead of `Ctx::alloc`:
+`vulkan/src/kernels/iq_vk.cpp`'s `iq_grids()` (six grids) and `vulkan/src/kernels/matvec_vk.cpp`'s `grid_for()`
+(four). `Ctx::alloc` picks `mem_type_` — HOST_VISIBLE|HOST_COHERENT, preferring a device-local heap, i.e. the
+BAR-mapped VRAM type on this card — so every grid came back MAPPED, and `Ctx::dispatch`
+(`vk_compute.cpp:1520`) flushes the live batch on any mapped binding. `iq_dequant_f32.spv` binds all six grids,
+so every dequant dispatch flushed, and every dispatch after it was swept into a ~5-dispatch batch and paid a
+submit+wait. **The host-visible rule itself is unchanged** (a grid is a shader-READ constant the host writes once
+and never reads back; on llvmpipe `alloc_device` lands in the same device-local+mappable type, so nothing there
+can change). No shader changed; no bound was widened; no case was skipped or dropped.
+
+**VERIFIED.** Gate on the Arc `intel_icd` **886 passed / 0 failed / 0 skipped** — the case count did NOT fall
+(886 at HEAD and 886 here), nothing is skipped, no bound was widened. lvp 872/0/4 (the same four documented
+skips, including the device-local-and-mappable path my change touches) and radeon 875/2/2 — both failures are the
+documented moving-failing-set intermittent (`bf16_gemv_fp32_mmvf_cols`, and `ple_block entry` 10239/10240 worst 1,
+the same one-element intermittent `/tmp/meas/gate_perf4` records on the Intel arm) and neither is a case this
+change touches; smoke 60/0/0 (20/0/0 per ICD). Logs: `/tmp/meas2/gate_arc.log` and
+`ports/vulkan/harness/build/icd-{intel,lvp,radeon}_icd.log`. Ids: `output  :` line md5 **`56a0b28d2de6`**
+(199-token) and **`3aed108cceee`** (8-token) in every one of the TEN runs of this batch (the three pre-change arms
+and the seven post-change ones), by the same convention the file has always used (md5 of the line including its
+newline). `check_port_map.py` passes and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (no
+`kernels::` symbol changed).
+
+**MEASURED.** 199-token arm, same binary/prompt/flags: prefill **16.02 → 19.74 tok/s** (12,359.3 ms → 10,128.6 /
+9,939.4, n=2) and flushes **13,619 → 3,021** (submit 69 → 16 ms); 8-token arm prefill 4.45-5.28 → **6.63** tok/s
+(1,056.4 ms). Decode UNMOVED: 8.36/8.34/8.35 before, 8.34/8.31/8.22/8.35 after. The cause was named by
+`addr2line` over `STRATA_VK_FLUSH_STAT`'s own call-site backtraces: the four `iq_dequant*` sites carried 10,737 of
+the 13,619 flushes at ~4.9 dispatches each, while `native_gdn_out_norm <- prefill::gdn_recurrence` showed exactly
+128 per flush (the batch limit) — so the ordinary arena dispatches never tripped the rule.
+
+**THE RE-TEST, AND WHY THE TILED PATH IS NOT THE DEFAULT.** `STRATA_VK_PREFILL_TILED=1` re-measured (the 46-54 us
+dispatch cost that made it lose is now 4.6-5.4 us): **1.49x faster on the PRE-narrowing binary** (8,294.1 ms /
+23.87 tok/s) but **indistinguishable on the narrowed one** (19.52 tok/s, n=3, against untiled 19.74, n=2). The
+1.49x was the flush, not the tile — the untiled GEMM's ~7,700 dispatches per chunk each landed in a flushed
+~5-dispatch batch; the tiled kernel's few hundred did not. So the shipped default is UNCHANGED and the env arms
+stay opt-in. `STRATA_VK_PREFILL_COOPMAT=1` = **18.02 tok/s** pre-narrowing (10,989.3 ms) and **20.14 tok/s** on the
+narrowed binary (9,829.9 ms), ids identical in both — a wash against untiled's 19.74 and tiled's 19.52, so all
+three GEMM arms are within ~3% and none is claimed as a win.
+
+**NOT DONE.** The expert matmul is still dequant-to-FP16-then-GEMM rather than the reference's MMQ shape
+(quantized operands in shared memory, packed integer dot behind a runtime `VK_KHR_shader_integer_dot_product`
+check — this card reports `int dot: 0` — the scale applied once, no separate dequantized buffer). After the
+narrowing, `dequant` (2,054 ms, 21%) is larger than the GEMM (596 + 616 ms, ~12%), and `iq_dequant_f32` costs
+~0.55 ms per dispatch at ~24 GB/s of traffic — dispatch count and occupancy (224 of each 256-lane workgroup's
+lanes idle), not bandwidth. **Also open:** the narrowed binary reports 59,640 live dispatches against 56,468
+before (+3,172, same prompt, same GEMM choices) — unexplained, recorded.
+
 ## THE PER-ROUND PREDICTION IS FALSIFIED, AND SO IS THE BARRIER — the delivered decode gap is SPECULATIVE WASTE (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** The verify window's five per-token loops are batched to ONE dispatch per ROUND: `gdn_conv_l2_multi`,

@@ -1,5 +1,81 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE EXPERT PATH'S `dequant` WAS A MAPPED GRID, NOT A KERNEL — 13,619 FLUSHES → 3,021, PREFILL 16.02 → 19.74 tok/s, AND THE TILED GEMM'S 1.49x WAS THAT FLUSH (later, same day, `vega`)
+
+**THE MEASUREMENT THAT FOUND IT.** `STRATA_VK_FLUSH_STAT=1` on the 199-token arm at the merged HEAD printed
+**13,619 live-batch flushes, 56,468 dispatches, submit 69 ms, wait 11,622 ms**. That instrument already dumps 20
+flush CALL SITES as backtraces; they were unresolved addresses on the shipped binary, so `addr2line` was run over
+the binary and NAME them:
+
+```
+site  0: n=3563  disp=17479  wait=5109ms   iq_dequant_gu_f16 <- Prefill::run_impl::{lambda}   (4.9 disp/flush)
+site  1: n=102   disp=13056  wait=2403ms   native_gdn_out_norm <- prefill::gdn_recurrence     (128 disp/flush = the batch limit)
+site  2: n=48    disp=4206   wait=2067ms   Prefill::run_impl
+site  4: n=3563  disp=7126   wait=393ms    iq_dequant_f16    <- Prefill::run_impl::{lambda}
+site  5: n=3563  disp=3563   wait=296ms    iq_dequant_gu_f16 <- Prefill::run_impl::{lambda}
+```
+
+The `iq_dequant` call sites carry **10,737 of the 13,619 flushes at ~4.9 dispatches each** — they ARE the flush.
+The batch limit is 128 (`kLiveBatchMax`) and site 1 shows exactly 128 per flush, so the ordinary arena dispatches
+never trip the rule. (The "~613 per prompt token" figure carried in this file earlier was the 8-TOKEN arm's 4,293
+divided by its 7 prompt tokens; on the 199-token arm it is 13,619 / 198 = 68.8 per prompt token.)
+
+**WHY IT FIRED.** `Ctx::dispatch` (`vulkan/src/device/vk_compute.cpp:1520`) flushes the live batch whenever any
+bound buffer is MAPPED — the port's documented contract, "a dispatch touching a host-visible region completes when
+`dispatch()` returns", because the engine and the gate read those regions directly. The buffers were the **IQ grid
+tables**: `iq_vk.cpp`'s `iq_grids()` and `matvec_vk.cpp`'s `grid_for()` placed them with `Ctx::alloc`, whose memory
+type is `mem_type_` — HOST_VISIBLE|HOST_COHERENT, preferring a device-local heap, i.e. on this card the **BAR-mapped
+VRAM type**. `iq_dequant_f32.spv` binds all six grids, so every dequant dispatch was a mapped dispatch and flushed.
+
+**THE CHANGE IS A NARROWING, NOT A WEAKENING.** Both sites now use `Ctx::alloc_device` (the device-local type). A
+grid is a shader-READ constant the host writes ONCE through `Ctx::write` and never reads back, so the mapping
+bought nothing and cost a submit+wait per dequant dispatch. The host-visible rule is untouched; on a device whose
+only heap is device-local AND mappable (llvmpipe) `alloc_device` lands in that same type, so its behaviour cannot
+change. **13,619 → 3,021 flushes** (submit 69 → 16 ms); the remaining 3,021 are the batch limit plus the host
+`stream_write` sites (`Ctx::write`/`read` flush by contract).
+
+**THE CHEAP TEST, RE-RUN FIRST — THE OLD REASON FOR LOSING IS DEAD, AND THE WIN IT SHOWED WAS THE FLUSH.** Same
+card, same prompt, same flags, ids identical in every arm:
+
+| 199-token arm | prefill ms | tok/s | decode tok/s | flushes | ids md5 |
+|---|---:|---:|---:|---:|---|
+| HEAD default (untiled) | 12,359.3 | 16.02 | 8.36 | 13,619 | `56a0b28d2de6` |
+| HEAD `STRATA_VK_PREFILL_TILED=1` | 8,294.1 | 23.87 | 8.34 | 13,619 | `56a0b28d2de6` |
+| HEAD `STRATA_VK_PREFILL_COOPMAT=1` | 10,989.3 | 18.02 | 8.35 | 13,551 | `56a0b28d2de6` |
+| **+ the grid narrowing, untiled (n=2)** | **10,128.6 / 9,939.4** | **19.55 / 19.92** | 8.34 / 8.31 | **3,021** | `56a0b28d2de6` |
+| + the grid narrowing, tiled (n=3) | 10,375.3 / 9,895.8 / 10,177.0 | 19.08 / 20.01 / 19.46 | 8.35 | 3,021 | `56a0b28d2de6` |
+| + the grid narrowing, coopmat (n=1) | 9,829.9 | 20.14 | 8.35 | 3,021 | `56a0b28d2de6` |
+| 8-token arm, shipped default | 1,056.4 | 6.63 | 8.22 | 381 | `3aed108cceee` |
+
+**THE TILED PATH IS NOT MADE THE DEFAULT, AND THE REASON IT LOOKED LIKE A WIN IS ITSELF THE FIX.** The tiled kernel
+is still 6.2x faster per dispatch in isolation, and it is NOT slower end to end (19.52 tok/s against untiled's
+19.74, n=3 vs n=2 — inside this box's spread). The 1.49x it showed BEFORE the narrowing was the flush, not the
+tile: with a mapped grid bound, every dequant dispatch flushed, so each dispatch that followed it was swept into a
+~5-dispatch batch and paid a submit+wait; the untiled GEMM issues ~7,700 dispatches per chunk against the tiled
+kernel's few hundred, so it paid that cost ~15x more often. Remove the serialisation and the whole gap goes with
+it. **The shipped default is unchanged**; `STRATA_VK_PREFILL_TILED=1` / `=COOPMAT=1` remain the opt-in arms.
+`coopmat`, the arm that measured slower than the tiled FMA kernel at EVERY shape in isolation (it loads its
+operands from global with no staging), is also a wash end to end once the flush is out of the way: **20.14 tok/s
+(9,829.9 ms) on the narrowed binary** against untiled's 19.74 and tiled's 19.52 — so the header's claim that it
+loses is a claim about the SHADER, and the cheap test says the FMA default is not measurably better either. All
+three keep their default-off status; none is claimed as a win.
+
+**THE SAME NUMBERS AGAINST THE REFERENCE ON THIS CARD** (llama.cpp Vulkan, `pp512 913.36 +/- 289.06`,
+`tg128 36.52 +/- 0.02`): 199-token prefill **19.74 / 913.36 = 2.16%** (was 1.77%), decode **8.34 / 36.52 = 22.8%**
+(unchanged); 8-token arm prefill **6.63 / 913.36 = 0.73%** (was 0.57%), decode **8.22 / 36.52 = 22.5%**. Flushes
+per prompt token: **13,619 / 198 = 68.8 → 3,021 / 198 = 15.3** on the 199-token arm, and **4,293 / 7 = 613 →
+381 / 7 = 54.4** on the 8-token arm (the "~613" figure that opened this lead was the 8-token arm's).
+
+**WHAT THE SAME NUMBERS SAY ABOUT WHERE THE PREFILL'S TIME NOW IS (narrowed binary, 199-token arm, `dequant`
+2,054 ms / `gdn recurrence` 2,754 / `host grouping` 1,885 / `qsa proj` 768 / `gemm gate/up` 596 / `gemm down` 616
+of a 9,964 ms host timeline).** The expert matmul itself is now ~12% of the prefill and `dequant` — the FP16
+staging in front of it — is ~21%. **The MMQ-shaped expert matmul (quantized operands staged in shared memory,
+packed integer dot behind a runtime `VK_KHR_shader_integer_dot_product` check, the scale applied once, no separate
+dequantized buffer) is NOT landed in this batch.** What is measured about it: `iq_dequant_f32` costs ~0.55 ms per
+dispatch over 10,833 dispatches, which at 24 GB/s of effective traffic is nowhere near this card's bandwidth — so
+its cost is dispatch count and occupancy (the shader decodes one 256-value superblock with a 32-lane subgroup and
+leaves 224 of its 256 lanes idle), not memory. Those are the next two numbers to attack, in that order.
+
 ## THE PER-ROUND BATCHING: 13-17% FEWER DISPATCHES, 1.2-1.4% OF `sync` — THE PREDICTION IS FALSIFIED, AND THE DELIVERED DECODE GAP IS SPECULATIVE WASTE (later, same day, `vega`)
 
 **THE CHANGE.** The verify window's five per-token loops (`gdn_conv_l2_multi`, `gdn_ab_multi`,

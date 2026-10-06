@@ -195,21 +195,28 @@ void quantize_q8_1_rows(Stream& s, const float* x, int64_t n_rows, int64_t n_col
 //        (`Stream::iq_grids`), lazily, so a per-layer call does not grow the arena.
 static const uint32_t* grid_for(Stream& s, int ggml_type, Buf& out) {
     // (type, spv name, grid pointer, grid size in uint32, grid slot) - the port's six IQ formats.
+    //
+    // `alloc_device`, NOT `alloc`: these are shader-READ constants the host writes once and never reads back, and
+    // `Ctx::alloc` returns a MAPPED buffer on the Arc Pro B70 (`mem_type_` is HOST_VISIBLE|HOST_COHERENT, and on
+    // that card it is the BAR-mapped VRAM type).  Every dispatch that binds a mapped buffer flushes the live
+    // batch - the port's documented "a dispatch touching a host-visible region completes when dispatch()
+    // returns" contract, which is unchanged.  A device-local grid simply does not trip it; the mapping was never
+    // needed here.  Same reasoning and same measurement as `iq_vk.cpp`'s `iq_grids()`.
     switch (ggml_type) {
     case 29:  // IQ1_M
-        if (s.iq_grids.iq1s.buffer == VK_NULL_HANDLE) { s.iq_grids.iq1s = s.ctx->alloc(sizeof(strata::vkport::kIq1sGrid));
+        if (s.iq_grids.iq1s.buffer == VK_NULL_HANDLE) { s.iq_grids.iq1s = s.ctx->alloc_device(sizeof(strata::vkport::kIq1sGrid));
             s.ctx->write(s.iq_grids.iq1s, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid)); }
         out = s.iq_grids.iq1s; return strata::vkport::kIq1sGrid;
     case 22:  // IQ2_S
-        if (s.iq_grids.iq2s.buffer == VK_NULL_HANDLE) { s.iq_grids.iq2s = s.ctx->alloc(sizeof(strata::vkport::kIq2sGrid));
+        if (s.iq_grids.iq2s.buffer == VK_NULL_HANDLE) { s.iq_grids.iq2s = s.ctx->alloc_device(sizeof(strata::vkport::kIq2sGrid));
             s.ctx->write(s.iq_grids.iq2s, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid)); }
         out = s.iq_grids.iq2s; return strata::vkport::kIq2sGrid;
     case 21:  // IQ3_S
-        if (s.iq_grids.iq3s.buffer == VK_NULL_HANDLE) { s.iq_grids.iq3s = s.ctx->alloc(sizeof(strata::vkport::kIq3sGrid));
+        if (s.iq_grids.iq3s.buffer == VK_NULL_HANDLE) { s.iq_grids.iq3s = s.ctx->alloc_device(sizeof(strata::vkport::kIq3sGrid));
             s.ctx->write(s.iq_grids.iq3s, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid)); }
         out = s.iq_grids.iq3s; return strata::vkport::kIq3sGrid;
     case 18:  // IQ3_XXS
-        if (s.iq_grids.iq3xxs.buffer == VK_NULL_HANDLE) { s.iq_grids.iq3xxs = s.ctx->alloc(sizeof(strata::vkport::kIq3xxsGrid));
+        if (s.iq_grids.iq3xxs.buffer == VK_NULL_HANDLE) { s.iq_grids.iq3xxs = s.ctx->alloc_device(sizeof(strata::vkport::kIq3xxsGrid));
             s.ctx->write(s.iq_grids.iq3xxs, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid)); }
         out = s.iq_grids.iq3xxs; return strata::vkport::kIq3xxsGrid;
     default: return nullptr;   // IQ4_NL / IQ4_XS carry their table in the shader

@@ -1,5 +1,52 @@
 # Start here next session
 
+## THE PREFILL'S EXPERT-PATH FLUSH WAS A MAPPED GRID — 13,619 FLUSHES → 3,021, PREFILL 16.02 → 19.74 tok/s, AND THE TILED GEMM'S 1.49x WAS THAT FLUSH (2026-10-06, `vega`, Arc Pro B70)
+
+**WHAT LANDED (correctness-neutral; it removes a forced submit+wait per dequant dispatch).** The IQ grid tables are
+now placed with `Ctx::alloc_device` instead of `Ctx::alloc` — `vulkan/src/kernels/iq_vk.cpp`'s `iq_grids()` (six
+grids) and `vulkan/src/kernels/matvec_vk.cpp`'s `grid_for()` (four). `Ctx::alloc` picks `mem_type_`, which is
+HOST_VISIBLE|HOST_COHERENT and prefers a device-local heap — the BAR-mapped VRAM type on this card — so every grid
+came back MAPPED, and `Ctx::dispatch` flushes the live batch on any mapped binding (the documented host-visible
+contract). `iq_dequant_f32.spv` binds all six grids, so every dequant dispatch flushed the batch, and every
+dispatch that followed it was swept into a ~5-dispatch batch and paid a submit+wait. **The host-visible rule is
+unchanged** — a grid is a shader-READ constant the host writes once with `Ctx::write` and never reads back, so the
+mapping bought nothing; on a device whose only heap is device-local AND mappable (llvmpipe) `alloc_device` lands in
+the same type, so nothing there can change. Measured: **13,619 → 3,021 flushes**, submit 69 → 16 ms, prefill
+**16.02 → 19.74 tok/s** on the 199-token arm (n=2: 10,128.6 / 9,939.4 ms against 12,359.3); 8-token arm prefill
+4.45-5.28 → **6.63** tok/s; decode unmoved (8.34/8.31/8.22); ids `56a0b28d2de6` and `3aed108cceee` in EVERY arm.
+
+**HOW IT WAS FOUND — attributable, not guessed.** `STRATA_VK_FLUSH_STAT=1` already prints 20 flush CALL SITES as
+backtraces; on the shipped binary they were unresolved addresses, so `addr2line` named them: the four `iq_dequant*`
+sites carry **10,737 of the 13,619 flushes at ~4.9 dispatches each** (they ARE the flush), while
+`native_gdn_out_norm <- prefill::gdn_recurrence` shows exactly 128 dispatches per flush — the batch limit
+(`kLiveBatchMax`) — so ordinary arena dispatches never trip the rule. The file's own "~613 flushes per prompt
+token" was the 8-TOKEN arm's 4,293 over its 7 tokens; the 199-token arm is 13,619/198 = 68.8.
+
+**THE CHEAP TEST, RE-RUN, AND THE ANSWER IS TWO-SIDED.** `STRATA_VK_PREFILL_TILED=1` (commit `ee69697`) was
+re-measured because the ~46-54 us dispatch cost that made it lose is now 4.6-5.4 us: on the pre-narrowing binary it
+was **1.49x faster** (8,294.1 ms / 23.87 tok/s against 12,359.3 / 16.02). But that win was the FLUSH — with a
+mapped grid bound, the untiled GEMM's ~7,700 dispatches per chunk each landed in a ~5-dispatch batch, and the tiled
+kernel's few hundred did not. On the narrowed binary the two are **indistinguishable**: tiled 19.52 tok/s (n=3)
+against untiled 19.74 (n=2). So **the tiled path was NOT made the default** (the shipped default is unchanged and
+the env arms stay opt-in) — a default is a claim and there is no measured win. `STRATA_VK_PREFILL_COOPMAT=1`
+measured **18.02 tok/s** (10,989.3 ms) on the pre-narrowing binary and **20.14 tok/s** (9,829.9 ms) on the narrowed
+one (ids identical in both) — a wash against untiled's 19.74 and tiled's 19.52, so all three GEMM arms sit within
+~3% and none is claimed as a win.
+
+**NOT DONE — AND IT IS THE NAMED NEXT LEVER.** The expert matmul is still `dequant-to-FP16-then-GEMM`, not the
+reference's MMQ shape (quantized operands staged in shared memory, packed integer dot with a runtime
+`VK_KHR_shader_integer_dot_product` check — this card reports `int dot: 0`, so a non-packed accumulation path is
+mandatory — the scale applied once, no separate dequantized buffer). With the flush narrowed, the 199-token arm's
+own timeline puts **`dequant` at 2,054 ms (21%)** and the GEMM at 596 + 616 ms (~12%), so the staging pass is now
+the larger of the two. Measured and worth keeping: `iq_dequant_f32` costs ~0.55 ms per dispatch over 10,833
+dispatches, which is ~24 GB/s of effective traffic — nowhere near this card's bandwidth — and the shader decodes a
+256-value superblock with a 32-lane subgroup inside a 256-lane workgroup, leaving 224 lanes idle. Occupancy and
+dispatch count, then the fusion. `STRATA_VK_PREFILL_TIMING`'s marks are **host wall-clock** (the shim's
+`cudaEventElapsedTime`), not GPU time: read the phase table as "where the host waits", and use `STRATA_VK_FLUSH_STAT`'s
+`wait` for GPU-bound time. **Open discrepancy:** the narrowed binary reports **59,640** live dispatches against the
+pre-narrowing binary's **56,468** (+3,172) with the same prompt and the same two GEMM choices — unexplained and
+recorded rather than smoothed over.
+
 ## THE PER-ROUND PREDICTION IS FALSIFIED, AND SO IS THE BARRIER — three suspects measured dead, and the delivered decode gap is SPECULATIVE WASTE (2026-10-06, `vega`, Arc Pro B70)
 
 **WHAT LANDED (correctness-neutral; it does reduce recorded dispatches 13-17%).** The verify window's five
