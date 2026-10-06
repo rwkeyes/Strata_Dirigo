@@ -1,5 +1,50 @@
 # Status — what is done, what is verified, what is not
 
+## THE PREFILL GEMM: COOPMAT CONFIRMED FASTER (n=5 A/B, EACH ARM PROVING ITS OWN CONFIG) AND NOW THE DEFAULT; THE REFERENCE'S SHARED-MEMORY STAGING IS A MEASURED LOSS AT THIS TILE (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) A **clean repeated A/B** of the two prefill GEMM paths, n=5 per arm, `--spec 2 --prefill 256` on the
+199-token prompt, one config per invocation, **every arm logging its own `env | grep -i strata_vk` AND its own
+per-shader histogram**, interleaved so a drift cannot land on one arm: default (untiled FMA)
+**11,613.1 / 12,338.8 / 11,632.0 / 12,084.4 / 11,629.5 ms** (median 11,632.0; 17.11 tok/s; 6.2% spread) against
+cooperative matrix **9,905.6 / 10,082.4 / 9,916.2 / 9,881.6 / 9,884.9 ms** (median 9,905.6; 20.09 tok/s; 2.0%
+spread). **Coopmat wins by 1.174x and the two sets do not overlap**; the default arms' histograms contain NO
+`gemm_prefill_f16_m8.spv` at all and the coopmat arms' contain 3,850 beside `fma_small` 7,150 - the labels are
+evidence now, not assumption. (2) **The matrix-unit path is the DEFAULT** for the shapes it can take
+(`vulkan/src/kernels/prefill_vk.cpp::gemm_f16`; `STRATA_VK_PREFILL_COOPMAT=0` forces the FMA path back on; the
+shape precondition `t%8==0 && n%16==0 && k%16==0` with no ragged edge IS the small-T rule, so T<8 and every ragged
+shape stay on FMA). Proven by four arms with no env var at all (median 9,900.2 ms / 20.09 tok/s, ids identical).
+(3) **The shared-memory operand staging the reference has** (`mul_mm.comp`/`mul_mmq.comp` stage both tiles before
+`coopMatLoad`; this port loaded straight from global) is **implemented, gated, falsified and measured three ways -
+and it is a LOSS**: 2.5-3.2x per dispatch in the port's bench, **1.62x end to end** (16,034/16,012 ms against
+9,896-10,120 ms), and 2,980 ms of the phase table's GEMM phases against 1,344 ms. It ships as a **built, gated,
+bench-armed variant that nothing dispatches**, with the reason named: a TM=8 row block gives **7.5 MACs per staged
+element** where the reference's 64-row block gives 16+, so the staging cannot be amortised at this port's tile.
+
+**VERIFIED.** Gate on the Arc `intel_icd` **889 passed / 0 failed / 0 skipped** - the count RISES by three new arms
+(two that exercise the staged kernel directly, one that drives the WRAPPER's grid at T=16 where the kernel is two
+row blocks wide), nothing is removed, nothing is skipped, no bound is widened; the intel default arm is
+`889/0/0` as well, lvp `873/0/4` (the same four documented skips) and radeon `875/3/2` in the full run against
+**`878/0/2` on an immediate re-run of the same binary** (the three failures - `fused_gdn_ab entry`, `qsa_decode_attn`,
+`bf16_gemv_fp32_mmvf_cols entry`, none of them a case this batch touches - CLEARED: the documented RADV
+moving-failing-set intermittent), smoke `60/0/0` - all in `/tmp/gemm/gate_final.log` plus
+`/tmp/gemm/q_radeon_recheck.log`. Three registered injections FALSIFY
+(`prefill-cm-grid-short` 1152/2176 worst 1e+30 on the new grid arm; `prefill-staged-b-rowmajor` 0/128 worst 42.7;
+`prefill-staged-drop-k-offset` 19/32768 worst 1.85e+05). Ids **`56a0b28d2de6`** in all nineteen 199-token arms of
+the batch and **`3aed108cceee`** in both 8-token arms (decode 8.20 tok/s, unmoved). `check_port_map.py` passes;
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (148 shaders built).
+
+**THE PHASE TABLE AGREES, AND IS QUOTED AS THE RANKING IT IS.** With `STRATA_PREFILL_TIMING=1` on both paths at the
+same shape and flags: the two GEMM phases cost **1,344 ms** on the shipped matrix-unit kernel (`q_t3g_1/2`) against
+**4,507 ms** on the FMA path (`q_t3f_1`, `STRATA_VK_PREFILL_COOPMAT=0`) - 3.4x, the same direction as the A/B. The
+phase table is host wall-clock (the port's standing caveat) and is not quoted as GPU time.
+
+**WHAT IS NOT / WHAT IT COSTS.** The staged kernel is deliberately unshipped; T is NOT thresholded (an isolated
+row that favours the untiled FMA kernel at T=8 is recorded but not turned into a rule); the tiled FMA kernel stays
+opt-in and unmeasured end to end; the phase table is host wall-clock and is used as a ranking only; the bench rows
+are in-stream marginal costs in the harness's mapped memory type and are NOT bandwidth figures. Logs:
+`/tmp/gemm/t1_{def,cm}_*.log`, `/tmp/gemm/q_def_*.log`, `/tmp/gemm/q_t3{g,s}_*.log`, `/tmp/gemm/bench.log`,
+`/tmp/gemm/gate_final.log`.
+
 ## THE `dequant` PHASE IS NOT THE DEQUANT KERNEL, AND THE +3,172 DISPATCHES WERE A GEMM CHOICE (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** Two open items from the last batch are closed with measurements, and one target was falsified rather than

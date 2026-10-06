@@ -119,6 +119,7 @@ vk_bench [--spv-dir D] [--device N] [--reps R] [--warmups W] [--sampler-vocab N]
 | `fused_gdn_conv_l2` vs `native_gdn_conv_silu`+2× `native_gdn_l2_norm` | C=10240 qk_heads=32 d_conv=4 (the 3-dispatch native chain) | elements/s |
 | `fused_gdn_ab` vs 2× `bf16_mmvf_f32` + `native_gdn_beta_gate` + `native_gdn_gate` | h_v=48 n=2560 (the 4-dispatch chain) | elements/s |
 | `fused_gdn_step_norm` vs `native_gdn_step` + `native_gdn_out_norm` | S=128 h_k=16 h_v=48 (3 MiB state; the 2-dispatch chain) | GMAC/s |
+| `gemm_prefill` — the four prefill GEMM schedules: `gemm_prefill_f16_m8` (matrix units, operands loaded straight from GLOBAL memory), `gemm_prefill_f16_m8_staged` (same tile, operands staged in SHARED memory as `mul_mm.comp` does), `gemm_prefill_fma` (tiled FMA) and `gemm_prefill_fma_small` (untiled FMA) | `T=8/16/64/199 x { gate/up N=1280 K=2560, down N=2560 K=640 }` — the engine's own expert shapes, one arm per schedule per shape | GMAC/s (T·N·K) |
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
@@ -514,6 +515,55 @@ default (`penalty_last_n = 0`) it is the k-round scan over the 61 partitions; wi
 is the window scan, which the port does per element (`O(hits × hlen)`) where the engine builds a 4,096-bit
 block bitmap. Attacking either is a post-integration question — it was descoped here by re-prioritisation (see
 `NEXT.md`).
+
+## THE PREFILL GEMM — the matrix-unit schedule against the FMA paths, and the SHARED-MEMORY staging the reference has (measured 2026-10-06, `vega`, Arc Pro B70)
+
+`strata::prefill::Gemm::f16` (`Y[T x ldy] = X[T x K] . W[N x K]^T`, f16 operands, f32 accumulate) is the prompt
+path's one deep kernel, and the engine calls it **once per expert per projection**: an expert's gate/up is
+`N = n_ff = 1280, K = n_embd = 2560`, its down is `N = n_embd = 2560, K = n_ff/2 = 640`, and **T is the row-batch
+routed to that one expert** - on the 199-token arm that is ~8 tokens for a popular expert, which is why the T
+column below starts at 8 rather than at the prompt length.
+
+Four schedules are measured at every shape, each as ONE dispatch per replay of a batch of 8, median of `reps=9`
+(all rows in `bench/build/icd-intel_icd.log`):
+
+| shape | cm-global (ms) | cm-staged (ms) | fma-untiled (ms) | fma-tiled (ms) | staged/global | global/untiled | tiled/untiled |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gate/up T=8 N=1280 K=2560 | 0.4017 | 1.2930 | 0.1952 | 0.2384 | **3.219** | **2.058** | 1.221 |
+| gate/up T=16 | 0.4057 | 1.2985 | 0.2822 | 0.2393 | **3.201** | 1.438 | 0.848 |
+| gate/up T=64 | 1.2511 | 3.4052 | 2.8117 | 0.3611 | **2.722** | 0.445 | **0.128** |
+| gate/up T=199 | 3.3341 | 9.0432 | 6.3302 | 1.0564 | **2.712** | 0.527 | **0.167** |
+| down T=8 N=2560 K=640 | 0.1099 | 0.3345 | 0.0688 | 0.0846 | **3.045** | **1.597** | 1.229 |
+| down T=64 | 0.5358 | 1.3594 | 1.1797 | 0.1390 | **2.537** | 0.454 | **0.118** |
+| down T=199 | 1.6094 | 4.9149 | 3.3530 | 0.4822 | **3.054** | 0.480 | **0.144** |
+
+`cm-global` = `gemm_prefill_f16_m8.spv` (the shipped matrix-unit kernel: `coopMatLoad` straight from global),
+`cm-staged` = `gemm_prefill_f16_m8_staged.spv` (the SAME tile with the operand tiles staged in shared memory, as
+llama.cpp's `mul_mm.comp`/`mul_mmq.comp` do - both are built by `run_bench.sh` and by the gate).
+
+**THE READING, AND IT HAS THREE PARTS THAT DO NOT AGREE WITH EACH OTHER - WHICH IS THE POINT.**
+
+* **The shared-memory staging is a 2.5-3.2x LOSS at every shape on this card.**  It is not the idea and not the
+  barriers: it is the TILE'S ARITHMETIC INTENSITY.  A workgroup here covers `TM = 8` token rows (one
+  cooperative-matrix row block - the engine's expert row-batches are ~8 tokens, so a taller block would stage
+  mostly zeros), so `CM_BN = 128` columns of W are staged and consumed by ONE row block:
+  `8 x 128 x BK` MACs per `(128 + 8) x BK` staged elements = **7.5 MACs per staged element**.  The reference's
+  `mul_mm.comp` stages `BM = 64 x BK` and `BN = 64 x BK` and computes `64 x 64 x BK` MACs from them = **16 MACs
+  per element** (more once `WMITER`/`WNITER` are counted), which is what pays for the staging, the barriers and
+  the shared round trip on Xe2.  Making it pay here needs a TALLER output block (BM 32-64 with a guarded store
+  for the blocks that hang off T) - a future increment, and the staggered guard for it is already in the body.
+* **At T = 8 - the engine's own expert row-batch - the UNTILED FMA kernel is the fastest of the four** (0.195 ms
+  against the matrix units' 0.402 and the tiled kernel's 0.238), and at T >= 64 **the tiled FMA kernel wins by
+  2.2-6x** (gate/up T=199: 1.056 against cm 3.334 and untiled 6.330).  Neither of those is the shipped default,
+  because an isolated row is not a token rate: the engine's own end-to-end A/B (n=5 per arm, `NEXT.md`) has the
+  matrix-unit path 17.4% ahead of the untiled FMA path on the 199-token arm, and a wash for the tiled path
+  (19.52 against 19.74 tok/s).  The rows here RANK the kernels; they do not decide the default - the engine
+  arm does, and that ordering is exactly the port's oldest lesson (the tiled GEMM was 6.2x in isolation and a
+  wash end to end).
+* **Both readings are the SAME instrument**, and the caveat that applies to every row above is the one in the
+  timing-method section: these are per-dispatch medians of a batch of 8 dispatches into one command buffer in
+  the harness's host-visible memory type.  They are a ranking and an in-stream marginal cost; they are NOT
+  bandwidth figures.
 
 ## Evidence the harness measures something real
 

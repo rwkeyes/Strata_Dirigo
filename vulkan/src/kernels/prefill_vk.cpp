@@ -81,6 +81,15 @@ using strata::vulkan::stream_write;
 constexpr uint32_t kLocal = 256;
 uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocal - 1) / kLocal); }
 
+// THE COOPERATIVE-MATRIX KERNEL'S COLUMN BLOCK, and it has to agree with the shader's own CM_BN
+// (`ports/vulkan/shaders/common/gemm_prefill_staged.glsl`, default 128).  It is named here rather than written
+// inline because the grid this wrapper dispatches IS the shader's block grid plus one: too few workgroups,
+// and whole blocks of output are silently never computed (there is no ragged-edge path and no error - the
+// kernel's header says so).  The gate pins the pair: `case_prefill_prompt_path`'s Gemm::f16 arm drives THIS
+// wrapper at a tile-aligned shape, so a host grid that under-covers the kernel FAILS the case rather than
+// quietly dropping rows.
+constexpr int64_t kCmBn = 128;   // == CM_BN in common/gemm_prefill_staged.glsl
+
 // The engine's own prefill geometry (src/prefill/kernels.cu:18-19).  Model-level constants, not tuning knobs.
 constexpr int64_t kN = 2560;    // n_embd
 constexpr int64_t kHC = 4;      // hyper-connection streams
@@ -162,24 +171,40 @@ void bf16_to_f16(Stream& s, const uint16_t* x, uint16_t* y, int64_t n) {
 
 // THE PREFILL GEMM, the layout the engine's `Gemm::f16` calls: Y[T x ldy] = X[T x K] . W[N x K]^T.
 //
-// THREE KERNELS, ALL THE SAME ARITHMETIC (f16 operands, f32 accumulate, k in increasing order); the choice is a
-// MEMORY SCHEDULE, and which one runs is decided by measured shape (the numbers are in `prefill_fma` below):
+// FOUR KERNELS, ALL THE SAME ARITHMETIC (f16 operands, f32 accumulate, k in increasing order); the choice is a
+// MEMORY SCHEDULE, and which one runs is decided by measurement, not by vendor or by taste:
 //
-//   * `gemm_prefill_fma_small.comp` (the untiled, one-invocation-per-output kernel) - THE DEFAULT, for every T.
-//     It is the behaviour this backend shipped before tiling, and after the flush narrowing (iq_vk.cpp's
-//     `iq_grids`) it measures the SAME as the tiled kernel end to end (19.74 tok/s against 19.52, n=2 vs n=3).
-//   * `gemm_prefill_fma.comp` (tiled, shared-memory FMA) - reachable with STRATA_VK_PREFILL_TILED=1, for T >= 16.
-//     A workgroup stages W[TN x TK] once and reuses it for TM token rows, so a weight byte is read from global
-//     once per 16-row tile instead of once per output element and the loads coalesce along K.  In isolation it is
-//     6.2x faster at T = 199; END TO END it is not - see `prefill_fma` for the full before/after and for why the
-//     1.49x it once showed was the flush serialisation, not the tile.
-//   * `gemm_prefill_f16_m8.spv` (cooperative matrix / XMX) - reachable with STRATA_VK_PREFILL_COOPMAT=1.  It is
-//     NOT dispatched by default because it MEASURED SLOWER than the tiled FMA kernel at EVERY shape tried on
-//     this card (gate/up T=8: 0.398 vs 0.234 ms; T=199: 3.33 vs 1.05 ms; down T=199: 1.60 vs 0.48 ms): this
-//     kernel loads its operand tiles straight from global memory with no shared-memory staging, so the same
-//     weight bytes are re-read per tile.  llama.cpp's XMX win on Xe2 is a property of ITS kernel (staged
-//     operands, larger tiles), not of the extension, and shipping a measured regression behind a vendor flag
-//     would be the "selection by vendor" mistake this port refuses.
+//   * `gemm_prefill_f16_m8.comp` (cooperative matrix / XMX) - **THE DEFAULT** for the shapes it can take, and
+//     `STRATA_VK_PREFILL_COOPMAT=0` forces the FMA path back on.  It has NO ragged edge, so it takes only the
+//     CM_M-aligned rows and the FMA kernels finish the tail: T < 8, or an N or K that is not a tile multiple,
+//     leaves t_cma = 0 and the FMA path runs alone - that IS the small-T rule, and it is a shape precondition
+//     rather than a threshold somebody picked.  WHY IT IS THE DEFAULT: a clean repeated A/B on the Arc Pro B70
+//     (this box, 199-token prompt, `--spec 2 --prefill 256`, n=5 per arm, EACH ARM'S OWN LOG CARRYING BOTH the
+//     `env | grep -i strata_vk` LAUNCH LINE AND THE PER-SHADER DISPATCH HISTOGRAM):
+//
+//       default (untiled FMA)  11,613.1 / 12,338.8 / 11,632.0 / 12,084.4 / 11,629.5 ms   (median 11,632.0)
+//       cooperative matrix      9,905.6 / 10,082.4 /  9,916.2 /  9,881.6 /  9,884.9 ms   (median  9,905.6)
+//
+//     - 17.4% in time / 17.4% in tok/s (17.11 -> 20.09), and NOT ONE arm of either set overlaps the other.
+//     The labels are evidence rather than assumption because each arm's histogram shows which kernel it ran:
+//     the default arms have `gemm_prefill_fma_small.spv` and NO `gemm_prefill_f16_m8.spv` in the top-15, the
+//     cooperative-matrix arms have `gemm_prefill_f16_m8.spv` 3,850 beside `fma_small` 7,150.  An inherited
+//     `STRATA_VK_PREFILL_COOPMAT=1` had mislabelled a whole earlier batch of arms, which is why the arms now
+//     record their own environment and their own histogram (logs: /tmp/gemm/t1_{def,cm}_*.log).
+//
+//   * `gemm_prefill_fma_small.comp` (the untiled, one-invocation-per-output kernel) - the fallback for every
+//     shape the matrix units cannot take, and the whole path when `STRATA_VK_PREFILL_COOPMAT=0`.
+//   * `gemm_prefill_fma.comp` (tiled, shared-memory FMA) - still opt-in with `STRATA_VK_PREFILL_TILED=1`, for
+//     T >= 16.  In isolation it is the FASTEST kernel of the four at large T (bench, Arc, gate/up T=199:
+//     1.056 ms against the matrix units' 3.334 and the untiled kernel's 6.330), and yet END TO END the tiled
+//     path measured a wash against the untiled one (19.52 against 19.74 tok/s, n=3 vs n=2) - see `prefill_fma`
+//     below.  It stays opt-in because a wash is not a claim, and the untiled kernel is no longer the default
+//     anyway; the tile's remaining value is as the FMA remainder's fast form if a future measurement wants it.
+//   * `gemm_prefill_f16_m8_staged.spv` (the same tile with the operand tiles staged in SHARED memory, as
+//     llama.cpp's `mul_mm.comp` does) - BUILT AND GATED, and NOT dispatched by anything: it measures
+//     **2.5-3.2x SLOWER** than the global-load kernel at every shape on this card (bench rows in its own
+//     header).  The reason is the tile's arithmetic intensity, not the idea: a TM = 8 row block gives 7.5 MACs
+//     per staged element where the reference's 64-row block gives 16+.
 //
 // The split is safe because Y rows are independent, and every dispatch fences, so their order does not matter.
 namespace {
@@ -203,9 +228,11 @@ uint32_t groups_for_(uint64_t n) { return (uint32_t) ((n + kLocal - 1) / kLocal)
 //                         chunk against the tiled kernel's few hundred, so it paid that cost 15x more often.
 //                         Narrowing the flush (see iq_vk.cpp's iq_grids) removed the serialisation and with it
 //                         the whole gap: 19.74 tok/s untiled (n=2) against 19.52 tiled (n=3).
-// So the default stays the untiled kernel: the tiled one is not slower, but it is not measurably faster
+// So the tiled path STAYS OPT-IN: the tiled one is not slower, but it is not measurably faster end to end
 // either, and a default is a claim.  `STRATA_VK_PREFILL_TILED=1` selects the tiled path for T >= 16 so the
 // claim stays testable; the same binary, same prompt, same flags, ids identical (`56a0b28d2de6`) in every arm.
+// (This block is about the FMA path only.  The SHIPPED default is no longer the untiled FMA kernel at all - it
+// is the cooperative-matrix kernel, whose own A/B is in the header above this function.)
 void prefill_fma(Stream& s, const Buf& xv, const Buf& wv, const Buf& yv, int64_t t, int64_t n, int64_t k,
                  int64_t ldy) {
     static const bool tiled_env = [] {
@@ -229,27 +256,33 @@ void gemm_f16(Stream& s, const uint16_t* X, const uint16_t* W, float* Y, int64_t
         !resolve_dev(s, Y, (uint64_t) T * ldy * 4, yv))
         refuse("prefill::Gemm::f16", "an operand is neither in this arena nor a live mapped region");
 
-    // The cooperative-matrix path, OFF by default and ON only when asked for (see the header note): the tile
-    // kernel has no ragged edge, so it takes only the CM_M-aligned rows and the FMA kernels finish the rest.
-    static const bool cma_env = [] {
+    // THE COOPERATIVE-MATRIX PATH IS THE DEFAULT FOR THE SHAPES IT CAN TAKE; `STRATA_VK_PREFILL_COOPMAT=0`
+    // forces the FMA path back on (the override is kept so the choice stays measurable in one binary).  The
+    // tile kernel has no ragged edge, so it takes only the CM_M-aligned rows and the FMA kernels finish the
+    // rest - which is also what keeps the SMALL-T case on the FMA path: a row count under CM_M (or a shape
+    // whose N or K is not a tile multiple) leaves t_cma at 0 and nothing is dispatched here.
+    static const int cma_env = [] {
         const char* v = std::getenv("STRATA_VK_PREFILL_COOPMAT");
-        return v != nullptr && std::atoi(v) != 0;
+        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);   // unset -> the default; 0 -> force FMA
     }();
     int64_t t_cma = 0;
     const strata::vulkan::DeviceInfo& di = s.ctx->info();
-    if (cma_env && beta == 0.0f && di.cooperative_matrix && di.cm_m == 8 && di.cm_n == 16 && di.cm_k == 16 &&
-        T >= 8 && N % 16 == 0 && K % 16 == 0)
+    // `di.subgroup_size <= 32` IS LOAD-BEARING: the kernel gives each of a 256-lane workgroup's subgroups one
+    // 8x16 column tile and stages a fixed 128-column W block, so a 64-wide subgroup (4 subgroups) would leave
+    // half of every block's columns uncomputed. It is a device-property precondition here, not a comment in the
+    // shader: an unknown (0) subgroup size makes the device INELIGIBLE, which is the safe direction.
+    if (cma_env != 0 && beta == 0.0f && di.cooperative_matrix && di.cm_m == 8 && di.cm_n == 16 && di.cm_k == 16 &&
+        di.subgroup_size != 0 && di.subgroup_size <= 32 && T >= 8 && N % 16 == 0 && K % 16 == 0)
         t_cma = (T / 8) * 8;
     if (t_cma > 0) {
         VkPipeline pc = s.ctx->pipeline(s.spv_dir + "/gemm_prefill_f16_m8.spv", 3, 16);
         struct { uint32_t t, n, k, ldy; } pc1{(uint32_t) t_cma, (uint32_t) N, (uint32_t) K, (uint32_t) ldy};
-        const uint32_t tiles = (uint32_t) ((t_cma / di.cm_m) * (N / di.cm_n));
-        // one 8x16 tile per SUBGROUP; how many a workgroup covers is gl_WorkGroupSize.x / gl_SubgroupSize.
-        // +1 workgroup: over-dispatch costs nothing (surplus tiles exit), under-dispatch drops output rows.
-        const uint32_t sub = di.subgroup_size ? di.subgroup_size : 32u;
-        const uint32_t per_wg = std::max<uint32_t>(1u, kLocal / sub);
-        const uint32_t groups = (tiles + per_wg - 1u) / per_wg + 1u;
-        s.ctx->dispatch(pc, {&xv, &wv, &yv}, &pc1, sizeof(pc1), groups);
+        // THE GRID IS THE SHADER'S BLOCK GRID (see kCmBn): t_cma/CM_M row blocks by ceil(N/CM_BN) column
+        // blocks, plus one workgroup of slack.  The kernel returns immediately on a workgroup past the grid,
+        // so the slack costs a no-op and covers any host rounding; a grid that is SHORT drops output rows.
+        const uint32_t blocks = (uint32_t) (t_cma / di.cm_m) *
+                                (uint32_t) ((N + kCmBn - 1) / kCmBn);
+        s.ctx->dispatch(pc, {&xv, &wv, &yv}, &pc1, sizeof(pc1), blocks + 1u);
     }
 
     const int64_t t_rem = T - t_cma;

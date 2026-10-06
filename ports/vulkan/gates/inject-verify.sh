@@ -202,6 +202,16 @@
 #                                       "live-batch probe: cudaStreamQuery does not say 'complete' while work
 #                                       is queued" (outstanding before/after 1/1)
 #
+#   (THE PREFILL GEMM's matrix-unit path: the shared-memory staged coopmat kernel and the WRAPPER's grid for it)
+#   inject-verify.sh prefill-cm-grid-short   vulkan/src/kernels/prefill_vk.cpp  dispatch the tile kernel ONE row
+#                                       block short -> must FAIL  "prefill Gemm::f16 entry: the tile-aligned grid"
+#   inject-verify.sh prefill-staged-b-rowmajor  common/gemm_prefill_staged.glsl  read the staged B tile RowMajor
+#                                       (the transposed-operand bug the kernel's own comment warns about)
+#                                       -> must FAIL  "prefill_cma"
+#   inject-verify.sh prefill-staged-drop-k-offset  common/gemm_prefill_staged.glsl  drop the `+ kk` inside the
+#                                       staged A load (every TK step re-reads the first TK columns)
+#                                       -> must FAIL  "prefill_cma"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -1035,6 +1045,34 @@ case "$name" in
     old=$'    const uint64_t base = (uint64_t) (uintptr_t) cache_base;'
     new=$'    const uint64_t base = (uint64_t) (uintptr_t) cache_base + 8;   // INJECTION: the base is off by 8 bytes'
     want="FAIL  resident_plan entry: ptr[grp]" ;;
+  prefill-cm-grid-short)
+    # THE HOST GRID OF THE MATRIX-UNIT PREFILL GEMM, ONE ROW BLOCK SHORT.  The wrapper dispatches
+    # t_cma/CM_M x ceil(N/CM_BN) workgroups (+1 slack) for a kernel that has no ragged edge and no error
+    # return: a grid one block short leaves the LAST row block uncomputed - which is what the case
+    # "prefill Gemm::f16 entry: the tile-aligned grid" exists to catch, at T=16 = two row blocks.
+    file="$TREE/vulkan/src/kernels/prefill_vk.cpp"; spv=""
+    old=$'        s.ctx->dispatch(pc, {&xv, &wv, &yv}, &pc1, sizeof(pc1), blocks + 1u);'
+    new=$'        s.ctx->dispatch(pc, {&xv, &wv, &yv}, &pc1, sizeof(pc1), (blocks > 1u ? blocks - 1u : 1u));'
+    want=$'FAIL  prefill Gemm::f16 entry: the tile-aligned grid' ;;
+  prefill-staged-b-rowmajor)
+    # THE TRANSFORMED-OPERAND BUG THE STAGED KERNEL'S OWN COMMENT WARNS ABOUT.  The staged B tile is loaded
+    # COLUMN-major out of the shared W block, because W's rows are B's columns; reading it RowMajor maps
+    # B[r][c] to a different element of the staged tile, which is a wrong matrix at every shape the gate
+    # reaches through gemm_prefill_f16_m8_staged.spv.
+    file="$SH/common/gemm_prefill_staged.glsl"; spv="gemm_prefill_f16_m8_staged"
+    comp="$SH/gemm_prefill_f16_m8_staged.comp"
+    old=$'            coopMatLoad(bmat, ws, sg * TN * WST + kk, WST, gl_CooperativeMatrixLayoutColumnMajor);'
+    new=$'            coopMatLoad(bmat, ws, sg * TN * WST + kk, WST, gl_CooperativeMatrixLayoutRowMajor);'
+    want=$'FAIL  prefill_cma_staged' ;;
+  prefill-staged-drop-k-offset)
+    # THE K OFFSET INSIDE THE STAGED TILE.  Every TK step must load the NEXT TK columns of the staged block
+    # (`+ kk`); dropping it makes each step re-read the first TK columns, so a K longer than one cooperative
+    # matrix step is summed wrongly - the "compiled fine, wrong number" failure a timing row cannot see.
+    file="$SH/common/gemm_prefill_staged.glsl"; spv="gemm_prefill_f16_m8_staged"
+    comp="$SH/gemm_prefill_f16_m8_staged.comp"
+    old=$'                coopMatLoad(amat, xs, kk, XST, gl_CooperativeMatrixLayoutRowMajor);'
+    new=$'                coopMatLoad(amat, xs, 0u, XST, gl_CooperativeMatrixLayoutRowMajor);'
+    want=$'FAIL  prefill_cma_staged' ;;
   cudart-stream-query-nofix)
     # THE CUDA-RUNTIME SMOKE'S OWN GUARD, IN THE FAILING DIRECTION.  `strata_vk_cudart_smoke` was a CMake target
     # that NOTHING ran, so the shipped `cudaStreamQuery` fix was unguarded.  Its UNFIXED answer is reachable in

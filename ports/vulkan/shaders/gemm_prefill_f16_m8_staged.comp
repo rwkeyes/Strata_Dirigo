@@ -1,0 +1,41 @@
+// ports/vulkan/shaders/gemm_prefill_f16_m8_staged.comp - THE COOPERATIVE-MATRIX PREFILL GEMM THAT STAGES ITS
+// OPERAND TILES IN SHARED MEMORY.
+//
+// It is the sibling of gemm_prefill_f16_m8.comp (which `coopMatLoad`s straight from GLOBAL memory).  SAME TILE,
+// SAME ARITHMETIC, SAME DISPATCH CONTRACT - only the memory schedule differs, which is what the shared body
+// (common/gemm_prefill_staged.glsl) documents at length.
+//
+// IT IS NOT THE SHIPPED DEFAULT, AND THAT IS A MEASUREMENT RATHER THAN A PREFERENCE.  On the Arc Pro B70, at the
+// engine's own expert shapes (`ports/vulkan/bench`, in-stream marginal cost, one dispatch per replay of a batch,
+// median of 9), staging is 2.5-3.2x SLOWER than the global-load kernel at every shape measured:
+//
+//   gate/up T=8   N=1280 K=2560   cm-global 0.402 ms   cm-staged 1.293 ms   staged/global 3.219
+//   gate/up T=16  N=1280 K=2560   0.406   1.299   3.201
+//   gate/up T=64  N=1280 K=2560   1.251   3.405   2.722
+//   gate/up T=199 N=1280 K=2560   3.334   9.043   2.712
+//   down    T=8   N=2560 K=640    0.110   0.334   3.045
+//   down    T=64  N=2560 K=640    0.536   1.359   2.537
+//   down    T=199 N=2560 K=640    1.609   4.915   3.054
+//
+// WHY, AND IT IS THE TILE'S ARITHMETIC INTENSITY, NOT THE IDEA.  This kernel's workgroup covers TM = 8 token rows
+// (one cooperative-matrix row block - the engine's expert row-batches are T ~ 8, so a taller block would stage
+// mostly zeros), so CM_BN = 128 columns of W are staged and used by ONE row block: 8 x 128 x BK MACs per
+// (128 + 8) x BK staged elements = **7.5 MACs per staged element**.  The reference's mul_mm.comp stages
+// BM=64 x BK and BN=64 x BK and computes 64 x 64 x BK MACs from them = **16 MACs per element** (and more once
+// WMITER/WNITER are counted), which is what pays for the staging, the barriers and the shared round trip on Xe2.
+// It does not pay here.  Making it pay needs a TALLER output block (BM 32-64 with a guarded store for the blocks
+// that hang off T), which is the next increment rather than a knob of this one.
+//
+// The body already carries the guard that makes the extra row count safe to add later, and it is the reason this
+// variant can be measured beside the shipped one at all: both are built by the gate (`gemm_prefill_f16_m8_staged`
+// is in the census's shared-memory list), both are measured by the bench, and the two staged falsifications in
+// `gates/inject-verify.sh` bite on THIS file.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+#define CM_M 8
+#include "common/gemm_prefill_staged.glsl"

@@ -717,10 +717,11 @@ void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
         skip("gemm_prefill", "device lacks storageBuffer16BitAccess - the operands are fp16");
         return;
     }
-    const bool cma = ctx.info().cooperative_matrix && ctx.info().cm_m == 8;
+    const bool cma = ctx.info().cooperative_matrix && ctx.info().cm_m == 8 && ctx.info().subgroup_size <= 32;
     std::printf("INFO  %-28s FMA on every shape; cooperative matrix %s\n", "gemm_prefill paths",
                 cma ? "on the tile-aligned ones (XMX, tile 8x16x16)"
-                    : "NOT USED - this device offers no M8 f16 config, so every shape takes the FMA path");
+                    : "NOT USED - this device offers no M8 f16 config (or a subgroup wider than 32), so every "
+                      "shape takes the FMA path");
     std::fflush(stdout);
 
     // THE TILED FMA KERNEL (gemm_prefill_fma.comp, the T >= 16 half of the wrapper's split), including the
@@ -752,6 +753,22 @@ void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
         prefill_check(ctx, dir, "gemm_prefill_f16_m8.spv", 8, 16, 16, 16, true, "prefill_cma 8x16x16 (one tile)");
         prefill_check(ctx, dir, "gemm_prefill_f16_m8.spv", 64, 512, 512, 512, true, "prefill_cma 64x512x512");
         prefill_check(ctx, dir, "gemm_prefill_f16_m8.spv", 128, 256, 256, 264, true, "prefill_cma 128x256x256 ldy>n");
+
+        // THE STAGED SIBLING (`gemm_prefill_f16_m8_staged.spv`): the same tile and the same arithmetic with the
+        // operands staged in SHARED memory.  It is NOT the shipped kernel - it measures 2.5-3.2x SLOWER at the
+        // engine's own shapes on this card (see the shader's header for the table and the reason: a TM = 8 row
+        // block gives 7.5 MACs per staged element where the reference's 64-row block gives 16+) - but it IS built,
+        // and a built kernel is a gated kernel in this port.  Same oracle, same tile-aligned shapes, distinct
+        // labels; `inject-verify.sh prefill-staged-b-rowmajor` and `...-drop-k-offset` must FALSIFY these arms,
+        // and the shared RNG is rewound around them so every later fixture is byte-identical.
+        {
+            const std::mt19937 rng_before_staged = g_rng;
+            prefill_check(ctx, dir, "gemm_prefill_f16_m8_staged.spv", 8, 16, 16, 16, true,
+                          "prefill_cma_staged 8x16x16 (one tile)");
+            prefill_check(ctx, dir, "gemm_prefill_f16_m8_staged.spv", 64, 512, 512, 520, true,
+                          "prefill_cma_staged 64x512x512 ldy>n");
+            g_rng = rng_before_staged;
+        }
 
         // THE SPLIT: T = 37 is 4 tiles of 8 plus 5 rows, so the aligned rows go to the matrix units and the
         // remainder to the FMA kernel - the two halves a real prefill of an odd-length prompt actually takes.
@@ -22452,6 +22469,61 @@ void case_prefill_entry(Ctx& ctx, const std::string& dir) {
         }
         verdict("prefill Gemm::f16 entry: beta=1 ADDS (Y = Y + X.W^T)", b2 == 0, b2, (int) (T * N), w2,
                 "the FMA kernel does not accumulate; the wrapper must");
+    }
+
+    // ---- (1b) THE MATRIX-UNIT GRID, THROUGH THE WRAPPER ------------------------------------------------
+    // The wrapper dispatches the cooperative-matrix kernel's BLOCK grid - t_cma/CM_M row blocks by
+    // ceil(N/CM_BN) column blocks, plus one workgroup of slack - and the matrix-unit kernels have NO
+    // ragged-edge path and no error return: a grid that is short simply leaves whole row blocks uncomputed.
+    // The arms above are all too small to reach it (T=3 < 8, N=5 not a tile multiple), so this arm drives the
+    // WRAPPER at a tile-aligned shape and grades the whole (T x ldy) block against a host double reference.
+    //
+    // THE SHAPE IS CHOSEN SO A SHORT GRID IS A FAILURE FOR **BOTH** MATRIX-UNIT MAPPINGS, and that is not
+    // automatic.  `gemm_prefill_f16_m8` (shipped) computes ONE 8x16 TILE PER SUBGROUP, so one 256-lane
+    // workgroup covers EIGHT tiles = up to 128 columns of TWO row blocks; the staged sibling computes one
+    // BLOCK (8 rows x CM_BN columns) per workgroup.  At N = 64 the shipped kernel needs HALF the workgroups
+    // the block grid names, so a one-workgroup-short dispatch is still enough for it and the injection does
+    // not bite (measured: N=64 passes 1152/1152 with the grid one short).  At N >= CM_BN the two mappings need
+    // the same count and the arm discriminates: `inject-verify.sh prefill-cm-grid-short` must FAIL it.
+    {
+        const std::mt19937 rng_before_cm_grid = g_rng;   // the shared RNG is rewound (see the note in (1))
+        const int64_t T = 16, N = 128, K = 32, ldy = 136;
+        std::vector<float> xf((size_t) T * K), wf((size_t) N * K);
+        for (float& v : xf) v = rndf(1.0f);
+        for (float& v : wf) v = rndf(1.0f);
+        std::vector<uint16_t> x16(xf.size()), w16(wf.size());
+        std::vector<double> xr(xf.size()), wr(wf.size());
+        for (size_t i = 0; i < xf.size(); ++i) { x16[i] = f16_from_f32(xf[i]); xr[i] = (double) strata::kernels::f32_from_f16(x16[i]); }
+        for (size_t i = 0; i < wf.size(); ++i) { w16[i] = f16_from_f32(wf[i]); wr[i] = (double) strata::kernels::f32_from_f16(w16[i]); }
+        uint16_t* dX = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) T * K);
+        uint16_t* dW = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) N * K);
+        float* dY = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * ldy);
+        strata::vulkan::stream_write(*s, dX, x16.data(), x16.size() * 2);
+        strata::vulkan::stream_write(*s, dW, w16.data(), w16.size() * 2);
+        std::vector<float> z((size_t) T * ldy, -1e30f);
+        strata::vulkan::stream_write(*s, dY, z.data(), z.size() * 4);
+        gm.f16(dX, dW, dY, T, N, K, ldy, 0.0f);
+        std::vector<float> got((size_t) T * ldy);
+        strata::vulkan::stream_read(*s, dY, got.data(), got.size() * 4);
+        int bad = 0, untouched = 0;
+        double worst = 0;
+        for (int64_t r = 0; r < T; ++r) {
+            for (int64_t c = 0; c < N; ++c) {
+                double acc = 0;
+                for (int64_t i = 0; i < K; ++i) acc += xr[r * K + i] * wr[c * K + i];
+                const double d = std::fabs((double) got[r * ldy + c] - acc);
+                if (!(d <= 1e-4 * (1.0 + std::fabs(acc)))) ++bad;
+                worst = std::max(worst, d);
+            }
+            for (int64_t c = N; c < ldy; ++c) if (got[r * ldy + c] != -1e30f) ++untouched;
+        }
+        std::printf("      cm-grid arm: T=%lld N=%lld K=%lld ldy=%lld, %d element(s) wrong, %d stride float(s) "
+                    "written outside N\n", (long long) T, (long long) N, (long long) K, (long long) ldy, bad,
+                    untouched);
+        verdict("prefill Gemm::f16 entry: the tile-aligned grid (T=16 N=128 K=32, ldy>N) computes EVERY row block",
+                bad == 0 && untouched == 0, bad + untouched, (int) (T * ldy), worst,
+                "a short host grid leaves whole row blocks uncomputed");
+        g_rng = rng_before_cm_grid;
     }
 
     // ---- (2) Gemm::bf16 - the engine's own bf16->f16 route, vs the clamped host transcription --------------

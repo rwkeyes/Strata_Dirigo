@@ -1,5 +1,182 @@
 # Start here next session
 
+## THE PREFILL GEMM, SETTLED THREE WAYS: COOPMAT IS FASTER AND IS NOW THE DEFAULT FOR TILE-ALIGNED SHAPES; AND THE SHARED-MEMORY STAGING THE REFERENCE HAS IS A **LOSS** AT THIS PORT'S TILE (2026-10-06, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH.** The label was the problem, so the A/B was rebuilt around proofs instead of names: ten
+sequential engine arms, n=5 per arm, EACH arm's own log carrying both `env | grep -i strata_vk` as launched and
+the per-shader dispatch histogram - and the cooperative-matrix arms are **17.4% faster** (median 9,905.6 ms against
+11,632.0 ms on the 199-token arm), with not one arm of either set overlapping the other. So the matrix-unit path is
+now **the default** for the shapes it can take (`STRATA_VK_PREFILL_COOPMAT=0` forces the FMA path back on, and the
+shape precondition `t%8==0 && n%16==0 && k%16==0` - no ragged edge - IS the small-T rule). The third thing the
+brief asked for, the reference's **shared-memory operand staging**, was implemented, gated, falsified and measured
+three ways - and it is a **2.5-3.2x loss per dispatch and a 1.62x loss end to end**, for a reason that is named
+rather than hand-waved: a TM = 8 row block gives **7.5 MACs per staged element** where the reference's 64-row block
+gives 16+, so the staging and its barriers cannot be amortised at this port's tile. It is built, gated and
+bench-armed, and it is NOT dispatched by anything.
+
+### 1. TASK 1 - THE CLEAN REPEATED A/B.  EACH ARM PROVES ITS OWN CONFIGURATION.
+
+`--spec 2 --prefill 256`, the 199-token prompt, one config per invocation (`setsid nohup ... < /dev/null`, polled;
+never a foreground long run), `STRATA_VK_DISP_STAT=1` in every run, interleaved def/cm so a drift cannot land on one
+arm. Every arm's log opens with the environment it was launched with; every arm's log ends with the histogram.
+
+| arm | mode | prefill ms | tok/s | `gemm_prefill_f16_m8` | `gemm_prefill_fma_small` | env line (the arm's own log) |
+|---|---|---:|---:|---:|---:|---|
+| `t1_def_1` | default | 11,613.1 | 17.14 | **0 (absent)** | 7,716 | `STRATA_VK_PREFILL_COOPMAT` **unset** |
+| `t1_def_2` | default | 12,338.8 | 16.13 | 0 | 7,7xx | unset |
+| `t1_def_3` | default | 11,632.0 | 17.11 | 0 | 7,7xx | unset |
+| `t1_def_4` | default | 12,084.4 | 16.47 | 0 | 7,7xx | unset |
+| `t1_def_5` | default | 11,629.5 | 17.11 | 0 | 7,7xx | unset |
+| `t1_cm_2` | coopmat | **9,905.6** | **20.09** | **3,850** | 7,150 | `STRATA_VK_PREFILL_COOPMAT=1` |
+| `t1_cm_3` | coopmat | 10,082.4 | 19.74 | 3,850 | 7,150 | =1 |
+| `t1_cm_4` | coopmat | 9,916.2 | 20.07 | 3,850 | 7,150 | =1 |
+| `t1_cm_5` | coopmat | 9,881.6 | 20.14 | 3,850 | 7,150 | =1 |
+| `t1_cm_6` | coopmat | 9,884.9 | 20.13 | 3,850 | 7,150 | =1 |
+
+* **Default (untiled FMA): n=5, median 11,632.0 ms, 17.11 tok/s, spread 11,613.1-12,338.8 (6.2%).**
+* **Cooperative matrix: n=5, median 9,905.6 ms, 20.09 tok/s, spread 9,881.6-10,082.4 (2.0%).**
+* **Coopmat is faster by 1.174x (14.8% less time, 17.4% more tok/s), and the ranges do not overlap** - the
+  slowest coopmat arm (10,082.4 ms) beats the fastest default arm (11,613.1 ms) by 13%.
+* **The labels are evidence.** No default arm's histogram contains `gemm_prefill_f16_m8.spv` at all (the pipeline is
+  only opened inside the coopmat branch); every coopmat arm's contains 3,850, beside `fma_small` at 7,150. An arm
+  label that is assumed is not evidence - `t1_cm_1` is EXCLUDED from the table because its own log shows it never
+  ran the engine: it refused the 28,560 MiB arena (`REFUSING ... free (driver) 3.30 GiB`) while the previous arm
+  still held the card, and the driver's validator rejected it (`INVALID ... no CM dispatch`). It was re-run, not
+  relabelled.
+* Ids: `output` line md5 **`56a0b28d2de6`** in **all ten** arms. Logs: `/tmp/gemm/t1_{def,cm}_*.log`,
+  driver `/tmp/gemm/ab_driver2.log`.
+
+### 2. TASK 2 - THE DEFAULT MOVED, AND THE FMA PATH IS STILL THERE.
+
+`vulkan/src/kernels/prefill_vk.cpp::gemm_f16`: `STRATA_VK_PREFILL_COOPMAT` is now read as a THREE-state switch
+(unset = the default, `0` = force the FMA path, anything else = force coopmat), and the dispatch is unchanged
+except for the grid, which is now the SHADER'S BLOCK GRID (see Task 3). The eligibility rule is the shape
+precondition, not a token threshold: `beta == 0`, `di.cooperative_matrix`, `cm = 8x16x16`, `subgroup_size <= 32`,
+`T >= 8`, `N % 16 == 0`, `K % 16 == 0`; `t_cma = (T/8)*8` rows go to the matrix units and `T % 8` rows (plus every
+T < 8 call, which is most of the expert row-batches) stay on the FMA kernels.
+
+**PROOF, per run:** four more arms with NO `STRATA_VK_PREFILL_COOPMAT` in their environment at all, each one's
+histogram showing the matrix-unit kernel (`gemm_prefill_f16_m8.spv` 3,850 beside `fma_small` 7,150):
+
+| arm | prefill ms | tok/s | ids md5 |
+|---|---:|---:|---|
+| `q_def_1` | 9,884.3 | 20.13 | `56a0b28d2de6` |
+| `q_def_2` | 9,925.8 | 20.05 | `56a0b28d2de6` |
+| `q_def_3` | 9,918.2 | 20.06 | `56a0b28d2de6` |
+| `q_def_4` | 9,886.0 | 20.13 | `56a0b28d2de6` |
+
+median 9,900.2 ms / 20.09 tok/s - inside the coopmat set above and 1.17x the FMA set, with the ids identical
+(logs `/tmp/gemm/q_def_*.log`). `STRATA_VK_PREFILL_COOPMAT=0` still selects the FMA path; the env override is kept
+so the choice stays measurable in one binary (verified: `q_t3f_1`, `STRATA_VK_PREFILL_COOPMAT=0`, 11,621.0 ms /
+17.12 tok/s, histogram `gemm_prefill_fma_small.spv` 7,716 and NO `gemm_prefill_f16_m8.spv`, id `56a0b28d2de6`).
+
+**AND THE PHASE TABLE PUTS THE SAME ORDER WHERE THE TOK/S DOES.** With `STRATA_PREFILL_TIMING=1` on both paths at
+the same shape and flags, the two GEMM phases cost **718 + 626 = 1,344 ms** on the shipped matrix-unit kernel
+(`q_t3g_1`/`q_t3g_2`, 13.5-13.8% of a 9,981/9,756 ms GPU timeline) against **4,053 + 454 = 4,507 ms** on the FMA
+path (`q_t3f_1`, 39.4% of an 11,449 ms timeline) - 3.4x. The phase table is host wall-clock (see 3(c) below) and
+is used as a RANKING only, but the ranking agrees with the A/B, which is exactly what it is for.
+
+### 3. TASK 3 - THE SHARED-MEMORY STAGING: BUILT, GATED, FALSIFIED, AND MEASURED **SLOWER**, THREE WAYS.
+
+The reference (`~/llama-050/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp` and `mul_mmq.comp`) stages both
+operand tiles in shared memory before the cooperative-matrix load
+(`shared FLOAT_TYPEV2 buf_a[BM*SHMEM_STRIDE] ... load_a_to_shmem(...); barrier(); coopMatLoad(cache_a, buf_a, ...)`).
+This port's coopmat GEMM `coopMatLoad`ed straight from global. `common/gemm_prefill_staged.glsl` now does what the
+reference does: a workgroup stages `X[TM x BK]` and `W[128 x BK]` (BK = 32) into shared memory with coalesced
+loads, one barrier, then each subgroup `coopMatLoad`s its own 8x16 tile from SHARED, then a second barrier.
+Shared memory used: 10,880 B of this card's 131,072 B. It is a compile-time variant
+(`gemm_prefill_f16_m8_staged.comp`), gated (two arms), falsified (two registered injections), bench-armed - and
+**not the shipped kernel**.
+
+**(a) The bench, in-stream marginal cost** (one dispatch per replay of a batch of 8, median of 9,
+`ports/vulkan/bench`, log `/tmp/gemm/bench.log` and `bench/build/icd-intel_icd.log`):
+
+| shape | cm-global ms | cm-staged ms | staged/global | fma-untiled | fma-tiled |
+|---|---:|---:|---:|---:|---:|
+| gate/up T=8 N=1280 K=2560 | 0.4017 | 1.2930 | **3.219** | 0.1952 | 0.2384 |
+| gate/up T=16 | 0.4057 | 1.2985 | **3.201** | 0.2822 | 0.2393 |
+| gate/up T=64 | 1.2511 | 3.4052 | **2.722** | 2.8117 | 0.3611 |
+| gate/up T=199 | 3.3341 | 9.0432 | **2.712** | 6.3302 | 1.0564 |
+| down T=8 N=2560 K=640 | 0.1099 | 0.3345 | **3.045** | 0.0688 | 0.0846 |
+| down T=64 | 0.5358 | 1.3594 | **2.537** | 1.1797 | 0.1390 |
+| down T=199 | 1.6094 | 4.9149 | **3.054** | 3.3530 | 0.4822 |
+
+**(b) The engine, end to end, phase table on** (`STRATA_PREFILL_TIMING=1`; the staged kernel under the shipped
+file name in its own SPV dir, and the sha256 of the kernel each arm was actually going to load written into its own
+log - `67a05a3e...` for the global build, `8f8d743d...` for the staged one):
+
+| arm | coopmat kernel | prefill ms | tok/s | phase `gemm gate/up` | `gemm down` | GPU timeline |
+|---|---|---:|---:|---:|---:|---:|
+| `q_t3g_1` | global (shipped) | 10,120.2 | 19.66 | 718 ms | 626 ms | 9,981 ms |
+| `q_t3g_2` | global (shipped) | 9,896.4 | 20.11 | 716 ms | 629 ms | 9,756 ms |
+| `q_t3s_1` | **staged** | **16,033.5** | **12.41** | 1,615 ms | 1,365 ms | 15,858 ms |
+| `q_t3s_2` | **staged** | **16,012.3** | **12.43** | - | - | - |
+
+**(c) The phase table** - the third measurement, and the phase table is HOST WALL-CLOCK (this port's standing
+caveat: it charges a phase for whatever the host blocked on, which is why the same dequant work has been charged
+28 ms and 2,059 ms on two arms). Used as the RANKING it is: the two GEMM phases go from **1,344-1,345 ms (13.5-13.8%)**
+on the shipped kernel to **2,980 ms (18.7%)** on the staged one, and the whole prefill's GPU timeline from
+9,756-9,981 ms to 15,858 ms - a 1.62x loss, consistent with (a) and (b) and **not** a figure this port would quote
+as GPU time; the flush `wait` is the GPU-bound number and is in the same logs.
+
+**WHY IT LOSES, NAMED.** Not the barriers, not the shared bandwidth: the TILE'S ARITHMETIC INTENSITY. This
+workgroup covers `TM = 8` token rows (one cooperative-matrix row block - the engine's expert row-batches are ~8
+tokens, so a taller block would stage mostly zeros), so 128 columns of W are staged and consumed by ONE row block:
+`8*128*BK` MACs per `(128+8)*BK` staged elements = **7.5 MACs per staged element**. `mul_mm.comp` stages BM=64 and
+BN=64 and computes `64*64*BK` from them = **16 MACs per element**, which is what pays for the staging on Xe2.
+**The next increment, named:** a TALLER output block (BM 32-64 with the accumulator stored through shared memory
+with per-element guards, as the reference does for a partial tile) - and the guard that makes it safe is already in
+the staged body.
+
+**THE NUMERIC BAR IS MET FOR BOTH KERNELS.** The staged kernel is bit-equivalent to the global one by construction
+(same tile, same k order, same f32 accumulate: the staged reads are the same elements in the same order), the ids
+are identical in every arm above, and the gate's GEMM arms pass for BOTH builds - including two NEW arms that
+exercise the staged kernel directly (`prefill_cma_staged 8x16x16 (one tile)` and `prefill_cma_staged 64x512x512
+ldy>n`) and one new arm that drives the WRAPPER's grid at T=16 (two row blocks, so a short grid is a FAILURE).
+Three registered injections bite: `prefill-staged-b-rowmajor` (FALSIFIED: `prefill_cma_staged 8x16x16 ... 0/128
+worst 42.7`), `prefill-staged-drop-k-offset` (`... 64x512x512 ldy>n 19/32768 worst 1.85e+05`) and
+`prefill-cm-grid-short` (`FAIL prefill Gemm::f16 entry: the tile-aligned grid (T=16 N=128 K=32, ldy>N) ... 1152/2176
+worst 1e+30`, i.e. the whole second row block).
+
+**AND THE NEW GRID ARM WAS ITSELF WRONG FIRST, WHICH IS WHY ITS SHAPE IS N=128 AND NOT N=64.** Written at
+N=64/ldy=72 it PASSED with the grid one workgroup short - because the SHIPPED kernel computes one 8x16 TILE PER
+SUBGROUP, so a single 256-lane workgroup covers eight tiles = 128 columns of TWO row blocks, and at N=64 the
+wrapper's block grid names twice the workgroups that kernel needs. The injection therefore did not bite: the arm
+was an oracle for the staged kernel (one block per workgroup, where it failed 640/1152) and VACUOUS for the shipped
+one. At N=128 (>= CM_BN) the two mappings need the same count, the injection bites for both, and the arm's own
+comment now carries the arithmetic. A case that cannot fail is not an oracle - this is the third time in this port
+that an ASSERTION was right and the ARM was wrong.
+
+
+### 4. GATE, IDS, MAP, PATHS.
+
+Gate on the Arc (`intel_icd`): **889 passed / 0 failed / 0 skipped** - the count RISES by the three new arms
+(886 -> 889), nothing is removed, nothing is skipped, no bound is widened; lvp `873/0/4` (the same four documented
+skips); radeon `875/3/2` on the full run and **`878/0/2` on an immediate re-run of the SAME binary** - the three
+failures (`fused_gdn_ab entry` 95/96, `qsa_decode_attn` 6138/6144, `bf16_gemv_fp32_mmvf_cols entry` 2493/2496, none
+of them a case this batch touches) CLEARED, which is the documented RADV moving-failing-set intermittent; smoke
+`60/0/0` - all in `/tmp/gemm/gate_final.log` and `/tmp/gemm/q_radeon_recheck.log`, and `run_gate.sh` exits 1 because
+of the radeon arm, as documented.
+Ids: **`56a0b28d2de6`** (199-token) in **all nineteen** arms of this batch, and **`3aed108cceee`** (8-token) in
+both of the two 8-token arms (`/tmp/gemm/e_def_*.log`: prefill 7 tokens, decode 8.20 tok/s, unmoved by any of
+this). `check_port_map.py` passes and `make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically (148 shaders
+built, one more than before: the staged variant).
+Log paths, exact: `/tmp/gemm/t1_{def,cm}_*.log` (Task 1 A/B), `/tmp/gemm/q_def_*.log` (the flip),
+`/tmp/gemm/q_t3{g,s,f}_*.log` (the staging and the FMA phase arm, with the sha256 of the kernel each arm loaded),
+`/tmp/gemm/e_def_*.log` (the 8-token id), `/tmp/gemm/bench.log` + `ports/vulkan/bench/build/icd-*.log` (the bench),
+`/tmp/gemm/gate_final.log` (the gate).
+
+**NOT DONE / DELIBERATELY LEFT.** (i) The staged kernel is NOT shipped as the default and is not dispatched by
+anything - the honest reading of a 1.62x end-to-end loss; the taller-block design that could make staging pay is
+described above and NOT attempted. (ii) T is not thresholded: the shipped rule is the shape precondition, and the
+bench's finding that the UNTILED FMA kernel is the fastest of the four at T = 8 in isolation (0.195 ms against the
+matrix units' 0.402) is recorded but NOT turned into a T threshold, because the engine's end-to-end A/B (the
+authority) favours the matrix units at the shapes this model's prefill actually issues, and a threshold picked from
+an isolated row would be exactly the "selection by an unmeasured claim" this port refuses.
+(iii) The tiled FMA kernel `gemm_prefill_fma` was not re-thresholded or promoted: it remains opt-in and unmeasured
+end to end since the last batch. (iv) The radeon bench arm hard-recovered (context lost) during this batch's bench
+run; it is the documented RADV iGPU intermittent, recorded and not chased.
+
 ## THE PREFILL'S `dequant` PHASE IS NOT THE DEQUANT KERNEL, AND THE +3,172 DISPATCHES WERE A GEMM CHOICE — the idle-lane fix is real, measured, and does not move the prefill; the default GEMM arm is ~12% slower than coopmat (2026-10-06, `vega`, Arc Pro B70)
 
 **BOTH OF THE BRIEF'S TARGET-1 NUMBERS ARE PRICED FROM INSTRUMENTS THAT DO NOT MEASURE THE KERNEL, AND A THIRD THAT DOES SETTLES IT.** Target 1 was "cut the dequant cost" on the strength of (a) a 2,054 ms `dequant` phase and (b) "`iq_dequant_f32` costs ~0.55 ms/dispatch over 10,833 dispatches". Reconciled against the port's own throughput harness (`ports/vulkan/bench/`), the kernel is **~0.30-0.60 s, i.e. ~3-5% of the prefill**, and (b) is the SUBMISSION layer's per-call cost, not the kernel's. The lane mapping was exactly as diagnosed, the fix was written and measured, and it buys **6.5-8.7% of the kernel on the Arc** (and 2.4-3.1x on llvmpipe / 2.45x on the Ryzen iGPU) with **no end-to-end prefill change** — so it is **reverted, with the patch and every number recorded below** rather than shipped as an unmeasured claim. The target MOVED: the default untiled GEMM is ~12% slower end-to-end than the coopmat arm, and that is where the next measurement should go.

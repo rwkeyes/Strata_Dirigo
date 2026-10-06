@@ -1,5 +1,97 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE PREFILL GEMM: COOPMAT IS 17.4% FASTER (n=5 A/B, EACH ARM PROVING ITS OWN CONFIG) AND IS NOW THE DEFAULT; THE SHARED-MEMORY STAGING IS A 2.5-3.2x LOSS PER DISPATCH AND 1.62x END TO END (later, same day, `vega`, Arc Pro B70)
+
+**THE A/B, AND WHY THE LABELS ARE NOW EVIDENCE.** Ten sequential engine arms, 199-token prompt,
+`--spec 2 --prefill 256`, `STRATA_VK_DISP_STAT=1`, one config per invocation, interleaved def/cm, and **every arm's
+own log carries both `env | grep -i strata_vk` as it was launched and its per-shader dispatch histogram** - the
+previous batch lost a whole set of arms to an inherited `STRATA_VK_PREFILL_COOPMAT=1`.
+
+| arm | prefill ms | tok/s | `gemm_prefill_f16_m8.spv` | `gemm_prefill_fma_small.spv` |
+|---|---:|---:|---:|---:|
+| `t1_def_1` default | 11,613.1 | 17.14 | absent | 7,716 |
+| `t1_def_2` default | 12,338.8 | 16.13 | absent | 7,716 |
+| `t1_def_3` default | 11,632.0 | 17.11 | absent | 7,7xx |
+| `t1_def_4` default | 12,084.4 | 16.47 | absent | 7,7xx |
+| `t1_def_5` default | 11,629.5 | 17.11 | absent | 7,7xx |
+| `t1_cm_2` coopmat | **9,905.6** | **20.09** | **3,850** | 7,150 |
+| `t1_cm_3` coopmat | 10,082.4 | 19.74 | 3,850 | 7,150 |
+| `t1_cm_4` coopmat | 9,916.2 | 20.07 | 3,850 | 7,150 |
+| `t1_cm_5` coopmat | 9,881.6 | 20.14 | 3,850 | 7,150 |
+| `t1_cm_6` coopmat | 9,884.9 | 20.13 | 3,850 | 7,150 |
+
+**median 11,632.0 ms / 17.11 tok/s (default) against 9,905.6 ms / 20.09 tok/s (coopmat): 1.174x, and the ranges do
+not overlap** (the slowest coopmat arm beats the fastest default arm by 13%). Spread: 6.2% default, 2.0% coopmat.
+One arm (`t1_cm_1`) is excluded because its own log shows it refused the arena while the previous arm held the card;
+it was re-run, not relabelled. Ids `56a0b28d2de6` in all ten.
+
+**THE DEFAULT MOVED, AND IT IS VERIFIED PER RUN.** Four arms with NO `STRATA_VK_PREFILL_COOPMAT` in their
+environment at all: **9,884.3 / 9,925.8 / 9,918.2 / 9,886.0 ms** (20.13 / 20.05 / 20.06 / 20.13 tok/s, median
+9,900.2 ms / 20.09 tok/s) - each one's histogram showing `gemm_prefill_f16_m8.spv` 3,850, i.e. the matrix units ran
+with nothing set. `STRATA_VK_PREFILL_COOPMAT=0` still forces the FMA path; the shape precondition
+(`t%8==0 && n%16==0 && k%16==0`, no ragged edge) is the small-T rule, so every T<8 and every ragged shape stays on
+the FMA kernels.
+
+**THE REFERENCE'S SHARED-MEMORY STAGING, MEASURED THREE WAYS - AND IT LOSES.** llama.cpp's `mul_mm.comp` /
+`mul_mmq.comp` stage the operand tiles in shared memory before the cooperative-matrix load; this port loaded
+straight from global. That staging is now implemented (`shaders/common/gemm_prefill_staged.glsl`, a workgroup
+stages `X[8 x 32]` and `W[128 x 32]` into 10,880 B of the card's 131,072 B with two barriers per K step), gated,
+falsified twice, and measured:
+
+**(a) bench, in-stream marginal cost** (one dispatch per replay, batch 8, median of 9):
+
+| shape | cm-global ms | cm-staged ms | staged/global |
+|---|---:|---:|---:|
+| gate/up T=8 N=1280 K=2560 | 0.4017 | 1.2930 | **3.219** |
+| gate/up T=16 | 0.4057 | 1.2985 | **3.201** |
+| gate/up T=64 | 1.2511 | 3.4052 | **2.722** |
+| gate/up T=199 | 3.3341 | 9.0432 | **2.712** |
+| down T=8 N=2560 K=640 | 0.1099 | 0.3345 | **3.045** |
+| down T=64 | 0.5358 | 1.3594 | **2.537** |
+| down T=199 | 1.6094 | 4.9149 | **3.054** |
+
+**(b) engine, end to end** (the staged kernel under the shipped file name in its own SPV dir; each arm logs the
+sha256 of the kernel it will load - `8f8d743d...` staged, `67a05a3e...` global):
+
+| arm | kernel | prefill ms | tok/s |
+|---|---|---:|---:|
+| `q_t3g_1` | global (shipped) | 10,120.2 | 19.66 |
+| `q_t3g_2` | global (shipped) | 9,896.4 | 20.11 |
+| `q_t3s_1` | staged | **16,033.5** | **12.41** |
+| `q_t3s_2` | staged | **16,012.3** | **12.43** |
+
+**(c) phase table** (`STRATA_PREFILL_TIMING=1`, HOST WALL-CLOCK - used as a ranking, not as GPU time): `gemm
+gate/up` + `gemm down` = **718+626 = 1,344 ms** on the shipped kernel (13.5% of a 9,981 ms timeline) against
+**1,615+1,365 = 2,980 ms** (18.7% of 15,858 ms) staged; the GPU timeline itself goes 9,756-9,981 ms -> 15,858 ms.
+The same pair of phases on the FMA path (`q_t3f_1`, `STRATA_VK_PREFILL_COOPMAT=0`) is **4,053+454 = 4,507 ms**
+(39.4% of 11,449 ms) - so the table ranks the three arms the way the token rate does: matrix units, then FMA, then
+staged.
+
+**WHY, AND IT IS THE TILE, NOT THE IDEA.** A workgroup here covers `TM = 8` token rows - one cooperative-matrix row
+block, because the engine's expert row-batches are ~8 tokens - so 128 staged W columns feed a single row block:
+**7.5 MACs per staged element**. `mul_mm.comp` stages a 64x64 output block and gets **16 MACs per element**, which
+is what pays for the staging, the barriers and the shared round trip on Xe2. Fixed by a TALLER output block
+(BM 32-64, guarded store through shared memory, as the reference does for partial tiles) - a named next increment,
+not attempted here. The staged kernel is built, gated and bench-armed and **nothing dispatches it**.
+
+**FOR SCALE.** The same bench, same shapes: the untiled FMA kernel is the FASTEST of the four at T=8 (0.195 ms
+against coopmat's 0.402 and the tiled FMA's 0.238), and the tiled FMA kernel is the fastest at T>=64 (gate/up T=199:
+1.056 ms against coopmat 3.334 and untiled 6.330) - yet the engine's end-to-end A/B (the authority) has coopmat
+17.4% ahead of the untiled path and the tiled path a wash (19.52 against 19.74 tok/s, n=3 vs n=2). An isolated row
+ranks kernels; it does not decide the default.
+
+**GATE + IDS.** Arc `intel_icd` **889 passed / 0 failed / 0 skipped** (the count RISES by the three new arms, 886 ->
+889; nothing skipped, no bound widened), the intel default arm likewise `889/0/0`; lvp `873/0/4` and radeon
+`875/3/2` in the full run with **`878/0/2` on an immediate re-run of the same binary** (the three failures - none of
+them a case this batch touches - CLEARED: the documented RADV moving-failing-set), smoke `60/0/0` - all in
+`/tmp/gemm/gate_final.log` and `/tmp/gemm/q_radeon_recheck.log`. Three injections FALSIFY the new arithmetic and the
+new grid (`prefill-cm-grid-short` 1152/2176 worst 1e+30; the arm had to be widened from N=64 to N=128 first, because
+at N=64 the SHIPPED kernel's eight-tiles-per-workgroup mapping is still covered by a one-short grid - see NEXT.md).
+Ids `56a0b28d2de6` (199-token) in all nineteen 199-token arms and `3aed108cceee` (8-token) in both 8-token arms
+(decode 8.20 tok/s, unmoved). Logs: `/tmp/gemm/t1_{def,cm}_*.log`, `/tmp/gemm/q_def_*.log`,
+`/tmp/gemm/q_t3{g,s,f}_*.log`, `/tmp/gemm/e_def_*.log`, `/tmp/gemm/bench.log`,
+`ports/vulkan/bench/build/icd-*.log`, `/tmp/gemm/gate_final.log`.
+
 ## THE DEQUANT PHASE IS NOT THE DEQUANT KERNEL — the idle-lane fix is worth ~7% of the kernel and 0% of the prefill, and the default GEMM arm is ~12% slower than coopmat (later, same day, `vega`, Arc Pro B70)
 
 **THIS SECTION FALSIFIES THE PREMISE OF THE PREVIOUS ONE, WITH THE PORT'S OWN BENCH.** The previous section's

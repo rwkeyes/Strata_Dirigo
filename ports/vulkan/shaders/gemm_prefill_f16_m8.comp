@@ -10,6 +10,12 @@
 // the Radeon that did is no longer in the box), and an untested tile variant is exactly the kind of claim this port
 // does not make.  Where the device's tile is not 8, the caller uses gemm_prefill_fma.comp - slower, correct, and
 // verified on every implementation.
+//
+// THIS IS THE SHIPPED KERNEL, AND IT IS THE GLOBAL-LOAD ONE ON A MEASUREMENT.  `gemm_prefill_f16_m8_staged.comp`
+// is the same tile with the operands staged in shared memory (as llama.cpp's mul_mm.comp does); on this card at
+// the engine's expert shapes it is **2.5-3.2x SLOWER** (see that file's header for the table and for the reason:
+// a TM = 8 row block gives 7.5 MACs per staged element where the reference's 64-row block gives 16+).  Both are
+// built and gated; this one is what the wrapper dispatches.
 #version 450
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require

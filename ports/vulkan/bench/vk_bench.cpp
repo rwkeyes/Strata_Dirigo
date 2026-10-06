@@ -182,6 +182,93 @@ std::vector<float> floats(size_t n) {
     return v;
 }
 
+// A finite, non-zero f16 fixture value: a random sign, exponent 14 or 15 (so |v| is in [0.5, 2)) and a random
+// mantissa.  No NaN and no denormal, so a timing arm cannot be measuring a subnormal flush.
+uint16_t rnd_half() {
+    const uint32_t r = next_rand();
+    const uint16_t sign = (uint16_t) ((r >> 20) & 0x8000u);
+    const uint16_t exp = (uint16_t) (0x3800u | ((r >> 8) & 0x0400u));
+    return (uint16_t) (sign | exp | (uint16_t) (r & 0x3FFu));
+}
+
+// =========================================================================================================
+// THE PREFILL GEMM - `strata::prefill::Gemm::f16`, i.e. Y[T x ldy] = X[T x K] . W[N x K]^T with f16 operands
+// and an f32 accumulate.  THE ONE DEEP KERNEL OF THE PROMPT PATH: it is what `gemm_prefill_*` compute, and the
+// rows below are its IN-STREAM MARGINAL COST (one dispatch per replay of a batch, median of `reps`), the same
+// instrument and the same documented limit as every other row in this file - the harness's buffers are the
+// mapped host-visible type, so a row is a per-dispatch cost for comparing two kernels and NOT a bandwidth
+// figure.
+//
+// THE SHAPES ARE THE ENGINE'S.  An expert's gate/up projection is N = n_ff = 1280, K = n_embd = 2560; its down
+// projection is N = n_embd = 2560, K = n_ff/2 = 640; and the TOKEN COUNT is the row-batch routed to that
+// expert, so 8/16/64/199 are the arms that matter rather than one prompt-sized shape.
+//
+// THE GRID IS THE CALLER'S CONTRACT, and each variant's is taken from the caller that really dispatches it:
+// the untiled small-T kernel is one invocation per output element; the cooperative-matrix kernel is
+// dispatched as an upper bound of one workgroup per tile (the gate's own `(t/8)*(n/16) + 8`); the tiled FMA
+// kernel owns an (N/64, T/16) grid.  A variant given the wrong grid measures the grid, not the kernel.
+Timing bench_gemm_one(Ctx& ctx, const std::string& dir, const char* spv, uint32_t T, uint32_t N, uint32_t K,
+                      int reps, int warmups) {
+    std::vector<uint16_t> x((size_t) T * K), w((size_t) N * K);
+    for (auto& v : x) v = rnd_half();
+    for (auto& v : w) v = rnd_half();
+    Buf bx = alloc(ctx, x.size() * 2), bw = alloc(ctx, w.size() * 2), by = alloc(ctx, (size_t) T * N * 4);
+    ctx.write(bx, x.data(), x.size() * 2);
+    ctx.write(bw, w.data(), w.size() * 2);
+    VkPipeline p = ctx.pipeline(dir + "/" + spv, 3, 16);
+    struct { uint32_t t, n, k, ldy; } pc{T, N, K, N};
+    const bool untiled = std::strstr(spv, "_small") != nullptr;
+    const bool cma = std::strstr(spv, "f16_m8") != nullptr;
+    uint32_t gx, gy = 1;
+    if (untiled) gx = (uint32_t) (((uint64_t) T * N + 255) / 256);
+    else if (cma) gx = (T / 8u) * (N / 16u) + 8u;
+    else { gx = (N + 63u) / 64u; gy = (T + 15u) / 16u; }
+    Timing t = time_kernel(ctx, p, {&bx, &bw, &by}, &pc, sizeof(pc), gx, gy, 8, reps, warmups);
+    ctx.free(bx); ctx.free(bw); ctx.free(by);
+    return t;
+}
+
+// The A/B table: the same shape on one device, both cooperative-matrix schedules (the shipped one, which
+// `coopMatLoad`s straight from GLOBAL memory, and the shared-memory STAGED one), and both FMA paths for
+// reference.  Printed as rows plus an XPAIR line so the ratio is read off one instrument.
+void bench_gemm_prefill(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    if (!ctx.info().storage_buffer_16bit) {
+        std::printf("SKIP gemm_prefill              | device lacks storageBuffer16BitAccess (the operands are f16)\n");
+        return;
+    }
+    const bool cma = ctx.info().cooperative_matrix && ctx.info().cm_m == 8 && ctx.info().cm_n == 16 &&
+                     ctx.info().cm_k == 16;
+    struct Shape { uint32_t t, n, k; const char* proj; };
+    const Shape shapes[] = {
+        {8, 1280, 2560, "gate/up"},   {16, 1280, 2560, "gate/up"},  {64, 1280, 2560, "gate/up"},
+        {199, 1280, 2560, "gate/up"}, {8, 2560, 640, "down"},       {64, 2560, 640, "down"},
+        {199, 2560, 640, "down"},
+    };
+    for (const Shape& s : shapes) {
+        char shape[80];
+        Timing tg{}, ts{}, tu{}, tt{};
+        if (cma) {
+            tg = bench_gemm_one(ctx, dir, "gemm_prefill_f16_m8.spv", s.t, s.n, s.k, reps, warmups);
+            std::snprintf(shape, sizeof shape, "%s T=%u N=%u K=%u", s.proj, s.t, s.n, s.k);
+            report("gemm_prefill", std::string("cm-global  ") + shape, tg, (double) s.t * s.n,
+                   (double) s.t * s.n * s.k);
+            ts = bench_gemm_one(ctx, dir, "gemm_prefill_f16_m8_staged.spv", s.t, s.n, s.k, reps, warmups);
+            report("gemm_prefill", std::string("cm-staged  ") + shape, ts, (double) s.t * s.n,
+                   (double) s.t * s.n * s.k);
+        } else {
+            std::snprintf(shape, sizeof shape, "%s T=%u N=%u K=%u", s.proj, s.t, s.n, s.k);
+        }
+        tu = bench_gemm_one(ctx, dir, "gemm_prefill_fma_small.spv", s.t, s.n, s.k, reps, warmups);
+        report("gemm_prefill", std::string("fma-untiled") + shape, tu, (double) s.t * s.n, (double) s.t * s.n * s.k);
+        tt = bench_gemm_one(ctx, dir, "gemm_prefill_fma.spv", s.t, s.n, s.k, reps, warmups);
+        report("gemm_prefill", std::string("fma-tiled  ") + shape, tt, (double) s.t * s.n, (double) s.t * s.n * s.k);
+        if (cma)
+            std::printf("XPAIR gemm_prefill %s | cm-staged/cm-global %.3f | cm-global/fma-untiled %.3f | "
+                        "cm-staged/fma-untiled %.3f | fma-tiled/fma-untiled %.3f\n",
+                        shape, ts.med / tg.med, tg.med / tu.med, ts.med / tu.med, tt.med / tu.med);
+    }
+}
+
 // =========================================================================================================
 // THE GDN / DELTA-NET MIXER CHAIN (36 of the model's 48 layers, under native_gdn_enabled() == false).
 // Shapes are the artifact's where the kernel has one (S=128, h_k=16, h_v=48, d_conv=4, n_embd=2560).
@@ -1311,6 +1398,9 @@ int main(int argc, char** argv) {
     bench_fused_gdn_step_norm_pair(ctx, dir, reps, warmups);
     // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`): the DEFAULT side of `native_bf16_projections`.
     bench_bf16_gemv_pair(ctx, dir, reps, warmups);
+    // THE PREFILL GEMM: the prompt path's own deep kernel, both cooperative-matrix schedules and both FMA
+    // paths, at the engine's shapes.
+    bench_gemm_prefill(ctx, dir, reps, warmups);
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a
