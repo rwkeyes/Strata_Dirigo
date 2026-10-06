@@ -22617,6 +22617,38 @@ void case_prefill_prompt_path(Ctx& ctx, const std::string& dir) {
     strata::vulkan::stream_close(s);
 }
 
+// `fused_gr_check` is a CARD CHARACTERISATION, not a compute kernel (fused_gr.hpp:59; it produces no tensors):
+// it records which bitwise-equal hyper-connection read runs on this card, and `fused_gr_variant()` reports it.
+// This backend has no fused_gr shader, so `fused_gr_supported()` is false and the engine runs the PORTED plain
+// read (`gr_read`); the honest characterisation is therefore "the plain read" (kHcPlain = 1, the engine's own
+// value, fused_gr.cu:509).  The case asserts the CONTRACT the engine's caller depends on:
+//   (A) BEFORE the check a caller gets the plain read - the engine's "0 = not checked yet" sentinel
+//       (fused_gr.cu:829/1330-1333) must never read as a fused variant;
+//   (B) the check RECORDS the plain read (1);
+//   (C) the recorded outcome AGREES with what the port actually runs - the recorded variant is the plain read
+//       IFF `fused_gr_supported()` is false (the capability answer that keeps the ported `gr_read` on the path);
+//       a "staged"/"split" reading here would be a claim about a kernel the backend does not have;
+//   (D) it is ONCE PER CARD: a second call does not re-characterise.
+// No shader, no stream: a pure host probe, so it cannot be skipped for a missing .spv.
+void case_fused_gr_check_entry(Ctx& ctx, const std::string& dir) {
+    (void) ctx; (void) dir;
+    const int before = strata::kernels::fused_gr_variant();
+    verdict("fused_gr_check: before the check, the variant reads plain", before == 1, before == 1 ? 0 : 1, 1,
+            (double) before, "variant id (1 = plain; 0 = not-checked sentinel; 2/3 = fused)");
+    strata::kernels::fused_gr_check();
+    const int after = strata::kernels::fused_gr_variant();
+    verdict("fused_gr_check: the check records the plain read", after == 1, after == 1 ? 0 : 1, 1,
+            (double) after, "variant id (1 = plain)");
+    const bool supported = strata::kernels::fused_gr_supported(2560, 4, 320);
+    const bool agrees = (after == 1) && !supported;
+    verdict("fused_gr_check: the outcome matches fused_gr_supported() == false", agrees, agrees ? 0 : 1, 1,
+            (double) after, "variant vs capability (plain must pair with an unsupported fused read)");
+    strata::kernels::fused_gr_check();
+    const int again = strata::kernels::fused_gr_variant();
+    verdict("fused_gr_check: once per card (a second call is a no-op)", again == after, again == after ? 0 : 1, 1,
+            (double) again, "variant id");
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -23064,6 +23096,10 @@ int main(int argc, char** argv) {
     case_prefill_entry(ctx, dir);
     case_prefill_prompt_path(ctx, dir);   // the rest of the prompt path: swiglu, moe_combine, split_q, gate_attn,
                                           // copy_i32, kv_append and the NATIVE QSA indexer append
+    // THIS BATCH: `fused_gr_check` - the hyper-connection read's CARD CHARACTERISATION, reached by
+    // `Verifier::init` (verify.cpp:311).  A pure host probe (no shader, no stream).  APPENDED last for the
+    // shared-RNG reason every batch above names.
+    case_fused_gr_check_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

@@ -123,6 +123,10 @@
 #   inject-verify.sh fused-gr-supported-true   vulkan/src/kernels/ple_vk.cpp  answer the CUDA geometry rule TRUE
 #                                       (claiming the fused read the backend has no shader for) -> must FAIL
 #                                       "fused_gr_supported entry"
+#   inject-verify.sh fused-gr-check-records-staged  vulkan/src/kernels/ple_vk.cpp  record a fused hyper-connection
+#                                       variant the backend has no shader for (the card characterisation
+#                                       reached at Verifier::init, verify.cpp:311) -> must FAIL
+#                                       "fused_gr_check: the check records the plain read"
 #
 #   (the DEFAULT QSA decode attention: the KV pools read through the PAGE TABLE, `qsa_decode_attn_step`)
 #   inject-verify.sh qsa-decode-attn-drop-kv-head  qsa_decode_attn.comp  drop the KV head term from the pool
@@ -624,6 +628,15 @@ case "$name" in
     old=$'    return false;   // no fused_gr shader in this tree: the backend reports what it implements'
     new=$'    return n_embd == 2560 && hc == 4 && hc_lr == 320;   // INJECTION: the fused read claimed supported (a HOLE)'
     want="FAIL  fused_gr_supported entry" ;;
+  fused-gr-check-records-staged)
+    # `fused_gr_check` is the hyper-connection read's CARD CHARACTERISATION (no tensors).  On this backend the
+    # ported plain read is what runs (`fused_gr_supported()` false), so the honest recorded variant is the plain
+    # one.  Recording a FUSED variant the backend has no shader for is the "card that does not exist" a wrong
+    # probe would report - and the case must FAIL.
+    file="$TREE/vulkan/src/kernels/ple_vk.cpp"
+    old=$'    g_hc_variant[0].store(kHcPlain);'
+    new=$'    g_hc_variant[0].store(kHcStaged);   // INJECTION: record a fused variant the backend does not run'
+    want="FAIL  fused_gr_check: the check records the plain read" ;;
   graph-drop-last-node)
     # THE CUDA GRAPH API (this batch).  A capture RECORDS the dispatches a body issues; dropping the LAST one is
     # the plausible "off by one node" a hand-rolled recorder ships with.  The recorded step then replays 5 of 6

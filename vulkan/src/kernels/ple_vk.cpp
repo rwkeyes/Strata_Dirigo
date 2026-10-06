@@ -80,6 +80,7 @@
 #include "strata/vulkan/vk_backend.hpp"      // the backend's seam: Stream, stream_of
 #include "vk_arena.hpp"                      // the arena + pointer->buffer resolution
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -583,6 +584,59 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
     (void) n_embd; (void) hc; (void) hc_lr;
     return false;   // no fused_gr shader in this tree: the backend reports what it implements
+}
+
+// fused_gr.hpp: `void fused_gr_check();` and `int fused_gr_variant();`  (verify.cpp:311; fused_gr.cu:1336/1326).
+// **THIS IS NOT A COMPUTE KERNEL: it produces no tensors.**  It is a CARD CHARACTERISATION - it runs the fused
+// hyper-connection read variants (split, staged) and the single-token read against the plain read on this card
+// with random weights and inputs, and RECORDS which one is usable (fused_gr.hpp:59-63).  On this backend there is
+// no fused_gr shader, so `fused_gr_supported()` above answers FALSE and the engine runs the PORTED plain read
+// (`gr_read`); the honest outcome of the characterisation here is therefore exactly "the hyper-connection read
+// runs as the plain read", and that is what this RECORDS - a real host-side probe, not a stub.  It is host-side
+// in both builds (no dispatch, no shader, no arena, no stream).
+//
+// THE SENTINEL IS THE ENGINE'S OWN: `0 = not checked yet` (fused_gr.cu:829).  BEFORE the check a caller reading
+// `fused_gr_variant()` gets the plain read (fused_gr.cu:1330-1333, which maps the 0 sentinel to kHcPlain unless
+// STRATA_HC_SPLIT=1/2 names a variant); the check stores kHcPlain (1) once per card.  STRATA_HC_SPLIT names a
+// variant: "0" is the plain read (honoured); "1"/"2" ASK for the fused split/staged reads - a capability this
+// backend does not implement, so a requested-but-absent variant is a LOUD REFUSAL, never a silent downgrade.
+//
+// REACHABILITY CORRECTION: this symbol was a LOUD REFUSAL in refusals_vk.cpp whose text read "NOT REACHED by the
+// shipped configuration".  MEASURED (vega, coder-iq1_m, `--native`): the shipped `--native` launch sets
+// `native_qsa_indexer`/`native_bf16_projections` and `layer_set_fused_gr` (generate.cpp:1804/1807/2284), so
+// `layer_verify_compatible()` now HOLDS and `Verifier::init` reaches `fused_gr_check()` at verify.cpp:311 - the
+// refusal's own claim was false.  See plan/DECODE-PATH-TRIAGE.md's verifier section.
+constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;   // the engine's own values (fused_gr.cu:509)
+std::atomic<int> g_hc_variant[64];                         // per device: 0 = not checked yet (fused_gr.cu:829)
+
+namespace {
+[[noreturn]] void refuse_hc_split(const char* what) {
+    std::fprintf(stderr,
+                 "strata::kernels::fused_gr_check: STRATA_HC_SPLIT asks for the %s hyper-connection read, which\n"
+                 "  this Vulkan backend has no fused_gr shader for - REFUSING rather than silently using the plain\n"
+                 "  read.  The ported read is the plain one (`gr_read`); fused_gr_supported() answers false here.\n",
+                 what);
+    std::exit(2);
+}
+}  // namespace
+
+int fused_gr_variant() {
+    // One logical device: the shim's cudaGetDevice is always 0.  Not checked yet -> the plain read.
+    const int v = g_hc_variant[0].load();
+    if (v > 0) return v;
+    const char* e = std::getenv("STRATA_HC_SPLIT");
+    if (e != nullptr && (e[0] == '1' || e[0] == '2')) refuse_hc_split(e[0] == '1' ? "split" : "staged");
+    return kHcPlain;
+}
+
+void fused_gr_check() {
+    if (g_hc_variant[0].load() > 0) return;   // once per card (fused_gr.cu:1339)
+    const char* e = std::getenv("STRATA_HC_SPLIT");
+    if (e != nullptr && (e[0] == '1' || e[0] == '2')) refuse_hc_split(e[0] == '1' ? "split" : "staged");
+    g_hc_variant[0].store(kHcPlain);
+    std::fprintf(stderr,
+                 "strata hc: CUDA0: the hyper-connection read runs as the plain read (the norm per token, the down "
+                 "projection on 41 blocks)\n");
 }
 
 // ngram.hpp: `void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c,

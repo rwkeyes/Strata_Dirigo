@@ -179,7 +179,7 @@ TABLE = {
     'embed_type_supported':           ('host', 'a capability check'),
     'f16_from_f32':                   ('host', 'a type conversion helper'),
     'f32_from_f16':                   ('host', 'a type conversion helper'),
-    'fused_gr_check':                 ('host', 'a capability check'),
+    'fused_gr_check':                 ('host', 'a capability check: the hyper-connection read CARD CHARACTERISATION (it produces no tensors; fused_gr.hpp:59).  ON THIS BACKEND its honest outcome is "the plain read runs here" - DEFINED in ple_vk.cpp, once per card, sentinel 0 = not checked yet'),
     'fused_gr_supported':             ('host', 'a capability check'),
     'gr_workspace_bytes':             ('host', 'a size'),
     'gr_workspace_init':              ('host', 'a workspace hand-out'),
@@ -280,7 +280,7 @@ REFUSED = {
     'moe_hit_grouped_s2_cpu_order',
     # the P6 verifier (class D)
     'broadcast_streams', 'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
-    'copy_rows_from_mapped', 'fetch_blobs', 'fused_gr_check', 'gdn_ab_multi', 'gdn_conv_commit', 'gdn_conv_l2_multi',
+    'copy_rows_from_mapped', 'fetch_blobs', 'gdn_ab_multi', 'gdn_conv_commit', 'gdn_conv_l2_multi',
     'gdn_step_norm_multi', 'gpu_stamp', 'native_moe_combine_multi', 'native_router_top10_multi',
     'ple_block_projected',
     'rebase_ptrs', 'resident_plan', 'shared_expert_multi', 'wait_flag_ge', 'wait_flag_ge_or',

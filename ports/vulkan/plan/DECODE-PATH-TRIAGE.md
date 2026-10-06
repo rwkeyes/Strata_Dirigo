@@ -547,14 +547,34 @@ answer can be re-checked when a default changes.
 | 31 | `wait_flag_ge` | todo (D) | **no** | `verify.cpp:638`/`:1042`/`:1049`/`:1066` |
 | 32 | `wait_flag_ge_or` | todo (D) | **no** | `verify.cpp:1039`/`:1048`/`:1062` |
 
-**THE VERIFIER IS UNREACHABLE, and this is WHY (it is one conjunction, checked, not assumed).**
-`Verifier::init` refuses unless `layer_verify_compatible()` holds (`layer.cpp:476-491`), which requires
-`native_bf16_projections` (a setting, default **false**; the shipped `--native` sets it true but the verifier is
-NOT the forward path), `g_fused_gr` (**false**, and the GR contract forces it false), `g_fused_gdn &&
-native_gdn_enabled()` (**true now**), `g_fast_attn && !native_flash_attn_short` (true), `g_fast_select` (true),
-AND `native_qsa_indexer_enabled()` (**false** — the indexer is unported).  So rows 19-32 are off every path the
-port runs.  **The batch-4 flip did not change this**: it satisfied one term of that conjunction, and three other
-terms keep it false.
+**THE VERIFIER IS REACHABLE — CORRECTED FROM A MEASUREMENT (2026-10-05, `vega`, `coder-iq1_m`, `--native`).**
+This paragraph read "THE VERIFIER IS UNREACHABLE" and rested on `native_qsa_indexer_enabled()` being false and
+`g_fused_gr` being "forced false by the GR contract".  **BOTH CLAIMS WERE STALE OF THE CODE**, and the shipped
+launch now drives `Verifier::init`:
+* `layer_verify_compatible()` (`layer.cpp:476-491`) HOLDS: `--native` sets `native_bf16_projections`
+  (generate.cpp:1805) and `layer_set_fused_gr` (generate.cpp:2284, with `gr_native_mmvf` true at :1804), so
+  `g_fused_gr` is TRUE; `g_fused_gdn && native_gdn_enabled()` is true; `g_fast_attn && !native_flash_attn_short`
+  is true; `g_fast_select` is true; and `native_qsa_indexer_enabled()` is a REAL flag since the native indexer
+  append landed (true under `--native`).  The old "one conjunction, checked" was checked against the wrong
+  answers.
+* With the expert pool NOT `--no-pool` and a profile + non-empty cache, `d_res` is built
+  (generate.cpp:4267/4268) and the `generate.cpp:7817` stop is cleared; `Verifier::init` runs to
+  `fused_gr_check()` (`verify.cpp:311`) — which is a real host-side card CHARACTERISATION now
+  (`vulkan/src/kernels/ple_vk.cpp`; `case_fused_gr_check_entry`).
+* **MEASURED, the verifier then refuses at `verify.cpp:336-338`:**
+  `if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || ...) err = "verify:
+  geometry differs from the artifact's";` — the FIRST disjunct is UNCONDITIONALLY true because this backend
+  ANSWERS `fused_gr_supported` FALSE (`ple_vk.cpp`), so the window refuses on the port's own (correct)
+  capability answer, not on the geometry.
+* AND `fused_gr_read_multi` IS the verify window's per-layer GR read, called UNCONDITIONALLY at
+  `verify.cpp:693` (inside `gr_read_group`, called at `:696`/`:902`) — it is NOT guarded by `fused_gr_supported`
+  or `g_fused_gr` as the layer body's `fused = g_fused_gr && fused_gr_supported(...)` is.  So the P6 window,
+  which is the NATIVE PACK'S ONLY DECODE PATH (`generate.cpp:7579`), reproduces the FUSED hyper-connection read
+  by construction.  Running it requires porting `fused_gr_read` + `fused_gr_read_multi` and then answering
+  `fused_gr_supported` true — the reading `refusals_vk.cpp`'s `fused_gr_read` refusal already names.
+So rows 19-32 are NOT "off every path the port runs": they sit behind the fused-GR gap above, which the
+backed-off `fused_gr_supported` answer (a correct capability answer for the LAYER body) does not close for the
+verifier.
 
 **THE REACHABLE-BUT-UNPORTED QUEUE, re-read after this batch.**  Both forward-path holes are now CLOSED:
 `native_qsa_indexer_append` by the FLAG (batch 5) and the two BF16-projection rows by PORTING BOTH MEMBERS (this
@@ -564,10 +584,10 @@ batch).  What remains is the drafter's eight, and this batch LABELS them **class
    `fused_gr_read_multi` (510/571/620) → `window_ids` / `qsa_decode_attn_batch` (551/552) → `moe_group_resident`
    (579) → `row_top_prob` / `map_ids` (643/644) → `mtp_select` (710/719/738).  They run ONLY when the engine takes
    the `--spec 4 --mtp` DRAFT loop — a configuration THE PORT DOES NOT SELECT, because the loop needs
-   `Verifier::init` to succeed and `layer_verify_compatible()` (`layer.cpp:476-491`) demands a conjunction the
-   port's contract leaves false: `g_fused_gr` (forced FALSE by the GR contract), `native_qsa_indexer_enabled()`
-   (answered FALSE — the native append is unported) and `native_bf16_projections` (a setting the port does not
-   pin).  **The flag chain that WOULD enable them is `--spec 4 --mtp` AND a verifier-compatible native stack; the
+   `Verifier::init` to succeed and `Verifier::init` now refuses at `fused_gr_supported` (`verify.cpp:336`, the
+   fused-GR gap above), not at `layer_verify_compatible()` — whose terms (`g_fused_gr`,
+   `native_qsa_indexer_enabled()`, `native_bf16_projections`) all HOLD under `--native` now.  **The flag chain
+   that WOULD enable them is `--spec 4 --mtp` AND a fused-GR-capable native stack; the
    selected branch (a `--spec 0` / non-drafting run) is the whole model.**  That is exactly the class-C shape — a
    NON-SELECTED configuration whose selected branch IS ported.  The port's own contract is what keeps the
    verifier out, so the drafter is not a branch this backend takes.  (`fused_gr_read_multi`'s ported siblings,

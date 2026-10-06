@@ -246,9 +246,10 @@ void copy_rows_from_mapped(float*, const float*, int64_t, int64_t, const int32_t
 void fetch_blobs(const unsigned long long*, const int32_t*, uint8_t*, int64_t, int, void*) {
     refuse_unreachable("fetch_blobs", "the P6 verifier (verify.cpp); Verifier::init refuses");
 }
-void fused_gr_check() {
-    refuse_unreachable("fused_gr_check", "the P6 verifier (verify.cpp:311); Verifier::init refuses");
-}
+// `fused_gr_check` is DEFINED (not refused) in `vulkan/src/kernels/ple_vk.cpp`: it is a card CHARACTERISATION
+// (no tensors), and on this backend its honest outcome is "the plain read runs here".  It was a refusal here
+// until the shipped `--native` launch was measured to REACH it at `Verifier::init` (verify.cpp:311) - the
+// "NOT REACHED by the shipped configuration" claim was false.  See that definition and DECODE-PATH-TRIAGE.md.
 void gdn_ab_multi(const float*, const uint16_t*, const uint16_t*, const float*, const float*, float*, float*, int, int,
                   int, void*) {
     refuse_unreachable("gdn_ab_multi", "the P6 verifier (verify.cpp); Verifier::init refuses");
