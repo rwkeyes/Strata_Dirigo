@@ -202,21 +202,25 @@ void mapped_unregister(void* host) {
 
 bool mapped_resolve(const void* host, uint64_t bytes, Buf& out) {
     if (host == nullptr || bytes == 0) return false;
+    // A pointer the caller DERIVED from the region's base (`p = host + k`, which the engine's own grouping tables
+    // do) must resolve too - the header promises it and the prefill relies on it.  The lookup is therefore a
+    // RANGE check on the region, and the view binds at the derived byte offset.  An out-of-region pointer, or
+    // bytes that would read past the region's end, still refuses: binding a token for bytes the caller never
+    // published is the wrong-view class.
+    const uintptr_t p = reinterpret_cast<uintptr_t>(host);
     for (const MappedRegion& r : mapped_regions()) {
-        if (r.host == host) {
-            // The view must fit INSIDE the region the shim handed out: binding the whole block and letting the
-            // shader read past `bytes` would read bytes the caller never published.  Refuse rather than bind a
-            // view the caller's size does not cover.
-            if (bytes > r.bytes) {
-                std::fprintf(stderr,
-                             "strata::vulkan: mapped_resolve: %llu bytes asked of a %llu-byte mapped region - "
-                             "refusing rather than reading past the published block\n",
-                             (unsigned long long) bytes, (unsigned long long) r.bytes);
-                return false;
-            }
-            out = r.buf;                                // offset 0: the region's own base
-            return true;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(r.host);
+        if (p < base || p - base > r.bytes) continue;
+        const uint64_t off = (uint64_t) (p - base);
+        if (bytes > r.bytes - off) {
+            std::fprintf(stderr,
+                         "strata::vulkan: mapped_resolve: %llu bytes asked at offset %llu of a %llu-byte mapped "
+                         "region - refusing rather than reading past the published block\n",
+                         (unsigned long long) bytes, (unsigned long long) off, (unsigned long long) r.bytes);
+            return false;
         }
+        out = view(r.buf, off);                     // the region's base + the caller's derived offset
+        return true;
     }
     return false;
 }

@@ -39,26 +39,16 @@ namespace strata::prefill {
 
 // ---- the stateful batched kernels still unported -----------------------------------------------------------
 void blob_dequant_f16(const uint8_t*, uint16_t*, uint16_t*, void*) { refuse_prompt("strata::prefill::blob_dequant_f16"); }
-void gate_attn(const float*, const float*, uint16_t*, int64_t, void*) { refuse_prompt("strata::prefill::gate_attn"); }
-void gdn_recurrence(float*, const float*, const float*, const float*, const float*, const float*, float, float*, uint16_t*,
-                    int64_t, void*) { refuse_prompt("strata::prefill::gdn_recurrence"); }
 void kv_append(const float*, const float*, int64_t, int64_t, const int32_t*, int64_t, uint16_t*, uint16_t*, int8_t*,
                int8_t*, uint16_t*, uint16_t*, void*, const strata::kernels::KvHostPools*,
                const strata::kernels::KvHostPools*) { refuse_prompt("strata::prefill::kv_append"); }
-void moe_combine(const float*, const int32_t*, const float*, const float*, const float*, float*, int64_t, void*) { refuse_prompt("strata::prefill::moe_combine"); }
 void round_f16(const float*, float*, int64_t, void*) { refuse_prompt("strata::prefill::round_f16"); }
-void rope(float*, int64_t, int64_t, int64_t, int64_t, int64_t, const strata::kernels::RopeScaling&, void*) { refuse_prompt("strata::prefill::rope"); }
-void split_q(const float*, float*, int64_t, void*) { refuse_prompt("strata::prefill::split_q"); }
-void swiglu_interleaved(const float*, uint16_t*, int64_t, void*) { refuse_prompt("strata::prefill::swiglu_interleaved"); }
-void swiglu_pair(const float*, const float*, uint16_t*, int64_t, void*) { refuse_prompt("strata::prefill::swiglu_pair"); }
 
 }  // namespace strata::prefill
 
 // ---- the prefill-path kernels-NAMESPACE symbols still unported ---------------------------------------------
 namespace strata::kernels {
 
-void iq_dequant_f16(int, const void*, int64_t, uint16_t*, void*) { refuse_prompt("strata::kernels::iq_dequant_f16"); }
-void iq_dequant_gu_f16(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*) { refuse_prompt("strata::kernels::iq_dequant_gu_f16"); }
 void kv_append_q4(uint8_t*, uint8_t*, const int32_t*, int64_t, int64_t, const float*, const float*, const QsaShapes&, void*,
                   const KvHostPools*, const KvHostPools*) { refuse_prompt("strata::kernels::kv_append_q4"); }
 void kv_stage_from_host(const QsaAttnPools&, const KvHostPools&, int, int64_t, const QsaShapes&, void*) { refuse_prompt("strata::kernels::kv_stage_from_host"); }

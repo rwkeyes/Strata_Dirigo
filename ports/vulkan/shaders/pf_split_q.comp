@@ -1,0 +1,18 @@
+// ports/vulkan/shaders/pf_split_q.comp - the prompt path's q split (`src/prefill/kernels.cu`'s `split_q_kernel`):
+// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256].  Element-wise, one thread per output element.
+//   i = t*24*256 + h*256 + d;   q[i] = q_full[t*24*512 + h*512 + d]
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QF { float v[]; } qf_b;
+layout(set = 0, binding = 1, std430) buffer        Q  { float v[]; } q_b;
+
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    const int t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
+    q_b.v[i] = qf_b.v[t * 24 * 512 + h * 512 + d];
+}

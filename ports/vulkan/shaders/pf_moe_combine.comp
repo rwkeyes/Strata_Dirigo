@@ -1,0 +1,32 @@
+// ports/vulkan/shaders/pf_moe_combine.comp - the PREFILL MoE combination (`src/prefill/kernels.cu`'s
+// `moe_combine_kernel`), one thread per output element.
+//
+//     bo[t*N + d] = sum_{k<10} w[t*10 + k] * D[slot[t*10 + k]*N + d]  +  shared[t*N + d] * sigmoid(sg[t])
+//
+// This is NOT the decode's `native_moe_combine` (shaders/native_moe_combine.comp): that one sums k weight-indexed
+// `parts` rows and adds the shared row PLAIN, whereas the prompt combine indirects through `slot` (the routed
+// expert's row in `D`) and SCALES the shared row by the per-token `sigmoid(sg[t])`.  The accumulation is the
+// engine's own `fmaf(w, D, s)` starting from 0.0, in the engine's order - hence the explicit FMA.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer D  { float v[]; } d_b;
+layout(set = 0, binding = 1, std430) readonly buffer S  { int sl[]; } sl_b;
+layout(set = 0, binding = 2, std430) readonly buffer W  { float v[]; } w_b;
+layout(set = 0, binding = 3, std430) readonly buffer SH { float v[]; } sh_b;
+layout(set = 0, binding = 4, std430) readonly buffer SG { float v[]; } sg_b;
+layout(set = 0, binding = 5, std430) buffer        BO { float v[]; } bo_b;
+
+layout(push_constant, std430) uniform PC { int T; int N; int K; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint kN = uint(pc.N), kK = uint(pc.K);
+    if (i >= uint(pc.T) * kN) return;
+    const uint t = i / kN, d = i % kN;
+    float s = 0.0;
+    for (uint k = 0u; k < kK; ++k)
+        s = fma(w_b.v[t * kK + k], d_b.v[uint(sl_b.sl[t * kK + k]) * kN + d], s);
+    bo_b.v[i] = s + sh_b.v[t * kN + d] * (1.0 / (1.0 + exp(-sg_b.v[t])));
+}

@@ -1,0 +1,23 @@
+// ports/vulkan/shaders/pf_copy_u32.comp - a 32-bit-WORD buffer copy, the generic byte-mover the prefill's
+// `copy_i32`/`copy_f32_wide`/`gather_rows16` reach for when a pointer may be an ARENA address OR a live MAPPED
+// host region.
+//
+// WHY A WORD COPY AND NOT `copy.spv`: the engine copies int32 (the routing tables), and the port's copy.spv is
+// float-typed.  A float storage load/store preserves bits, but the int path deliberately does not route a
+// bit-pattern through a float type - so this shader moves `uint` words, which is bit-exact by construction.
+// It is a DISPATCH, so it RECORDS under capture and re-reads the source BUFFER at submit (the graph property
+// the mapped-region handshake needs), and it submits+fences outside capture - one mechanism for both sides.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer S { uint v[]; } s_b;
+layout(set = 0, binding = 1, std430) buffer        D { uint v[]; } d_b;
+
+layout(push_constant, std430) uniform PC { uint n; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    d_b.v[i] = s_b.v[i];
+}

@@ -1,0 +1,31 @@
+// ports/vulkan/shaders/pf_gu_interleave_f16.comp - the PREFILL native-expert gate/up dequantiser's LAYOUT step.
+//
+// `src/kernels/cuda/iq_kernels.cu`'s `dequant_gu_kernel` does NOT write the flat layout: superblock i of the GATE
+// role matrix goes to row `2r` and the same superblock of the UP matrix to row `2r + 1` (r = i / (n_embd/256)), so
+// the engine's single [2*n_ff][n_embd] FP16 matrix is gate/up row-interleaved.  The port decodes each role matrix
+// with the ALREADY-GATED flat `iq_dequant_f32.spv` (a superblock is a superblock; the decode does not depend on
+// row position) and this shader performs only the interleave and the FP16 conversion - the arithmetic stays in
+// one place, and the mapping `(2r + parity)` is written once, here.
+//
+// Element-wise: one thread per element of one role matrix.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer GA { float v[]; } g_b;   // gate [n_ff][n_embd]
+layout(set = 0, binding = 1, std430) readonly  buffer UP { float v[]; } u_b;   // up   [n_ff][n_embd]
+layout(set = 0, binding = 2, std430) writeonly buffer OU { uint16_t v[]; } o_b; // [2*n_ff][n_embd]
+
+layout(push_constant, std430) uniform PC { int n_ff; int n_embd; } pc;
+
+#include "common/f16_bits.glsl"
+
+void main() {
+    const uint n = uint(pc.n_ff) * uint(pc.n_embd), ne = uint(pc.n_embd);
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+    const uint r = i / ne, c = i % ne;
+    o_b.v[(2u * r) * ne + c]     = f16_from_f32_port(g_b.v[i]);
+    o_b.v[(2u * r + 1u) * ne + c] = f16_from_f32_port(u_b.v[i]);
+}

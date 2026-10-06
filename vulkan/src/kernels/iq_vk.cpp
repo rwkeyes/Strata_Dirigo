@@ -25,10 +25,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 
 namespace strata::vulkan {
 
 static constexpr uint32_t kLocalSize = 256;
+static uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocalSize - 1) / kLocalSize); }
 
 [[noreturn]] static void refuse(const char* who, const char* what) {
     std::fprintf(stderr, "strata::vulkan::%s: %s - refusing rather than dispatching a wrong view\n", who, what);
@@ -123,12 +125,55 @@ void iq_embed_rows(Stream& s, int ggml_type, const void* table, size_t row_bytes
                     (uint32_t) (n_embd / 256), (uint32_t) n_tok);
 }
 
+// ============================================================================================================
+// The PREFILL native-expert dequantiser: `iq_dequant_f16` / `iq_dequant_gu_f16` (iq_kernels.hpp).
+// ============================================================================================================
+// The prompt path's FP16 expert tier (`src/prefill/prefill.cpp:2783-2785`) dequantizes an expert's gate/up and
+// down roles into FP16 matrices, then runs the port's `prefill::Gemm::f16`.  The DECODE is the SAME one the flat
+// `iq_dequant_f32` already drives - a superblock is a superblock; only the OUTPUT TYPE (fp16) and, for gate/up,
+// the ROW-INTERLEAVED destination differ.  So this reuses the ALREADY-GATED `iq_dequant_f32.spv` for the
+// arithmetic and adds only the two mapping steps: an f32->f16 conversion, and the `(2r + parity)` interleave
+// (see pf_gu_interleave_f16.comp).  No second copy of the decode exists.
+namespace {
+struct IqScratch { uint8_t* p = nullptr; uint64_t bytes = 0; };
+std::unordered_map<Stream*, IqScratch> g_iq_f32;
+float* iq_scratch(Stream& s, uint64_t bytes) {
+    IqScratch& c = g_iq_f32[&s];
+    if (c.bytes < bytes) { c.p = (uint8_t*) arena_alloc(s, bytes); c.bytes = bytes; }
+    return (float*) c.p;
+}
+}  // namespace
+
+// f32 -> fp16 bits over n elements (f32_to_f16.spv: the engine's round-to-nearest-even, gated bit-exact).
+static void f32_to_f16_vk(Stream& s, const float* x, uint16_t* y, int64_t n) {
+    if (n <= 0) return;
+    Buf xv{}, yv{};
+    if (!arena_resolve(s, x, (uint64_t) n * 4, xv) || !arena_resolve(s, y, (uint64_t) n * 2, yv))
+        refuse("iq_dequant_f16", "a pointer is not inside this stream's arena");
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/f32_to_f16.spv", 2, 4);
+    struct { int32_t n; } pc{(int32_t) n};
+    s.ctx->dispatch(p, {&xv, &yv}, &pc, sizeof(pc), groups_for((uint64_t) n));
+}
+
+// The gate/up interleave: two [n_ff][n_embd] f32 role matrices -> one [2*n_ff][n_embd] fp16 matrix, gate rows even.
+void gu_interleave_f16(Stream& s, const float* gate, const float* up, uint16_t* dst, int64_t n_ff, int64_t n_embd) {
+    const uint64_t n = (uint64_t) n_ff * (uint64_t) n_embd;
+    Buf gv{}, uv{}, ov{};
+    if (!arena_resolve(s, gate, n * 4, gv) || !arena_resolve(s, up, n * 4, uv) || !arena_resolve(s, dst, n * 2, ov))
+        refuse("iq_dequant_gu_f16", "a pointer is not inside this stream's arena");
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/pf_gu_interleave_f16.spv", 3, 8);
+    struct { int32_t n_ff, n_embd; } pc{(int32_t) n_ff, (int32_t) n_embd};
+    s.ctx->dispatch(p, {&gv, &uv, &ov}, &pc, sizeof(pc), groups_for(n));
+}
+
 }  // namespace strata::vulkan
 
 // ============================================================================================================
 // THE ENGINE'S OWN SYMBOLS (the thin wrappers the engine headers declare)
 // ============================================================================================================
 namespace strata::kernels {
+
+namespace { bool iq_type_covered(int t); }   // defined below; the f16 dequantisers reuse it
 
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream) {
     if (n <= 0) return;
@@ -139,6 +184,35 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
     if (n_tok <= 0 || n_embd <= 0) return;
     strata::vulkan::iq_embed_rows(strata::vulkan::stream_for("iq_embed_rows", stream), ggml_type, table, row_bytes,
                                   tokens, n_tok, n_embd, out);
+}
+
+// The prompt path's FP16 expert dequantiser (prefill.cpp:2783-2785).  Same decode as `iq_dequant_f32`, composed
+// with the f32->f16 conversion; `iq_dequant_gu_f16` additionally interleaves the two role matrices into the
+// engine's [2*n_ff][n_embd] gate/up layout.  The CUDA's own argument checks are kept (n multiple of 256; is_iq).
+void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream) {
+    if (n <= 0) return;
+    if (n % 256 != 0 || !iq_type_covered(ggml_type)) {
+        std::fprintf(stderr, "iq_dequant_f16: bad arguments (type %d, n %lld)\n", ggml_type, (long long) n);
+        std::exit(1);
+    }
+    strata::vulkan::Stream& s = strata::vulkan::stream_for("iq_dequant_f16", stream);
+    float* tmp = strata::vulkan::iq_scratch(s, (uint64_t) n * 4);
+    strata::vulkan::iq_dequant_f32(s, ggml_type, src, n, tmp);
+    strata::vulkan::f32_to_f16_vk(s, tmp, dst, n);
+}
+void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
+                       void* stream) {
+    if (n_ff <= 0 || n_embd <= 0) return;
+    const int64_t n = n_ff * n_embd;
+    if (n % 256 != 0 || !iq_type_covered(ggml_type)) {
+        std::fprintf(stderr, "iq_dequant_gu_f16: bad arguments (type %d, n %lld)\n", ggml_type, (long long) n);
+        std::exit(1);
+    }
+    strata::vulkan::Stream& s = strata::vulkan::stream_for("iq_dequant_gu_f16", stream);
+    float* tmp = strata::vulkan::iq_scratch(s, (uint64_t) n * 8);   // gate then up, both f32
+    strata::vulkan::iq_dequant_f32(s, ggml_type, gate, n, tmp);
+    strata::vulkan::iq_dequant_f32(s, ggml_type, up, n, tmp + n);
+    strata::vulkan::gu_interleave_f16(s, tmp, tmp + n, dst, n_ff, n_embd);
 }
 
 // ---- THE IQ CAPABILITY PREDICATES (model load, not decode) ---------------------------------------------------

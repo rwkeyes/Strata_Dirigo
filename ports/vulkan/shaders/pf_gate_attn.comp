@@ -1,0 +1,24 @@
+// ports/vulkan/shaders/pf_gate_attn.comp - the prompt path's per-head attention gate (`src/prefill/kernels.cu`'s
+// `gate_attn_kernel`): attn [T,24,256] scaled by sigmoid(q_full[..., 256 + d]) -> FP16 (the o-projection is
+// quantized).  The CUDA writes `hf(...)` = the engine's plain round-to-nearest-even conversion (NOT the
+// saturating `hf_sat` the expert SwiGLU uses), so `f16_from_f32_port` is the exact conversion here.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A  { float v[]; } a_b;
+layout(set = 0, binding = 1, std430) readonly  buffer QF { float v[]; } qf_b;
+layout(set = 0, binding = 2, std430) writeonly buffer O  { uint16_t v[]; } o_b;
+
+layout(push_constant, std430) uniform PC { int n; } pc;
+
+#include "common/f16_bits.glsl"
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.n) return;
+    const int t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
+    const float g = qf_b.v[t * 24 * 512 + h * 512 + 256 + d];
+    o_b.v[i] = f16_from_f32_port(a_b.v[i] * (1.0 / (1.0 + exp(-g))));
+}

@@ -47,6 +47,9 @@
 #include "strata/kernels/native_mmvq.hpp"   // native_quantize_q8_1 / native_mmvq / native_q8_1_bytes
 #include "strata/kernels/router_top10.hpp"  // router_top10
 #include "strata/kernels/qsa_select.hpp"    // qsa_block_scores_tc
+#include "strata/kernels/native_gdn.hpp"            // native_gdn_step (the DECODE recurrence, reused)
+#include "strata/kernels/native_gdn_preprocess.hpp" // native_gdn_out_norm (the DECODE closing norm, reused)
+#include "strata/kernels/native_rope.hpp"           // native_rope_apply (the DECODE rotation, reused)
 #include "strata/vulkan/vk_backend.hpp"     // Stream, stream_of, rms_norm_weighted
 #include "vk_arena.hpp"                     // the arena + pointer->buffer resolution
 
@@ -56,6 +59,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace strata::vulkan {
 // Declared where it is defined (elementwise_vk.cpp) - used here for `beta != 0` (the opt-in bf16x2 remainder).
@@ -104,6 +108,20 @@ bool arena_resolve_span(const Stream& s, const void* p, Buf& out) {
     return arena_resolve(s, p, s.bump - off, out);
 }
 
+// ============================================================================================================
+// POINTER -> BUFFER, TWO SOURCES, ONCE.
+// ============================================================================================================
+// The engine legitimately hands this backend pointers from MORE THAN ONE allocator: arena allocations
+// (cudaMalloc / arena_alloc) AND mapped pinned host regions (`cudaHostAlloc` - the shim returns the mapping of a
+// HOST_VISIBLE | HOST_COHERENT device block, and `cudaHostGetDevicePointer` returns that same host address, so a
+// "device" pointer like the prefill's `grp_dev` IS a live mapped region).  A Vulkan shader binds a BUFFER, so
+// every prefill entry that takes a raw pointer resolves through BOTH and refuses loudly when neither matches -
+// the same handshake `iq_embed_rows` and `copy_from_mapped` use.  Four separate refusals (doorbell ->
+// doorbell/x -> iq_embed_rows -> copy_i32) were each one more entry point missing this; it is answered HERE.
+bool resolve_dev(const Stream& s, const void* p, uint64_t bytes, Buf& out) {
+    return arena_resolve(s, p, bytes, out) || mapped_resolve(p, bytes, out);
+}
+
 // ---- per-stream scratch, from the ARENA (a `ctx->alloc` buffer is NOT resolvable to a device pointer) -------
 struct Scratch { uint8_t* p = nullptr; uint64_t bytes = 0; };
 Scratch& scratch_gr(std::unordered_map<Stream*, Scratch>& m, Stream& s, uint64_t bytes) {
@@ -121,8 +139,8 @@ Scratch& tempf(Stream& s, uint64_t b) { return scratch_gr(g_temp, s, b); }
 void f16_to_f32(Stream& s, const uint16_t* x, float* y, int64_t n) {
     if (n <= 0) return;
     Buf xv{}, yv{};
-    if (!arena_resolve(s, x, (uint64_t) n * 2, xv) || !arena_resolve(s, y, (uint64_t) n * 4, yv))
-        refuse("prefill::Gemm::native", "the activation is not inside this stream's arena");
+    if (!resolve_dev(s, x, (uint64_t) n * 2, xv) || !resolve_dev(s, y, (uint64_t) n * 4, yv))
+        refuse("prefill::Gemm::native", "the activation is neither in this arena nor a live mapped region");
     VkPipeline p = s.ctx->pipeline(s.spv_dir + "/pf_f16_to_f32.spv", 2, 4);
     struct { int32_t n; } pc{(int32_t) n};
     s.ctx->dispatch(p, {&xv, &yv}, &pc, sizeof(pc), groups_for((uint64_t) n));
@@ -132,8 +150,8 @@ void f16_to_f32(Stream& s, const uint16_t* x, float* y, int64_t n) {
 void bf16_to_f16(Stream& s, const uint16_t* x, uint16_t* y, int64_t n) {
     if (n <= 0) return;
     Buf xv{}, yv{};
-    if (!arena_resolve(s, x, (uint64_t) n * 2, xv) || !arena_resolve(s, y, (uint64_t) n * 2, yv))
-        refuse("prefill::Gemm::bf16", "an operand is not inside this stream's arena");
+    if (!resolve_dev(s, x, (uint64_t) n * 2, xv) || !resolve_dev(s, y, (uint64_t) n * 2, yv))
+        refuse("prefill::Gemm::bf16", "an operand is neither in this arena nor a live mapped region");
     VkPipeline p = s.ctx->pipeline(s.spv_dir + "/bf16_to_f16.spv", 2, 4);
     struct { int32_t n; } pc{(int32_t) n};
     s.ctx->dispatch(p, {&xv, &yv}, &pc, sizeof(pc), groups_for((uint64_t) n));
@@ -145,9 +163,9 @@ void bf16_to_f16(Stream& s, const uint16_t* x, uint16_t* y, int64_t n) {
 void gemm_f16(Stream& s, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
               int64_t ldy, float beta) {
     Buf xv{}, wv{}, yv{};
-    if (!arena_resolve(s, X, (uint64_t) T * K * 2, xv) || !arena_resolve(s, W, (uint64_t) N * K * 2, wv) ||
-        !arena_resolve(s, Y, (uint64_t) T * ldy * 4, yv))
-        refuse("prefill::Gemm::f16", "an operand is not inside this stream's arena");
+    if (!resolve_dev(s, X, (uint64_t) T * K * 2, xv) || !resolve_dev(s, W, (uint64_t) N * K * 2, wv) ||
+        !resolve_dev(s, Y, (uint64_t) T * ldy * 4, yv))
+        refuse("prefill::Gemm::f16", "an operand is neither in this arena nor a live mapped region");
     VkPipeline p = s.ctx->pipeline(s.spv_dir + "/gemm_prefill_fma.spv", 3, 16);
     struct { uint32_t t, n, k, ldy; } pc{(uint32_t) T, (uint32_t) N, (uint32_t) K, (uint32_t) ldy};
     if (beta == 0.0f) {
@@ -269,8 +287,8 @@ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     Stream* s = need(strata::vulkan::stream_of(stream), "prefill::to_f16");
     Buf xv{}, yv{};
-    if (!arena_resolve(*s, x, (uint64_t) n * 4, xv) || !arena_resolve(*s, y, (uint64_t) n * 2, yv))
-        refuse("prefill::to_f16", "a pointer is not inside this stream's arena");
+    if (!resolve_dev(*s, x, (uint64_t) n * 4, xv) || !resolve_dev(*s, y, (uint64_t) n * 2, yv))
+        refuse("prefill::to_f16", "x or y is neither inside this stream's arena nor a live mapped region");
     VkPipeline p = s->ctx->pipeline(s->spv_dir + "/f32_to_f16.spv", 2, 4);
     struct { int32_t n; } pc{(int32_t) n};
     s->ctx->dispatch(p, {&xv, &yv}, &pc, sizeof(pc), groups_for((uint64_t) n));
@@ -281,8 +299,8 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
     if (ylo != nullptr) refuse("prefill::to_bf16", "the bf16x2 low image (STRATA_PREFILL_BF16X2) is not ported");
     Stream* s = need(strata::vulkan::stream_of(stream), "prefill::to_bf16");
     Buf xv{}, yv{};
-    if (!arena_resolve(*s, x, (uint64_t) n * 4, xv) || !arena_resolve(*s, y, (uint64_t) n * 2, yv))
-        refuse("prefill::to_bf16", "a pointer is not inside this stream's arena");
+    if (!resolve_dev(*s, x, (uint64_t) n * 4, xv) || !resolve_dev(*s, y, (uint64_t) n * 2, yv))
+        refuse("prefill::to_bf16", "x or y is neither inside this stream's arena nor a live mapped region");
     VkPipeline p = s->ctx->pipeline(s->spv_dir + "/f32_to_bf16.spv", 2, 4);
     struct { int32_t n; } pc{(int32_t) n};
     s->ctx->dispatch(p, {&xv, &yv}, &pc, sizeof(pc), groups_for((uint64_t) n));
@@ -292,31 +310,31 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     Stream* s = need(strata::vulkan::stream_of(stream), "prefill::copy_f32_wide");
     Buf sv{}, dv{};
-    const bool ok_src = mapped_resolve(src, (uint64_t) n * 4, sv) || arena_resolve(*s, src, (uint64_t) n * 4, sv);
-    if (!ok_src || !arena_resolve(*s, dst, (uint64_t) n * 4, dv))
-        refuse("prefill::copy_f32_wide", "a pointer is neither a live mapped region nor inside this arena");
+    if (!resolve_dev(*s, src, (uint64_t) n * 4, sv) || !resolve_dev(*s, dst, (uint64_t) n * 4, dv))
+        refuse("prefill::copy_f32_wide", "src or dst is neither inside this arena nor a live mapped region");
     VkPipeline p = s->ctx->pipeline(s->spv_dir + "/copy.spv", 2, 4);
     struct { int32_t n; } pc{(int32_t) n};
     s->ctx->dispatch(p, {&sv, &dv}, &pc, sizeof(pc), groups_for((uint64_t) n));
 }
 
-// The int copy: a mapped/arena byte copy.  Under CAPTURE it must RECORD a device copy (a host-staged copy
-// records nothing and every replay would see the capture-time bytes); outside a capture it keeps the fenced
-// host-staged write.  Byte copies either way, so the int32 payload is bit-exact (copy.spv is float-typed).
+// The int copy: a word-for-word device copy, EVERY side resolved through BOTH the arena and the live mapped
+// regions (see resolve_dev).  A DISPATCH records under capture (re-reading the source BUFFER at submit - the
+// mapped-region ordering contract) and submits+fences otherwise, so one mechanism covers both and a mapped
+// destination like the prefill's `grp_dev` is handled instead of refused.
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     Stream* s = need(strata::vulkan::stream_of(stream), "prefill::copy_i32");
-    Buf dv{};
-    if (!arena_resolve(*s, dst, (uint64_t) n * 4, dv))
-        refuse("prefill::copy_i32", "dst is not inside this stream's arena");
-    if (s->ctx != nullptr && s->ctx->capturing()) {
-        Buf sv{};
-        if (!mapped_resolve(src, (uint64_t) n * 4, sv) && !arena_resolve(*s, src, (uint64_t) n * 4, sv))
-            refuse("prefill::copy_i32", "the source is not a live mapped region nor in this arena (under capture)");
-        s->ctx->capture_copy(dv, sv, (uint64_t) n * 4);
-        return;
-    }
-    stream_write(*s, dst, src, (uint64_t) n * 4);
+    const uint64_t bytes = (uint64_t) n * 4;
+    Buf dv{}, sv{};
+    const bool dok = resolve_dev(*s, dst, bytes, dv);
+    const bool sok = resolve_dev(*s, src, bytes, sv);
+    if (!dok || !sok)
+        refuse("prefill::copy_i32", !dok ? "dst is neither inside this stream's arena nor a live mapped host region"
+                                        : "src is neither inside this stream's arena nor a live mapped host region");
+    if ((uint64_t) n > 0xFFFFFFFFull) refuse("prefill::copy_i32", "n overflows the shader's uint");
+    VkPipeline p = s->ctx->pipeline(s->spv_dir + "/pf_copy_u32.spv", 2, 4);
+    struct { uint32_t n; } pc{(uint32_t) n};
+    s->ctx->dispatch(p, {&sv, &dv}, &pc, sizeof(pc), groups_for((uint64_t) n));
 }
 
 void gather_rows16(const uint16_t* x16p, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width,
@@ -325,9 +343,10 @@ void gather_rows16(const uint16_t* x16p, const int32_t* src, uint16_t* dst16, in
     Stream* s = need(strata::vulkan::stream_of(stream), "prefill::gather_rows16");
     const uint64_t total = (uint64_t) n * (uint64_t) width * 2;   // output bytes
     Buf sv{}, iv{}, dv{};
-    if (!arena_resolve_span(*s, x16p, sv) || !arena_resolve(*s, src, (uint64_t) n * 4, iv) ||
-        !arena_resolve(*s, dst16, total, dv))
-        refuse("prefill::gather_rows16", "src/ids/dst is not inside this stream's arena");
+    if (!arena_resolve_span(*s, x16p, sv) || !resolve_dev(*s, src, (uint64_t) n * 4, iv) ||
+        !resolve_dev(*s, dst16, total, dv))
+        refuse("prefill::gather_rows16",
+               "the table/ids/dst is neither inside this stream's arena nor a live mapped region");
     if (total > 0xFFFFFFFFull) refuse("prefill::gather_rows16", "n*row_bytes overflows the shader's uint");
     VkPipeline p = s->ctx->pipeline(s->spv_dir + "/gather_rows.spv", 3, 8);
     struct { uint32_t row_bytes, n; } pc{(uint32_t) (width * 2), (uint32_t) n};
@@ -494,6 +513,149 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
         struct { int32_t C, T, S, NH; float eps; } pc{(int32_t) kC, (int32_t) T, (int32_t) kS, (int32_t) NH, eps};
         s->ctx->dispatch(p, {&hb}, &pc, sizeof(pc), (uint32_t) (T * NH));
     }
+}
+
+// ================================ the GDN recurrence (the DECODE step, per prompt token) ==================
+// THE SHAPE.  `src/prefill/kernels.cu`'s `gdn_rec_kernel` walks the chunk INSIDE one launch, carrying the state in
+// registers - but the recurrence is a sequential walk in time, so for a 1-2 token prompt the "batched" kernel
+// computes exactly what the DECODE step computes, one token at a time.  This wrapper therefore reuses the port's
+// ALREADY-GATED decode recurrence and closing norm per token, rather than transcribing the register-block kernel:
+//
+//   * `strata::kernels::native_gdn_step`  -> native_gdn_step.spv         (case_native_gdn_step)
+//   * `strata::kernels::native_gdn_out_norm` -> native_gdn_out_norm.spv  (case_native_gdn_out_norm)
+//   * `to_f16` -> f32_to_f16.spv (the FP16 image `y16` the out-projection reads; the CUDA writes hf(v) itself)
+//
+// The two are the SAME arithmetic, proved against the CUDA source rather than assumed.  `native_gdn.cu`'s `step`
+// (line 46-81): q_head = head % h_k, state[(i*h_v + head)*S + col] - which IS `gdn_rec_kernel`'s
+// `base = state + ((rg*RPG)*HV + head)*S + col`, rs = HV*S` with i = rg*RPG + r; dec = expf(gate[head]); the rank-1
+// update is applied AFTER the decay (line 71: `s = g*s + k*delta`), and the readout is `sum s*q*scale`,
+// scale = 1/sqrt(S) - exactly the prefill's `oc = (sum)*rsqrtf((float)S)`.  `gdn_out_norm` then applies
+// `y = rms_norm(o, eps) * gamma * sigmoid(z)`, which is the prefill's
+// `y = oc * rsqrtf(ss/S + eps) * gamma * sigmoid(z)`.  The state layout, the head pairing and the readout scale
+// all agree, so this is a re-expression, not an approximation.
+//
+// GEOMETRY.  `h` is [T, C=10240] laid out [q 16*128 | k 16*128 | v 48*128]; q/k/v are passed as CONTIGUOUS slices
+// of the token's row (the engine's own three headers live in that one row).  `state` is (S=128, HV=48, S=128), the
+// same buffer/layout the decode path owns.  `z` is [T, HV*S]; `y` is the FP32 scratch and `y16` its FP16 image.
+void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
+    if (T <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::gdn_recurrence");
+    const strata::kernels::GdnShapes sh{kS, kHK, kHV};
+    float* o = (float*) xf32(*s, (uint64_t) kHV * kS * 4).p;
+    for (int64_t t = 0; t < T; ++t) {
+        const float* ht = h + t * kC;
+        strata::kernels::native_gdn_step(state, ht, ht + kHK * kS, ht + 2 * kHK * kS, gate + t * kHV,
+                                         beta + t * kHV, o, sh, stream);
+        strata::kernels::native_gdn_out_norm(o, z + t * kHV * kS, gamma, y + t * kHV * kS, kHV, kS, eps, stream);
+    }
+    if (y16 != nullptr) to_f16(y, y16, T * kHV * kS, stream);
+}
+
+// ================================ the MoE combination and the expert SwiGLU ==============================
+// `src/prefill/kernels.cu`'s `moe_combine_kernel` (line 704): one thread per element, NOT the decode's
+// `native_moe_combine` (that one sums weight-indexed `parts` rows and adds the shared row plain; this one
+// indirects through `slot` and scales the shared row by `sigmoid(sg[t])`).  K is baked at 10 in the CUDA loop.
+void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                 float* bo, int64_t T, void* stream) {
+    if (T <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::moe_combine");
+    constexpr int64_t kK = 10;
+    Buf dv{}, sv{}, wv{}, shv{}, sgv{}, bov{};
+    if (!arena_resolve(*s, D, (uint64_t) T * kK * kN * 4, dv) ||
+        !arena_resolve(*s, slot, (uint64_t) T * kK * 4, sv) ||
+        !arena_resolve(*s, w, (uint64_t) T * kK * 4, wv) ||
+        !arena_resolve(*s, shared, (uint64_t) T * kN * 4, shv) ||
+        !arena_resolve(*s, sg, (uint64_t) T * 4, sgv) ||
+        !arena_resolve(*s, bo, (uint64_t) T * kN * 4, bov))
+        refuse("prefill::moe_combine", "an argument is not inside this stream's arena");
+    VkPipeline p = s->ctx->pipeline(s->spv_dir + "/pf_moe_combine.spv", 6, 12);
+    struct { int32_t T, N, K; } pc{(int32_t) T, (int32_t) kN, (int32_t) kK};
+    s->ctx->dispatch(p, {&dv, &sv, &wv, &shv, &sgv, &bov}, &pc, sizeof(pc), groups_for((uint64_t) T * kN));
+}
+
+// `swiglu_pair_kernel` / `swiglu_il_kernel`: h16 = hf_sat(silu(gate) * up), one 256-lane element-wise pass.
+// The two shapes are ONE shader with a mode (see pf_swiglu16.comp); the element count is n*640 either way, and the
+// interleaved form's stride is 2*640 (the engine's own 1280).
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+    if (n <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::swiglu_pair");
+    const uint64_t m = (uint64_t) n * 640;
+    Buf gv{}, uv{}, ov{};
+    if (!arena_resolve(*s, g, m * 4, gv) || !arena_resolve(*s, u, m * 4, uv) || !arena_resolve(*s, h16, m * 2, ov))
+        refuse("prefill::swiglu_pair", "an operand is not inside this stream's arena");
+    VkPipeline p = s->ctx->pipeline(s->spv_dir + "/pf_swiglu16.spv", 3, 12);
+    struct { int32_t n, mode, ld; } pc{(int32_t) m, 0, 0};
+    s->ctx->dispatch(p, {&gv, &uv, &ov}, &pc, sizeof(pc), groups_for(m));
+}
+
+void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
+    if (n <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::swiglu_interleaved");
+    const uint64_t m = (uint64_t) n * 640;
+    Buf gv{}, ov{};
+    if (!arena_resolve(*s, gu, m * 2 * 4, gv) || !arena_resolve(*s, h16, m * 2, ov))
+        refuse("prefill::swiglu_interleaved", "an operand is not inside this stream's arena");
+    VkPipeline p = s->ctx->pipeline(s->spv_dir + "/pf_swiglu16.spv", 3, 12);
+    struct { int32_t n, mode, ld; } pc{(int32_t) m, 1, 1280};
+    s->ctx->dispatch(p, {&gv, &gv, &ov}, &pc, sizeof(pc), groups_for(m));
+}
+
+// ================================ RoPE (the DECODE rotation, per prompt row) ==============================
+// `src/prefill/kernels.cu`'s `rope_kernel` rotates the first n_rot=64 channels of every (t, head) row in NEOX
+// pairs (pair, pair+32), at angle `mrope_pos(..., pos0 + t, pair) * powf(theta_scale, pair)`.  The port's
+// ALREADY-GATED DECODE `native_rope_apply` (native_rope_apply.spv, case_native_rope_apply) computes the SAME
+// analytic angle ON DEVICE, per ROW, from an explicit `positions` array - so the prompt's T*heads rows are ONE
+// call with positions[r] = pos0 + r/heads, in place (the kernel supports exact x == out).  The engine's call is
+// contiguous (ld == heads*dim), which is the shape the decode kernel assumes; a strided call would be a
+// silently wrong view, so it refuses.  (STRATA_ROPE_TABLE=1 is refused by the decode wrapper itself.)
+void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+          const strata::kernels::RopeScaling& scaling, void* stream) {
+    if (T <= 0 || heads <= 0 || dim <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::rope");
+    if (ld != heads * dim)
+        refuse("prefill::rope", "a row stride != heads*dim (the decode rope kernel's rows are contiguous)");
+    if (dim < 64) refuse("prefill::rope", "dim < 64: the rotation needs the first 64 channels");
+    // CAPTURE DISCIPLINE: the positions array is a HOST-STAGED input (a `stream_write`).  A host transfer
+    // records NOTHING, so a replay would read the capture-time positions - every token after the first would
+    // rotate at the wrong position.  The prefill is not captured today, but a wrapper that cannot record must
+    // REFUSE rather than replay stale bytes.
+    if (s->ctx != nullptr && s->ctx->capturing())
+        refuse("prefill::rope", "the positions upload is host-staged and cannot be recorded under capture");
+    const int64_t rows = T * heads;
+    int32_t* pos = (int32_t*) xf32(*s, (uint64_t) rows * 4).p;
+    std::vector<int32_t> hp((size_t) rows);
+    for (int64_t r = 0; r < rows; ++r) hp[(size_t) r] = (int32_t) (pos0 + r / heads);
+    stream_write(*s, pos, hp.data(), (uint64_t) rows * 4);
+    strata::kernels::native_rope_apply(x, x, (int) rows, (int) dim, 64, scaling, pos, stream);
+}
+
+// ================================ the QSA q split and attention gate ======================================
+// `split_q_kernel` / `gate_attn_kernel` (kernels.cu:750/756): element-wise gather and FP16 gate over the
+// [T,24,512] q_full.  One thread per output element; the two are separate shaders (pf_split_q / pf_gate_attn).
+void split_q(const float* q_full, float* q, int64_t T, void* stream) {
+    if (T <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::split_q");
+    const uint64_t n = (uint64_t) T * 24 * 256;
+    Buf qv{}, ov{};
+    if (!resolve_dev(*s, q_full, (uint64_t) T * 24 * 512 * 4, qv) || !resolve_dev(*s, q, n * 4, ov))
+        refuse("prefill::split_q", "q_full or q is neither in this arena nor a live mapped region");
+    VkPipeline p = s->ctx->pipeline(s->spv_dir + "/pf_split_q.spv", 2, 4);
+    struct { int32_t n; } pc{(int32_t) n};
+    s->ctx->dispatch(p, {&qv, &ov}, &pc, sizeof(pc), groups_for(n));
+}
+
+void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
+    if (T <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::gate_attn");
+    const uint64_t n = (uint64_t) T * 24 * 256;
+    Buf av{}, qv{}, ov{};
+    if (!resolve_dev(*s, attn, n * 4, av) || !resolve_dev(*s, q_full, (uint64_t) T * 24 * 512 * 4, qv) ||
+        !resolve_dev(*s, out16, n * 2, ov))
+        refuse("prefill::gate_attn", "an argument is neither in this arena nor a live mapped region");
+    VkPipeline p = s->ctx->pipeline(s->spv_dir + "/pf_gate_attn.spv", 3, 4);
+    struct { int32_t n; } pc{(int32_t) n};
+    s->ctx->dispatch(p, {&av, &qv, &ov}, &pc, sizeof(pc), groups_for(n));
 }
 
 }  // namespace strata::prefill

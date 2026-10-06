@@ -1,0 +1,46 @@
+// ports/vulkan/shaders/pf_swiglu16.comp - the PREFILL expert tier's SwiGLU, written as FP16 bits.
+//
+// The prefill's FP16 expert path (`src/prefill/kernels.cu`'s `swiglu_pair_kernel` / `swiglu_il_kernel`) computes
+// `hf_sat(silu(g) * u)` into a uint16 image the next FP16 GEMM reads.  This is ONE shader for both shapes, because
+// they differ only in WHERE the gate and up values are read (two separate buffers, or interleaved pairs inside one):
+//
+//   mode 0 - `swiglu_pair`:        a = g[i],         u = u[i]
+//   mode 1 - `swiglu_interleaved`: a = gu[r*ld+2k],  u = gu[r*ld+2k+1]   (r = i/640, k = i%640)
+//
+// `hf_sat` is the engine's own saturation: the CUDA is `hf(isnan(f) ? f : fminf(fmaxf(f, -65504), 65504))`, whose
+// NaN special case exists because `fmaxf(NaN, -65504)` is -65504 (it would hide a NaN rather than propagate it).
+// The conversion is `common/f16_bits.glsl`'s `f16_from_f32_port` - the same round-to-nearest-even the `f32_to_f16`
+// gate case holds bit-exact - NOT `packHalf2x16`, which was measured to saturate instead of overflow.
+// Element-wise, one thread per output element: no reduction, no barrier, no subgroup op.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer G { float v[]; } g_b;
+layout(set = 0, binding = 1, std430) readonly  buffer U { float v[]; } u_b;
+layout(set = 0, binding = 2, std430) writeonly buffer O { uint16_t v[]; } o_b;
+
+layout(push_constant, std430) uniform PC { int n; int mode; int ld_gu; } pc;
+
+#include "common/f16_bits.glsl"
+
+uint16_t hf_sat(float f) {
+    if (isnan(f)) return f16_from_f32_port(f);
+    return f16_from_f32_port(clamp(f, -65504.0, 65504.0));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    float a, u;
+    if (pc.mode == 0) {
+        a = g_b.v[i];
+        u = u_b.v[i];
+    } else {
+        const uint r = i / 640u, k = i % 640u;
+        a = g_b.v[r * uint(pc.ld_gu) + 2u * k];
+        u = g_b.v[r * uint(pc.ld_gu) + 2u * k + 1u];
+    }
+    o_b.v[i] = hf_sat(a / (1.0 + exp(-a)) * u);
+}
