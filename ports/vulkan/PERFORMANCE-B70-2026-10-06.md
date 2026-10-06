@@ -128,3 +128,39 @@ bash ports/vulkan/gates/inject-verify.sh pf-gemm-fma-wrong-ldy
 Equivalence, without which the batched number would not be trustworthy: `--prefill 1` (7 chunks, 9137.2 ms) and
 `--prefill 256` (1 chunk, 2582.1 ms) produce the **same output token ids in the same order** on the 8-token
 prompt, for 3.7x better time to first token. A batched path that changes the answer is a defect, not a win.
+
+### The SYCL path, measured — it is not the way on this card
+
+The obvious alternative to hand-written Vulkan is Intel's own toolchain, so it was built and run on the same card,
+same model, same flags (`oneAPI DPC++/C++ 2026.1.1`, ggml `bdff91b14`, `-ngl 99 -p 512 -n 128 -r 3`):
+
+| configuration | pp512 | tg128 |
+|---|---:|---:|
+| llama.cpp **Vulkan** (the reference above) | **913.36 +/- 289.06 tok/s** | **36.52 +/- 0.02 tok/s** |
+| SYCL, default | not run - SIGSEGV | not run - SIGSEGV |
+| SYCL + `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1` | not run - SIGSEGV | not run - SIGSEGV |
+| SYCL + `GGML_SYCL_ENABLE_VMM=0` | not run - SIGSEGV | not run - SIGSEGV |
+| SYCL + `GGML_SYCL_FORCE_MMQ=1` | not run - compile-time define, rebuild required | - |
+
+`sycl-ls` sees the card (`[level_zero:gpu] Intel(R) Arc(TM) Pro B70 Graphics`), the build succeeds, and **every**
+run dies `RC=139`: one at device enumeration, one deep in prompt processing (`ggml_sycl_get_rows` on
+`conv_states-0`), with `general protection fault ... in libc.so.6` in the kernel log and **no xe engine reset** — a
+userspace fault, not a GPU hang. No SYCL throughput number exists; none is inferred, none is written as 0.
+
+### The mechanism that actually closes the gap (read from the source, not guessed)
+
+| engine | mechanism | in this port |
+|---|---|---|
+| llama.cpp Vulkan, **expert matmul** | **batched into ONE dispatch**: `mul_mm_id_funcs.glsl` loads the routing row-ids once, uses `gl_WorkGroupID.z` as the expert index, `subgroupBallot` for the counts | **no** — this port dispatches per expert (`matvec_vk.cpp:192`, one workgroup per output row) |
+| llama.cpp Vulkan, **quantized matmul** | **MMQ** (`mul_mmq.comp`, BM/BN 64, BK 32): stages the quantized operands in shared memory, accumulates with the packed integer dot, applies the scale **once at the end** — the weights are never dequantized into a separate buffer | **no** — this port runs a dequant-to-FP16 pass (`iq_vk.cpp:189-216`) and then GEMMs |
+| llama.cpp Vulkan, prefill | tiled `mul_mm` / `mul_mmq` with shared-memory staging | **opt-in** (`STRATA_VK_PREFILL_TILED=1`); untiled is the default because tiling measured *slower* end-to-end (`ee69697`) |
+| llama.cpp Vulkan, cooperative matrix | `mul_mm_cm2.comp`, device-gated (`ggml-vulkan.cpp:82`; Xe2 = `minSubgroupSize == 16`), enabled for Xe2 by PR #14001 | shaders shipped, **off**; measured slower at every shape (they load from global with no staging) |
+| llama.cpp Vulkan, attention | `flash_attn*` (cm1/cm2/dequant/split-k) | **no** — `qsa_decode_attn.comp`, `attn_decode_short.comp`, no tiled flash attention |
+| llama.cpp SYCL, expert matmul | **not** one dispatch: decode is a per-hit GEMV (`ggml_sycl_mul_mat_id_mmvq_fused`), prefill a host-side counting sort into per-expert slices, then batched GEMM | n/a |
+| llama.cpp SYCL, XMX | **explicitly unused** — `ggml-sycl/common.hpp:99-102`: *"define for XMX in Intel GPU / TODO: currently, it's not used for XMX really"* | n/a |
+
+Two things follow. **The lever is the expert dispatch, not arithmetic** — which is what the per-token-layer
+measurement said independently (prefill ~2.9-3.6 ms/token-layer, decode ~2.9 ms). And **XMX is not the lever for
+this pack**: the vendor's own SYCL backend leaves it unused, the reference's quantized path uses the integer dot
+instead, and this card's own probe reports `int dot: 0` — so a ported MMQ must test
+`VK_KHR_shader_integer_dot_product` first and keep a non-packed accumulation path.
