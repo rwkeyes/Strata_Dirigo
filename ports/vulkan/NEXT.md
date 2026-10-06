@@ -512,6 +512,21 @@ shader this batch changed (the diff is a trace + a refusal message).  **Recorded
 count, NOT chased** (the rule: never loop the gate for a clean arm); whether it is the iGPU intermittent at a
 larger magnitude or a real replay defect is LEFT OPEN and must be settled by a dedicated arm, not assumed.
 
+**THE PLATFORM INTERMITTENT IS NOT RADV-SPECIFIC - IT APPEARED ON THE ARC ARM (prefill-tiling batch, commit
+`ee69697`; logs `/tmp/gate_perf{1,4,5,6}.log`).**  ONE binary, FOUR gate runs, and the Arc arm was not the same
+twice: `intel_icd == 883 passed, 0 failed, 0 skipped` (`gate_perf1`), **`intel_icd == 884 passed, 2 failed, 0
+skipped` (`gate_perf4`)**, `intel_icd == 886/0/0` (`gate_perf5`), `intel_icd == 886/0/0` (`gate_perf6`).  The two
+failures are ONE case at two shapes - `fused_gdn_step_norm S=128 h_k=4 h_v=8` 132099/132100 and `S=128 h_k=3
+h_v=9` 148611/148612 - **one element out of ~132k, on the Intel arm, with no prefill or GEMM case failing in any
+of the four runs** (so the batch's own changes are not implicated; the failing set MOVES, which is the
+intermittent's signature).  **The reported number is the trap:** the failing runs print `worst err/tol 0.0183`
+and `0.0101`, while the SAME case in the PASSING runs prints `worst 0.0508` - a LARGER error against the same
+`tol 2e-4 rel + 1e-5 abs`.  So the discriminator is NOT the numeric tolerance; the case also carries `+ 4
+fixture margins`, and the failing element tripped one of those.  Recorded with the kernel, the shape and the
+count, NOT chased.  OPEN, and it must not be assumed either way: which margin, and whether this is the platform
+intermittent on a third driver or a code-dependent flake - settle it with a dedicated arm (the single case, N
+repetitions, other arms starved), not by re-running the whole gate hoping for green.
+
 # Start here next session
 
 ## THE RECORDING COMPLETES AND THE GRAPH CAPTURES; the stop is now AT LAUNCH, in the engine's own host expert path (`native_quant_act`) (2026-10-05, `vega`)
