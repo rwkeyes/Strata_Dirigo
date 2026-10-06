@@ -1,5 +1,47 @@
 # Status — what is done, what is verified, what is not
 
+## THE ARITHMETIC IS CHECKED AGAINST AN INDEPENDENT IMPLEMENTATION (not a transcription): 10 mmvq formats vs ggml-cpu's own `vec_dot` on the pack's REAL weight rows (`coder-iq1_m`, Intel Arc Pro B70) (2026-10-06, `vega`)
+
+**WHAT IS DONE.** The gate's numeric oracles for the quantised mmvq shaders are HOST TRANSCRIPTIONS of the same
+CUDA dots the shaders were transcribed from (`iq2s_dot_host`, `iq3xxs_dot_host`, `q4/q5/q6_dot_host`), on synthetic
+bytes - so a green gate there means two transcriptions of one expression agree. The new MEASUREMENT-ONLY tool
+`ports/vulkan/ref/ref_vs_ggml.cpp` (built by `ref/build_ref.sh`; on no engine path, touching no engine TU) drives
+the port's shaders through the port's own device layer and compares each against **ggml-cpu's own function**,
+`ggml_get_type_traits_cpu(ty)->vec_dot`, in `~/llama-050/build-vulkan`, plus a second reference from ggml's
+`to_float` (dequantise, then an exact double dot). Weights are REAL rows read at `native_experts.txt`'s offsets; one
+synthetic activation per format is quantised once by ggml and fed to both sides (int8 values identical; fp16 scale
+identical - the reference's scale is rounded to the same fp16).
+
+**WHAT IS VERIFIED.** `10 passed / 0 failed / 0 skipped`, 32 real rows per format (`/tmp/ref_run2.log`): IQ3_XXS
+(blk.0 gate, 6.4e-07 of sum|terms|), IQ2_S (blk.1 gate, 2.1e-06), IQ3_S (blk.17 gate, 9.4e-09), IQ4_XS (blk.47
+gate, 1.3e-08), IQ4_NL (blk.0 down, 2.3e-08), Q2_0 (blk.1 down, 1.3e-08), Q4_K (blk.0 attn_gate, 2.5e-08), Q5_K
+(blk.1 attn_qkv, 1.3e-08), Q6_K (output.weight, 1.2e-08), Q8_0 (blk.47 ffn_down_shexp, 2.2e-08). The bound is
+`1e-5 x sum|terms| + 1e-6 x |value|` PLUS, for IQ2_S and IQ3_XXS ONLY, the per-part integer-truncation allowance
+`sum over parts of d_w x d_a` read from the bytes - those two round `(ls*sumi + sumi/2)/2` per part where ggml
+accumulates exactly, which is exactly why they are the two at ~1e-6 while everything else is at 1e-8. The worst case
+reaches 15% of the bound; no bound was widened. The positive control (eight spread weight bytes flipped per row
+between the two sides) must FAIL: all ten formats moved, `ctl-unchanged=0`. On this pack Q8_K exists only as an
+ACTIVATION type (no type-15 tensor), stated so nobody hunts for a Q8_K weight row.
+
+**A REAL MULTI-TOKEN PROMPT.** 19 ids from the pack's own tokenizer (`def fib(n):\n    if n < 2:\n        return n\n
+   return`, `decode(encode(s)) == s` exact), `--max-new 4`, output ids `15336 1393 8 198` -> ` fib(n)\n`, completing
+`return fib(n)` (`/tmp/ref_prompt.log`); prefill 18 tokens 37,633.6 ms (0.48 tok/s), decode 4 tokens 1,346.7 ms
+(2.97 tok/s, 337 ms/token), `CPU experts 0.00`, `RAM 0 blobs, files 0 blobs`, `pcie experts 0.00`, `100% VRAM
+resident`. **This shows the chain conditions on a longer prompt and decodes more than one step; it does NOT show the
+text is correct or coherent** - one prompt to a high-probability Python continuation, greedy, `--spec 4` with 0 of 9
+drafts accepted.
+
+**WHAT IS NOT.** (1) THE END-TO-END CPU-HYBRID A/B. The port CANNOT reach the engine's CPU expert kernels:
+`native_quant_act`/the row kernels are `refuse_cpu_row` (`vulkan/src/kernels/native_expert_vk.cpp:152`) and every
+non-all-resident config needs a non-resident expert computed on the CPU, so the refusal IS the observed behaviour.
+Running the A/B would mean writing the CPU-hybrid expert path into a shipped port TU; the instruction for that case
+is to stop and report, so it is reported and NOT attempted. The kernel-level half is done and is the same
+arithmetic (`src/kernels/cpu/native_expert.cpp`: "Nothing here is Strata arithmetic: the activation quantizers and
+the row dot products are ggml-cpu's" - the comparison runs against exactly those functions). Unmeasured: the
+whole-model end to end (router, PLE, attention, KV cache, sampler, logits/top-k). (2) A CORRECT TOKEN: the prompt
+above is a chain-executes-and-conditions result, not a semantic one. (3) The `verify.cpp:943` device-plan arm, the
+`pools 2..61` growth, and `z820b` - all still untouched.
+
 ## `resident_plan` PORTED, THE P6 VERIFY WINDOW CAPTURES AND LAUNCHES, AND THE ENGINE PRODUCES ITS FIRST REAL-CONTENT TOKEN (`coder-iq1_m`, Intel Arc Pro B70) (2026-10-06, `vega`)
 
 **WHAT IS DONE.**  The LAST unported symbol between the all-resident verify window and the launch is wired:

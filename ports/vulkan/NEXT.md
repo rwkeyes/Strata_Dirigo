@@ -1,5 +1,110 @@
 # Start here next session
 
+## THE ARITHMETIC IS CHECKED AGAINST AN INDEPENDENT IMPLEMENTATION: the port's mmvq shaders vs ggml-cpu's `vec_dot`, 10 formats on the pack's REAL weight rows, 1e-8..2e-6 (2026-10-06, `vega`)
+
+**THE GATE AGREES WITH ITS ORACLES; THIS AGREES WITH ggml - and the difference matters.** Every numeric case in
+`harness/vk_gate.cpp` for the quantised expert/dense mmvq shaders compares against a **HOST TRANSCRIPTION of the
+same CUDA dot the shader was transcribed from** (`iq2s_dot_host`, `iq3xxs_dot_host`, `q4_dot_host`/`q5_dot_host`/
+`q6_dot_host`), fed SYNTHETIC weight bytes. A transcription agrees with the code it was transcribed from whether or
+not either is right, and this port has had nine wrong oracles. So "the gate is green" is evidence that two
+transcriptions of one expression agree - NOT evidence that the arithmetic is right. The new MEASUREMENT-ONLY tool
+**`ports/vulkan/ref/ref_vs_ggml.cpp`** (built by `ports/vulkan/ref/build_ref.sh`; it touches no engine TU and is on
+no path the engine calls) closes that gap: it drives the port's shaders through the port's own device layer
+(`harness/vk_compute.*`) and compares each result against **ggml-cpu's own dot product for that type**,
+`ggml_get_type_traits_cpu(ty)->vec_dot`, in the llama.cpp build on this host (`~/llama-050/build-vulkan`, ggml
+0.25.1). A second reference, `ggml_get_type_traits(ty)->to_float`, dequantises the same row and dots it against the
+exact activation values in double. Nothing re-derives the expression under test.
+
+**THE FIXTURE IS THE PACK'S OWN BYTES.** 32 weight rows per format, read at the offsets `native_experts.txt`
+records (expert gate/up/down, spread across the 256 experts) or from the tensor table (dense). ONE f32 activation
+per format is quantised ONCE by ggml's `from_float` for the type's `vec_dot_type` and fed to both sides; the port
+receives a q8_1 block whose int8 values are ggml's and whose fp16 scale is ggml's scale rounded to fp16 (the
+reference's scale is rounded to the same fp16, so both sides read the same number). The ACTIVATION is synthetic;
+the WEIGHTS are the pack's. `ref/scan_types.py` and `ref/dump_gguf.py` pick and check the tensors.
+
+**RESULT: 10 passed / 0 failed / 0 skipped (`/tmp/ref_run2.log`), and the agreement is at fp32 summation noise.**
+
+| format | tensor | ggml act | worst err/bound | err / sum\|terms\| |
+|---|---|---|---|---|
+| IQ3_XXS (18) | blk.0.ffn_gate_exps | Q8_K | 0.077 | 6.4e-07 |
+| IQ2_S (22) | blk.1.ffn_gate_exps | Q8_K | 0.152 | 2.1e-06 |
+| IQ3_S (21) | blk.17.ffn_gate_exps | Q8_K | 9.3e-04 | 9.4e-09 |
+| IQ4_XS (23) | blk.47.ffn_gate_exps | Q8_K | 1.3e-03 | 1.3e-08 |
+| IQ4_NL (20) | blk.0.ffn_down_exps | Q8_0 | 2.2e-03 | 2.3e-08 |
+| Q2_0 (42) | blk.1.ffn_down_exps | Q8_0 | 1.2e-03 | 1.3e-08 |
+| Q4_K (12) | blk.0.attn_gate | Q8_K | 2.5e-03 | 2.5e-08 |
+| Q5_K (13) | blk.1.attn_qkv | Q8_K | 1.3e-03 | 1.3e-08 |
+| Q6_K (14) | output.weight | Q8_K | 1.2e-03 | 1.2e-08 |
+| Q8_0 (8) | blk.47.ffn_down_shexp | Q8_0 | 2.2e-03 | 2.2e-08 |
+
+**THE BOUND, PER FORMAT, AND WHY IT IS THAT BOUND.** Two differences are EXPECTED and are quantified, not waved at:
+* **fp32 summation order** - the port sums per part then reduces the workgroup as a barrier tree; ggml sums in its
+  own order. Bound: `1e-5 x sum|term|` plus `1e-6 x |value|` - the same "terms bound" shape the gate itself uses
+  in `gemv_bound`.
+* **the per-part INTEGER rounding, in IQ2_S and IQ3_XXS ONLY.** Their transcribed CUDA rounds `(ls*sumi + sumi/2)/2`
+  to an integer per part; ggml-cpu's `vec_dot_iq2_s_q8_K`/`iq3_xxs_q8_K` accumulate exactly and divide once. Each
+  part loses < 1 unit of `sumi`, so the allowance is the sum over parts of `d_w x d_a`, **read from the actual
+  bytes** (`truncation_allowance()`), NOT chosen to make a case pass. Those two formats are exactly the two whose
+  residual is ~1e-6; every other format sits at 1e-8, i.e. at the summation floor. That is the signature of the
+  stated cause, not of a defect - and the worst case (IQ2_S) reaches only 15% of the bound.
+* **no bound was widened**: the numbers above are the run as it failed 0. (An earlier run FAILED on the control,
+  not on the comparison; the control was fixed, not the bound.)
+
+**THE CONTROL BITES.** For every format and every row, eight spread weight bytes are flipped between the two sides
+and the comparison must FAIL. All ten formats: **0 rows still agreed** (`ctl-unchanged=0`). A comparator that cannot
+see a changed byte is decoration; this one sees it. (The first control flipped ONE byte per row and one Q5_K row did
+not move - the byte landed where the activation was zero. The control was strengthened rather than the case excused.)
+
+**Q8_K IS AN ACTIVATION TYPE HERE, NOT A WEIGHT TYPE.** The pack's tensor table has no type-15 tensor
+(`ref/scan_types.py`); Q8_K appears only as ggml's `vec_dot_type` for the IQ and K-quant rows. That is what "plus
+IQ4_XS/Q8_K where they appear" amounts to on this pack - stated so the reader does not go looking for a Q8_K weight
+row that is not there.
+
+**WHAT THIS PROVES, AND WHAT IT DOES NOT.** It proves the port's shader arithmetic for all ten formats matches an
+implementation that was NOT derived from it, on the pack's real weights, to fp32 noise: a wrong grid index, sign
+mask, nibble order or sub-scale would have to be wrong in ggml too. It does NOT touch the router, the PLE, the
+attention, the KV cache, the sampler or the logits, and it does not prove a token.
+
+### THE END-TO-END CPU-HYBRID A/B WAS **NOT** DONE, AND THE REASON IS A JUDGEMENT, NOT AN OMISSION
+
+The sharpest end-to-end reference would be the engine's OWN CPU expert kernels on this pack and prompt against the
+port's GPU path. The port cannot reach them: `native_quant_act` (and the row kernels beside it) are `refuse_cpu_row`
+in `vulkan/src/kernels/native_expert_vk.cpp:152`, and that refusal is the shipped behaviour the user's constraint
+fixes. To run a CPU-hybrid config the refusal would have to become an implementation - the CPU-hybrid expert
+execution path INSIDE the port, in a shipped TU. A measurement-only flag would still be that path. **The instruction
+for this case is to stop and report rather than bend the constraint, so this is reported, not attempted.**
+
+The kernel-level half of that A/B IS done, and it is the same arithmetic: `src/kernels/cpu/native_expert.cpp` states
+verbatim that its expert dot products are ggml-cpu's ("Nothing here is Strata arithmetic: the activation quantizers
+and the row dot products are ggml-cpu's"), and the comparison above runs against exactly those functions, per
+format, on the same real bytes. What remains unmeasured is the WHOLE-MODEL end-to-end (router, PLE, attention,
+sampler, logits/top-k), not the expert math. The engine itself corroborates the expected GPU/CPU split: it prints
+`the GPU computes the experts in the cache; it rounds differently from the CPU, so a reply can differ slightly from
+a run without the cache (same quality: bench/results/2026-09-27-cache-parity)`.
+
+### A REAL MULTI-TOKEN PROMPT: 19 ids, 4 decode steps, `return fib(n)` (`/tmp/ref_prompt.log`)
+
+Same config as the milestone run, with a prompt built from the PACK'S OWN tokenizer
+(`tools/strata_tokenizer.py`, `Tokenizer.from_gguf` on shard 1) and `--max-new 4 --max-context 64`:
+
+```
+prompt  : 727 15336 1393 1590 198 262 413 307 361 220 17 25 198 285 460 307 198 262 460
+output  : 15336 1393 8 198
+decode                   4 tokens in 1346.7 ms  ->  2.97 tok/s
+prefill                  18 tokens in 37633.6 ms  ->  0.48 tok/s  (time to first token 38035.2 ms)
+```
+* The prompt is `def fib(n):\n    if n < 2:\n        return n\n    return` - **19 ids, and `decode(encode(s)) == s`
+  exactly**. The output ids decode to **` fib(n)\n`**, which completes the line as `return fib(n)`. Full round trip:
+  `def fib(n):\n    if n < 2:\n        return n\n    return fib(n)\n`.
+* `CPU experts 0.00 distinct / 0.00 routed per layer`, `RAM 0 blobs, files 0 blobs`, `pcie experts 0.00`, `100% VRAM
+  resident: zero-doorbell graph` - the same no-CPU-hybrid shape as the milestone run, at a longer prompt and more
+  decode steps.
+* **WHAT IT DOES NOT PROVE.** One prompt does not show the text is correct or coherent in general: it shows the
+  chain conditions on a 19-token prompt and decodes four steps to a high-probability Python continuation. The two
+  bounds persist: `--spec 4` accepted 0 of 9 drafts, and the sampler is greedy, so a deterministic token is
+  expected rather than surprising. Decode is 337 ms/token here against 143 ms for the 1-token window in the
+  milestone run - the window holds 4 tokens, so each round does ~4x the expert work.
+
 ## THE LAST SYMBOL LANDS AND THE ENGINE PRODUCES ITS FIRST REAL-CONTENT TOKEN: `resident_plan` PORTED, the P6 verify window CAPTURES AND LAUNCHES, token id 20 from `coder-iq1_m` on the Intel Arc Pro B70 (2026-10-06, `vega`)
 
 **A TOKEN CAME OUT OF THE REAL MODEL.**  `strata_vulkan` on the pack `coder-iq1_m` ran the whole 48-layer
