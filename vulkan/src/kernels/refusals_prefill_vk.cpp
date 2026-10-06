@@ -37,11 +37,13 @@ namespace {
 
 namespace strata::prefill {
 
-// ---- the stateful batched kernels still unported -----------------------------------------------------------
+// `native_qsa_indexer_append` (layer.cpp:945) is PORTED (qsa_vk.cpp) and the flag is TRUE; `kv_append` and
+// `qsa_prompt_attn_batch` are PORTED in prefill_vk.cpp.  The remaining prompt-path refusals are the pack/flag
+// cases this backend is not running (kv_q4, kv_mode 1) plus the two diagnostics and the batched PLE block.
+// `blob_dequant_f16` is the Q2_0 pack's expert blob -> FP16 reader (a pack variant this port is not running, and
+// the engine's own `native` expert route is a different kernel).  `round_f16` is only the
+// STRATA_IDX_FP16_CHECK diagnostic (kernels.cu:813).
 void blob_dequant_f16(const uint8_t*, uint16_t*, uint16_t*, void*) { refuse_prompt("strata::prefill::blob_dequant_f16"); }
-void kv_append(const float*, const float*, int64_t, int64_t, const int32_t*, int64_t, uint16_t*, uint16_t*, int8_t*,
-               int8_t*, uint16_t*, uint16_t*, void*, const strata::kernels::KvHostPools*,
-               const strata::kernels::KvHostPools*) { refuse_prompt("strata::prefill::kv_append"); }
 void round_f16(const float*, float*, int64_t, void*) { refuse_prompt("strata::prefill::round_f16"); }
 
 }  // namespace strata::prefill
@@ -53,9 +55,5 @@ void kv_append_q4(uint8_t*, uint8_t*, const int32_t*, int64_t, int64_t, const fl
                   const KvHostPools*, const KvHostPools*) { refuse_prompt("strata::kernels::kv_append_q4"); }
 void kv_stage_from_host(const QsaAttnPools&, const KvHostPools&, int, int64_t, const QsaShapes&, void*) { refuse_prompt("strata::kernels::kv_stage_from_host"); }
 void native_ple_postops_batch(float*, float*, const float*, float*, const PleWeights&, float*, float*, float*, int, void*) { refuse_prompt("strata::kernels::native_ple_postops_batch"); }
-void native_qsa_indexer_append_batch(const float*, int64_t, int64_t, int32_t, const float*, float, const QsaIndexerBuffers&,
-                                     const QsaShapes&, int64_t, const RopeScaling&, void*) { refuse_prompt("strata::kernels::native_qsa_indexer_append_batch"); }
-bool qsa_prompt_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
-                           float*, int64_t, void*) { refuse_prompt("strata::kernels::qsa_prompt_attn_batch"); }
 
 }  // namespace strata::kernels

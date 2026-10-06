@@ -50,6 +50,8 @@
 #include "strata/kernels/native_gdn.hpp"            // native_gdn_step (the DECODE recurrence, reused)
 #include "strata/kernels/native_gdn_preprocess.hpp" // native_gdn_out_norm (the DECODE closing norm, reused)
 #include "strata/kernels/native_rope.hpp"           // native_rope_apply (the DECODE rotation, reused)
+#include "strata/kernels/qsa_decode_attn.hpp"       // QsaAttnPools (the qsa_prompt_attn_batch signature)
+#include "strata/kernels/qsa_prompt_attn.hpp"       // qsa_prompt_attn_batch (answered false: no tensor-core shader)
 #include "strata/vulkan/vk_backend.hpp"     // Stream, stream_of, rms_norm_weighted
 #include "vk_arena.hpp"                     // the arena + pointer->buffer resolution
 
@@ -179,6 +181,45 @@ void gemm_f16(Stream& s, const uint16_t* X, const uint16_t* W, float* Y, int64_t
     if (!arena_resolve(s, t, (uint64_t) T * ldy * 4, tv)) refuse("prefill::Gemm", "no temp scratch");
     s.ctx->dispatch(p, {&xv, &wv, &tv}, &pc, sizeof(pc), groups_for((uint64_t) T * N));
     strata::vulkan::add_inplace(s, Y, t, T * ldy);
+}
+
+// ---- ONE TOKEN of the KV append, in the DECODE kernel's shape -------------------------------------------------
+// `kv_f16_append.spv` / `kv_q8_append.spv` are the port's ALREADY-GATED decode appends: they read the cell's
+// position from `step` (kStepPos == 0, a DEVICE int) and `host_layout` selects the VRAM page-table row (0) or
+// the identity host row (1).  The prefill's batched CUDA kernel (`kv_append_kernel`) computes the SAME row
+// formula `(page*kv_heads + h)*page_size + pos%page_size` and the SAME host identity row, one token at a time,
+// so a chunk is a LOOP over these two shaders.  Every pointer goes through `resolve_dev` because the KV host
+// mirror is a MAPPED pinned region, not arena memory.
+void kv_append_f16_one(Stream& s, uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table,
+                       const int32_t* step, int32_t host_layout, const float* kc, const float* vc, int64_t kh,
+                       int64_t hd, int64_t page_size) {
+    Buf kv{}, vv{}, tv{}, sv{}, kcv{}, vcv{};
+    if (!resolve_dev(s, k_pool, (uint64_t) kh * hd * 2, kv) || !resolve_dev(s, v_pool, (uint64_t) kh * hd * 2, vv) ||
+        !resolve_dev(s, page_table, 4, tv) || !resolve_dev(s, step, 4, sv) ||
+        !resolve_dev(s, kc, (uint64_t) kh * hd * 4, kcv) || !resolve_dev(s, vc, (uint64_t) kh * hd * 4, vcv))
+        refuse("prefill::kv_append", "an argument is neither in this arena nor a live mapped region");
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/kv_f16_append.spv", 6, 16);
+    struct { int32_t kv_heads, head_dim, page_size, host_layout; } pc{
+        (int32_t) kh, (int32_t) hd, (int32_t) page_size, host_layout};
+    s.ctx->dispatch(p, {&kv, &vv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc), groups_for((uint64_t) 2 * kh * hd));
+}
+
+void kv_append_q8_one(Stream& s, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+                      const int32_t* page_table, const int32_t* step, int32_t host_layout, const float* kc,
+                      const float* vc, int64_t kh, int64_t hd, int64_t page_size) {
+    if (hd % 64 != 0) refuse("prefill::kv_append", "head_dim is not a multiple of 64 (the KV-Q8 group)");
+    const uint64_t code = (uint64_t) kh * hd, scale = (uint64_t) kh * (hd / 64) * 2;
+    Buf kqv{}, vqv{}, ksv{}, vsv{}, tv{}, sv{}, kcv{}, vcv{};
+    if (!resolve_dev(s, k_q, code, kqv) || !resolve_dev(s, v_q, code, vqv) ||
+        !resolve_dev(s, k_scale, scale, ksv) || !resolve_dev(s, v_scale, scale, vsv) ||
+        !resolve_dev(s, page_table, 4, tv) || !resolve_dev(s, step, 4, sv) ||
+        !resolve_dev(s, kc, (uint64_t) kh * hd * 4, kcv) || !resolve_dev(s, vc, (uint64_t) kh * hd * 4, vcv))
+        refuse("prefill::kv_append", "an argument is neither in this arena nor a live mapped region");
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/kv_q8_append.spv", 8, 16);
+    struct { int32_t kv_heads, head_dim, page_size, host_layout; } pc{
+        (int32_t) kh, (int32_t) hd, (int32_t) page_size, host_layout};
+    s.ctx->dispatch(p, {&kqv, &vqv, &ksv, &vsv, &tv, &sv, &kcv, &vcv}, &pc, sizeof(pc),
+                    groups_for(2 * (uint64_t) kh * (uint64_t) (hd / 64)));
 }
 
 }  // namespace
@@ -658,6 +699,60 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
     s->ctx->dispatch(p, {&av, &qv, &ov}, &pc, sizeof(pc), groups_for(n));
 }
 
+// ================================ the KV append into the paged cache =====================================
+// `src/prefill/kernels.cu`'s `kv_append_kernel` (line 766) writes T consecutive cells at positions
+// pos0..pos0+T-1: for each cell it computes `page = table[pos/page_size]`,
+// `row = (page*kv_heads + kvh)*page_size + pos%page_size` for the VRAM pool (skipped when the block is not
+// resident, page < 0) and the IDENTITY row for the host mirror (always).  That is EXACTLY the row rule of the
+// port's DECODE append (`kv_f16_append.spv` / `kv_q8_append.spv`, case_kv_append), whose cell position arrives
+// through `step` (kStepPos == 0) - so a chunk is a LOOP over the already-gated decode appends, one cell per
+// dispatch, with a per-token position written to a device int.  The DECODE-equivalent shaping, as with
+// `gdn_recurrence`.
+//
+// THE STAGING POOL (kv_mode 1) IS REFUSED: `stage` is non-null only under KV streaming, which is a pack/flag
+// this run does not select (`staged = st.kv_mode == 1`, prefill.cpp:2040).  `host` IS honoured - the default
+// pack writes its pinned host mirror.
+void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table,
+               int64_t page_size, uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale,
+               uint16_t* v_scale, void* stream, const strata::kernels::KvHostPools* host,
+               const strata::kernels::KvHostPools* stage) {
+    if (T <= 0) return;
+    Stream* s = need(strata::vulkan::stream_of(stream), "prefill::kv_append");
+    if (page_size <= 0) refuse("prefill::kv_append", "page_size <= 0");
+    if (stage != nullptr && (stage->k_pool != nullptr || stage->k_q != nullptr || stage->k_q4 != nullptr))
+        refuse("prefill::kv_append", "the KV staging pool (kv_mode 1) is not ported; the resident/host pair is");
+    if (k_pool == nullptr && k_q == nullptr)
+        refuse("prefill::kv_append", "neither an f16 pool nor an int8 pool is present");
+    // CAPTURE DISCIPLINE: the per-token positions are host-staged inputs (a `stream_write`), so a replay would
+    // read the capture-time positions - every token after the first would land on the wrong cell.  The prompt
+    // path is not captured today, but a wrapper that cannot record must REFUSE rather than replay stale bytes
+    // (the same contract `prefill::rope` carries).
+    if (s->ctx != nullptr && s->ctx->capturing())
+        refuse("prefill::kv_append", "the per-token positions upload is host-staged and cannot be recorded under capture");
+    const int64_t KH = 2, HD = 256;             // the artifact's QSA geometry (qsa.hpp qsa_real_shapes)
+    const uint64_t cell = (uint64_t) KH * HD;   // floats per token per side (K or V)
+    int32_t* steps = (int32_t*) xf32(*s, (uint64_t) (T + 1) * 4 * 4).p;   // one kStepCount-wide slot per token + tail
+    std::vector<int32_t> hs((size_t) (T + 1) * 4, 0);
+    for (int64_t t = 0; t < T; ++t) hs[(size_t) t * 4] = (int32_t) (pos0 + t);   // kStepPos == 0
+    stream_write(*s, steps, hs.data(), (uint64_t) (T + 1) * 4 * 4);
+    const bool f16 = (k_pool != nullptr);
+    for (int64_t t = 0; t < T; ++t) {
+        const int32_t* stept = steps + t * 4;
+        const float* kc = K + t * cell;
+        const float* vc = V + t * cell;
+        if (f16) {
+            kv_append_f16_one(*s, k_pool, v_pool, page_table, stept, 0, kc, vc, KH, HD, page_size);
+            if (host != nullptr && host->k_pool != nullptr)
+                kv_append_f16_one(*s, host->k_pool, host->v_pool, page_table, stept, 1, kc, vc, KH, HD, page_size);
+        } else {
+            kv_append_q8_one(*s, k_q, v_q, k_scale, v_scale, page_table, stept, 0, kc, vc, KH, HD, page_size);
+            if (host != nullptr && host->k_q != nullptr)
+                kv_append_q8_one(*s, host->k_q, host->v_q, host->k_scale, host->v_scale, page_table, stept, 1, kc,
+                                 vc, KH, HD, page_size);
+        }
+    }
+}
+
 }  // namespace strata::prefill
 
 // ---- the prefill-path kernels-NAMESPACE symbols this batch answers ------------------------------------------
@@ -668,6 +763,19 @@ namespace strata::kernels {
 // honest answer is false; a stub that returned true would route the prompt at a kernel the port does not have.
 bool qsa_block_scores_tc(const float*, const float*, const float*, const int32_t*, int64_t, int64_t,
                          const QsaShapes&, float*, void*, int64_t) {
+    return false;
+}
+
+// `qsa_prompt_attn_batch` (qsa_prompt_attn.hpp, prefill.cpp:2222): the prompt path's QSA attention ON TENSOR
+// CORES, and it is an OPTIMISATION with a designed FALLBACK rather than a required kernel.  The engine calls it
+// and, when it answers false, runs `qsa_decode_attn_batch` (prefill.cpp:2224-2229) - which this port implements
+// as a per-query loop over the gated decode attention.  This backend has no tensor-core prompt-attention shader,
+// so the honest answer is false: it is a real CAPABILITY answer, the same shape as `qsa_block_scores_tc`, and
+// returning true would route the prompt at a kernel the port does not have.  (The header is explicit that the
+// tensor-core form is not bitwise equal to the decode form anyway: "`qsa_decode_attn_batch` serves a prompt one
+// query at a time with the decode kernel".)
+bool qsa_prompt_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,
+                           const QsaShapes&, float*, int64_t, void*) {
     return false;
 }
 

@@ -1,5 +1,38 @@
 # Status — what is done, what is verified, what is not
 
+## THE PREFILL PATH RUNS TO COMPLETION on the REAL pack; the stop is the verifier's residency table (2026-10-05, `vega`)
+
+**8 -> 5 prefill refusals, and the prompt path now executes every stage.**  `coder-iq1_m` with
+`--spec 4 --prefill 1 --tokens "1,2" --max-new 1 --max-context 8` prints
+`prefill 1 tokens in 1 chunks, 29680.6 ms (0.0 tok/s); experts streamed 480 ...; PLE 5.5 ms` and only THEN stops at
+`generate.cpp:7818` — `--spec needs the device residency table (--expert-profile, --expert-cache and the token graph)`
+(`/tmp/run_pf9.log`, `RC=2`).  **NO TOKEN**, and the bounds are unchanged (real weights, 2-token prompt, PLE
+file-backed, `--spec 4`, `pcie_frac 0.00`; per-kernel numerics are the GATE's job, not this run's).
+
+**PORTED (DECODE-equivalent per-token shaping):** `prefill::kv_append` (loop over the gated `kv_f16_append`/
+`kv_q8_append`), `native_qsa_indexer_append` + `_batch` (NEW shader `pf_indexer_native.comp`, transcribed from
+`native_qsa_indexer.cu:46-106`; the batch loops the single append), `qsa_decode_attn_batch` (per-query loop over the
+gated decode attention), `qsa_prompt_attn_batch` -> FALSE (a capability; the engine falls back to
+`qsa_decode_attn_batch`).  `native_qsa_indexer_enabled()` is now a REAL flag.  **REFUSED honestly** (not on this path):
+`kv_append_q4`, `kv_stage_from_host`, `native_ple_postops_batch`, `blob_dequant_f16`, `round_f16`.
+
+**PROVEN, not assumed.**  `case_prefill_prompt_path` gates the six shaders the last batch left gate-compiled-only
+(`pf_swiglu16` both modes, `pf_moe_combine`, `pf_gu_interleave_f16`, `pf_split_q`, `pf_gate_attn`, `pf_copy_u32`) plus
+`kv_f16_append` (through `prefill::kv_append`) and `pf_indexer_native` (through `native_qsa_indexer_append`) — nine new
+arms, each against the engine's own rule (double where that is the only reference).  Seven registered injections, ALL
+FALSIFY.  **The first failing case was the ORACLE, not the kernel** (a relative-to-result tolerance on `moe_combine`
+blown up by cancellation) — the port's fifth wrong oracle.
+
+**THE VERIFIER PRECONDITION, from the code:** the message is `thits.d_res == nullptr` (`generate.cpp:7817`); `d_res` is
+built only with `hit_fn && !profile.empty() && !no_pool` (`:4267`) and a capturable token graph (`:4268`).
+`--expert-profile P` reads a `profile.bin` from `tools/make_profile.py` (a real producer needing a routing trace);
+`--expert-cache` must be non-empty; and the token graph is captured only when `!native_pack && !multi_gpu` (`:4334`),
+so a native pack has none by design.  Bigger than one batch.
+
+**MAP:** `168 = 81 kernel + 0 shader + 45 host + 0 todo + 42 refused` (two decode-path rows moved `refused -> kernel`);
+`check_port_map.py` passes, `make_port_map.py` regenerates byte-identically.  **ENGINE BAR: 0 undefined — 0 BY
+CONSTRUCTION.**  GATE (vega): Arc `intel_icd` **802/0/0 (exit 0)**.  `z820b` untouched.
+
 ## THE PREFILL PATH LANDS 23 OF ITS 40 ENTRY POINTS; the real pack RUNS the prompt path and stops at `gdn_recurrence` (2026-10-05, `vega`)
 
 **THE STOPPING POINT MOVED OFF `Gemm::init_external`.**  New TU `vulkan/src/kernels/prefill_vk.cpp` + 8 new

@@ -82,6 +82,7 @@
 #include "strata/kernels/qsa.hpp"            // QsaShapes / qsa_step_fill / kStepCount
 #include "strata/kernels/qsa_select.hpp"     // qsa_block_scores / qsa_block_topk
 #include "strata/kernels/qsa_decode_attn.hpp"  // qsa_decode_attn_step / qsa_decode_attn_scratch_floats
+#include "strata/kernels/native_qsa_indexer.hpp"  // native_qsa_indexer_append / _batch
 #include "strata/kernels/native_router.hpp"  // native_router_top10
 #include "strata/vulkan/vk_backend.hpp"      // the backend's seam: Stream, stream_of
 #include "vk_arena.hpp"                      // the arena + pointer->buffer resolution
@@ -440,6 +441,62 @@ static void indexer_key_append_impl(Stream& s, const float* raw, const int32_t* 
     s.ctx->dispatch(p, {&rawv, &posv, &wv, &tailv, &deadv, &poolv, &bpv, &ctv, &stv}, &pc, sizeof(pc), 1u);
 }
 
+// The same pointer rule the prefill TU uses (`resolve_dev`): a native pack holds some of these tables in MAPPED
+// PINNED HOST memory, and a Vulkan shader binds the region's device-visible buffer, not the host address.
+bool resolve_dev(const Stream& s, const void* p, uint64_t bytes, Buf& out) {
+    if (p == nullptr) return false;
+    return arena_resolve(s, p, bytes, out) || mapped_resolve(p, bytes, out);
+}
+
+// ---- native_qsa_indexer_append -> pf_indexer_native.spv.  ONE cell per dispatch, ONE workgroup of 256 with
+// the first idx_dim (128) lanes active.  This is the NATIVE sibling of indexer_key_append_impl, a DIFFERENT
+// arithmetic (see pf_indexer_native.comp): F16-rounded raw keys, an F32 barrier-tree reduce, and the rotation
+// angle computed ON DEVICE.  `pos_dev` is a DEVICE pointer (the CUDA reads `*pos_dev`), so the wrapper reads
+// nothing back - the shader derives the slot and the block from device memory, which keeps it capturable.
+void native_qsa_indexer_append_dev(Stream& s, const float* raw, const int32_t* pos_dev, int32_t pos_base,
+                                   const float* gamma, float eps, const strata::kernels::QsaIndexerBuffers& b,
+                                   const strata::kernels::QsaShapes& sh, int64_t max_cells,
+                                   const strata::kernels::RopeScaling& scaling) {
+    const int64_t D = sh.idx_dim, r = sh.idx_block, n_rot = sh.n_rot;
+    if (D != 128 || r != 4 || n_rot != 64)
+        refuse("native_qsa_indexer_append", "the native indexer's geometry is fixed (idx_dim 128, idx_block 4, n_rot 64)");
+    if (max_cells < 1) refuse("native_qsa_indexer_append", "max_cells < 1");
+    if (!raw || !pos_dev || !gamma || !b.tail || !b.dead || !b.pooled || !b.block_pos)
+        refuse("native_qsa_indexer_append", "a required pointer is null");
+    // STRATA_ROPE_TABLE=1 with a matching table: the engine's <true> append rotates by the table's exact float64
+    // angles; this shader computes the angle analytically.  Refuse the one configuration the port cannot honour
+    // rather than silently diverge - the same guard native_rope_apply applies.
+    if (strata::kernels::rope_table_for(scaling).cos != nullptr)
+        refuse("native_qsa_indexer_append", "STRATA_ROPE_TABLE=1 with a matching table: this backend computes the "
+                                            "indexer angle analytically, not from the float64 table");
+    Buf rawv{}, posv{}, gv{}, tailv{}, deadv{}, poolv{}, bpv{};
+    const uint64_t pooled_bytes = (uint64_t) (max_cells / r + 1) * (uint64_t) D * 4;
+    if (!resolve_dev(s, raw, (uint64_t) D * 4, rawv) || !resolve_dev(s, pos_dev, 4, posv) ||
+        !resolve_dev(s, gamma, (uint64_t) D * 4, gv) ||
+        !resolve_dev(s, b.tail, (uint64_t) (r - 1) * D * 4, tailv) ||
+        !resolve_dev(s, b.dead, (uint64_t) D * 4, deadv) || !resolve_dev(s, b.pooled, pooled_bytes, poolv) ||
+        !resolve_dev(s, b.block_pos, 4, bpv))
+        refuse("native_qsa_indexer_append", "a pointer is neither in this stream's arena nor a live mapped region");
+    const strata::kernels::RopeKernelArgs ka = scaling.kernel_args((int) n_rot);
+    struct Push {
+        int32_t idx_dim, r, n_rot, pos_base;
+        float eps, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale;
+    } pc{};
+    pc.idx_dim = (int32_t) D;
+    pc.r = (int32_t) r;
+    pc.n_rot = (int32_t) n_rot;
+    pc.pos_base = pos_base;
+    pc.eps = eps;
+    pc.theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    pc.freq_scale = ka.freq_scale;
+    pc.corr_low = ka.corr_low;
+    pc.corr_high = ka.corr_high;
+    pc.ext_factor = ka.ext_factor;
+    pc.mscale = ka.attn_factor;
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/pf_indexer_native.spv", 7, sizeof(pc));
+    s.ctx->dispatch(p, {&rawv, &posv, &gv, &tailv, &deadv, &poolv, &bpv}, &pc, sizeof(pc), 1u);
+}
+
 }  // namespace strata::vulkan
 
 // ---- the engine's entry points: the symbols include/strata/kernels/*.hpp declare --------------------------
@@ -565,6 +622,56 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                         const float* sin_tab, void* stream) {
     strata::vulkan::indexer_key_append_impl(*need_stream("indexer_key_append", stream), raw, pos_dev, pos_base,
                                             w_k_norm, eps, b, s, cos_tab, sin_tab);
+}
+
+// native_qsa_indexer.hpp: `void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
+//     int32_t pos_base, const float* gamma, float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s,
+//     int64_t max_cells, const RopeScaling& scaling, void* stream);`  (layer.cpp:945, verify.cpp:819/1305/1859).
+//     The NATIVE indexer member the `native_qsa_indexer_enabled()` contract selects; the flag is now TRUE
+//     (native_caps_vk.cpp), so this is on the MAIN forward path of all 12 QSA layers every token.
+void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
+                               const float* gamma, float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s,
+                               int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    strata::vulkan::native_qsa_indexer_append_dev(*need_stream("native_qsa_indexer_append", stream), raw,
+                                                  relative_pos_device, pos_base, gamma, epsilon, b, s, max_cells,
+                                                  scaling);
+}
+
+// native_qsa_indexer.hpp: the BATCHED append (prefill.cpp:2101).  The header's own contract: "leaving the
+// buffers exactly as n calls of the single append in order would" - so this is a LOOP over the single append,
+// one cell per dispatch, positions written to a device int per token.  The batch is documented HOST-side
+// positions ("not for a captured graph"), so the host-staged position is honest here; the SINGLE append (the
+// decode/verify path) reads the engine's real device `pos_dev` and is capturable.
+void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
+                                     float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
+                                     const RopeScaling& scaling, void* stream) {
+    if (n <= 0) return;
+    strata::vulkan::Stream* st = need_stream("native_qsa_indexer_append_batch", stream);
+    if (p0 < 0 || p0 + n > max_cells)
+        strata::vulkan::refuse("native_qsa_indexer_append_batch", "the batch [p0, p0+n) does not fit max_cells");
+    int32_t* pos_dev = strata::vulkan::arena_alloc<int32_t>(*st, 1);
+    for (int64_t t = 0; t < n; ++t) {
+        const int32_t pos = (int32_t) (p0 + t);
+        strata::vulkan::stream_write(*st, pos_dev, &pos, 4);
+        strata::vulkan::native_qsa_indexer_append_dev(*st, raw + t * s.idx_dim, pos_dev, pos_base, gamma, epsilon,
+                                                      b, s, max_cells, scaling);
+    }
+}
+
+// qsa_decode_attn.hpp: the BATCHED decode attention (layer.cpp:996? - the `qsa_decode_attn_batch` fallback the
+//     prompt path takes when `qsa_prompt_attn_batch` returns false, prefill.cpp:2226; the P6 verifier and the
+//     MTP drafter use it too).  Plan v0.3 P5: "n_q queries at once, each with its own selection".  Served one
+//     query at a time by the ALREADY-GATED decode kernel `qsa_decode_attn_step` (case_qsa_decode_attn) - the
+//     batch is a LOOP, not a second attention kernel, which is exactly the header's own description
+//     ("`qsa_decode_attn_batch` serves a prompt one query at a time with the decode kernel").
+void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* out, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    strata::vulkan::Stream* st = need_stream("qsa_decode_attn_batch", stream);
+    const int64_t zv = s.n_head * s.head_dim;   // floats per query across heads
+    for (int64_t i = 0; i < n_q; ++i)
+        strata::vulkan::qsa_decode_attn(*st, q + i * zv, pools, ids + i * cap, steps + i * kStepCount, cap, s,
+                                        scratch, out + i * zv);
 }
 
 // ---- the `host` row: the rope CONSTANTS (rope_scaling.hpp) -------------------------------------------------

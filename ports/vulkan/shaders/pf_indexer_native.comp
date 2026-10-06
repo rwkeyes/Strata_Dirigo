@@ -1,0 +1,143 @@
+#version 450
+// ports/vulkan/shaders/pf_indexer_native.comp - the NATIVE QSA indexer append: one raw indexer key in, the
+// pooling that fires when a cell COMPLETES a block.
+//
+// Transcribed from `src/kernels/cuda/native_qsa_indexer.cu`'s `append<false>` (the default: no STRATA_ROPE_TABLE
+// path), lines 46-106, and it is the arithmetic `native_qsa_indexer_append` drives on the DECODE path
+// (layer.cpp:945, verify.cpp:819) and `native_qsa_indexer_append_batch` drives on the PROMPT path
+// (prefill.cpp:2101).  Its legacy sibling (`indexer_key_append`, ported in qsa_vk.cpp/indexer_key_append.comp)
+// is a DIFFERENT arithmetic: the legacy pools the RAW keys with a double reduce and rotates from a host-built
+// table; this one rounds each key through F16, reduces in F32, and computes the angle ON DEVICE.
+//
+// THE RULE (ONE workgroup, D = 128 lanes active)
+//
+//     pos       = POS[0]
+//     slot      = pos % 4
+//     incoming  = f32(f16(raw[d]))                       // SET_ROWS stores F16; GET_ROWS widens those bits
+//     if slot < 3:  tail[slot*D + d] = incoming
+//     if pos != 0 and slot != 3: return                  // nothing pools until a block completes
+//     mean      = 0.25 * (the block's four raw keys, in cell order, F16-rounded)   pos 0: raw[d] four times
+//     scale     = rsqrt(sum(mean^2 over D)/D + eps)
+//     values[d] = scale * mean * gamma[d]
+//     b         = pos / 4
+//     rope_pos  = pos == 0 ? 0 : pos_base + 4*b           // the block's FIRST cell
+//     y         = rope(values, rope_pos)                  // the first n_rot dims, NEOX pairs
+//     pooled[b*D + d] = y
+//     if pos == 0: dead[d] = y
+//     else:        pooled[(b+1)*D + d] = dead[d]          // the spare slot MOVES to row b+1
+//     if d == 0 and pos != 0: BPOS[0] = rope_pos
+//
+// THE TWO CLAUSES THE CUDA PINNED, KEPT AS WRITTEN:
+//   * the spare key comes from CELL 0 (`pos == 0` pools `raw[d]` four times); the spare is CONSTANT in value.
+//   * the rotation position is the block's FIRST cell, and the spare keeps angle ZERO.
+//
+// WHAT IS DELIBERATELY DIFFERENT FROM THE CUDA, AND WHY IT IS NOT A NUMERIC CLAIM.
+//   * the CUDA reduces the sum of squares with a two-level warp tree (`warp_sum` + shared `partials[32]`); this
+//     port uses the barrier tree in common/wg_reduce.glsl with a FIXED workgroup of 256 (the host's kLocalSize),
+//     D = 128 lanes contributing and the rest 0.  The summation ORDER of 128 values differs in the last bits;
+//     the gate MEASURES the gap against a host transcription of the CUDA rule in double rather than claiming
+//     bit-exactness (the same stance indexer_key_append.comp takes on the CUDA's double reduce).
+//   * the CUDA's angle is `powf`/`cosf`/`sinf` under fast math; this port computes the SAME analytic rule with
+//     the driver's trig.  The rope gate already measures that gap at 3e-3 relative to the row magnitude.
+//   * `mrope_pos` is the IDENTITY here (text - the engine's `mrope_table()` is null for this model), exactly as
+//     `native_rope_apply.comp` assumes; a non-null mrope table is out of scope and is refused by the wrapper.
+//   * the max_cells / pos range guard the CUDA does on the host is the WRAPPER's (`pos < 0 || pos >= max_cells`
+//     was a device guard in the CUDA; here the wrapper range-checks the pooled extent it resolves).
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+#include "common/f16_bits.glsl"
+#include "common/wg_reduce.glsl"
+
+layout(set = 0, binding = 0, std430) readonly buffer RAW { float v[]; } RAW_;
+layout(set = 0, binding = 1, std430) readonly buffer POS { int v[]; } POS_;
+layout(set = 0, binding = 2, std430) readonly buffer GAM { float v[]; } GAM_;
+layout(set = 0, binding = 3, std430) buffer TAIL { float v[]; } TAIL_;
+layout(set = 0, binding = 4, std430) buffer DEAD { float v[]; } DEAD_;
+layout(set = 0, binding = 5, std430) buffer POOL { float v[]; } POOL_;
+layout(set = 0, binding = 6, std430) buffer BPOS { int v[]; } BPOS_;
+
+layout(push_constant, std430) uniform Pc {
+    int idx_dim;      // 128 (D)
+    int r;            // 4  (the block size; R-1 = 3 tail slots)
+    int n_rot;        // 64 (ROT)
+    int pos_base;     // the sequence's first cell's POSITION
+    float eps;
+    float theta_scale;   // powf(freq_base, -2/ROT), computed on the host as the source does
+    float freq_scale;
+    float corr_low;
+    float corr_high;
+    float ext_factor;
+    float mscale;
+} pc;
+
+// `rope_yarn_ramp` / `rope_scaled_angle`, transcribed from rope_scaling.hpp - the SAME two helpers
+// native_rope_apply.comp carries, so the indexer's pooled key and the decode rotation cannot drift apart.
+float rope_yarn_ramp(float low, float high, int pair) {
+    float y = (float(pair) - low) / (high - low > 0.001f ? high - low : 0.001f);
+    float clamped = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+    return 1.0f - clamped;
+}
+void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_low, float corr_high, float ext_factor,
+                       float mscale_in, int pair, out float cos_out, out float sin_out) {
+    float theta = freq_scale * theta_extrap;
+    float mscale_v = mscale_in;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
+        theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale_v *= 1.0f + 0.1f * log(1.0f / freq_scale);
+    }
+    cos_out = cos(theta) * mscale_v;
+    sin_out = sin(theta) * mscale_v;
+}
+
+shared float pf_values[128];
+
+void main() {
+    const int d = int(gl_LocalInvocationIndex);
+    const int D = pc.idx_dim;
+    const int pos = POS_.v[0];
+    const int slot = pos % pc.r;
+    const bool in_d = d < D;
+    const bool pools = (pos == 0) || (slot == pc.r - 1);
+    const float incoming = in_d ? unpackHalf2x16(uint(f16_from_f32_port(RAW_.v[d]))).x : 0.0f;
+    if (in_d && slot < pc.r - 1) TAIL_.v[slot * D + d] = incoming;
+    // EVERY invocation reaches wg_sum (barriers): an inactive lane contributes 0.
+    float mean = 0.0f;
+    if (in_d && pools) {
+        float sum;
+        if (pos == 0) {
+            sum = incoming;                       // the spare's four gather indices all name cell zero
+            for (int j = 1; j < pc.r; ++j) sum += incoming;
+        } else {
+            sum = TAIL_.v[d];                     // tail[0] then tail[1], tail[2], then this cell
+            for (int j = 1; j < pc.r - 1; ++j) sum += TAIL_.v[j * D + d];
+            sum += incoming;
+        }
+        mean = 0.25f * sum;
+    }
+    const float ss = (in_d && pools) ? mean * mean : 0.0f;
+    const float total = wg_sum(ss);
+    if (!pools) return;
+    const float scale = inversesqrt(total / float(D) + pc.eps);
+    if (in_d) pf_values[d] = scale * mean * GAM_.v[d];
+    barrier();
+    if (d >= D) return;
+    const int b = pos / pc.r;
+    const int rope_pos = (pos == 0) ? 0 : pc.pos_base + pc.r * b;
+    float y = pf_values[d];
+    if (d < pc.n_rot) {                            // NEOX pairs (pair, pair + n_rot/2)
+        const int nhalf = pc.n_rot / 2;
+        const int pair = d % nhalf;
+        const float theta_extrap = float(rope_pos) * pow(pc.theta_scale, float(pair));
+        float c = 0.0f, s = 0.0f;
+        rope_scaled_angle(theta_extrap, pc.freq_scale, pc.corr_low, pc.corr_high, pc.ext_factor, pc.mscale, pair, c, s);
+        const float a = pf_values[pair], z = pf_values[pair + nhalf];
+        y = d < nhalf ? a * c - z * s : a * s + z * c;
+    }
+    POOL_.v[b * D + d] = y;
+    if (pos == 0) DEAD_.v[d] = y;
+    else POOL_.v[(b + 1) * D + d] = DEAD_.v[d];
+    if (d == 0 && pos != 0) BPOS_.v[0] = rope_pos;
+}

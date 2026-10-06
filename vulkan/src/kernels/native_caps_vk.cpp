@@ -119,14 +119,17 @@ bool native_moe_combine_enabled() { return true; } // native_moe_combine.comp, g
 void native_qsa_set_enabled(bool) { /* see the header note */ }
 bool native_qsa_enabled() { return true; }         // native_qsa_rms_norm_weighted + native_qsa_gate_apply, both built
 
-// ---- native QSA INDEXER: the flag gates the UNPORTED native_qsa_indexer_append - answer FALSE ----------------
-// This getter/setter pair is the reachability hole closed by this batch (plan/DECODE-PATH-TRIAGE.md's
-// REACHABILITY AUDIT): src/core calls it (layer.cpp:483, :944) and the option plumbing sets it
-// (generate.cpp:2294) but NO Vulkan definition existed, so the shipped `--native` option (which sets it TRUE,
-// generate.cpp:1807) would have selected `native_qsa_indexer_append` - a symbol with no shader - on every QSA
-// layer.  Answering FALSE selects the ported legacy `indexer_key_append` (layer.cpp:948).
-void native_qsa_indexer_set_enabled(bool) { /* see the header note */ }
-bool native_qsa_indexer_enabled() { return false; } // native_qsa_indexer_append unported; indexer_key_append is ported
+// ---- native QSA INDEXER: the native append is now PORTED - the flag is a REAL flag ---------------------------
+// The getter/setter pair once answered a constant FALSE while `native_qsa_indexer_append` had no shader; the
+// engine's `--native` option sets it TRUE (generate.cpp:1807 -> :2294), which would have selected an undefined
+// symbol on every QSA layer.  That symbol is now PORTED (`qsa_vk.cpp`, shader `pf_indexer_native.spv`, case
+// `case_native_qsa_indexer_append`), so this is a REAL flag mirroring `native_qsa_indexer.cu:226`: false by
+// default, set TRUE by the engine's own startup call under `--native`.  With it TRUE the decode/verifier path
+// uses the native append (layer.cpp:945, verify.cpp:819) and `layer_verify_compatible()`'s indexer precondition
+// is satisfied; with it FALSE the ported legacy `indexer_key_append` (layer.cpp:948) runs - both are ported.
+static bool g_native_qsa_indexer = false;
+void native_qsa_indexer_set_enabled(bool enabled) { g_native_qsa_indexer = enabled; }
+bool native_qsa_indexer_enabled() { return g_native_qsa_indexer; }
 
 // ---- native GDN: ALL NINE gated symbols (six native kernels + three fused paths) are now ported -------------
 // `native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate`, `native_gdn_gate`, `native_gdn_step`,

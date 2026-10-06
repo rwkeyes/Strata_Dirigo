@@ -104,17 +104,9 @@ void topk_512_step(const float*, const QsaShapes&, int64_t, const int32_t*, int3
                        "of `if (g_fast_select)` (layer.cpp:968); the selected branch is the ported qsa_block_topk");
 }
 
-// `native_qsa_indexer_append` (layer.cpp:945): inside `if (native_qsa_indexer_enabled())` (:944).  The backend
-// ANSWERS that getter FALSE (`native_caps_vk.cpp`, with `native_qsa_indexer_set_enabled` a no-op), which selects
-// the ported `indexer_key_append` (:948).  So the reaching configuration is the BACKEND ANSWERING TRUE, which it
-// does not - see the capability contract.
-void native_qsa_indexer_append(const float*, const int32_t*, int32_t, const float*, float,
-                               const QsaIndexerBuffers&, const QsaShapes&, int64_t, const RopeScaling&, void*) {
-    refuse_unreachable("native_qsa_indexer_append",
-                       "native_qsa_indexer_enabled() == true (layer.cpp:944); the backend ANSWERS it false "
-                       "(native_caps_vk.cpp; native_qsa_indexer_set_enabled is a no-op), selecting the ported "
-                       "indexer_key_append (layer.cpp:948)");
-}
+// `native_qsa_indexer_append` (layer.cpp:945) is now PORTED (vulkan/src/kernels/qsa_vk.cpp, shader
+// pf_indexer_native.spv) and the backend ANSWERS `native_qsa_indexer_enabled()` TRUE (native_caps_vk.cpp), so
+// that branch is the shipped one.  Nothing is refusen here for it any more.
 
 // ---- the fused hyper-connection read -------------------------------------------------------------------------
 // `fused_gr_read` (layer.cpp:1253/1276): inside `if (fused)` where `fused = g_fused_gr &&
@@ -218,10 +210,9 @@ void embedding_gather_dev(const uint8_t*, const float*, const float*, const int3
                           uint64_t, uint64_t, float*, void*) {
     refuse_unreachable("embedding_gather_dev", "--spec 4 --mtp (mtp.cpp:485), the drafter's device-id gather");
 }
-void qsa_decode_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
-                           float*, float*, int64_t, void*) {
-    refuse_unreachable("qsa_decode_attn_batch", "--spec 4 --mtp (mtp.cpp:552) OR the P6 verifier (verify.cpp), neither selected");
-}
+// `qsa_decode_attn_batch` (qsa_decode_attn.hpp) is now PORTED (qsa_vk.cpp: a per-query LOOP over the gated
+// `qsa_decode_attn_step`), so the prompt fallback, the P6 verifier and the MTP drafter all reach a real body.
+
 KvStreamCounters kv_stream_counters(const KvStreamMap&) {
     refuse_unreachable("kv_stream_counters", "--kv-resident N>0 (g_kv_resident default 0, layer.cpp:515)");
 }

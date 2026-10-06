@@ -125,7 +125,7 @@ native_q5_k_f32	kernel	native_q5_k_f32
 native_q8_1_bytes	host	a size
 native_qsa_enabled	host	a capability check
 native_qsa_gate_apply	kernel	native_qsa_gate_apply
-native_qsa_indexer_append	refused	no shader in this tree yet
+native_qsa_indexer_append	kernel	pf_indexer_native
 native_qsa_indexer_enabled	host	a capability check
 native_qsa_rms_norm_weighted	kernel	native_qsa_rms_norm_weighted
 native_quantize_q8_1	kernel	quantize_q8_1
@@ -145,7 +145,7 @@ ple_native_postops_enabled	host	a capability check
 qsa_attend_step	refused	no shader in this tree yet
 qsa_block_scores	kernel	qsa_block_scores
 qsa_block_topk	kernel	qsa_block_topk
-qsa_decode_attn_batch	refused	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
+qsa_decode_attn_batch	kernel	qsa_decode_attn
 qsa_decode_attn_scratch_floats	host	a size
 qsa_decode_attn_step	kernel	qsa_decode_attn
 qsa_gate_apply_f32	kernel	qsa_gate_apply_f32

@@ -239,11 +239,11 @@ TABLE = {
     'moe_group_resident':             ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'mtp_select':                     ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),
-    'native_qsa_indexer_append':      ('todo', 'no shader in this tree yet'),
+    'native_qsa_indexer_append':      ('kernel', 'pf_indexer_native'),
     'native_router_top10_multi':      ('todo', 'no shader in this tree yet'),
     'ple_block_projected':            ('todo', 'no shader in this tree yet'),
     'qsa_attend_step':                ('todo', 'no shader in this tree yet'),
-    'qsa_decode_attn_batch':          ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
+    'qsa_decode_attn_batch':          ('kernel', 'qsa_decode_attn'),
     'qsa_index_step':                 ('todo', 'no shader in this tree yet'),
     'rebase_ptrs':                    ('todo', 'no shader in this tree yet'),
     'resident_plan':                  ('todo', 'no shader in this tree yet'),
@@ -269,13 +269,13 @@ assert not extra, f"table rows that src/core/ does not reach: {extra}"
 REFUSED = {
     # the QSA/flash-attention tail
     'native_flash_attn_short_step', 'qsa_attend_step', 'qsa_index_step', 'topk_512_step',
-    'native_qsa_indexer_append', 'fused_gr_read',
+    'fused_gr_read',
     # the KV streaming resident tier
     'kv_stream_reset', 'kv_ring_table', 'kv_stream_resolve', 'kv_ring_restore',
     # the speculative drafter (class C)
     'add_streams_broadcast', 'fused_gr_read_multi', 'moe_grouped_s2', 'moe_group_resident', 'coupled_draft_sample',
     'coupled_draft_stage', 'coupled_draft_scratch_bytes', 'row_top_prob', 'map_ids', 'window_ids', 'mtp_select',
-    'embedding_gather_dev', 'qsa_decode_attn_batch',
+    'embedding_gather_dev',
     # the A/B arm defaulting off (class C)
     'moe_hit_grouped_s2_cpu_order',
     # the P6 verifier (class D)

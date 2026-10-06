@@ -21840,6 +21840,7 @@ void case_native_expert_capability_entry(Ctx& ctx, const std::string& dir) {
 
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"   // native_qsa_indexer_append (the prompt-path case)
 
 // ============================================================================================================
 // THIS BATCH: THE PREFILL PATH (`strata::prefill::Gemm`, its five methods, and the hyper-connection family).
@@ -22242,6 +22243,375 @@ void case_prefill_entry(Ctx& ctx, const std::string& dir) {
         const int tot = (int) (refY.size() + refR.size());
         verdict("prefill entry: a CAPTURED block containing Gemm::f16 + gr_broadcast replays == direct execution",
                 bad == 0, bad, tot, 0, "the wrappers must RECORD under capture, not run");
+    }
+
+    strata::vulkan::stream_close(s);
+}
+
+// ============================================================================================================
+// THIS BATCH: the PROMPT-PATH shaders the previous batch gate-compiled but never PROVED, plus this batch's
+// arrivals.  Each was transcribed from a CUDA rule and shipped census-clean; a wrong prompt conditioning is a
+// wrong token that LOOKS like a working model, so every one gets a case against the engine's own rule (in
+// double where that is the only reference) and the fused/prefill wrappers are driven THROUGH the backend.
+// ============================================================================================================
+static uint16_t pf_hf_sat_host(float f) {   // pf_swiglu16.comp's hf_sat
+    if (std::isnan(f)) return f16_from_f32(f);
+    return f16_from_f32(std::max(-65504.0f, std::min(65504.0f, f)));
+}
+static uint16_t pf_f16_host(float f) { return f16_from_f32(f); }   // the engine's plain f16 conversion
+
+// The pf_gu_interleave_f16 layout and conversion, as a raw dispatch (its wrapper, iq_dequant_gu_f16, needs an IQ
+// fixture; the SHADER's own rule is the row mapping plus the f16 conversion, and that is what this pins).
+static void case_pf_gu_interleave(Ctx& ctx, const std::string& dir) {
+    const int64_t n_ff = 5, n_embd = 8;                  // n_embd must be a multiple of 8 for the port's rows
+    std::vector<float> g((size_t) n_ff * n_embd), u((size_t) n_ff * n_embd);
+    for (float& v : g) v = rndf(2.0f);
+    for (float& v : u) v = rndf(2.0f);
+    Buf bg = ctx.alloc((uint64_t) g.size() * 4), bu = ctx.alloc((uint64_t) u.size() * 4);
+    Buf bo = ctx.alloc((uint64_t) n_ff * 2 * n_embd * 2);
+    ctx.write(bg, g.data(), g.size() * 4);
+    ctx.write(bu, u.data(), u.size() * 4);
+    VkPipeline p = ctx.pipeline(dir + "/pf_gu_interleave_f16.spv", 3, 8);
+    struct { int32_t n_ff, n_embd; } pc{(int32_t) n_ff, (int32_t) n_embd};
+    ctx.dispatch(p, {&bg, &bu, &bo}, &pc, sizeof(pc), groups_for((uint64_t) n_ff * n_embd));
+    std::vector<uint16_t> got((size_t) n_ff * 2 * n_embd);
+    ctx.read(bo, got.data(), got.size() * 2);
+    int bad = 0; double worst = 0;
+    for (int64_t r = 0; r < n_ff; ++r) for (int64_t c = 0; c < n_embd; ++c) {
+        const uint16_t rg = got[(size_t) (2 * r) * n_embd + c];
+        const uint16_t ru = got[(size_t) (2 * r + 1) * n_embd + c];
+        if (rg != pf_f16_host(g[(size_t) r * n_embd + c])) ++bad;
+        if (ru != pf_f16_host(u[(size_t) r * n_embd + c])) ++bad;
+        worst = std::max(worst, std::fabs((double) strata::kernels::f32_from_f16(rg) -
+                                          (double) strata::kernels::f32_from_f16(pf_f16_host(g[(size_t) r * n_embd + c]))));
+    }
+    verdict("pf_gu_interleave_f16: row (2r,2r+1) mapping + f16 conversion, BITWISE", bad == 0, bad,
+            (int) (2 * n_ff * n_embd), worst, "f16 ulp");
+    ctx.free(bg); ctx.free(bu); ctx.free(bo);
+}
+
+void case_prefill_prompt_path(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "pf_swiglu16.spv") || !have(dir, "pf_moe_combine.spv") || !have(dir, "pf_gu_interleave_f16.spv") ||
+        !have(dir, "pf_split_q.spv") || !have(dir, "pf_gate_attn.spv") || !have(dir, "pf_copy_u32.spv") ||
+        !have(dir, "pf_indexer_native.spv") || !have(dir, "kv_f16_append.spv"))
+        return;
+    if (!ctx.info().storage_buffer_16bit) { skip("prefill prompt path", "device lacks storageBuffer16BitAccess"); return; }
+
+    case_pf_gu_interleave(ctx, dir);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(96ull << 20, dir); }
+    if (s == nullptr) { verdict("prefill prompt path", false, 0, 1, 0, "the backend could not open a stream"); return; }
+    strata::vulkan::cuda_compat_set_stream(s);
+
+    // ---- (1) swiglu_pair / swiglu_interleaved -> pf_swiglu16 (modes 0 and 1), vs hf_sat(silu(a)*u) --------
+    {
+        const int64_t n = 3, m = n * 640;                  // n rows of 640 outputs each
+        std::vector<float> g((size_t) m), u((size_t) m);
+        for (float& v : g) v = rndf(3.0f);
+        for (float& v : u) v = rndf(3.0f);
+        float* dg = strata::vulkan::arena_alloc<float>(*s, (uint64_t) m);
+        float* du = strata::vulkan::arena_alloc<float>(*s, (uint64_t) m);
+        uint16_t* dh = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) m);
+        strata::vulkan::stream_write(*s, dg, g.data(), g.size() * 4);
+        strata::vulkan::stream_write(*s, du, u.data(), u.size() * 4);
+        strata::prefill::swiglu_pair(dg, du, dh, n, s);
+        std::vector<uint16_t> got((size_t) m);
+        strata::vulkan::stream_read(*s, dh, got.data(), got.size() * 2);
+        int bad = 0; double worst = 0;
+        for (int64_t i = 0; i < m; ++i) {
+            const float a = g[(size_t) i], uu = u[(size_t) i];
+            const float f = a / (1.0f + std::exp(-a)) * uu;
+            const uint16_t ref = pf_hf_sat_host(f);
+            const uint16_t gg = got[(size_t) i];
+            const double d = std::fabs((double) strata::kernels::f32_from_f16(gg) - (double) strata::kernels::f32_from_f16(ref));
+            if (d > 2e-3 * (1.0 + std::fabs((double) strata::kernels::f32_from_f16(ref)))) ++bad;
+            worst = std::max(worst, d);
+        }
+        verdict("prefill swiglu_pair: h16 = hf_sat(silu(g)*u) vs the host rule", bad == 0, bad, (int) m, worst,
+                "worst abs (f16)");
+        // interleaved: LD = 1280, gu[r*1280 + 2k], +1
+        const int64_t ld = 1280;
+        std::vector<float> gu((size_t) n * ld);
+        for (float& v : gu) v = rndf(3.0f);
+        float* dgu = strata::vulkan::arena_alloc<float>(*s, (uint64_t) n * ld);
+        uint16_t* dh2 = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) m);
+        strata::vulkan::stream_write(*s, dgu, gu.data(), gu.size() * 4);
+        strata::prefill::swiglu_interleaved(dgu, dh2, n, s);
+        std::vector<uint16_t> got2((size_t) m);
+        strata::vulkan::stream_read(*s, dh2, got2.data(), got2.size() * 2);
+        int bad2 = 0; double worst2 = 0;
+        for (int64_t r = 0; r < n; ++r) for (int64_t k = 0; k < 640; ++k) {
+            const float a = gu[(size_t) r * ld + 2 * k], uu = gu[(size_t) r * ld + 2 * k + 1];
+            const float f = a / (1.0f + std::exp(-a)) * uu;
+            const uint16_t ref = pf_hf_sat_host(f);
+            const uint16_t gg = got2[(size_t) (r * 640 + k)];
+            const double d = std::fabs((double) strata::kernels::f32_from_f16(gg) - (double) strata::kernels::f32_from_f16(ref));
+            if (d > 2e-3 * (1.0 + std::fabs((double) strata::kernels::f32_from_f16(ref)))) ++bad2;
+            worst2 = std::max(worst2, d);
+        }
+        verdict("prefill swiglu_interleaved: interleaved LD=1280 read + hf_sat", bad2 == 0, bad2, (int) m, worst2,
+                "worst abs (f16)");
+    }
+
+    // ---- (2) moe_combine -> pf_moe_combine, vs the host rule (slot-indirect sum + sigmoid(sg)*shared) ------
+    {
+        const int64_t T = 2, N = 2560, K = 10, ROWS = T * K;
+        std::vector<float> D((size_t) ROWS * N), sh((size_t) T * N), w((size_t) T * K), sg((size_t) T);
+        std::vector<int32_t> slot((size_t) T * K);
+        for (float& v : D) v = rndf(1.0f);
+        for (float& v : sh) v = rndf(1.0f);
+        for (float& v : w) v = rndf(1.0f);
+        for (float& v : sg) v = rndf(2.0f);
+        for (size_t i = 0; i < slot.size(); ++i) slot[i] = (int32_t) (i % ROWS);
+        float* dD = strata::vulkan::arena_alloc<float>(*s, (uint64_t) ROWS * N);
+        float* dsh = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * N);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * K);
+        float* dsg = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T);
+        int32_t* dsl = strata::vulkan::arena_alloc<int32_t>(*s, (uint64_t) T * K);
+        float* dbo = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * N);
+        strata::vulkan::stream_write(*s, dD, D.data(), D.size() * 4);
+        strata::vulkan::stream_write(*s, dsh, sh.data(), sh.size() * 4);
+        strata::vulkan::stream_write(*s, dw, w.data(), w.size() * 4);
+        strata::vulkan::stream_write(*s, dsg, sg.data(), sg.size() * 4);
+        strata::vulkan::stream_write(*s, dsl, slot.data(), slot.size() * 4);
+        strata::prefill::moe_combine(dD, dsl, dw, dsh, dsg, dbo, T, s);
+        std::vector<float> got((size_t) T * N);
+        strata::vulkan::stream_read(*s, dbo, got.data(), got.size() * 4);
+        int bad = 0; double worst = 0;
+        for (int64_t t = 0; t < T; ++t) for (int64_t d = 0; d < N; ++d) {
+            // THE ORACLE'S DENOMINATOR IS THE SUMMATION'S MAGNITUDE, not the result: with random weights a
+            // handful of outputs cancel to near zero and a relative-to-result bound would flag them as wrong
+            // while the kernel is right (the "check the oracle before the kernel" rule).
+            double acc = 0, mag = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const double term = (double) w[(size_t) (t * K + k)] *
+                                    (double) D[(size_t) slot[(size_t) (t * K + k)] * N + d];
+                acc = std::fma((double) w[(size_t) (t * K + k)],
+                               (double) D[(size_t) slot[(size_t) (t * K + k)] * N + d], acc);
+                mag += std::fabs(term);
+            }
+            const double gs = 1.0 / (1.0 + std::exp(-(double) sg[(size_t) t]));
+            const double shterm = (double) sh[(size_t) (t * N + d)] * gs;
+            mag += std::fabs(shterm);
+            const double ref = acc + shterm;
+            const double e = std::fabs((double) got[(size_t) (t * N + d)] - ref) / (mag + 1e-6);
+            if (e > 1e-5) ++bad;
+            worst = std::max(worst, e);
+        }
+        verdict("prefill moe_combine: slot-indirect sum + sigmoid(sg)*shared vs host", bad == 0, bad, (int) (T * N),
+                worst, "worst rel err");
+    }
+
+    // ---- (3) split_q + gate_attn -> pf_split_q / pf_gate_attn, vs the host gather/sigmoid -------------------
+    {
+        const int64_t T = 2, H = 24, HD = 256;
+        const int64_t n = T * H * HD;
+        std::vector<float> qf((size_t) T * H * 2 * HD), at((size_t) n);
+        for (float& v : qf) v = rndf(1.0f);
+        for (float& v : at) v = rndf(1.0f);
+        float* dqf = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * H * 2 * HD);
+        float* dq = strata::vulkan::arena_alloc<float>(*s, (uint64_t) n);
+        uint16_t* dh = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) n);
+        float* dat = strata::vulkan::arena_alloc<float>(*s, (uint64_t) n);
+        strata::vulkan::stream_write(*s, dqf, qf.data(), qf.size() * 4);
+        strata::vulkan::stream_write(*s, dat, at.data(), at.size() * 4);
+        strata::prefill::split_q(dqf, dq, T, s);
+        std::vector<float> q((size_t) n);
+        strata::vulkan::stream_read(*s, dq, q.data(), q.size() * 4);
+        int bad = 0; double worst = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t t = i / (H * HD), h = (i / HD) % H, d = i % HD;
+            const double ref = (double) qf[(size_t) (t * H * 2 * HD + h * 2 * HD + d)];
+            const double e = std::fabs((double) q[(size_t) i] - ref);
+            if (e != 0.0) ++bad;
+            worst = std::max(worst, e);
+        }
+        verdict("prefill split_q: q_full[T,24,512] -> q[T,24,256] gather, BITWISE", bad == 0, bad, (int) n, worst,
+                "worst abs");
+        strata::prefill::gate_attn(dat, dqf, dh, T, s);
+        std::vector<uint16_t> gh((size_t) n);
+        strata::vulkan::stream_read(*s, dh, gh.data(), gh.size() * 2);
+        int bad2 = 0; double worst2 = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t t = i / (H * HD), h = (i / HD) % H, d = i % HD;
+            const float g = qf[(size_t) (t * H * 2 * HD + h * 2 * HD + 256 + d)];
+            const float ref = at[(size_t) i] / (1.0f + std::exp(-g));
+            const double e = std::fabs((double) strata::kernels::f32_from_f16(gh[(size_t) i]) - (double) ref) /
+                             (std::fabs((double) ref) + 1e-3);
+            if (e > 1e-3) ++bad2;
+            worst2 = std::max(worst2, e);
+        }
+        verdict("prefill gate_attn: attn * sigmoid(q gate half) -> f16 vs host", bad2 == 0, bad2, (int) n, worst2,
+                "worst rel err");
+    }
+
+    // ---- (4) copy_i32 -> pf_copy_u32, BITWISE ---------------------------------------------------------------
+    {
+        const int64_t n = 1000;
+        std::vector<int32_t> src((size_t) n);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = (int32_t) (rnd() & 0x3fffffff) - 5;
+        int32_t* ds = strata::vulkan::arena_alloc<int32_t>(*s, (uint64_t) n);
+        int32_t* dd = strata::vulkan::arena_alloc<int32_t>(*s, (uint64_t) n);
+        strata::vulkan::stream_write(*s, ds, src.data(), src.size() * 4);
+        std::vector<int32_t> sent((size_t) n, 0x7ee7ee7e);
+        strata::vulkan::stream_write(*s, dd, sent.data(), sent.size() * 4);
+        strata::prefill::copy_i32(dd, ds, n, s);
+        std::vector<int32_t> got((size_t) n);
+        strata::vulkan::stream_read(*s, dd, got.data(), got.size() * 4);
+        int bad = 0;
+        for (int64_t i = 0; i < n; ++i) if (got[(size_t) i] != src[(size_t) i]) ++bad;
+        verdict("prefill copy_i32: 32-bit word copy, BITWISE", bad == 0, bad, (int) n, 0, "mismatched words");
+    }
+
+    // ---- (5) kv_append -> kv_f16_append, the page-table row + the host identity row, BITWISE ----------------
+    {
+        const int64_t T = 2, KH = 2, HD = 256, PS = 4;
+        const int64_t cell = KH * HD;
+        std::vector<float> K((size_t) T * cell), V((size_t) T * cell);
+        for (float& v : K) v = rndf(1.0f);
+        for (float& v : V) v = rndf(1.0f);
+        const int64_t pages = 2;
+        const int64_t pool_n = pages * KH * PS * HD;
+        std::vector<int32_t> tab((size_t) pages);
+        tab[0] = 1; tab[1] = 0;   // a SWAP, not the identity: a logical/physical page mix-up must MOVE the pool
+        float* dK = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * cell);
+        float* dV = strata::vulkan::arena_alloc<float>(*s, (uint64_t) T * cell);
+        int32_t* dtab = strata::vulkan::arena_alloc<int32_t>(*s, (uint64_t) pages);
+        uint16_t* kp = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) pool_n);
+        uint16_t* vp = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) pool_n);
+        uint16_t* hkp = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) pool_n);
+        uint16_t* hvp = strata::vulkan::arena_alloc<uint16_t>(*s, (uint64_t) pool_n);
+        strata::vulkan::stream_write(*s, dK, K.data(), K.size() * 4);
+        strata::vulkan::stream_write(*s, dV, V.data(), V.size() * 4);
+        strata::vulkan::stream_write(*s, dtab, tab.data(), tab.size() * 4);
+        std::vector<uint16_t> sent((size_t) pool_n, 0xdead);
+        strata::vulkan::stream_write(*s, kp, sent.data(), sent.size() * 2);
+        strata::vulkan::stream_write(*s, vp, sent.data(), sent.size() * 2);
+        strata::vulkan::stream_write(*s, hkp, sent.data(), sent.size() * 2);
+        strata::vulkan::stream_write(*s, hvp, sent.data(), sent.size() * 2);
+        strata::kernels::KvHostPools host{}; host.k_pool = hkp; host.v_pool = hvp;
+        strata::prefill::kv_append(dK, dV, T, 0, dtab, PS, kp, vp, nullptr, nullptr, nullptr, nullptr, s, &host, nullptr);
+        std::vector<uint16_t> gk((size_t) pool_n), gv((size_t) pool_n), ghk((size_t) pool_n), ghv((size_t) pool_n);
+        strata::vulkan::stream_read(*s, kp, gk.data(), gk.size() * 2);
+        strata::vulkan::stream_read(*s, vp, gv.data(), gv.size() * 2);
+        strata::vulkan::stream_read(*s, hkp, ghk.data(), ghk.size() * 2);
+        strata::vulkan::stream_read(*s, hvp, ghv.data(), ghv.size() * 2);
+        int bad = 0, checked = 0;
+        for (int64_t pos = 0; pos < T; ++pos) for (int64_t h = 0; h < KH; ++h) for (int64_t d = 0; d < HD; ++d) {
+            const uint16_t ek = pf_f16_host(K[(size_t) (pos * cell + h * HD + d)]);
+            const uint16_t ev = pf_f16_host(V[(size_t) (pos * cell + h * HD + d)]);
+            const int64_t vrow = ((tab[(size_t) (pos / PS)] * KH + h) * PS + pos % PS) * HD + d;
+            const int64_t hrow = (((pos / PS) * KH + h) * PS + pos % PS) * HD + d;
+            if (gk[(size_t) vrow] != ek) ++bad;
+            if (gv[(size_t) vrow] != ev) ++bad;
+            if (ghk[(size_t) hrow] != ek) ++bad;
+            if (ghv[(size_t) hrow] != ev) ++bad;
+            checked += 4;
+        }
+        // the untouched cells of the pool must still be the sentinel: a wrong row would leave a stale value
+        int untouched = 0;
+        for (int64_t i = 0; i < pool_n; ++i) if (gk[(size_t) i] == 0xdead) ++untouched;
+        verdict("prefill kv_append: page row + host identity row, BITWISE (kv_f16_append)", bad == 0 && untouched > 0,
+                bad, checked, 0, "mismatched f16");
+    }
+
+    // ---- (6) native_qsa_indexer_append -> pf_indexer_native, vs the CUDA rule (double) ----------------------
+    {
+        const int64_t D = 128, R = 4, ROT = 64, MAXC = 16;
+        const int64_t N = 5;                          // five cells: block 0 completes at cell 3, block 1 at cell 7 is not reached
+        strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+        std::vector<float> raw((size_t) N * D), gamma((size_t) D);
+        for (float& v : raw) v = rndf(1.0f);
+        for (float& v : gamma) v = 0.5f + 0.5f * std::fabs(rndf(1.0f));
+        float* draw = strata::vulkan::arena_alloc<float>(*s, (uint64_t) N * D);
+        float* dgam = strata::vulkan::arena_alloc<float>(*s, (uint64_t) D);
+        int32_t* dpos = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        float* dtail = strata::vulkan::arena_alloc<float>(*s, (uint64_t) (R - 1) * D);
+        float* ddead = strata::vulkan::arena_alloc<float>(*s, (uint64_t) D);
+        float* dpool = strata::vulkan::arena_alloc<float>(*s, (uint64_t) (MAXC / R + 1) * D);
+        int32_t* dbp = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        strata::vulkan::stream_write(*s, draw, raw.data(), raw.size() * 4);
+        strata::vulkan::stream_write(*s, dgam, gamma.data(), gamma.size() * 4);
+        std::vector<float> zero((size_t) (MAXC / R + 1) * D, 0.0f);
+        strata::vulkan::stream_write(*s, dpool, zero.data(), zero.size() * 4);
+        strata::vulkan::stream_write(*s, ddead, zero.data(), (size_t) D * 4);
+        strata::vulkan::stream_write(*s, dtail, zero.data(), (size_t) (R - 1) * D * 4);
+        strata::kernels::QsaIndexerBuffers ib{dtail, ddead, dpool, dbp};
+        const strata::kernels::RopeScaling rs{};      // the default: no scaling (the identity constants)
+        for (int64_t pos = 0; pos < N; ++pos) {
+            const int32_t p = (int32_t) pos;
+            strata::vulkan::stream_write(*s, dpos, &p, 4);
+            strata::kernels::native_qsa_indexer_append(draw + pos * D, dpos, 0, dgam, strata::kernels::qsa_rms_eps(),
+                                                       ib, sh, MAXC, rs, s);
+        }
+        std::vector<float> got_pool((size_t) (MAXC / R + 1) * D), got_dead((size_t) D), got_tail((size_t) (R - 1) * D);
+        int32_t got_bp = 0;
+        strata::vulkan::stream_read(*s, dpool, got_pool.data(), got_pool.size() * 4);
+        strata::vulkan::stream_read(*s, ddead, got_dead.data(), got_dead.size() * 4);
+        strata::vulkan::stream_read(*s, dtail, got_tail.data(), got_tail.size() * 4);
+        strata::vulkan::stream_read(*s, dbp, &got_bp, 4);
+        // HOST transcription of `append<false>` (native_qsa_indexer.cu:46-106), in double; the device uses fast
+        // trig, so the rotated dims are compared at 3e-3 relative (the rope case's own standard) and the rest at
+        // 1e-4.
+        std::vector<float> tail((size_t) (R - 1) * D, 0.0f), dead((size_t) D, 0.0f), pool((size_t) (MAXC / R + 1) * D, 0.0f);
+        int32_t ref_bp = 0;
+        const double theta_scale = std::pow(1e7, -2.0 / (double) ROT);
+        for (int64_t pos = 0; pos < N; ++pos) {
+            const int slot = (int) (pos % R);
+            std::vector<float> incoming((size_t) D);
+            for (int64_t d = 0; d < D; ++d) incoming[(size_t) d] = strata::kernels::f32_from_f16(pf_f16_host(raw[(size_t) (pos * D + d)]));
+            if (slot < R - 1) for (int64_t d = 0; d < D; ++d) tail[(size_t) (slot * D + d)] = incoming[(size_t) d];
+            if (!(pos == 0 || slot == R - 1)) continue;
+            std::vector<double> mean((size_t) D);
+            for (int64_t d = 0; d < D; ++d) {
+                double sum;
+                if (pos == 0) { sum = incoming[(size_t) d]; for (int j = 1; j < R; ++j) sum += incoming[(size_t) d]; }
+                else {
+                    sum = tail[(size_t) d];
+                    for (int j = 1; j < R - 1; ++j) sum += tail[(size_t) (j * D + d)];
+                    sum += incoming[(size_t) d];
+                }
+                mean[(size_t) d] = 0.25 * sum;
+            }
+            double ss = 0;
+            for (int64_t d = 0; d < D; ++d) ss += mean[(size_t) d] * mean[(size_t) d];
+            const double scale = 1.0 / std::sqrt(ss / (double) D + (double) strata::kernels::qsa_rms_eps());
+            std::vector<double> values((size_t) D);
+            for (int64_t d = 0; d < D; ++d) values[(size_t) d] = scale * mean[(size_t) d] * (double) gamma[(size_t) d];
+            const int64_t b = pos / R;
+            const int rope_pos = (pos == 0) ? 0 : (R * (int) b);   // pos_base == 0
+            std::vector<double> y((size_t) D);
+            for (int64_t d = 0; d < D; ++d) y[(size_t) d] = values[(size_t) d];
+            for (int64_t d = 0; d < ROT; ++d) {
+                const int pair = (int) (d % (ROT / 2));
+                const double th = (pos == 0 ? 0.0 : (double) rope_pos) * std::pow(theta_scale, (double) pair);
+                const double c = std::cos(th), s = std::sin(th);
+                const double a = values[(size_t) pair], z = values[(size_t) (pair + ROT / 2)];
+                y[(size_t) d] = d < ROT / 2 ? a * c - z * s : a * s + z * c;
+            }
+            for (int64_t d = 0; d < D; ++d) pool[(size_t) (b * D + d)] = (float) y[(size_t) d];
+            if (pos == 0) for (int64_t d = 0; d < D; ++d) dead[(size_t) d] = (float) y[(size_t) d];
+            else for (int64_t d = 0; d < D; ++d) pool[(size_t) ((b + 1) * D + d)] = dead[(size_t) d];
+            if (pos != 0) ref_bp = rope_pos;
+        }
+        int bad = 0, tot = 0; double worst = 0;
+        auto cmp = [&](const std::vector<float>& got, const std::vector<float>& ref, int64_t rows, const char*) {
+            for (int64_t i = 0; i < rows * D; ++i) {
+                const double g = (double) got[(size_t) i], r = (double) ref[(size_t) i];
+                const double tol = (i % D) < ROT ? 3e-3 : 1e-4;
+                const double e = std::fabs(g - r) / (std::fabs(r) + 1e-4);
+                if (e > tol) ++bad;
+                worst = std::max(worst, e);
+                ++tot;
+            }
+        };
+        cmp(got_pool, pool, MAXC / R + 1, "pooled");
+        cmp(got_dead, dead, 1, "dead");
+        cmp(got_tail, tail, R - 1, "tail");
+        if (got_bp != ref_bp) ++bad;
+        verdict("prefill native_qsa_indexer_append: pooled/dead/tail/block_pos vs the CUDA rule", bad == 0, bad, tot,
+                worst, "worst rel err (f32)");
     }
 
     strata::vulkan::stream_close(s);
@@ -22692,6 +23062,8 @@ int main(int argc, char** argv) {
     // THIS BATCH: THE PREFILL PATH - `strata::prefill::Gemm` (its five methods) and the hyper-connection family,
     // with a capture arm.  APPENDED last for the shared-RNG reason every batch above names.
     case_prefill_entry(ctx, dir);
+    case_prefill_prompt_path(ctx, dir);   // the rest of the prompt path: swiglu, moe_combine, split_q, gate_attn,
+                                          // copy_i32, kv_append and the NATIVE QSA indexer append
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

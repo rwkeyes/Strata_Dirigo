@@ -760,6 +760,54 @@ case "$name" in
     old=$'    const uint base = t * C + head * S;'
     new=$'    const uint base = t * S + head * S;   // INJECTION: the row stride taken as S, not C'
     want="FAIL  prefill gdn_conv entry" ;;
+  pf-swiglu16-drop-silu)
+    # pf_swiglu16's rule is `hf_sat(silu(a) * u)` with silu(a) = a/(1+exp(-a)).  Dropping the silu leaves the raw
+    # gate times up - every shape and magnitude "looks like" a SwiGLU output.  The case oracles against the host
+    # rule, so it moves on both modes.
+    file="$SH/pf_swiglu16.comp"; spv="pf_swiglu16"
+    old=$'    o_b.v[i] = hf_sat(a / (1.0 + exp(-a)) * u);'
+    new=$'    o_b.v[i] = hf_sat(a * u);   // INJECTION: the SiLU dropped'
+    want="FAIL  prefill swiglu_pair" ;;
+  pf-moe-combine-plain-shared)
+    # The prompt combine SCALES the shared row by sigmoid(sg[t]); adding it PLAIN (the decode combine's rule) is
+    # the plausible wrong reading the header warns about.  The oracle is the double rule, so it bites at any sg.
+    file="$SH/pf_moe_combine.comp"; spv="pf_moe_combine"
+    old=$'    bo_b.v[i] = s + sh_b.v[t * kN + d] * (1.0 / (1.0 + exp(-sg_b.v[t])));'
+    new=$'    bo_b.v[i] = s + sh_b.v[t * kN + d];   // INJECTION: the shared row added PLAIN (no sigmoid)'
+    want="FAIL  prefill moe_combine" ;;
+  pf-split-q-wrong-stride)
+    # q_full is [T,24,512]: the q half of head h starts at h*512.  Reading at h*256 (the OUTPUT stride) aliases
+    # the previous head's gate half - correctly shaped, wrong content.
+    file="$SH/pf_split_q.comp"; spv="pf_split_q"
+    old=$'    q_b.v[i] = qf_b.v[t * 24 * 512 + h * 512 + d];'
+    new=$'    q_b.v[i] = qf_b.v[t * 24 * 512 + h * 256 + d];   // INJECTION: the output stride used on the input'
+    want="FAIL  prefill split_q" ;;
+  pf-gate-attn-first-half)
+    # The attention gate is the SECOND half of the 2*head_dim q_full block (the + 256).  Taking the FIRST half
+    # (the q values) keeps every shape.
+    file="$SH/pf_gate_attn.comp"; spv="pf_gate_attn"
+    old=$'    const float g = qf_b.v[t * 24 * 512 + h * 512 + 256 + d];'
+    new=$'    const float g = qf_b.v[t * 24 * 512 + h * 512 + d];   // INJECTION: the gate taken from the FIRST half'
+    want="FAIL  prefill gate_attn" ;;
+  pf-indexer-native-rotate-last)
+    # The native append rotates the pooled key at the block's FIRST cell (`pos_base + R*b`); the LAST cell keeps
+    # every shape and magnitude.  The case's host transcription rotates at the first cell, so this moves pool.
+    file="$SH/pf_indexer_native.comp"; spv="pf_indexer_native"
+    old=$'    const int rope_pos = (pos == 0) ? 0 : pc.pos_base + pc.r * b;'
+    new=$'    const int rope_pos = (pos == 0) ? 0 : pc.pos_base + pc.r * b + pc.r - 1;   // INJECTION: rotate at the LAST cell'
+    want="FAIL  prefill native_qsa_indexer_append" ;;
+  pf-kv-append-step-off-by-one)
+    # kv_f16_append reads the cell from `step`; +1 writes every token one cell late, which the row check catches.
+    file="$SH/kv_f16_append.comp"; spv="kv_f16_append"
+    old=$'    const int pos = STEP_.s[0];                      // kStepPos == 0 in qsa.hpp'"'"'s enum'
+    new=$'    const int pos = STEP_.s[0] + 1;                  // INJECTION: the cell off by one'
+    want="FAIL  prefill kv_append" ;;
+  pf-gu-interleave-swap-roles)
+    # The gate matrix goes to the EVEN rows (2r) and up to the odd (2r+1).  Swapping the roles keeps the shape.
+    file="$SH/pf_gu_interleave_f16.comp"; spv="pf_gu_interleave_f16"
+    old=$'    o_b.v[(2u * r) * ne + c]     = f16_from_f32_port(g_b.v[i]);\n    o_b.v[(2u * r + 1u) * ne + c] = f16_from_f32_port(u_b.v[i]);'
+    new=$'    o_b.v[(2u * r) * ne + c]     = f16_from_f32_port(u_b.v[i]);   // INJECTION: gate/up roles swapped\n    o_b.v[(2u * r + 1u) * ne + c] = f16_from_f32_port(g_b.v[i]);'
+    want="FAIL  pf_gu_interleave_f16" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

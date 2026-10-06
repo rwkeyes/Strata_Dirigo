@@ -1,5 +1,69 @@
 # Start here next session
 
+## THE PREFILL PATH RUNS TO COMPLETION; the stop is now the VERIFIER's residency-table precondition (2026-10-05, `vega`)
+
+**THE STOP MOVED OFF THE ENTIRE PREFILL.**  With `--spec 4 --prefill 1 --tokens "1,2" --max-new 1 --max-context 8` on
+`coder-iq1_m`, the prompt path now runs END TO END — `strata generate: prefill 1 tokens in 1 chunks, 29680.6 ms
+(0.0 tok/s); experts streamed 480 (0 by DMA, host 25917.8 ms), resident 0; PLE 5.5 ms` — and only THEN stops, at
+the P6 verifier's first precondition (`/tmp/run_pf9.log`, `RC=2`):
+
+```
+strata generate: --spec needs the device residency table (--expert-profile, --expert-cache and the token graph)
+```
+
+**PREFILL REFUSALS: 8 -> 5** (`vulkan/src/kernels/{prefill_vk,refusals_prefill_vk}.cpp`).  PORTED this batch, all as
+the DECODE-equivalent per-token route the last batch established:
+* `prefill::kv_append` — a per-token LOOP over the ALREADY-GATED decode appends (`kv_f16_append.spv` / `kv_q8_append.spv`):
+  the prefill kernel's row rule `(page*kv_heads + h)*page_size + pos%page_size` and the host identity row are the
+  decode append's own, with a per-token position written to a device int (host-staged; refuses under capture).
+* `native_qsa_indexer_append` + `native_qsa_indexer_append_batch` — ONE new shader, `pf_indexer_native.comp`,
+  transcribed from `src/kernels/cuda/native_qsa_indexer.cu:46-106` (`append<false>`): F16-rounded raw keys, an F32
+  barrier-tree reduce, and the rotation computed ON DEVICE.  The batch is a LOOP over the single append (the header's
+  own contract: "exactly as n calls ... in order").  `native_qsa_indexer_enabled()` is now a REAL flag (false by
+  default; `--native` sets it TRUE, generate.cpp:1807/2294), so the DECODE/verifier path uses the native append too.
+* `qsa_decode_attn_batch` — a per-query LOOP over the gated `qsa_decode_attn_step` (the header: "serves a prompt one
+  query at a time with the decode kernel").
+* `qsa_prompt_attn_batch` -> FALSE: a real CAPABILITY answer (no tensor-core prompt-attention shader), and the engine
+  falls back to `qsa_decode_attn_batch` (prefill.cpp:2222-2229) — the same shape as `qsa_block_scores_tc`.
+
+STILL REFUSED, honestly (not on this run's path): `kv_append_q4` (a kv_q4 pack), `kv_stage_from_host` (kv_mode 1),
+`native_ple_postops_batch` (`STRATA_PLE_BATCH=1`), `blob_dequant_f16` (a Q2_0 pack), `round_f16` (the
+`STRATA_IDX_FP16_CHECK` diagnostic).  **A refusal that is correct is not a shortfall.**
+
+### DELIVERABLE B — THE PROMPT-PATH SHADERS ARE NOW PROVEN, NOT ASSUMED
+
+`case_prefill_prompt_path` (harness) drives the wrappers and oracles each shader against the engine's own rule
+(double where that is the only reference): `pf_swiglu16` (both modes), `pf_moe_combine`, `pf_gu_interleave_f16`,
+`pf_split_q`, `pf_gate_attn`, `pf_copy_u32` (copy_i32), `kv_f16_append` (through `prefill::kv_append`) and
+`pf_indexer_native` (through `native_qsa_indexer_append`).  Nine new arms; Arc `intel_icd` **802/0/0**.  SEVEN
+registered injections, ALL FALSIFY (`gates/inject-verify.sh`): swiglu16-drop-silu, moe-combine-plain-shared,
+split-q-wrong-stride, gate-attn-first-half, indexer-native-rotate-last, kv-append-step-off-by-one,
+gu-interleave-swap-roles.  **The one case that first FAILED was the ORACLE, not the kernel** (a relative-to-result
+tolerance on `moe_combine` that a handful of near-zero outputs blew up) — the FIFTH wrong oracle in this port, caught
+by fixing the denominator to the summation magnitude.
+
+### DELIVERABLE D — WHAT `--expert-profile` WANTS, ESTABLISHED FROM THE CODE (bigger than one batch)
+
+The stop is `thits.d_res == nullptr` (generate.cpp:7817).  `thits.d_res` is built ONLY when
+`graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool` (:4267) AND `!no_capture && !no_token_graph` and no
+layer/half dump (:4268).  `profile` is filled from `--expert-profile P`, which reads a **`profile.bin` written by
+`tools/make_profile.py`** (:396, `read_expert_profile`) — a real PRODUCER that ranks (layer, expert) pairs by routing
+frequency, so it needs a routing trace over a real workload.  `--expert-cache` must also be non-empty.  AND the token
+graph the message names is captured only when **`!native_pack && !multi_gpu`** (:4334) — so a native pack's verify
+window has NO token graph BY DESIGN.  Satisfying the verifier is therefore: (a) produce a `profile.bin` (a real
+producer + a trace), (b) a non-empty `--expert-cache`, (c) resolve the native-pack token-graph guard.  None is a
+one-line change; this is the honest NEXT increment.
+
+### DELIVERABLE C/E — THE BAR, THE MAP, THE GATE
+
+**NO TOKEN.**  BOUNDS: real weights (the 23.42 GiB expert tier + the pack's dense/native projections), a TWO-token
+prompt, PLE file-backed, `--spec 4`, PCIe 0.1 GB/s -> `pcie_frac 0.00`; **per-kernel numerics are the GATE's job,
+not this run's**.  The prefill's completion certifies the PROMPT PATH EXECUTES through every stage to the verifier,
+not that its numbers are right.  ENGINE BAR: the `strata_vulkan` program LINKS, 0 undefined — **0 BY CONSTRUCTION**,
+not a porting gain.  MAP: **`168 = 81 kernel + 0 shader + 45 host + 0 todo + 42 refused`** — two DECODE-path rows
+moved `refused -> kernel` (`native_qsa_indexer_append`, `qsa_decode_attn_batch`); `check_port_map.py` passes,
+`make_port_map.py` regenerates byte-identically.  GATE (vega): Arc `intel_icd` **802/0/0 (exit 0)**.
+
 ## THE PREFILL PATH: 23 of its 40 entry points land, the REAL pack now RUNS the prompt path (embedding -> hyper-connection read -> BF16 projections -> `Gemm::native` -> GDN gates/conv/L2), and stops at `gdn_recurrence` (2026-10-05, `vega`)
 
 **THE STOPPING POINT MOVED OFF `Gemm::init_external` AND THROUGH THE WHOLE PREFILL PROLOGUE.**  With
