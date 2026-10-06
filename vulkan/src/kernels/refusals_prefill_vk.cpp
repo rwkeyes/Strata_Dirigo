@@ -23,14 +23,19 @@
 #include <string>
 
 namespace {
-[[noreturn]] void refuse_prompt(const char* sym) {
+// Every refusal names its own DECIDING CONDITION.  The honest question an operator has in front of a "NOT PORTED"
+// line is not "is this symbol unported" but "is MY configuration a HOLE or a note", and the answer differs per
+// symbol even inside the prompt path.  The evidence that none of the five below is reached by the shipped
+// configuration is the RUN, not a reading: every definition here exits 2, and the shipped prompt run
+// (coder-iq1_m, 199-token prompt, one chunk) COMPLETES - so none of them was called.  Each condition was read at
+// its call site; the line is cited per symbol so the next reader can check it rather than trust this comment.
+[[noreturn]] void refuse_prompt(const char* sym, const char* reach) {
     std::fprintf(stderr,
                  "%s: NOT PORTED on the Vulkan backend - REFUSING.\n"
-                 "  Reached only by the batched PROMPT path (--prefill / a request with a prompt); the remaining\n"
-                 "  src/prefill entry points are the DELIVERABLE-B list in the port's report.  A bare single-token\n"
-                 "  decode does not run it.  This definition exists so the `strata` program LINKS; it is a LOUD\n"
-                 "  REFUSAL, never a silent fallback.\n",
-                 sym);
+                 "  %s\n"
+                 "  This definition exists so the `strata` program LINKS; it is a LOUD REFUSAL, never a silent\n"
+                 "  fallback - it exits 2, so a run that completes proves no refusal fired.\n",
+                 sym, reach);
     std::exit(2);
 }
 }  // namespace
@@ -43,8 +48,15 @@ namespace strata::prefill {
 // `blob_dequant_f16` is the Q2_0 pack's expert blob -> FP16 reader (a pack variant this port is not running, and
 // the engine's own `native` expert route is a different kernel).  `round_f16` is only the
 // STRATA_IDX_FP16_CHECK diagnostic (kernels.cu:813).
-void blob_dequant_f16(const uint8_t*, uint16_t*, uint16_t*, void*) { refuse_prompt("strata::prefill::blob_dequant_f16"); }
-void round_f16(const float*, float*, int64_t, void*) { refuse_prompt("strata::prefill::round_f16"); }
+void blob_dequant_f16(const uint8_t*, uint16_t*, uint16_t*, void*) {
+    refuse_prompt("strata::prefill::blob_dequant_f16",
+                  "NOT reached - the NON-native pack path (prefill.cpp:2783 `if (lay.native) { ... } else { blob_dequant_f16 ... }`).\n"
+                  "  The shipped pack is native, so the else branch is never taken; the engine's native route is a different kernel.");
+}
+void round_f16(const float*, float*, int64_t, void*) {
+    refuse_prompt("strata::prefill::round_f16",
+                  "NOT reached - only the STRATA_IDX_FP16_CHECK diagnostic (prefill.cpp:2160-2167, whose own error text names the flag).");
+}
 
 }  // namespace strata::prefill
 
@@ -52,8 +64,18 @@ void round_f16(const float*, float*, int64_t, void*) { refuse_prompt("strata::pr
 namespace strata::kernels {
 
 void kv_append_q4(uint8_t*, uint8_t*, const int32_t*, int64_t, int64_t, const float*, const float*, const QsaShapes&, void*,
-                  const KvHostPools*, const KvHostPools*) { refuse_prompt("strata::kernels::kv_append_q4"); }
-void kv_stage_from_host(const QsaAttnPools&, const KvHostPools&, int, int64_t, const QsaShapes&, void*) { refuse_prompt("strata::kernels::kv_stage_from_host"); }
-void native_ple_postops_batch(float*, float*, const float*, float*, const PleWeights&, float*, float*, float*, int, void*) { refuse_prompt("strata::kernels::native_ple_postops_batch"); }
+                  const KvHostPools*, const KvHostPools*) {
+    refuse_prompt("strata::kernels::kv_append_q4",
+                  "NOT reached - the pack's KV format (prefill.cpp:2064 `if (st.kv_q4)` and the `st.kv_hybrid` (K8V4) arm at :2066).\n"
+                  "  The shipped pack sets neither, and the shipped prompt run completes.");
+}
+void kv_stage_from_host(const QsaAttnPools&, const KvHostPools&, int, int64_t, const QsaShapes&, void*) {
+    refuse_prompt("strata::kernels::kv_stage_from_host",
+                  "NOT reached - `const bool staged = st.kv_mode == 1;` (prefill.cpp:2040); the shipped pack stages no KV from host.");
+}
+void native_ple_postops_batch(float*, float*, const float*, float*, const PleWeights&, float*, float*, float*, int, void*) {
+    refuse_prompt("strata::kernels::native_ple_postops_batch",
+                  "NOT reached - the batched-PLE block, `if (l == 1 && ple_on && ple_batch)` (prefill.cpp:1922; the call is at :1956).");
+}
 
 }  // namespace strata::kernels
