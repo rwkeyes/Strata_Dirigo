@@ -351,15 +351,28 @@ void copy_from_mapped(Stream& s, float* dst, const float* src, int64_t n) {
                              "refusing rather than binding a wrong view\n", (long long) n);
         std::exit(2);
     }
-    // THE SOURCE IS THE MAPPED REGION'S DEVICE-VISIBLE BUFFER.  A host pointer the shim did not hand out (or one
-    // whose published size does not cover `n` floats) is refused: binding it as if it were mapped would read
-    // bytes the caller never published.
+    // THE SOURCE IS EITHER THE MAPPED REGION'S DEVICE-VISIBLE BUFFER OR AN ARENA (DEVICE) BUFFER.
+    //
+    // **THE SECOND FALLBACK WAS ADDED AFTER THE `verify.cpp:678` STOP, AND IT IS A CORRECTION OF A TOO-STRICT
+    // CONTRACT, NOT A WIDENING.**  The CUDA `copy_from_mapped_kernel` (elementwise.cu:226) reads `src` as a
+    // `const volatile float4*` - it works on MAPPED PINNED HOST MEMORY **or any device pointer**.  Its call
+    // sites use BOTH kinds: `session.cpp:875` passes the mapped `m_ymiss_` twin, but the P6 verify window's PLE
+    // snapshot (`verify.cpp:678`, `copy_from_mapped(hist_snap_ + t*HS, hist, HS, cs)`) passes `hist` =
+    // `ss.ple.hist`, which is `ss.ple_hist` - the SESSION ARENA's PLE conv history (`session.cpp:126`,
+    // `take(ple_hist_bytes())`), a DEVICE buffer, and the port's `ple_block`/`ple_history_advance` already bind
+    // it as an arena view.  The old body demanded a MAPPED region and refused this legitimate device source.  A
+    // pointer that resolves in the arena is now bound as the arena view (a device->device copy, exactly what the
+    // CUDA does); only a pointer that is NEITHER mapped NOR in the arena is refused, so the wrong-view guard is
+    // unchanged.
     Buf sv{};
-    if (!mapped_resolve(src, (uint64_t) n * 4, sv)) {
+    bool have_src = mapped_resolve(src, (uint64_t) n * 4, sv);
+    if (!have_src) have_src = arena_resolve(s, src, (uint64_t) n * 4, sv);
+    if (!have_src) {
         std::fprintf(stderr,
                      "strata::vulkan::copy_from_mapped: the source %p is not a live MAPPED region covering %lld "
-                     "floats.  A shader cannot dereference host memory, so this refuses rather than binding bytes "
-                     "the caller never published (session.cpp:875, the captured per-layer parts copy)\n",
+                     "floats, and it is not inside this stream's arena either.  A shader cannot dereference host "
+                     "memory, so this refuses rather than binding bytes the caller never published "
+                     "(session.cpp:875 / verify.cpp:678)\n",
                      (const void*) src, (long long) n);
         std::exit(2);
     }

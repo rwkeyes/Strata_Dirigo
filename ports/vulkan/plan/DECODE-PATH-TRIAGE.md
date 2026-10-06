@@ -936,3 +936,37 @@ whether the shipped configuration reaches it.
 `device_plan_` / `pcie_mode == 2` / `--kv-resident` conditions named above.  `add_streams_broadcast` is the one
 of that family that was PORTED (it shares `bcast_streams.comp`), so the pair is no longer split between a real
 symbol and a refusal.
+
+---
+
+# THE CORRECTED RULE ABOUT DEFAULTS, AND THE `fetch_blobs`/`rebase_ptrs` RECLASSIFICATION (2026-10-05, `vega`)
+
+**A SYMBOL BEHIND A FLAG IS ON PATH WHEN THAT FLAG'S VALUE IS THE DEFAULT - CHECK THE DEFAULT, NOT THE BRANCH.**
+This file's earlier "the pair is off in the shipped configuration" reading for `fetch_blobs`/`rebase_ptrs`
+(`verify.cpp:1053/:1054`) was WRONG, and the run is the evidence.  `sink_.pcie_mode` gates the pair, and it is
+**2 for the DEFAULT `--pcie-mode auto`**: `generate.cpp:471` `std::string pcie_mode = "auto";` and
+`:5168`/`:7848` `ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2)`.  The earlier
+reading conflated the flag with `pcie_frac` (the PCIe probe reads 0.1 GB/s -> `pcie_frac 0.00`, which zeroes the
+COUNT, not the branch).  Both lessons are load-bearing and are now rules:
+* **reachability is decided by the flag's DEFAULT**, not by whether a symbol sits behind an `if`;
+* **a zero COUNT is not an off-path branch** - the branch is taken and the work is empty.
+
+**WHAT THE PAIR NEEDS, MEASURED FROM THE COUNTS.**  `P.counts[2] = fetches` (`expert_source.cpp:2097`); with
+`pcie_frac 0.00`: `pcie_num = (int)(0.00*256 + 0.5) = 0` (`generate.cpp:7850`) -> `pcie_ok = (pcie_num > 0) && ...`
+FALSE (`expert_source.cpp:2034`) -> `m = 0` (`:2035`) -> the condition `miss_rank >= nmiss - m` is never true ->
+`fetches = 0` on EVERY group.  So the CUDA pair is the EMPTY no-op (`total = *n * per = 0`; `k < *n` false).  Both
+are PORTED as DEVICE-side shaders (`fetch_blobs.spv`, `rebase_ptrs.spv`) that read `*n` at submit, so the empty
+case is a true no-op AND the non-empty case (a PCIe-capable box) actually runs - never a host-side shortcut that
+would be right here and silently wrong when `pcie_frac` moves.
+
+**TWO MORE SYMBOLS CLOSED BY A DIAGNOSIS, NOT A GUESS.**  `copy_from_mapped` (`verify.cpp:678`, the PLE snapshot)
+was refused because its source "is not a live MAPPED region" - MEASURED, the source is `0x700260...`, an ARENA
+(device) pointer (`ss.ple.hist` = `ss.ple_hist`, `session.cpp:126`), and the CUDA kernel accepts either kind, so
+the wrapper now accepts an arena source.  `sample_tokens` (`verify.cpp:1170`) was refused the same way - MEASURED,
+the failure was `out = m_out_`, the MAPPED twin the engine reads the token id back from, so the wrapper now
+accepts a mapped `out` too.  In both cases the wrapper still refuses a pointer that is neither.
+
+**MAP:** `168 = 96 kernel + 0 shader + 47 host + 0 todo + 25 refused` (`fetch_blobs`/`rebase_ptrs`
+`refused -> kernel`).  **The generator was found STALE and fixed:** `make_port_map.py`'s `REFUSED` set still named
+`copy_indexed`, `copy_rows_from_mapped` and `wait_flag_ge` - all DEFINED by the seam batch - so it did NOT
+regenerate byte-identically; it now does, and is idempotent.

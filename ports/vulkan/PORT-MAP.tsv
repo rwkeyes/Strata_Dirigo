@@ -48,7 +48,7 @@ embedding_gather_dev	refused	embedding_gather
 f16_from_f32	host	a type conversion helper
 f32_from_f16	host	a type conversion helper
 f32_to_bf16_bulk	kernel	f32_to_bf16
-fetch_blobs	refused	no shader in this tree yet
+fetch_blobs	kernel	fetch_blobs
 fused_gdn_ab	kernel	fused_gdn_ab
 fused_gdn_conv_l2	kernel	fused_gdn_conv_l2
 fused_gdn_step_norm	kernel	fused_gdn_step_norm
@@ -159,7 +159,7 @@ quantize_q8_0	kernel	quantize_q8_0
 quantize_q8_0_scaled	kernel	quantize_q8_0_scaled
 quantize_q8_1_rows	kernel	quantize_q8_1
 quantize_q8_K	kernel	quantize_q8_K
-rebase_ptrs	refused	no shader in this tree yet
+rebase_ptrs	kernel	rebase_ptrs
 resident_plan	refused	no shader in this tree yet
 rms_norm_weighted	kernel	rms_norm
 rope_neox_apply	kernel	rope_neox

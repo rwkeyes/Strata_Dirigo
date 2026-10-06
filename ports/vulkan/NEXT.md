@@ -1,5 +1,75 @@
 # Start here next session
 
+## THE RECORDING COMPLETES AND THE GRAPH CAPTURES; the stop is now AT LAUNCH, in the engine's own host expert path (`native_quant_act`) (2026-10-05, `vega`)
+
+**THE P6 VERIFY WINDOW'S WHOLE RECORDING RUNS AND THE TOKEN GRAPH IS CAPTURED.**  On `coder-iq1_m` (NO
+`--no-pool`, `--expert-profile /tmp/expert-profile-coder-built.bin`, `--expert-cache 2048`), `/tmp/run_real_pool9.log`
+prints, after `prefill 1 tokens in 1 chunks, 22504.3 ms` and `strata verify: window up to 6 tokens, 74.0 MiB of
+device buffers`:
+
+```
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata::kernels::cpu::native_quant_act: ... the port has no CPU-hybrid execution path ... REFUSING.
+```
+
+**Every symbol on the window's path, the handshake seam, the PCIe staging and the sampler are BEHIND it.**  The
+refusal now fires at LAUNCH, not during the recording: the engine's expert-source streaming path
+(`src/core/expert_source.cpp:2147`) asks the CPU to build the quantized activation for the experts it computed on
+the CPU, and the port refuses that verb CORRECTLY (a loud stop, not a silent CPU fallback).
+
+**DELIVERABLE A - `fetch_blobs`/`rebase_ptrs` ARE PORTED, AND THE FORM THIS RUN NEEDS IS MEASURED FROM THE
+COUNTS.**  What they do (`verify_kernels.cu:271-284`): `fetch_blobs` gathers `*n` DEVICE-POINTED blobs of
+`blob_bytes` from the pinned complement into the VRAM staging region; `rebase_ptrs` rewrites the device pointer
+table to `base + k*blob_bytes` for `k < *n`.  `pcie_mode == 2` IS the default (`generate.cpp:471` `"auto"` ->
+`:5168`), so the pair IS on path.  The count that gates the work is `P.counts[2] = fetches`, and with this box's
+PCIe probe (0.1 GB/s -> `pcie_frac 0.00`): `pcie_num = (int)(0.00*256+0.5) = 0` (`generate.cpp:7850`) ->
+`pcie_ok` FALSE (`expert_source.cpp:2034`) -> `m = 0` (`:2035`) -> `miss_rank >= nmiss - 0` never true ->
+**`fetches = 0` on EVERY group**, i.e. the CUDA pair is the EMPTY no-op (the run agrees: `0 by DMA`).  **Both are
+carried as their GENERAL, DEVICE-SIDE forms** - `fetch_blobs.spv` (the `ptr_to_off` technique: the pointer table
+read as lo/hi uint32, the arena base subtracted in 64-bit arithmetic, the source bound as a 4 GiB arena WINDOW)
+and `rebase_ptrs.spv` (the lo/hi write) - so `*n` is read AT SUBMIT and the empty case is a true no-op while the
+non-empty case actually runs.  A host-side "record nothing" shortcut would have been right for this
+configuration and a SILENT wrong answer the moment `pcie_frac` moved.
+
+**DELIVERABLE B - `copy_from_mapped(:678)` WAS A TOO-STRICT CONTRACT, NOT A MAPPING.**  The PLE snapshot's source
+is `ss.ple.hist` = `ss.ple_hist` = the SESSION ARENA's PLE conv history (`session.cpp:126`), a DEVICE buffer -
+measured: the run printed the source as `0x700260...`, on the arena base.  `ple_block`/`ple_history_advance`
+already bind it as an arena view.  The CUDA `copy_from_mapped_kernel` reads MAPPED PINNED HOST MEMORY **or any
+device pointer**; the port demanded the mapped kind.  The wrapper now accepts a source that resolves in the ARENA
+too (a device->device copy), and still REFUSES a pointer that is neither (the refusal arm's text is preserved).
+
+**DELIVERABLE C - THE NEW STOP, AND THE TWO ROUTES.**  After the capture, the LAUNCH reaches the engine's own
+`native_quant_act` (`expert_source.cpp:2147`, a `strata::kernels::cpu::` symbol).  The switch is ONE array: in the
+PLAN branch (`d.plan != nullptr && n <= 128 && n <= d.plan->cap`, `:2020`) `kind[i]` is set to {0 VRAM, 1 PCIe,
+2 peer} (`:2067`) and `any_cpu` (`:2135-2137`) is FALSE, so the CPU activation is SKIPPED; only the ELSE branch
+(`:2104-2109`) leaves `kind[i] = -1` for a NON-RESIDENT expert.  So the two honest routes are:
+* **all-resident** - `--expert-cache 12288` (~23.5 GiB of the 24.79 GiB pack) is **0.62 GiB SHORT**: the run
+  prints `arena exhausted - wanted 25146163200 bytes at offset 4510555648` (total 29,656,718,848; 27 GiB is
+  28,991,029,248; 28 GiB does not allocate on this device).  A candidate to relocate is the experimental native
+  Q5_K head (`521472000 bytes`, 0.49 GiB) - still ~0.14 GiB short - and every relocated byte that is touched per
+  token costs at 0.1 GB/s.
+* **the plan branch** - if the plan is present at the LAUNCH, `kind` is never -1 and the CPU verb is not reached
+  at all.  (The plan IS set at `generate.cpp:7849`; WHICH dispatch saw `d.plan == nullptr` is the open question.)
+
+**THE `prefill: routed id out of range` WAS INTERMITTENT AND IS NOT THIS DIFF - stated plainly.**  One run with
+this batch's diff failed the prefill's routing check (`/tmp/run_real_pool8.log`, RC=1); a repeat with the SAME
+diff PASSED the prefill and reached the sampler (`/tmp/run_real_pool_full2.log`).  A stash run and the
+elementwise-reverted bisect both passed too.  So the prefill's routing check is NONDETERMINISTIC; nothing in this
+batch's diff is implicated, and the elementwise change is NOT reverted in the tree.
+
+**MAP:** `168 = 96 kernel + 0 shader + 47 host + 0 todo + 25 refused` (`fetch_blobs`/`rebase_ptrs`
+`refused -> kernel`).  **AN INSTRUMENT DEFECT WAS FOUND AND FIXED: `make_port_map.py` did NOT regenerate
+byte-identically** - its `REFUSED` set was STALE and would have REVERTED `copy_indexed`, `copy_rows_from_mapped`
+and `wait_flag_ge`, which the seam batch had already defined.  The generator now reproduces the committed file
+byte-for-byte on the rows this batch did not intend to move, and is idempotent.
+
+**RECORDED OPEN (not chased, not a claim):** the window's recording creates MANY descriptor pools - the log shows
+`descriptor pool 79` through `pool 90 created: the previous one was full` (the previous batch saw pool 2).  This
+batch's `fetch_blobs` adds one dispatch per 4 GiB window per call (7 for a 26 GiB arena), so the window's
+dispatch count is now in the thousands and the pool-per-N design is the thing to look at.
+
+# Start here next session
+
 ## THE HANDSHAKE SEAM IS CLOSED: the P6 verify window's RECORDING now passes `wait_flag_ge` and stops at `fetch_blobs`, which is ON PATH and was mis-classified OFF it (2026-10-05, `vega`)
 
 **`wait_flag_ge` IS NO LONGER THE STOP.**  The engine's device spin is carried HOST-SIDE: the captured window is CUT

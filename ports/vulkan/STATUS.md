@@ -1,5 +1,34 @@
 # Status — what is done, what is verified, what is not
 
+## THE RECORDING COMPLETES AND THE GRAPH CAPTURES; the stop moved to the engine's host expert verb at LAUNCH (2026-10-05, `vega`)
+
+**WHAT IS DONE.**  The P6 verify window's RECORDING now runs to completion and the token graph is captured -
+`strata verify: captured the 1-token window (upload no error, sync no error)` (`/tmp/run_real_pool9.log`).  Three
+symbols were closed to get here: `fetch_blobs`/`rebase_ptrs` (`verify.cpp:1053/:1054`, the PCIe staging - ON PATH
+under the default `--pcie-mode auto` -> `pcie_mode == 2`; carried as DEVICE-side shaders, `fetch_blobs.spv` over
+the pointer table with the 4 GiB window, `rebase_ptrs.spv` the lo/hi rewrite, so the device count is read at
+submit and the `pcie_frac 0.00` case is a true no-op), and `copy_from_mapped` (`:678`, the PLE snapshot) whose
+source is an ARENA (device) buffer and whose wrapper demanded a MAPPED one.  A fourth fix was measured:
+`sample_tokens` (the window's own sampling, `verify.cpp:1170`) takes a MAPPED `out` (`m_out_`) - the engine reads
+the token id back on the host - and the wrapper now accepts either kind.
+
+**WHAT IS VERIFIED.**  Gate (vega): intel_icd `?/?/?`, lvp `?/?/?`, radeon `?/?/?` (see the gate log at the
+commit).  `case_blob_stage_entry` proves `fetch_blobs`/`rebase_ptrs` against an independent host transcription of
+the CUDA loops, the device count against the capacity (sentinel slots), rivals that MOVE, a VACUITY arm for each
+(`*n == 0` writes nothing, and the same call with `*n == NB` is required to have written everything), and the 4
+GiB WINDOW SPLIT driven directly at a 4 KiB window.  `case_copy_from_mapped_entry` gains an ARENA-source arm
+(the `:678` shape) with a rival that re-publishes the source; `case_sample_tokens_entry` gains a MAPPED-`out` arm
+(`verify.cpp:1170`).  Five new registered injections.
+
+**WHAT IS NOT.**  A TOKEN.  The refusal at LAUNCH is the engine's own CPU expert-activation
+(`strata::kernels::cpu::native_quant_act`, `expert_source.cpp:2147`) - reached only when the per-expert `kind[i]`
+array has a `-1` (an expert the CPU computes), which the PLAN branch never produces.  The port has no
+CPU-hybrid path and refuses it, correctly.  Two honest routes are named in `NEXT.md`: all-resident
+(`--expert-cache 12288` is 0.62 GiB short of the 26/27 GiB arena) or the plan branch.  The window's descriptor
+pools grow to `pool 90` (RECORDED, not chased).
+
+# Status — what is done, what is verified, what is not
+
 ## THE P6 HANDSHAKE SEAM IS CARRIED HOST-SIDE AND GATE-PROVEN; the window's RECORDING passes `wait_flag_ge` and now stops at `fetch_blobs` (2026-10-05, `vega`)
 
 **WHAT IS DONE.**  `wait_flag_ge` (`verify_kernels.cu:496`, a 1-thread SPIN on host-mapped memory) is carried

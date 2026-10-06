@@ -1,0 +1,32 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// ports/vulkan/shaders/rebase_ptrs.comp - the CUDA `rebase_ptrs_kernel` (src/kernels/cuda/verify_kernels.cu:281):
+//
+//   const int k = threadIdx.x;
+//   if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
+//
+// The P6 verify window stages the PCIe share of a layer's missed experts into VRAM (`fetch_blobs`) and then
+// REBASES the device pointer table so the following grouped-expert launch reads the staged copies rather than
+// the pack (`verify.cpp:1054`).  The table is DEVICE memory and `*n` is DEVICE memory, so this is a shader, not
+// a host loop; `*n == 0` (which is the case for EVERY group at `pcie_frac 0.00` - see verify.cpp:1050-1054 and
+// the counts proof in the port's notes) makes every invocation return, i.e. the rebase is the IDENTITY.
+//
+// NO POINTER IS DEREFERENCED.  `base` is the staging region's start (a value the host knows) and `bytes` the
+// per-blob stride, both passed as push constants; only the WRITE is device-side, and it is written as a lo/hi
+// uint32 PAIR because glslang has no 64-bit buffer index (the `ptr_to_off.spv` technique).  The 64-bit ADD is
+// exact (`GL_EXT_shader_explicit_arithmetic_types_int64`), so the stored pointer is byte-for-byte the address
+// the CUDA stores.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Ptr { uint v[]; } ptr;      // 2 uint per device pointer (lo, hi)
+layout(set = 0, binding = 1, std430) readonly buffer N { int v[]; } n;  // the count, on the device
+layout(push_constant, std430) uniform PC { uint base_lo; uint base_hi; uint bytes_lo; uint bytes_hi; } pc;
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    if (k >= uint(n.v[0])) return;                                      // the CUDA's `if (k < *n)`
+    const uint64_t base  = (uint64_t(pc.base_hi)  << 32) | uint64_t(pc.base_lo);
+    const uint64_t bytes = (uint64_t(pc.bytes_hi) << 32) | uint64_t(pc.bytes_lo);
+    const uint64_t v = base + uint64_t(k) * bytes;
+    ptr.v[2u * k]      = uint(v & 0xFFFFFFFFu);
+    ptr.v[2u * k + 1u] = uint(v >> 32);
+}

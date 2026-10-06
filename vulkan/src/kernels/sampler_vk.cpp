@@ -97,18 +97,39 @@ void sample_tokens(Stream& s, const float* logits, int n_tokens, int n_vocab, co
                      p.penalty_last_n, (const void*) history, history_len);
         std::exit(1);
     }
+    // THE OPERANDS ARE EITHER ARENA (DEVICE) BUFFERS OR REGISTERED MAPPED REGIONS - the same two kinds the CUDA
+    // `sampler.cu` kernel accepts (it writes `out` through a plain device store, and the engine's `out` may be
+    // either kind), and the same two `copy_from_mapped` accepts.  **THE MAPPED CASE IS NOT OPTIONAL HERE:** the
+    // P6 verify window's own sampling step is `verify.cpp:1170`
+    // `sample_tokens(head_logits_, T, n_vocab_, nullptr, 0, sp, m_out_, cs)` - `head_logits_` is an arena buffer
+    // (`verify.cpp:437`) but `m_out_` is the MAPPED twin of `h_out_` (`:371` `mapped(T*4+16, &h_out_, &m_out_)`),
+    // the token id the ENGINE reads back on the HOST.  Refusing it as "not in the arena" was the port demanding a
+    // kind the CUDA never demanded; the mapped region's buffer IS device-visible, so binding it is exact.  A
+    // pointer that is NEITHER is still refused, so the wrong-view guard stands.
+    auto resolve_operand = [&](const void* q, uint64_t bytes, Buf& b) -> bool {
+        if (q == nullptr) return false;
+        if (arena_resolve(s, q, bytes, b)) return true;
+        return strata::vulkan::mapped_resolve(q, bytes, b);
+    };
     Buf lv{}, ov{};
-    if (!arena_resolve(s, logits, (uint64_t) n_tokens * (uint64_t) n_vocab * 4, lv) ||
-        !arena_resolve(s, out, (uint64_t) n_tokens * 4, ov)) {
-        std::fprintf(stderr, "sample_tokens: logits or out is not inside this stream's arena; refusing rather "
-                             "than binding a wrong view\n");
+    const bool lok = resolve_operand(logits, (uint64_t) n_tokens * (uint64_t) n_vocab * 4, lv);
+    const bool ook = resolve_operand(out, (uint64_t) n_tokens * 4, ov);
+    if (!lok || !ook) {
+        std::fprintf(stderr,
+                     "sample_tokens: logits %p (%s, %llu bytes) or out %p (%s, %llu bytes) is neither in this "
+                     "stream's arena nor a live mapped region; refusing rather than binding a wrong view\n",
+                     (const void*) logits, lok ? "ok" : "BAD",
+                     (unsigned long long) ((uint64_t) n_tokens * (uint64_t) n_vocab * 4),
+                     (const void*) out, ook ? "ok" : "BAD",
+                     (unsigned long long) ((uint64_t) n_tokens * 4));
         std::exit(2);
     }
     const Buf* hv = nullptr;
     Buf hb{};
     if (history != nullptr && history_len > 0) {
-        if (!arena_resolve(s, history, (uint64_t) n_tokens * (uint64_t) history_len * 4, hb)) {
-            std::fprintf(stderr, "sample_tokens: the history is not inside this stream's arena; refusing\n");
+        if (!resolve_operand(history, (uint64_t) n_tokens * (uint64_t) history_len * 4, hb)) {
+            std::fprintf(stderr, "sample_tokens: the history is neither in this stream's arena nor a live mapped "
+                                 "region; refusing\n");
             std::exit(2);
         }
         hv = &hb;

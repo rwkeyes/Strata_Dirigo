@@ -947,6 +947,41 @@ case "$name" in
     old=$'    const int use_scratch = (n_keep == nullptr) ? 1 : 0;'
     new=$'    const int use_scratch = 0;   // INJECTION: the verify half runs in place'
     want="FAIL  gdn_step_norm_multi entry (verify half): the STATE is left untouched" ;;
+  fetch-blobs-ignore-count)
+    # `fetch_blobs` reads its blob count `*n` FROM DEVICE MEMORY; dropping the guard copies the CAPACITY, so the
+    # arms past the real count move.  `case_blob_stage_entry` (A2) pins it with sentinel slots.
+    file="$SH/fetch_blobs.comp"; spv="fetch_blobs"
+    old=$'    if (g >= uint(n.v[0])) return;                       // the CUDA\'s `k < *n`'
+    new=$'    // INJECTION: the device count is ignored (the capacity is copied)'
+    want="FAIL  fetch_blobs entry: the DEVICE count caps the gather" ;;
+  fetch-blobs-window-ignored)
+    # The source is bound as a 4 GiB WINDOW and only the blobs whose window matches may be copied; dropping the
+    # test copies a blob that lives in another window - the 4 GiB-index-limit class.
+    file="$SH/fetch_blobs.comp"; spv="fetch_blobs"
+    old=$'    if (w != uint64_t(pc.win_id)) return;                // another window owns this blob'
+    new=$'    // INJECTION: the window test is dropped (every window copies every blob)'
+    want="FAIL  fetch_blobs window: a blob in ANOTHER window is NOT copied" ;;
+  rebase-ptrs-fixed-cap)
+    # `rebase_ptrs` rewrites `ptr[k] = base + k*bytes` for `k < *n` (DEVICE data).  A FIXED cap of 8 rewrites
+    # entries past `*n`, which the tail arm catches (the table carries sentinels past the count).
+    file="$SH/rebase_ptrs.comp"; spv="rebase_ptrs"
+    old=$'    if (k >= uint(n.v[0])) return;                                      // the CUDA\'s `if (k < *n)`'
+    new=$'    if (k >= 8u) return;   // INJECTION: a fixed cap instead of the device count'
+    want="FAIL  rebase_ptrs entry: entries >= *n are UNCHANGED" ;;
+  copy-from-mapped-arena-binds-dst)
+    # The `verify.cpp:678` PLE snapshot has an ARENA (device) source; this batch added the arena fallback.  This
+    # injection binds the DESTINATION as the source - the copy becomes a no-op and the arm's oracle bites.
+    file="$TREE/vulkan/src/kernels/elementwise_vk.cpp"; spv=""
+    old=$'    if (!have_src) have_src = arena_resolve(s, src, (uint64_t) n * 4, sv);'
+    new=$'    if (!have_src) { have_src = true; sv = dv; }   // INJECTION: the arena source binds the DESTINATION'
+    want="FAIL  copy_from_mapped entry: a DEVICE (arena) source copies" ;;
+  sample-tokens-mapped-out-wrong-view)
+    # The verify window's sampler writes `out` into a MAPPED region (`verify.cpp:1170`, `m_out_`); this batch
+    # accepts it.  This injection binds the LOGITS view as `out`, so the id never reaches the mapped buffer.
+    file="$TREE/vulkan/src/kernels/sampler_vk.cpp"; spv=""
+    old=$'    const bool ook = resolve_operand(out, (uint64_t) n_tokens * 4, ov);'
+    new=$'    const bool ook = resolve_operand(out, (uint64_t) n_tokens * 4, ov);\n    if (ook) ov = lv;   // INJECTION: the mapped out binds the logits view'
+    want="FAIL  sample_tokens entry (mapped out): the id lands" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

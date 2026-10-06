@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// ports/vulkan/shaders/fetch_blobs.comp - the CUDA `fetch_blobs_kernel` (src/kernels/cuda/verify_kernels.cu:271):
+//
+//   const long long total = (long long) *n * per;                    // per = blob_bytes / 16
+//   for (i = blockIdx.x*blockDim.x + threadIdx.x; i < total; i += gridDim.x*blockDim.x) {
+//       const long long k = i / per, off = i - k * per;
+//       dst_as_uint4[i] = ((const uint4*) src[k])[off];              // 16-byte coalesced gathers
+//   }
+//
+// This is the P6 verify window's PCIe staging (`verify.cpp:1053`): the layer's `*n` missed experts (whose blobs
+// the CPU pool published into the pinned complement) are copied into the VRAM staging region before the
+// grouped-expert launch reads them.  `src[k]` is a DEVICE-HOSTED pointer (`expert_source.cpp:2083`
+// `P.ptr2[q] = d.src->device_alias(...)`).
+//
+// A SHADER CANNOT DEREFERENCE A DEVICE POINTER - so this uses the port's solution to that exact problem
+// (`ptr_to_off.spv`, native_expert_grouped_vk.cpp): the pointer table is read as lo/hi uint32 words, the arena
+// base is subtracted with 64-BIT arithmetic only, and the source is bound as the arena VIEWED AT
+// `win_id * WIN_BYTES` (glslang 15.1 has no 64-bit buffer index: one binding reaches 4 GiB).  This shader is one
+// dispatch PER WINDOW; a workgroup per blob slot copies the blobs whose window is `win_id`.  `per` is
+// `blob_bytes / 16` (uint4 steps), so the bytes are the CUDA's.
+//
+// `*n == 0` - which is EVERY group at `pcie_frac 0.00` (expert_source.cpp:2034-2036: `pcie_num = 0` -> `pcie_ok`
+// false -> `m = 0` -> the `miss_rank >= nmiss` test is never true -> `fetches = 0`) - returns before any load,
+// so the PCIe staging is the empty no-op the engine's own CUDA performs there.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Ptr { uint v[]; } ptr;   // lo,hi per device pointer
+layout(set = 0, binding = 1, std430) readonly buffer N { int v[]; } n;        // the blob count, on the device
+layout(set = 0, binding = 2, std430) readonly buffer Src { uint v[]; } src;   // the arena viewed at win_id*WIN
+layout(set = 0, binding = 3, std430) buffer Dst { uint v[]; } dst;            // the VRAM staging region
+layout(push_constant, std430) uniform PC { uint base_lo; uint base_hi; uint win_bytes; uint win_id; uint per; } pc;
+
+void main() {
+    const uint g = gl_WorkGroupID.x;
+    if (g >= uint(n.v[0])) return;                       // the CUDA's `k < *n`
+    const uint64_t p = (uint64_t(ptr.v[2u * g + 1u]) << 32) | uint64_t(ptr.v[2u * g]);
+    const uint64_t base = (uint64_t(pc.base_hi) << 32) | uint64_t(pc.base_lo);
+    const uint64_t f = p - base;                         // the arena byte offset of the blob
+    const uint64_t wb = uint64_t(pc.win_bytes);
+    const uint64_t w = f / wb;
+    if (w != uint64_t(pc.win_id)) return;                // another window owns this blob
+    const uint o0 = uint(f - w * wb) >> 2u;              // the blob's u32 start inside this window view
+    const uint d0 = g * pc.per * 4u;                     // the blob's u32 start inside staging
+    for (uint o = gl_LocalInvocationID.x; o < pc.per; o += gl_WorkGroupSize.x) {
+        const uint s = o0 + o * 4u;                      // 16 bytes = 4 u32
+        const uint d = d0 + o * 4u;
+        dst.v[d]        = src.v[s];
+        dst.v[d + 1u]   = src.v[s + 1u];
+        dst.v[d + 2u]   = src.v[s + 2u];
+        dst.v[d + 3u]   = src.v[s + 3u];
+    }
+}

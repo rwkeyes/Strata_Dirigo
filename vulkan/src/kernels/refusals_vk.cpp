@@ -273,11 +273,12 @@ void copy_or_zero_from_mapped(float*, const float*, long long, const uint32_t*, 
 // moves `refused -> kernel` in PORT-MAP.tsv.
 // `copy_indexed` is NOW DEFINED in `vulkan/src/kernels/verify_vk.cpp` (shader `copy_indexed.spv`): the commit
 // graph's PLE-history copy (verify.cpp:1311/:1867), reached whenever the PLE stage is ready.  Same row move.
-void fetch_blobs(const unsigned long long*, const int32_t*, uint8_t*, int64_t, int, void*) {
-    refuse_not_ported("fetch_blobs",
-                      "NOT reached - the P6 verifier's PCIe staging (verify.cpp:1053, `if (sink_.pcie_mode == 2)`); "
-                      "the PCIe probe reads 0.1 GB/s -> pcie_frac 0.00");
-}
+// `fetch_blobs` is NOW DEFINED (not refused) in `vulkan/src/kernels/verify_vk.cpp`: the P6 verify window's PCIe
+// staging (`verify.cpp:1053`), ON PATH under the default `--pcie-mode auto` -> `set_pcie_mode(2)`.  It is a
+// DEVICE-side gather over the pointer table (the `ptr_to_off.spv` technique: lo/hi uint32 words, the arena base
+// subtracted in 64-bit arithmetic, the source bound as a 4 GiB arena window) so `*n` is re-read at every replay;
+// at `pcie_frac 0.00` `*n == 0` for every group, which is the CUDA's own empty no-op.  The refusal that used to
+// sit here claimed the symbol was NOT reached - FALSE of the code, as the run showed.
 // `fused_gr_check` is DEFINED (not refused) in `vulkan/src/kernels/ple_vk.cpp`: it is a card CHARACTERISATION
 // (no tensors), and on this backend its honest outcome is "the plain read runs here".  It was a refusal here
 // until the shipped `--native` launch was measured to REACH it at `Verifier::init` (verify.cpp:311) - the
@@ -325,11 +326,10 @@ void ple_block_projected(const float*, const float*, const float*, const float*,
                       "`ple_native_bf16_enabled()` AND `ple_native_postops_enabled()`; the backend answers both "
                       "FALSE (vulkan/src/kernels/ple_vk.cpp)");
 }
-void rebase_ptrs(unsigned long long*, const int32_t*, uint8_t*, int64_t, void*) {
-    refuse_not_ported("rebase_ptrs",
-                      "NOT reached - the P6 verifier's PCIe staging (verify.cpp:1054, `if (sink_.pcie_mode == 2)`); "
-                      "the PCIe probe reads 0.1 GB/s -> pcie_frac 0.00");
-}
+// `rebase_ptrs` is NOW DEFINED (not refused) in `vulkan/src/kernels/verify_vk.cpp` (shader `rebase_ptrs.spv`):
+// `ptr[k] = base + k*blob_bytes` for `k < *n`, the lo/hi write the CUDA does (`verify_kernels.cu:281`).  At
+// `pcie_frac 0.00` `*n == 0`, so it writes nothing (the rebase is the IDENTITY); the shader carries the general
+// case, not a host-side shortcut.
 void resident_plan(const int32_t*, int, int, const int32_t*, int, const uint8_t*, const unsigned long long*, long long,
                    int32_t*, long long, uint32_t*, uint32_t, void*) {
     refuse_not_ported("resident_plan",

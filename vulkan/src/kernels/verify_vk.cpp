@@ -489,4 +489,96 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     strata::vulkan::scale_rows(s, out, g, n_tok, n_embd);
 }
 
+// ---- `fetch_blobs` / `rebase_ptrs` - the P6 verify window's PCIe STAGING (verify.cpp:1053/:1054) -----------
+//
+// WHAT THEY DO (verify_kernels.cu:271-284, verify_kernels.hpp:72-74):
+//   * `fetch_blobs(src, n, dst, blob_bytes, cap, stream)` gathers `*n` DEVICE-POINTED blobs of `blob_bytes`
+//     bytes each - `src[k]` is a device address in the pinned complement (`expert_source.cpp:2083`
+//     `P.ptr2[q] = d.src->device_alias(...)`) - into the VRAM staging region at `dst + k*blob_bytes`, as
+//     coalesced 16-byte loads.  `per = blob_bytes/16` uint4s per blob; the CUDA launches a flat grid over
+//     `*n * per` and early-returns if `cap <= 0`.
+//   * `rebase_ptrs(ptr, n, base, bytes, stream)` then rewrites the DEVICE pointer table so the following
+//     grouped-expert launch (`verify.cpp:1059`) reads the staged copies: `ptr[k] = base + k*bytes` for `k < *n`.
+//
+// WHICH FORM THIS RUN NEEDS - MEASURED FROM THE COUNTS, NOT ASSUMED.  The branch is taken under the DEFAULT
+// `--pcie-mode auto` (`generate.cpp:471` default `"auto"`; `:5168` `set_pcie_mode(... : 2)` -> `pcie_mode == 2`).
+// The count that gates the work is `P.counts[2] = fetches` (`expert_source.cpp:2086`), and with this box's PCIe
+// probe (0.1 GB/s -> `pcie_frac 0.00`):
+//     `pcie_num   = (int)(0.00*256 + 0.5) = 0`                       (generate.cpp:7850)
+//     `pcie_ok    = (pcie_num > 0) && ... = FALSE`                   (expert_source.cpp:2034)
+//     `m          = pcie_ok ? (nmiss*pcie_num)>>8 : 0 = 0`           (expert_source.cpp:2035)
+//     `miss_rank >= nmiss - m`  =>  `miss_rank >= nmiss`, never true for miss_rank in [0, nmiss)
+//   so `fetches = 0` and **`counts[2] == 0` on EVERY group** - the CUDA pair is an EMPTY no-op
+//   (`fetch_blobs_kernel` is launched with `total = 0`; `rebase_ptrs_kernel` writes nothing because `k < 0` is
+//   false for all 128 threads).  The measured run agrees: `experts streamed 375 (0 by DMA)`.
+//
+// SO BOTH ARE CARRIED AS THEIR GENERAL, DEVICE-SIDE FORMS - which is STRICTLY SAFER than a host-side empty
+// shortcut, because `*n` is DEVICE data read AT SUBMIT: with `*n == 0` every invocation returns before any load
+// or store (a faithful empty no-op), and with `*n > 0` the gather and the rewrite actually run.  A host-side
+// shortcut that recorded nothing would be right for this configuration and a SILENT wrong answer the moment
+// `pcie_frac` moved.  NO KERNEL WAITS OR SPINS.
+//
+// `rebase_ptrs`'s stored address is written as a lo/hi uint32 PAIR (glslang has no 64-bit buffer index; the
+// `ptr_to_off.spv` technique) with the 64-bit ADD done in the shader, so the stored synthetic pointer is
+// byte-for-byte what the CUDA stores.
+static constexpr uint64_t kBlobWinBytes = (1ull << 32) - (64ull << 20);   // 4 GiB window the source view advances by
+static constexpr uint64_t kBlobFetchCap = 64;   // the engine's own hard cap on a layer's PCIe fetches (expert_source.cpp:2054)
+
+void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
+    if (cap <= 0) return;                                       // the CUDA's own early return (verify_kernels.cu:364)
+    if (blob_bytes <= 0 || blob_bytes % 16 != 0) {              // the CUDA exits(1) on a non-multiple of 16 (:365)
+        std::fprintf(stderr, "strata::vulkan::fetch_blobs: blob_bytes %lld is not a positive multiple of 16 "
+                             "(the CUDA's own precondition) - refusing\n", (long long) blob_bytes);
+        std::exit(2);
+    }
+    const uint64_t per = (uint64_t) blob_bytes / 16;            // uint4 chunks per blob
+    if (per == 0 || per > 0xFFFFFFFFull) {
+        std::fprintf(stderr, "strata::vulkan::fetch_blobs: blob_bytes/16 = %llu does not fit the shader's 32-bit per\n",
+                     (unsigned long long) per);
+        std::exit(2);
+    }
+    strata::vulkan::Stream& s = strata::vulkan::need_stream("fetch_blobs", stream);
+    strata::vulkan::Buf b_ptr{}, b_n{}, b_dst{};
+    if (!strata::vulkan::arena_resolve(s, src, (uint64_t) cap * 8, b_ptr) ||
+        !strata::vulkan::arena_resolve(s, n, 4, b_n) ||
+        !strata::vulkan::arena_resolve(s, dst, (uint64_t) cap * (uint64_t) blob_bytes, b_dst))
+        strata::vulkan::refuse("fetch_blobs",
+                               "the pointer table, the count or the staging destination is not inside this stream's arena");
+    const uint64_t base = strata::vulkan::Stream::kArenaBase;
+    struct { uint32_t base_lo, base_hi, win_bytes, win_id, per; } pc{
+        (uint32_t) (base & 0xFFFFFFFFu), (uint32_t) (base >> 32), (uint32_t) kBlobWinBytes, 0u, (uint32_t) per};
+    const uint32_t nwin = (uint32_t) ((s.arena_bytes + kBlobWinBytes - 1) / kBlobWinBytes);
+    for (uint32_t w = 0; w < nwin; ++w) {
+        const uint64_t wbase = (uint64_t) w * kBlobWinBytes;
+        if (wbase >= s.arena_bytes) break;
+        strata::vulkan::Buf wview = strata::vulkan::view(s.arena, wbase);
+        pc.win_id = w;
+        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/fetch_blobs.spv", 4, sizeof(pc));
+        // RECORDS under capture (the count is re-read at every replay), submits+waits otherwise.
+        s.ctx->dispatch(p, {&b_ptr, &b_n, &wview, &b_dst}, &pc, sizeof(pc), (uint32_t) cap);
+    }
+}
+
+void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
+    if (blob_bytes <= 0) return;
+    strata::vulkan::Stream& s = strata::vulkan::need_stream("rebase_ptrs", stream);
+    strata::vulkan::Buf b_ptr{}, b_n{};
+    // The table has `capx = max_t_*K` entries; the engine's `fetches` is capped at 64, so a 64-entry bound
+    // covers every write.  A shorter window sizes the table below that, so fall back to a 16-entry bound.
+    if (!strata::vulkan::arena_resolve(s, ptr, kBlobFetchCap * 8, b_ptr)) {
+        if (!strata::vulkan::arena_resolve(s, ptr, 16 * 8, b_ptr) ||
+            !strata::vulkan::arena_resolve(s, n, 4, b_n))
+            strata::vulkan::refuse("rebase_ptrs", "the pointer table or the count is not inside this stream's arena");
+    } else if (!strata::vulkan::arena_resolve(s, n, 4, b_n)) {
+        strata::vulkan::refuse("rebase_ptrs", "the count is not inside this stream's arena");
+    }
+    const uint64_t b = (uint64_t) (uintptr_t) base;             // the staging region's synthetic device address
+    const uint64_t bytes = (uint64_t) blob_bytes;
+    struct { uint32_t base_lo, base_hi, bytes_lo, bytes_hi; } pc{
+        (uint32_t) (b & 0xFFFFFFFFu), (uint32_t) (b >> 32),
+        (uint32_t) (bytes & 0xFFFFFFFFu), (uint32_t) (bytes >> 32)};
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/rebase_ptrs.spv", 2, sizeof(pc));
+    s.ctx->dispatch(p, {&b_ptr, &b_n}, &pc, sizeof(pc), 1u);    // one 256-thread group covers k < *n <= 64
+}
+
 }  // namespace strata::kernels

@@ -158,9 +158,9 @@ TABLE = {
     'copy_from_mapped':               ('kernel', 'copy'),
     'copy_i32_from_mapped':           ('host', 'a mapped-buffer copy'),
     'copy_i32_from_mapped_unless':    ('host', 'a mapped-buffer copy'),
-    'copy_indexed':                   ('host', 'a device-indexed copy'),
+    'copy_indexed':                   ('kernel', 'copy_indexed'),
     'copy_or_zero_from_mapped':       ('host', 'a mapped-buffer copy'),
-    'copy_rows_from_mapped':          ('host', 'a mapped-buffer copy'),
+    'copy_rows_from_mapped':          ('kernel', 'copy_rows_from_mapped'),
     'coupled_draft_scratch_bytes':    ('host', 'a size'),
     'coupled_draft_stage':            ('host', "the coupled round's mapped staging (a copy; the coupled kernels read it)"),
     'cpu':                            ('host', 'the engine ticks its own clock'),
@@ -237,7 +237,7 @@ TABLE = {
     'gdn_conv_commit':                ('kernel', 'gdn_conv_tail'),
     'native_router_top10_multi':      ('kernel', 'native_router_top10'),
     'native_moe_combine_multi':       ('kernel', 'native_moe_combine'),
-    'fetch_blobs':                    ('todo', 'no shader in this tree yet'),
+    'fetch_blobs':                    ('kernel', 'fetch_blobs'),
     'fused_gdn_ab':                   ('kernel', 'fused_gdn_ab'),          # replaces 2x bf16 mmvf + beta_gate + gate
     'fused_gdn_conv_l2':              ('kernel', 'fused_gdn_conv_l2'),     # replaces native_gdn_conv_silu + 2x l2_norm
     'fused_gdn_step_norm':            ('kernel', 'fused_gdn_step_norm'),   # replaces native_gdn_step + native_gdn_out_norm
@@ -256,11 +256,11 @@ TABLE = {
     'qsa_attend_step':                ('todo', 'no shader in this tree yet'),
     'qsa_decode_attn_batch':          ('kernel', 'qsa_decode_attn'),
     'qsa_index_step':                 ('todo', 'no shader in this tree yet'),
-    'rebase_ptrs':                    ('todo', 'no shader in this tree yet'),
+    'rebase_ptrs':                    ('kernel', 'rebase_ptrs'),
     'resident_plan':                  ('todo', 'no shader in this tree yet'),
     'row_top_prob':                   ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'topk_512_step':                  ('todo', 'no shader in this tree yet; ANSWERED BY A LOUD REFUSAL (refusals_vk.cpp): --no-fast-select reaches it'),
-    'wait_flag_ge':                   ('todo', 'no shader in this tree yet'),
+    'wait_flag_ge':                   ('host', 'the handshake seam - a HOST boundary, no shader (vulkan/src/kernels/verify_vk.cpp)'),
     'wait_flag_ge_or':                ('todo', 'no shader in this tree yet'),
     'window_ids':                     ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
 }
@@ -289,14 +289,19 @@ REFUSED = {
     'embedding_gather_dev',
     # the A/B arm defaulting off (class C)
     'moe_hit_grouped_s2_cpu_order',
-    # the P6 verifier: **THE NINE THAT MOVED OUT (this batch) are NOT HERE** - `broadcast_streams`,
+    # the P6 verifier: **THE NINE THAT MOVED OUT (the seam batch) are NOT HERE** - `broadcast_streams`,
     # `add_streams_broadcast`, `gdn_conv_l2_multi`, `gdn_ab_multi`, `gdn_step_norm_multi`, `gdn_conv_commit`,
     # `native_router_top10_multi`, `native_moe_combine_multi`, `shared_expert_multi` are DEFINED, not refused.
-    # What is left is the window's genuinely-unreached tail PLUS the one symbol it DOES reach (wait_flag_ge).
-    'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
-    'copy_rows_from_mapped', 'fetch_blobs', 'gpu_stamp',
+    # **AND THE FIVE THAT MOVED OUT SINCE** (this batch found the generator's REFUSED set STALE - it would have
+    # REVERTED `copy_indexed`, `copy_rows_from_mapped` and `wait_flag_ge`, which the seam batch had already
+    # defined, so `make_port_map.py` did NOT regenerate byte-identically): `copy_indexed` and
+    # `copy_rows_from_mapped` (shaders, seam batch), `wait_flag_ge` (the host boundary, seam batch),
+    # `fetch_blobs` and `rebase_ptrs` (shaders, THIS batch) are all DEFINED.  What is left is the window's
+    # genuinely-unreached tail.
+    'copy_i32_from_mapped_unless', 'copy_or_zero_from_mapped',
+    'gpu_stamp',
     'ple_block_projected',
-    'rebase_ptrs', 'resident_plan', 'wait_flag_ge', 'wait_flag_ge_or',
+    'resident_plan', 'wait_flag_ge_or',
 }
 _stale_refusals = sorted(REFUSED - set(syms))
 assert not _stale_refusals, f"REFUSED names symbols src/core/ does not reach: {_stale_refusals}"

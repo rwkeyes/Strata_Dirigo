@@ -21333,6 +21333,38 @@ void case_copy_from_mapped_entry(Ctx& ctx, const std::string& dir) {
     }
     verdict("copy_from_mapped entry: live publish, not the capture-time block", badb == 0, badb, (int) N, 0, "elements differ");
 
+    // ---- (G) A DEVICE (ARENA) SOURCE - the `verify.cpp:678` PLE-SNAPSHOT SHAPE -------------------------------
+    // `hist` there is `ss.ple.hist` = the SESSION ARENA's PLE conv history (`session.cpp:126`), a device buffer,
+    // NOT a mapped region - and the CUDA kernel (`elementwise.cu:226`, a float4 device read) copies it all the
+    // same.  The wrapper must accept an arena source too; refusing it is what stopped the real run at
+    // `verify.cpp:678`.  The rival re-publishes the SOURCE and requires the copy to move (a snapshot would not).
+    {
+        float* asrc = strata::vulkan::arena_alloc<float>(*s, (size_t) N);
+        float* adst = strata::vulkan::arena_alloc<float>(*s, (size_t) N);
+        std::vector<float> dead((size_t) N, 1234.5f);
+        strata::vulkan::stream_write(*s, asrc, A.data(), (size_t) N * 4);
+        strata::vulkan::stream_write(*s, adst, dead.data(), dead.size() * 4);
+        strata::kernels::copy_from_mapped(adst, asrc, N, (void*) cs);
+        std::vector<float> gota((size_t) N, -1.0f);
+        strata::vulkan::stream_read(*s, adst, gota.data(), gota.size() * 4);
+        int bada = 0;
+        for (int64_t i = 0; i < N; ++i) if (gota[(size_t) i] != A[(size_t) i]) ++bada;
+        verdict("copy_from_mapped entry: a DEVICE (arena) source copies (the verify.cpp:678 PLE-snapshot shape)",
+                bada == 0, bada, (int) N, 0, "elements differ");
+        strata::vulkan::stream_write(*s, asrc, C.data(), (size_t) N * 4);
+        strata::vulkan::stream_write(*s, adst, dead.data(), dead.size() * 4);
+        strata::kernels::copy_from_mapped(adst, asrc, N, (void*) cs);
+        std::vector<float> gotc((size_t) N, -1.0f);
+        strata::vulkan::stream_read(*s, adst, gotc.data(), gotc.size() * 4);
+        int badc = 0, movedc = 0;
+        for (int64_t i = 0; i < N; ++i) {
+            if (gotc[(size_t) i] != C[(size_t) i]) ++badc;
+            if (gotc[(size_t) i] != gota[(size_t) i]) ++movedc;
+        }
+        verdict("copy_from_mapped entry: the arena-source rival MOVES (the copy re-reads the source)",
+                badc == 0 && movedc == (int) N, badc, (int) N, movedc, "the arena source did not move");
+    }
+
     if (ex != nullptr) cudaGraphExecDestroy(ex);
     cudaFree(dst2);
     cudaFree(dst);
@@ -22160,6 +22192,38 @@ void case_sample_tokens_entry(Ctx& ctx, const std::string& dir) {
                 "this arm decorative");
     }
     sp.temperature = 1.0f;
+
+    // ---- THE MAPPED `out` ARM: the verify window's own sampling call (`verify.cpp:1170`, `m_out_`) ----------
+    // The engine reads the token id back ON THE HOST, so `out` may be a registered MAPPED region rather than an
+    // arena buffer, and the CUDA kernel writes it through a plain store either way.  The wrapper must accept
+    // both; refusing the mapped form is what stopped the real run at `verify.cpp:1170`.  On this backend the
+    // mapped host address and the device token are ONE allocation (vk_arena.hpp), so no copy reads it back.
+    {
+        int* hout = nullptr;
+        // `cudaHostAlloc` carves from the CURRENT stream's arena (`cuda_runtime.cpp`), so bind this case's stream
+        // before allocating - the other mapped-region cases do the same.
+        strata::vulkan::cuda_compat_set_stream(s);
+        if (cudaHostAlloc((void**) &hout, 16, cudaHostAllocMapped) != cudaSuccess || hout == nullptr) {
+            skip("sample_tokens entry (mapped out)", "cudaHostAlloc failed");
+        } else {
+            int* doutm = nullptr;
+            if (cudaHostGetDevicePointer((void**) &doutm, hout, 0) != cudaSuccess) doutm = hout;
+            stage();
+            hout[0] = -12345;                                   // sentinel: an unwritten out stays distinct
+            strata::kernels::sample_tokens(dl, n_tokens, n_vocab, dh, history_len, sp, doutm, s);
+            const int first = hout[0];
+            const bool ok1 = (first == ref_split);
+            verdict("sample_tokens entry (mapped out): the id lands in the MAPPED out (verify.cpp:1170 shape)",
+                    ok1, ok1 ? 0 : 1, 1, (double) first, "out != the shader path's token");
+            stage();
+            hout[0] = -12345;
+            strata::kernels::sample_tokens(dl, n_tokens, n_vocab, dh, history_len, sp, doutm, s);
+            const bool ok2 = (hout[0] == ref_split) && (first == ref_split);
+            verdict("sample_tokens entry (mapped out): a second call reproduces the id (a live write, not a snapshot)",
+                    ok2, ok2 ? 0 : 1, 1, (double) hout[0], "the mapped out was not re-written");
+            cudaFreeHost(hout);
+        }
+    }
 
     // ---- the CAPTURE ARM: records a block containing the wrapper, replays, requires bitwise equality ----------
     {
@@ -23288,6 +23352,223 @@ void case_verify_seam_entry(Ctx& ctx, const std::string& dir) {
     strata::vulkan::stream_close(s);
 }
 
+// *** `fetch_blobs` / `rebase_ptrs` - the P6 verify window's PCIe staging (verify.cpp:1053/:1054, this batch) ***
+//
+// THE ENGINE'S RULE (verify_kernels.cu:271-284), independently recomputed below:
+//   fetch_blobs(src, n, dst, blob_bytes, cap, cs): for k < *n, dst[k*blob_bytes ...] = the blob at src[k].
+//   rebase_ptrs(ptr, n, base, bytes, cs):          for k < *n, ptr[k] = base + k*bytes.
+// `*n` is DEVICE int32 data (the plan's `counts[2]`), so the count is read at SUBMIT, not at record.  The
+// VACUITY arms are load-bearing: `*n == 0` - the shipped `pcie_frac 0.00` form - must leave EVERY byte
+// untouched, and the SAME call with `*n > 0` is REQUIRED to have written everything, so a "does nothing"
+// implementation cannot pass both.  The window-split arm drives the shader with a 4 KiB window so a small
+// arena crosses a boundary - the 4 GiB-window rule the real pack (experts at 1.4 .. 24.8 GiB) needs.
+void case_blob_stage_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "fetch_blobs.spv") || !have(dir, "rebase_ptrs.spv")) return;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(24ull << 20, dir); }
+    if (s == nullptr) { verdict("blob staging: engine stream", false, 1, 1, 0, "no stream"); return; }
+    strata::vulkan::cuda_compat_set_stream(s);
+    const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+    strata::vulkan::Stream& st = *s;
+
+    const int NB = 4;
+    const int64_t BB = 256;                    // blob_bytes: a multiple of 16 (the CUDA's precondition)
+    const uint8_t DEAD = 0xA5;
+    const int n_all = NB, n_two = 2, n_zero = 0;
+
+    std::vector<std::vector<uint8_t>> blobs((size_t) NB, std::vector<uint8_t>((size_t) BB));
+    std::vector<void*> sp((size_t) NB, nullptr);
+    for (int k = 0; k < NB; ++k) {
+        sp[(size_t) k] = strata::vulkan::arena_alloc(st, (uint64_t) BB);
+        for (int64_t i = 0; i < BB; ++i) blobs[(size_t) k][(size_t) i] = (uint8_t) ((k * 37 + i * 5 + 1) & 0xFF);
+        strata::vulkan::stream_write(st, sp[(size_t) k], blobs[(size_t) k].data(), (size_t) BB);
+    }
+    auto* ptr = strata::vulkan::arena_alloc<unsigned long long>(st, (uint64_t) NB + 2);
+    auto* cnt = strata::vulkan::arena_alloc<int32_t>(st, 1);
+    auto* dst = strata::vulkan::arena_alloc<uint8_t>(st, (uint64_t) NB * BB);
+    auto read_dst = [&](std::vector<uint8_t>& v) {
+        v.assign((size_t) NB * BB, DEAD);
+        strata::vulkan::stream_read(st, dst, v.data(), v.size());
+    };
+    auto write_ptr = [&](int a, int b, int c, int d) {
+        const int ord[4] = {a, b, c, d};
+        std::vector<unsigned long long> t((size_t) NB + 2, 0xEEEE000000000000ull);
+        for (int k = 0; k < NB; ++k) t[(size_t) k] = (unsigned long long) (uintptr_t) sp[(size_t) ord[k]];
+        strata::vulkan::stream_write(st, (void*) ptr, t.data(), t.size() * 8);
+    };
+    std::vector<uint8_t> dead((size_t) NB * BB, DEAD);
+
+    // ---------------- (A) fetch_blobs: the engine rule, independently recomputed ----------------
+    {
+        write_ptr(0, 1, 2, 3);
+        strata::vulkan::stream_write(st, cnt, &n_all, 4);
+        strata::vulkan::stream_write(st, dst, dead.data(), dead.size());
+        strata::kernels::fetch_blobs(ptr, cnt, dst, BB, NB, (void*) cs);
+        std::vector<uint8_t> got;
+        read_dst(got);
+        int bad = 0;
+        for (int k = 0; k < NB; ++k)
+            for (int64_t i = 0; i < BB; ++i)
+                if (got[(size_t) k * BB + i] != blobs[(size_t) k][(size_t) i]) ++bad;
+        verdict("fetch_blobs entry: *n blobs gather to staging (engine rule)", bad == 0, bad, NB * (int) BB, 0,
+                "bytes differ");
+
+        // (A2) the DEVICE count is honoured against the capacity
+        strata::vulkan::stream_write(st, cnt, &n_two, 4);
+        strata::vulkan::stream_write(st, dst, dead.data(), dead.size());
+        strata::kernels::fetch_blobs(ptr, cnt, dst, BB, NB, (void*) cs);
+        std::vector<uint8_t> g2;
+        read_dst(g2);
+        int bad2 = 0, over = 0;
+        for (int k = 0; k < 2; ++k)
+            for (int64_t i = 0; i < BB; ++i) if (g2[(size_t) k * BB + i] != blobs[(size_t) k][(size_t) i]) ++bad2;
+        for (int k = 2; k < NB; ++k)
+            for (int64_t i = 0; i < BB; ++i) if (g2[(size_t) k * BB + i] != DEAD) ++over;
+        verdict("fetch_blobs entry: the DEVICE count caps the gather (slots >= *n untouched)",
+                bad2 == 0 && over == 0, bad2 + over, NB * (int) BB, 0, "bytes wrong or over-written");
+
+        // (A3) the rival MOVES
+        write_ptr(1, 0, 2, 3);
+        strata::vulkan::stream_write(st, cnt, &n_all, 4);
+        strata::vulkan::stream_write(st, dst, dead.data(), dead.size());
+        strata::kernels::fetch_blobs(ptr, cnt, dst, BB, NB, (void*) cs);
+        std::vector<uint8_t> g3;
+        read_dst(g3);
+        int moved = 0, bad3 = 0;
+        for (int64_t i = 0; i < BB; ++i) {
+            if (g3[(size_t) i] != got[(size_t) i]) ++moved;
+            if (g3[(size_t) i] != blobs[1][(size_t) i]) ++bad3;
+        }
+        verdict("fetch_blobs entry: a different source pointer MOVES blob 0 (a rival that ignored src fails)",
+                moved == BB && bad3 == 0, bad3, (int) BB, moved, "blob 0 did not move");
+
+        // (A4) THE VACUITY ARM: *n == 0 writes nothing (and A1 proved *n == NB writes everything)
+        strata::vulkan::stream_write(st, cnt, &n_zero, 4);
+        strata::vulkan::stream_write(st, dst, dead.data(), dead.size());
+        strata::kernels::fetch_blobs(ptr, cnt, dst, BB, NB, (void*) cs);
+        std::vector<uint8_t> g0;
+        read_dst(g0);
+        int wrote = 0;
+        for (size_t i = 0; i < g0.size(); ++i) if (g0[i] != DEAD) ++wrote;
+        verdict("fetch_blobs entry: *n == 0 is a true NO-OP (the pcie_frac 0.00 form)", wrote == 0, wrote,
+                NB * (int) BB, 0, "bytes written by an empty gather");
+    }
+
+    // ---------------- (B) rebase_ptrs: ptr[k] = base + k*bytes for k < *n ----------------
+    {
+        const unsigned long long BASE = (unsigned long long) (uintptr_t) dst;
+        const unsigned long long SEN = 0xDEADBEEF00000000ull;
+        auto write_sen = [&]() {
+            std::vector<unsigned long long> t((size_t) NB + 2);
+            for (int k = 0; k < NB + 2; ++k) t[(size_t) k] = SEN + (unsigned long long) k;
+            strata::vulkan::stream_write(st, (void*) ptr, t.data(), t.size() * 8);
+        };
+        auto read_t = [&](std::vector<unsigned long long>& v) {
+            v.assign((size_t) NB + 2, 0);
+            strata::vulkan::stream_read(st, ptr, v.data(), v.size() * 8);
+        };
+        write_sen();
+        strata::vulkan::stream_write(st, cnt, &n_all, 4);
+        strata::kernels::rebase_ptrs(ptr, cnt, (uint8_t*) (uintptr_t) BASE, BB, (void*) cs);
+        std::vector<unsigned long long> got;
+        read_t(got);
+        int bad = 0;
+        for (int k = 0; k < NB; ++k)
+            if (got[(size_t) k] != BASE + (unsigned long long) k * (unsigned long long) BB) ++bad;
+        int tail = 0;
+        for (int k = NB; k < NB + 2; ++k) if (got[(size_t) k] != SEN + (unsigned long long) k) ++tail;
+        verdict("rebase_ptrs entry: ptr[k] = base + k*blob_bytes (engine rule)", bad == 0, bad, NB, 0, "entries wrong");
+        verdict("rebase_ptrs entry: entries >= *n are UNCHANGED (the device count caps the rewrite)", tail == 0,
+                tail, 2, 0, "tail entries rewritten");
+
+        write_sen();
+        const unsigned long long B2 = BASE + 4096;
+        strata::kernels::rebase_ptrs(ptr, cnt, (uint8_t*) (uintptr_t) B2, BB, (void*) cs);
+        std::vector<unsigned long long> g2;
+        read_t(g2);
+        int moved = 0, bad2 = 0;
+        for (int k = 0; k < NB; ++k) {
+            if (g2[(size_t) k] != got[(size_t) k]) ++moved;
+            if (g2[(size_t) k] != B2 + (unsigned long long) k * (unsigned long long) BB) ++bad2;
+        }
+        verdict("rebase_ptrs entry: a different base MOVES every entry", moved == NB && bad2 == 0, bad2, NB, moved,
+                "entries did not move");
+
+        write_sen();
+        strata::vulkan::stream_write(st, cnt, &n_zero, 4);
+        strata::kernels::rebase_ptrs(ptr, cnt, (uint8_t*) (uintptr_t) BASE, BB, (void*) cs);
+        std::vector<unsigned long long> g0;
+        read_t(g0);
+        int wrote = 0;
+        for (int k = 0; k < NB + 2; ++k) if (g0[(size_t) k] != SEN + (unsigned long long) k) ++wrote;
+        verdict("rebase_ptrs entry: *n == 0 is the IDENTITY (nothing rewritten)", wrote == 0, wrote, NB + 2, 0,
+                "entries written by an empty rebase");
+    }
+
+    // ---------------- (C) THE WINDOW SPLIT, driven at the SHADER level (the 4 GiB-window rule) ----------------
+    {
+        const uint64_t WB = 4096;
+        void* q0 = strata::vulkan::arena_alloc(st, 256);
+        strata::vulkan::arena_alloc(st, 4096);             // a pad: q1 lands in a LATER window
+        void* q1 = strata::vulkan::arena_alloc(st, 256);
+        const uint64_t f0 = (uint64_t) (uintptr_t) q0 - (uint64_t) strata::vulkan::Stream::kArenaBase;
+        const uint64_t f1 = (uint64_t) (uintptr_t) q1 - (uint64_t) strata::vulkan::Stream::kArenaBase;
+        const uint32_t w0 = (uint32_t) (f0 / WB), w1 = (uint32_t) (f1 / WB);
+        std::vector<uint8_t> b0(256), b1(256);
+        for (int i = 0; i < 256; ++i) { b0[(size_t) i] = (uint8_t) (i + 11); b1[(size_t) i] = (uint8_t) (i ^ 0x5A); }
+        strata::vulkan::stream_write(st, q0, b0.data(), 256);
+        strata::vulkan::stream_write(st, q1, b1.data(), 256);
+        const bool clean = w0 != w1 && (f0 % WB) + 256 <= WB && (f1 % WB) + 256 <= WB;
+        if (!clean) {
+            skip("fetch_blobs window split", "the test arena's offsets did not land cleanly in two windows");
+        } else {
+            auto* tp = strata::vulkan::arena_alloc<unsigned long long>(st, 2);
+            const unsigned long long tv[2] = {(unsigned long long) (uintptr_t) q0, (unsigned long long) (uintptr_t) q1};
+            strata::vulkan::stream_write(st, tp, tv, sizeof tv);
+            auto* tn = strata::vulkan::arena_alloc<int32_t>(st, 1);
+            strata::vulkan::stream_write(st, tn, &n_two, 4);
+            auto* td = strata::vulkan::arena_alloc<uint8_t>(st, 512);
+            strata::vulkan::Buf b_tp{}, b_tn{}, b_td{};
+            const uint64_t base = strata::vulkan::Stream::kArenaBase;
+            if (strata::vulkan::arena_resolve(st, tp, 16, b_tp) && strata::vulkan::arena_resolve(st, tn, 4, b_tn) &&
+                strata::vulkan::arena_resolve(st, td, 512, b_td)) {
+                auto run = [&](uint32_t wid) {
+                    strata::vulkan::Buf wv = strata::vulkan::view(st.arena, (uint64_t) wid * WB);
+                    struct { uint32_t base_lo, base_hi, win_bytes, win_id, per; } pc{
+                        (uint32_t) (base & 0xFFFFFFFFu), (uint32_t) (base >> 32), (uint32_t) WB, wid, 16u};
+                    VkPipeline p = st.ctx->pipeline(dir + "/fetch_blobs.spv", 4, sizeof(pc));
+                    st.ctx->dispatch(p, {&b_tp, &b_tn, &wv, &b_td}, &pc, sizeof(pc), 2u);
+                };
+                std::vector<uint8_t> deadw(512, DEAD);
+                strata::vulkan::stream_write(st, td, deadw.data(), deadw.size());
+                run(w0);
+                std::vector<uint8_t> gw(512, DEAD);
+                strata::vulkan::stream_read(st, td, gw.data(), gw.size());
+                int okw = 0, leakw = 0;
+                for (int i = 0; i < 256; ++i) if (gw[(size_t) i] != b0[(size_t) i]) ++okw;
+                for (int i = 256; i < 512; ++i) if (gw[(size_t) i] != DEAD) ++leakw;
+                verdict("fetch_blobs window: the blob in the bound window IS copied", okw == 0, okw, 256, 0,
+                        "bytes differ");
+                verdict("fetch_blobs window: a blob in ANOTHER window is NOT copied", leakw == 0, leakw, 256, 0,
+                        "wrong-window blob copied");
+                strata::vulkan::stream_write(st, td, deadw.data(), deadw.size());
+                run(w1);
+                std::vector<uint8_t> gw1(512, DEAD);
+                strata::vulkan::stream_read(st, td, gw1.data(), gw1.size());
+                int ok1 = 0, leak1 = 0;
+                for (int i = 256; i < 512; ++i) if (gw1[(size_t) i] != b1[(size_t) (i - 256)]) ++ok1;
+                for (int i = 0; i < 256; ++i) if (gw1[(size_t) i] != DEAD) ++leak1;
+                verdict("fetch_blobs window: the OTHER window's blob IS copied", ok1 == 0, ok1, 256, 0, "bytes differ");
+                verdict("fetch_blobs window: the first window's blob is NOT copied here", leak1 == 0, leak1, 256, 0,
+                        "wrong-window blob copied");
+            }
+        }
+    }
+
+    strata::vulkan::cuda_compat_set_stream(nullptr);
+    strata::vulkan::stream_close(s);
+}
+
 void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     for (const char* spv : {"bcast_streams.spv", "gdn_conv_tail.spv", "gdn_step_norm_multi.spv"})
         if (!have(dir, spv)) return;
@@ -24380,6 +24661,7 @@ int main(int argc, char** argv) {
     // read (`broadcast_streams` is the FIRST, at verify.cpp:592).  Every multi is held BITWISE to the
     // already-gated single-token kernel it is a loop over.
     case_verify_seam_entry(ctx, dir);                // the P6 handshake seam (host boundary) + copy_indexed + copy_rows_from_mapped
+    case_blob_stage_entry(ctx, dir);                 // fetch_blobs / rebase_ptrs (the P6 PCIe staging) + the window split
     case_verify_window_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
