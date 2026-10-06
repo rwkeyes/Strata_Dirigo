@@ -169,6 +169,20 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
+// -------------------------------------------------------------------------------------------------------------
+// THE ONE-COMMAND-BUFFER WINDOW (`STRATA_VK_WINDOW_ONE_CB=1`), an execution-model option, not a kernel change.
+//
+// The all-resident verify window records into ~2 command buffers because ONE `wait_flag_ge` sits inside it -
+// the PLE handshake at layer 1 - and the Vulkan backend cuts a recording at every host boundary (it forbids a
+// spinning kernel).  The port's own instrument prices that split: `vk disp stat by arm: ... segment 42 (59111
+// recorded dispatches, submit 1 ms, wait 3783 ms)` - i.e. the submits are free and the wait is the GPU running
+// the recorded dispatches.  This switch moves the HOST half of the PLE (the table gather) to BEFORE the
+// window's launch, which removes the need for the boundary, so the recording is not cut and the window is ONE
+// command buffer submitted once per round.  Same publish edge, same device work, same ids - one submission.
+//
+// It is also what bounds the submission against the GuC preemption timeout (640 ms on this card's kernel): the
+// whole window must still fit in ONE submission, which is checked by the caller's own window-time report.
+const bool g_window_one_cb = std::getenv("STRATA_VK_WINDOW_ONE_CB") != nullptr;
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
@@ -635,7 +649,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             if (grp == 0) {
-                if (all_resident_) wait_flag_ge(m_flag_, 1, cs);
+                // ============================ THE ONE-COMMAND-BUFFER WINDOW ============================
+                // With `STRATA_VK_WINDOW_ONE_CB=1` the driver PUBLISHES the PLE rows BEFORE the window's launch
+                // (see `Verifier::run`), so the recorded window needs no host handshake at all: this
+                // `wait_flag_ge` - the ONLY host boundary inside an all-resident window, and therefore the reason
+                // the recording is CUT into segments at all - is not recorded, and the whole window becomes ONE
+                // command buffer submitted once per round.  It is exactly the technique the engine already uses
+                // for the captured per-layer block: "the driver calls `ple_stage_token` once per token, BEFORE
+                // the graphs, and what is captured here is only the device half" (`layer.cpp:1186`).  The
+                // recorded `copy_from_mapped` binds the mapped region's BUFFER (`elementwise_vk.cpp:328-334`),
+                // so it re-reads whatever the host published before the launch - the publish edge is the
+                // pre-launch gather, and the flag is then never read.  Off unless the env var is set.
+                if (all_resident_ && !g_window_one_cb) wait_flag_ge(m_flag_, 1, cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
@@ -1416,6 +1441,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+    // THE ONE-CB WINDOW'S PUBLISH EDGE (see g_window_one_cb).  The host half of the PLE runs BEFORE the launch,
+    // so the recorded window's `copy_from_mapped` re-reads rows already published (it binds the mapped region's
+    // buffer) and the recorded `wait_flag_ge` boundary is not needed: the window is ONE command buffer.  The
+    // engine already stages this way for the captured per-layer block (`layer.cpp:1186`).
+    const bool one_cb_win = g_window_one_cb && all_resident_ && !test_stall;
+    if (one_cb_win && do_ple) {
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        ms_host += ms_since(tp);
+    }
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     const Clock::time_point t_launch = Clock::now();   // DECODE MARK: launch .. the window's sync
@@ -1429,9 +1467,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
-    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     if (all_resident_ && !test_stall) {
-        if (do_ple) {
+        if (do_ple && !one_cb_win) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);

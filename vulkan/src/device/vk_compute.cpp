@@ -66,6 +66,10 @@ struct DispStat {
     double t_seg_wait = 0, t_seg_submit = 0;      // the segment path's own submit + fence wait (ms)
     double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
     std::vector<std::pair<std::string, uint64_t>> by_pipe;   // per-spv dispatch counts
+    // THE RECORDED ARM'S OWN COMPOSITION.  A recorded command buffer is re-executed once per segment submit, so its
+    // composition IS the composition of the work the replay arm executes each round - which `by_pipe` above cannot
+    // show, because it pools the (one-shot) prefill with the (repeated) replay.  Counted once per ENCODE.
+    std::vector<std::pair<std::string, uint64_t>> by_pipe_rec;
 };
 DispStat g_ds;
 // ---- STRATA_VK_NOBARRIER: MEASUREMENT-ONLY, UNSAFE.  Every dispatch carries a full COMPUTE -> COMPUTE pipeline
@@ -73,6 +77,14 @@ DispStat g_ds;
 // kernel's read inside a recorded step.  This switch ELIDES it so the barrier can be PRICED - the answers are
 // then WRONG wherever a real hazard exists.  Off unless the env var is set; never a shipping mode.
 bool g_nobarrier = false;
+// ---- STRATA_VK_NOBARRIER_REC: MEASUREMENT-ONLY, UNSAFE, and the LIVE path keeps its barriers.  `STRATA_VK_NOBARRIER`
+// above cannot price the REPLAY arm's barriers at all: the prompt path needs them for correctness and the engine's own
+// guard (`prefill: routed id out of range`) aborts the run inside the prefill, before a single decode round runs -
+// measured, `/tmp/em/nobar199.log`.  This narrower switch elides the chain barrier ONLY where the dispatches were
+// ENCODED into a recorded step (`fresh_set`, i.e. `record_dispatch`), so the prefill runs normally and the verify
+// window's replay is barrier-free: the decode's `sync`/`wait` then PRICES those barriers.  The decode's answers are
+// expected to be wrong; this is a diagnostic, never a candidate.
+bool g_nobarrier_rec = false;
 // ---- STRATA_VK_BARRIER_HAZARD: MEASUREMENT-ONLY hazard narrowing, so the chain barrier can be PRICED.
 // The unconditional rule is one full COMPUTE -> COMPUTE pipeline barrier after EVERY chained dispatch.  The
 // device layer has no read/write information - a binding is just a buffer - so "a real data hazard exists" is
@@ -96,6 +108,12 @@ void disp_stat_count(const std::string& spv) {
         if (kv.first == spv) { ++kv.second; return; }
     }
     g_ds.by_pipe.push_back({spv, 1});
+}
+void disp_stat_count_rec(const std::string& spv) {
+    for (auto& kv : g_ds.by_pipe_rec) {
+        if (kv.first == spv) { ++kv.second; return; }
+    }
+    g_ds.by_pipe_rec.push_back({spv, 1});
 }
 bool g_ds_printed = false;
 void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx still reports
@@ -123,6 +141,22 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
                 std::to_string(v[i].second);
     }
     std::fprintf(stderr, "vk disp stat by shader (top):%s\n", line.c_str());
+    {
+        std::vector<std::pair<std::string, uint64_t>> r = g_ds.by_pipe_rec;
+        std::sort(r.begin(), r.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        uint64_t tot = 0;
+        for (const auto& kv : r) tot += kv.second;
+        std::string l2;
+        for (size_t i = 0; i < r.size() && i < 24; ++i) {
+            const size_t slash = r[i].first.find_last_of('/');
+            l2 += " " + r[i].first.substr(slash == std::string::npos ? 0 : slash + 1) + " " +
+                  std::to_string(r[i].second);
+        }
+        std::fprintf(stderr, "vk disp stat RECORDED arm (%llu dispatches encoded; each RECORDED command buffer is "
+                             "re-executed once per segment submit, so this IS the replay arm's per-round "
+                             "composition):%s\n",
+                     (unsigned long long) tot, l2.c_str());
+    }
     std::fprintf(stderr, "vk disp stat by arm: live-batch %llu | transfer %llu | recorded-submit %llu (replays %llu) | "
                          "segment %llu (%llu recorded dispatches, %llu chain barriers, submit %.0f ms, wait %.0f ms)\n",
                  (unsigned long long) g_ds.sub_live, (unsigned long long) g_ds.sub_transfer,
@@ -513,6 +547,12 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     g_ds.on = std::getenv("STRATA_VK_DISP_STAT") != nullptr;
     if (g_ds.on) std::atexit(disp_stat_dump);
     g_nobarrier = std::getenv("STRATA_VK_NOBARRIER") != nullptr;
+    g_nobarrier_rec = std::getenv("STRATA_VK_NOBARRIER_REC") != nullptr;
+    if (g_nobarrier_rec)
+        std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_NOBARRIER_REC=1 - the chain barrier is elided ONLY "
+                             "inside a RECORDED step (the verify window's replay).  The LIVE path keeps its barriers, "
+                             "so the run still reaches the decode; the decode's answers may be WRONG and this PRICES "
+                             "the replay's barriers.  Not a shipping mode.\n");
     if (g_nobarrier)
         std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_NOBARRIER=1 - the per-dispatch COMPUTE->COMPUTE "
                              "pipeline barrier is ELIDED.  The answers may be WRONG wherever a real hazard exists; "
@@ -1435,7 +1475,7 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
         // the step has exactly one host-read barrier, at its end.  COUNTED whether or not it is emitted (the
         // `STRATA_VK_NOBARRIER` and `STRATA_VK_BARRIER_HAZARD` measurements).
         ++g_ds.barriers;
-        bool emit = !g_nobarrier;
+        bool emit = !(g_nobarrier || (g_nobarrier_rec && fresh_set));
         if (g_hazard_only) {
             bool need = g_haz.size() >= kHazardCap;
             std::vector<HazardRange> cur;
@@ -1562,7 +1602,7 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
     if (g_ds.on) {
         ++g_ds.recorded;
         for (const Pipe& p : pipes_) {
-            if (p.pipe == pipe) { disp_stat_count(p.spv_path); break; }
+            if (p.pipe == pipe) { disp_stat_count(p.spv_path); disp_stat_count_rec(p.spv_path); break; }
         }
     }
 }

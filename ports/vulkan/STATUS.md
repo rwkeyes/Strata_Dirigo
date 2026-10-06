@@ -1,5 +1,49 @@
 # Status — what is done, what is verified, what is not
 
+## THE VERIFY WINDOW'S WAIT STRUCTURE: PRICED, RESTRUCTURED, FALSIFIED (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) **The structure was priced BEFORE it was touched.** 199-token arm, `--spec 2`: the whole run has
+**42 segment submits** (14 rounds x 3 — the window is cut in **two** by its single all-resident host boundary, the
+PLE `wait_flag_ge` at `verify.cpp:638`, plus one for the commit graph), they cost **1 ms of submit in total**, and
+the `sync` they were blamed for is **260.166 ms/round of fence wait over 59,111 recorded dispatches = 3,783 ms** —
+the GPU running the window, not a round trip. (2) **The restructure was built and measured anyway**:
+`STRATA_VK_WINDOW_ONE_CB=1` (`src/core/verify.cpp`) moves the host half of the PLE — the table gather — to BEFORE
+the window's launch, so the recorded window needs no handshake and is **ONE command buffer** (the technique
+`layer.cpp:1186` already states for the captured per-layer block). Segments **42 -> 28**, segment submit
+**1 -> 0 ms**, segment wait **3,783 ms unchanged**, the round's window cost **265.53 -> 265.41 ms (0.05%)**, decode
+8.36 -> 8.31, ids `56a0b28d2de6` **unmoved**. **It is NEUTRAL and it ships OPT-IN** — a default is a claim and
+this is not a win. (3) **Two falsifications from the same counters.** `STRATA_VK_NOBARRIER=1` **cannot** price the
+replay's barriers: it aborts inside the *prefill* (`prefill: routed id out of range`, 6 live-batch flushes,
+`RUN_RC=1`) — recorded as **did not run**, not as a rate; and the **barrier count is not the cost**: the recorded
+arm carries **exactly one chain barrier per recorded dispatch** in every arm (`11,365/11,365` at 199 tokens,
+`7,084/7,084` at 8); the pooled 1.20/dispatch and 0.30/dispatch ratios are the *prefill's* barriers mixed in
+(`71,005 = 59,640 live + 11,365 recorded`). (4) **The barrier's size was measured with a new, narrow switch.**
+`STRATA_VK_NOBARRIER_REC=1` (measurement-only) elides the chain barrier **only in recorded steps** (`fresh_set`),
+so the live prefill keeps its barriers and the run reaches the decode: the wait per recorded dispatch falls
+**64.0 -> 41.3 µs**, the window **265.4 -> 158.0 ms/round (-40%)**, decode **11.69 tok/s** — **and the output id is
+`5c30ca20`, not `56a0b28d2de6`.** It is an **UPPER BOUND from an arm whose answer is wrong** (and whose trajectory
+diverged: 65,372 dispatches, 51 segments), never a candidate and never a rate. (5) **A new instrument**:
+`vk disp stat RECORDED arm` prints the dispatches encoded into recorded steps — because each recorded command
+buffer re-executes once per segment submit, **that is the replay arm's per-round composition**, which the pooled
+`by shader` line could not show. It reads `quantize_q8_1` 1,875, `swiglu_f32` 1,296, `native_gu_any`/`native_down_any`
+1,152 each, `native_k_mmvq` 633, the four `fused_gr_*` 576 each — **a long chain of small, latency-bound
+dispatches**, which names the next lever as *fewer dependent pairs*, not conditional barriers.
+
+**VERIFIED.** Arc `intel_icd` **895 passed / 0 failed / 0 skipped** (the count did NOT fall, nothing skipped);
+lvp `879/0/4` (the four documented skips); smoke `60/0/0`. Ids **`56a0b28d2de6`** (199-token) in `base199`,
+`hist199` and `onecb199`; **`3aed108cceee`** (8-token) in `base8` (md5 of the engine's own `output  :` line).
+Every arm ran one config per invocation, detached, and logged its own env, its shaders' sha256 and the binary's.
+
+**NOT VERIFIED / NOT DONE.** (i) **No correct cheaper barrier exists yet** — only the wrong-answer bound above;
+the port's single correct barrier experiment (`STRATA_VK_BARRIER_HAZARD=1`) left 21,825 of 21,826 barriers emitted
+and moved `sync` **1.2%**, i.e. the hazards are real and conditional barriers are a wash. (ii) The **taller coopmat
+row block and the opt-in tiled FMA GEMM are still not attempted**. (iii) The **3-12x between the engine's
+per-dispatch cost and the bench's in-stream marginal** (replay 64.0 µs, live 152.5 µs, bench 5-20 µs) is
+**unexplained** and is the largest number in the record. (iv) The MTP draft path is **not enabled**: the port
+refuses the config by name (`refusals_vk.cpp:169-206`, nine-plus `refuse_not_ported` seams) and its rationale is
+`layer_verify_compatible()`'s conjunction; it is a multi-kernel port for ~1.2x. (v) The **PCIe probe disagreement**
+(2.0 GB/s here vs 6.6-7.0 GB/s measured by the SYCL port on the same card) is noted, not chased.
+
 ## THE STEP KERNEL'S SERIAL WALK: MEASURED, THEN UNROLLED BIT-EXACT (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** (1) **The parallelism in flight is measured and printed**, not assumed: `groups_for(h_v*S)` = **24
