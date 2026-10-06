@@ -53,8 +53,8 @@ fused_gdn_ab	kernel	fused_gdn_ab
 fused_gdn_conv_l2	kernel	fused_gdn_conv_l2
 fused_gdn_step_norm	kernel	fused_gdn_step_norm
 fused_gr_check	host	a capability check: the hyper-connection read CARD CHARACTERISATION (it produces no tensors; fused_gr.hpp:59).  ON THIS BACKEND its honest outcome is "the plain read runs here" - DEFINED in ple_vk.cpp, once per card, sentinel 0 = not checked yet
-fused_gr_read	refused	a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes
-fused_gr_read_multi	refused	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
+fused_gr_read	kernel	fused_gr_rs fused_gr_down fused_gr_mix fused_gr_inject
+fused_gr_read_multi	kernel	fused_gr_rs fused_gr_down fused_gr_mix fused_gr_inject
 fused_gr_supported	host	a capability check
 fwht256_inplace_cuda	kernel	fwht256
 gather_rows	kernel	gather_rows

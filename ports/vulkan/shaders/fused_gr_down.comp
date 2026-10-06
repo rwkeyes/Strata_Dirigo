@@ -1,0 +1,50 @@
+#version 450
+// ports/vulkan/shaders/fused_gr_down.comp - stage 2 of the FUSED hyper-connection read: the down projection and
+// the silu bottleneck, over the FP32 activation `xn = R_out * w_norm * rs`.
+//
+// Transcribed from the SECOND HALF of `gr_down_kernel` (src/kernels/cuda/fused_gr.cu:88-105):
+//
+//     xn[i]  = R_out[i] * w_norm[i] * rs[c]          (i = c*n_embd + d)
+//     lo[k]  = silu( (w_down[k] . xn) / hc )         k < hc_lr,  the `/hc` INSIDE the silu
+//
+// THE ACTIVATION IS FP32, NOT BF16.  The CUDA's `dot8(w4, xn + j*8)` reads the UNROUNDED f32 `xn` (the fused
+// read's declared contract, fused_gr.hpp:15); the port's unfused `gr_down.spv` reads `bf16(xn)`.  That is the
+// one arithmetic difference between this file and `gr_down.spv`, and it is why the fused read has its own
+// down shader rather than a flag on that one - a rounding mode that silently changes the activation's contract
+// is not a mode.
+//
+// ONE WORKGROUP PER OUTPUT ROW (the CUDA is one warp per row, 8 warps per 41-block grid); the reduction order is
+// this workgroup's barrier tree, not the CUDA's warp tree - both are sums, and the gate case measures against the
+// engine's own rule rather than assuming a bit-identity with the CUDA.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer RF { float v[]; } rf;     // (hc, n_embd) the FOLDED R
+layout(set = 0, binding = 1, std430) readonly buffer WN { float v[]; } wn;     // (hc*n_embd) per-stream gamma
+layout(set = 0, binding = 2, std430) readonly buffer RS { float v[]; } rsb;    // (hc)
+layout(set = 0, binding = 3, std430) readonly buffer WD { uint  v[]; } wd;     // row k as uint32 bf16 PAIRS
+layout(set = 0, binding = 4, std430) buffer LQ { float v[]; } lq;              // (hc_lr) lo, FP32
+layout(push_constant, std430) uniform PC { int n_embd; int hc; int hc_lr; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint k = gl_WorkGroupID.x;
+    if (k >= uint(pc.hc_lr)) return;
+    const uint n = uint(pc.n_embd);
+    const uint np = uint(pc.hc) * n / 2u;      // bf16 pairs in a weight row
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
+        const uint packed = wd.v[k * np + p];
+        const uint i0 = 2u * p, i1 = i0 + 1u;
+        const uint c0 = i0 / n;                // n_embd is even, so i0 and i1 share a stream
+        acc += (rf.v[i0] * wn.v[i0] * rsb.v[c0]) * bf16_to_f32(packed & 0xFFFFu);
+        acc += (rf.v[i1] * wn.v[i1] * rsb.v[c0]) * bf16_to_f32(packed >> 16u);
+    }
+    const float t = wg_sum(acc);
+    if (lid == 0u) {
+        const float z = t / float(pc.hc);      // the division is INSIDE the silu
+        lq.v[k] = z / (1.0f + exp(-z));
+    }
+}

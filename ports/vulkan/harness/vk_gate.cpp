@@ -19814,31 +19814,457 @@ void case_indexer_key_append_entry(Ctx& ctx, const std::string& dir) {
 // 3. `fused_gr_supported` -> the geometry predicate (layer.cpp:1189/:1328).  PURE HOST, `fused_gr.cu:1164`:
 // (n_embd, hc, hc_lr) == (2560, 4, 320).  Each of the five false arms falsifies "always true"; the true arm
 // falsifies "always false" - so the arm set itself is the margin.
+// `fused_gr_read` / `fused_gr_read_multi` -> fused_gr_rs + fused_gr_down + fused_gr_mix + fused_gr_inject
+// (`vulkan/src/kernels/fused_gr_vk.cpp`).  THE GEOMETRY IS THE ARTIFACT'S and is compile-time in BOTH builds
+// (the CUDA's fused_gr.cu:20-23; this port's three constants) - the fused read is not a general shape, and
+// `fused_gr_supported` is exactly the predicate that says so.  THE ARMS:
+//
+//   (1) THE ENGINE WRAPPER == THE PORTED SHADER PATH, BITWISE.  The shader path runs on the harness `ctx`, the
+//       wrapper on its own `EnginePin`-pinned stream, from the SAME bytes; a wrapper that dispatched nothing
+//       could not match.  Compared on `R_out`, `rs`, `lo`, `mixed` and `inject`.
+//   (2) THE WRAPPER vs THE ENGINE'S OWN RULE, in double, with the FP32-ACTIVATION contract the fused read
+//       declares (`fused_gr.hpp:15`): `xn` and `lo` unrounded.
+//   (3) `fused_gr_read_multi` == n x `fused_gr_read`, BITWISE - the header's own contract (`fused_gr.hpp:47`),
+//       on three tokens with DIFFERENT R/bo/inj so "token 0's args for every token" cannot pass.
+//   (4) THE FINAL MIXER (`w_inject == nullptr`): the inject dispatch is SKIPPED and the caller's buffer is left
+//       untouched (a sentinel), exactly as `gr.cu:387-389` requires.
+//   (5) THE FOLD (`apply == false`): `R_out` is left untouched and `rs`/`mixed` are computed from the UNFOLDED
+//       R - the CUDA writes `R_out` only inside `if (apply)`.
+//   (6) RIVALS THAT MUST MOVE THE REFERENCE: the whole-stack RMS, the SUM over streams instead of the MEAN,
+//       the fold dropped, and - the honest one - THE UNFUSED READ'S BF16-ACTIVATION CONTRACT.  The last is why
+//       the fused read is NOT bitwise-equal to the port's `gr_read`, and the case MEASURES them apart rather
+//       than asserting an equality the header never claims.
+//   (7) CAPTURE: a recorded block containing `fused_gr_read_multi` records (does not run), replays BITWISE equal
+//       to direct execution, and re-reads its buffers (a second replay after R moves sees the new R).
+void case_fused_gr_read_entry(Ctx& ctx, const std::string& dir) {
+    for (const char* spv : {"fused_gr_rs.spv", "fused_gr_down.spv", "fused_gr_mix.spv", "fused_gr_inject.spv"})
+        if (!have(dir, spv)) return;
+    const int n_embd = 2560, hc = 4, hc_lr = 320, hc_dim = hc * n_embd;
+    const float EPS = 1e-6f;
+    auto to_bf16 = [](double d) {
+        float f = (float) d; uint32_t i; std::memcpy(&i, &f, 4);
+        i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u; std::memcpy(&f, &i, 4); return f;
+    };
+    // ---- the fixture: one weight set; per-token R / bo / inj ----
+    std::vector<float> w_norm(hc_dim), bo(n_embd), inj0(hc), inj1(hc);
+    for (auto& x : w_norm) x = 1.0f + 0.1f * rndf(1.0f);
+    for (auto& x : bo) x = 0.5f * rndf(1.0f);
+    for (auto& x : inj0) x = 2.0f * rndf(1.0f);
+    for (auto& x : inj1) x = 2.0f * rndf(1.0f) + 1.0f;      // the fold's gate differs from token 0's
+    std::vector<std::vector<float>> w_down(hc_lr, std::vector<float>(hc_dim)),
+        w_up(hc_dim, std::vector<float>(hc_lr)), w_inject(hc, std::vector<float>(hc_dim));
+    for (auto& r : w_down) for (auto& x : r) x = to_bf16(0.02 * rndf(1.0f));
+    for (auto& r : w_up) for (auto& x : r) x = to_bf16(0.05 * rndf(1.0f));
+    for (auto& r : w_inject) for (auto& x : r) x = to_bf16(0.02 * rndf(1.0f));
+    auto b16 = [&](float f) { const float bf = to_bf16(f); uint32_t u; std::memcpy(&u, &bf, 4); return u >> 16; };
+    std::vector<uint32_t> wd_pack((size_t) hc_lr * (hc_dim / 2)), wu_pack((size_t) hc_dim * (hc_lr / 2)),
+        wi_pack((size_t) hc * (hc_dim / 2));
+    for (int k = 0; k < hc_lr; ++k)
+        for (int p = 0; p < hc_dim / 2; ++p)
+            wd_pack[(size_t) k * (hc_dim / 2) + p] = b16(w_down[k][2 * p]) | (b16(w_down[k][2 * p + 1]) << 16);
+    for (int i = 0; i < hc_dim; ++i)
+        for (int p = 0; p < hc_lr / 2; ++p)
+            wu_pack[(size_t) i * (hc_lr / 2) + p] = b16(w_up[i][2 * p]) | (b16(w_up[i][2 * p + 1]) << 16);
+    for (int c = 0; c < hc; ++c)
+        for (int p = 0; p < hc_dim / 2; ++p)
+            wi_pack[(size_t) c * (hc_dim / 2) + p] = b16(w_inject[c][2 * p]) | (b16(w_inject[c][2 * p + 1]) << 16);
+
+    // THREE tokens: t0 (apply false), t1 (apply true, bo/inj0), t2 (apply true, a DIFFERENT bo/inj).
+    std::vector<std::vector<float>> Rt(3, std::vector<float>(hc_dim)), BOt(3, std::vector<float>(n_embd));
+    std::vector<std::vector<float>> INJt(3, std::vector<float>(hc));
+    const bool APPLY[3] = {false, true, true};
+    for (int t = 0; t < 3; ++t) {
+        for (int c = 0; c < hc; ++c) {
+            const float sc = std::pow(4.0f, (float) c) * (1.0f + 0.25f * (float) t);   // per-stream scaled
+            for (int d = 0; d < n_embd; ++d) Rt[t][(size_t) c * n_embd + d] = sc * rndf(1.0f);
+        }
+        for (int d = 0; d < n_embd; ++d) BOt[t][d] = 0.5f * rndf(1.0f) + 0.1f * (float) t;
+        for (int c = 0; c < hc; ++c) INJt[t][c] = (t == 2 ? inj1[c] : inj0[c]);
+    }
+    // R_out sentinels: a huge finite value, so "left untouched" is distinguishable from any computed value.
+    const float DEADF = 1.0e30f;
+
+    // ---- the ORACLE: the engine's fused rule in DOUBLE, with switchable rivals ----
+    struct Oracle { std::vector<float> Rout, rs, lo, mixed, inject; };
+    auto run_oracle = [&](const std::vector<float>& R, const std::vector<float>& bo_v, const std::vector<float>& inj_v,
+                          bool apply, bool whole_rms, bool sum_streams, bool drop_fold,
+                          bool unfused_bf16) -> Oracle {
+        Oracle o;
+        o.Rout.assign(hc_dim, 0); o.rs.assign(hc, 0); o.lo.assign(hc_lr, 0);
+        o.mixed.assign(n_embd, 0); o.inject.assign(hc, 0);
+        std::vector<double> Rp(hc_dim, 0.0);
+        for (int c = 0; c < hc; ++c) {
+            double gw = (apply && !drop_fold) ? 2.0 / (1.0 + std::exp(-(double) inj_v[c] / (double) hc)) : 0.0;
+            for (int d = 0; d < n_embd; ++d) {
+                const size_t i = (size_t) c * n_embd + d;
+                Rp[i] = (double) R[i] + (apply && !drop_fold ? (double) bo_v[d] * gw : 0.0);
+            }
+        }
+        for (int i = 0; i < hc_dim; ++i) o.Rout[i] = (float) Rp[i];
+        if (whole_rms) {
+            double ms = 0; for (int i = 0; i < hc_dim; ++i) ms += Rp[i] * Rp[i];
+            ms /= (double) hc_dim;
+            const float r = (float) (1.0 / std::sqrt(ms + EPS));
+            for (int c = 0; c < hc; ++c) o.rs[c] = r;
+        } else {
+            for (int c = 0; c < hc; ++c) {
+                double ms = 0; for (int d = 0; d < n_embd; ++d) ms += Rp[(size_t) c * n_embd + d] * Rp[(size_t) c * n_embd + d];
+                ms /= (double) n_embd;
+                o.rs[c] = (float) (1.0 / std::sqrt(ms + EPS));
+            }
+        }
+        // xn as the GATE sees it (f32) and as the DOWN/INJECT see it (bf16 under the unfused contract)
+        std::vector<double> xng(hc_dim), xnd(hc_dim);
+        for (int i = 0; i < hc_dim; ++i) {
+            const int c = i / n_embd;
+            xng[i] = Rp[i] * (double) w_norm[i] * (double) o.rs[c];
+            xnd[i] = unfused_bf16 ? (double) to_bf16(xng[i]) : xng[i];
+        }
+        for (int k = 0; k < hc_lr; ++k) {
+            double a = 0; for (int i = 0; i < hc_dim; ++i) a += (double) w_down[k][i] * xnd[i];
+            const double z = a / (double) hc;
+            double l = z / (1.0 + std::exp(-z));
+            if (unfused_bf16) l = (double) to_bf16(l);
+            o.lo[k] = (float) l;
+        }
+        for (int d = 0; d < n_embd; ++d) {
+            double s = 0;
+            for (int c = 0; c < hc; ++c) {
+                const int i = c * n_embd + d;
+                double a = 0; for (int k = 0; k < hc_lr; ++k) a += (double) w_up[i][k] * (double) o.lo[k];
+                s += xng[i] * (1.0 / (1.0 + std::exp(-a)));
+            }
+            o.mixed[d] = (float) (sum_streams ? s : s / (double) hc);
+        }
+        for (int c = 0; c < hc; ++c) {
+            double a = 0; for (int i = 0; i < hc_dim; ++i) a += (double) w_inject[c][i] * xnd[i];
+            o.inject[c] = (float) a;
+        }
+        return o;
+    };
+
+    auto true_oracle = [&](int t) { return run_oracle(Rt[t], BOt[t], INJt[t], APPLY[t], false, false, false, false); };
+    const Oracle ref[3] = {true_oracle(0), true_oracle(1), true_oracle(2)};
+
+    // ---- the SHADER PATH (harness ctx) ----
+    auto alloc_w = [&]() {
+        Buf bR = ctx.alloc((size_t) hc_dim * 4), bRo = ctx.alloc((size_t) hc_dim * 4), bWN = ctx.alloc((size_t) hc_dim * 4);
+        Buf bBO = ctx.alloc((size_t) n_embd * 4), bIJ = ctx.alloc((size_t) hc * 4), bRS = ctx.alloc((size_t) hc * 4);
+        Buf bWD = ctx.alloc(wd_pack.size() * 4), bWU = ctx.alloc(wu_pack.size() * 4), bWI = ctx.alloc(wi_pack.size() * 4);
+        Buf bLQ = ctx.alloc((size_t) hc_lr * 4), bMX = ctx.alloc((size_t) n_embd * 4), bIN = ctx.alloc((size_t) hc * 4);
+        ctx.write(bWN, w_norm.data(), (size_t) hc_dim * 4);
+        ctx.write(bWD, wd_pack.data(), wd_pack.size() * 4);
+        ctx.write(bWU, wu_pack.data(), wu_pack.size() * 4);
+        ctx.write(bWI, wi_pack.data(), wi_pack.size() * 4);
+        struct W { Buf R, Ro, WN, BO, IJ, RS, WD, WU, WI, LQ, MX, IN; };
+        return W{bR, bRo, bWN, bBO, bIJ, bRS, bWD, bWU, bWI, bLQ, bMX, bIN};
+    };
+    auto free_w = [&](auto& w) {
+        ctx.free(w.R); ctx.free(w.Ro); ctx.free(w.WN); ctx.free(w.BO); ctx.free(w.IJ); ctx.free(w.RS);
+        ctx.free(w.WD); ctx.free(w.WU); ctx.free(w.WI); ctx.free(w.LQ); ctx.free(w.MX); ctx.free(w.IN);
+    };
+    auto shader_read = [&](auto& w, int t, bool with_inject) {
+        ctx.write(w.R, Rt[t].data(), (size_t) hc_dim * 4);
+        ctx.write(w.BO, BOt[t].data(), (size_t) n_embd * 4);
+        ctx.write(w.IJ, INJt[t].data(), (size_t) hc * 4);
+        ctx.write(w.Ro, &DEADF, 4);                     // sentinel word; the full Ro is checked via the read-back
+        struct { int32_t n_embd, hc; float eps; int32_t apply; } p1{n_embd, hc, EPS, APPLY[t] ? 1 : 0};
+        { VkPipeline p = ctx.pipeline(dir + "/fused_gr_rs.spv", 5, (int) sizeof(p1));
+          ctx.dispatch(p, {&w.R, &w.BO, &w.IJ, &w.Ro, &w.RS}, &p1, sizeof(p1), (uint32_t) hc); }
+        struct { int32_t n_embd, hc, hc_lr; } p2{n_embd, hc, hc_lr};
+        { VkPipeline p = ctx.pipeline(dir + "/fused_gr_down.spv", 5, (int) sizeof(p2));
+          ctx.dispatch(p, {&w.Ro, &w.WN, &w.RS, &w.WD, &w.LQ}, &p2, sizeof(p2), (uint32_t) hc_lr); }
+        { VkPipeline p = ctx.pipeline(dir + "/fused_gr_mix.spv", 6, (int) sizeof(p2));
+          ctx.dispatch(p, {&w.Ro, &w.WN, &w.RS, &w.LQ, &w.WU, &w.MX}, &p2, sizeof(p2), (uint32_t) n_embd); }
+        if (with_inject) {
+            struct { int32_t n_embd, hc; } p4{n_embd, hc};
+            VkPipeline p = ctx.pipeline(dir + "/fused_gr_inject.spv", 5, (int) sizeof(p4));
+            ctx.dispatch(p, {&w.Ro, &w.WN, &w.RS, &w.WI, &w.IN}, &p4, sizeof(p4), (uint32_t) hc);
+        }
+    };
+    auto ws = alloc_w();
+    shader_read(ws, 1, true);
+    std::vector<float> sf_Ro(hc_dim), sf_RS(hc), sf_LQ(hc_lr), sf_MX(n_embd), sf_IN(hc);
+    ctx.read(ws.Ro, sf_Ro.data(), (size_t) hc_dim * 4);
+    ctx.read(ws.RS, sf_RS.data(), (size_t) hc * 4);
+    ctx.read(ws.LQ, sf_LQ.data(), (size_t) hc_lr * 4);
+    ctx.read(ws.MX, sf_MX.data(), (size_t) n_embd * 4);
+    ctx.read(ws.IN, sf_IN.data(), (size_t) hc * 4);
+
+    // ---- the ENGINE WRAPPER (EnginePin) ----
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(128ull << 20, dir); }
+    if (s == nullptr) { verdict("fused_gr_read entry: engine wrapper", false, 1, 1, 0, "no stream"); free_w(ws); return; }
+    strata::vulkan::cuda_compat_set_stream(s);
+    // named slots for THREE tokens, so the multi and the single read share one arena layout
+    struct Slot { float *R, *Ro, *BO, *IJ, *RS, *LQ, *MX, *IN; };
+    Slot sl[3]{};
+    uint16_t *dWD = nullptr, *dWU = nullptr, *dWI = nullptr; float* dWN = nullptr;
+    dWN = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+    dWD = strata::vulkan::arena_alloc<uint16_t>(*s, wd_pack.size() * 2);
+    dWU = strata::vulkan::arena_alloc<uint16_t>(*s, wu_pack.size() * 2);
+    dWI = strata::vulkan::arena_alloc<uint16_t>(*s, wi_pack.size() * 2);
+    strata::vulkan::stream_write(*s, dWN, w_norm.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_write(*s, dWD, wd_pack.data(), wd_pack.size() * 4);
+    strata::vulkan::stream_write(*s, dWU, wu_pack.data(), wu_pack.size() * 4);
+    strata::vulkan::stream_write(*s, dWI, wi_pack.data(), wi_pack.size() * 4);
+    for (int t = 0; t < 3; ++t) {
+        sl[t].R = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+        sl[t].Ro = strata::vulkan::arena_alloc<float>(*s, hc_dim);
+        sl[t].BO = strata::vulkan::arena_alloc<float>(*s, n_embd);
+        sl[t].IJ = strata::vulkan::arena_alloc<float>(*s, hc);
+        sl[t].RS = strata::vulkan::arena_alloc<float>(*s, hc);
+        sl[t].LQ = strata::vulkan::arena_alloc<float>(*s, hc_lr);
+        sl[t].MX = strata::vulkan::arena_alloc<float>(*s, n_embd);
+        sl[t].IN = strata::vulkan::arena_alloc<float>(*s, hc);
+        strata::vulkan::stream_write(*s, sl[t].R, Rt[t].data(), (size_t) hc_dim * 4);
+        strata::vulkan::stream_write(*s, sl[t].BO, BOt[t].data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_write(*s, sl[t].IJ, INJt[t].data(), (size_t) hc * 4);
+    }
+    auto mk_args = [&](int t, bool with_inject) {
+        strata::kernels::FusedGrArgs a;
+        a.R = sl[t].R; a.R_out = sl[t].Ro; a.apply = APPLY[t];
+        a.bo_prev = sl[t].BO; a.inj_prev = sl[t].IJ;
+        a.w_norm = dWN; a.w_down = dWD; a.w_up = dWU; a.w_inject = with_inject ? dWI : nullptr;
+        a.eps = EPS; a.lo = sl[t].LQ; a.rs = sl[t].RS; a.inject_out = sl[t].IN; a.mixed = sl[t].MX;
+        return a;
+    };
+    strata::kernels::FusedGrArgs ga = mk_args(1, true);
+    strata::kernels::fused_gr_read(ga, s);
+    std::vector<float> g_Ro(hc_dim), g_RS(hc), g_LQ(hc_lr), g_MX(n_embd), g_IN(hc);
+    strata::vulkan::stream_read(*s, sl[1].Ro, g_Ro.data(), (size_t) hc_dim * 4);
+    strata::vulkan::stream_read(*s, sl[1].RS, g_RS.data(), (size_t) hc * 4);
+    strata::vulkan::stream_read(*s, sl[1].LQ, g_LQ.data(), (size_t) hc_lr * 4);
+    strata::vulkan::stream_read(*s, sl[1].MX, g_MX.data(), (size_t) n_embd * 4);
+    strata::vulkan::stream_read(*s, sl[1].IN, g_IN.data(), (size_t) hc * 4);
+    auto bits_differ = [](const std::vector<float>& a, const std::vector<float>& b) {
+        if (a.size() != b.size()) return (int) std::max(a.size(), b.size());
+        int bad = 0; for (size_t i = 0; i < a.size(); ++i) {
+            uint32_t u, v; std::memcpy(&u, &a[i], 4); std::memcpy(&v, &b[i], 4); if (u != v) ++bad; }
+        return bad;
+    };
+    // (1) wrapper == shader path, BITWISE
+    int bad_bw = bits_differ(sf_Ro, g_Ro) + bits_differ(sf_RS, g_RS) + bits_differ(sf_LQ, g_LQ) +
+                 bits_differ(sf_MX, g_MX) + bits_differ(sf_IN, g_IN);
+    verdict("fused_gr_read entry (apply=true): engine wrapper == the ported shader path, BITWISE",
+            bad_bw == 0, bad_bw, hc_dim + hc + hc_lr + n_embd + hc, 0.0,
+            "words differ - the wrapper's dispatch does not match the ported shader chain");
+    // (2) wrapper vs the engine's own rule (double, FP32 activations)
+    auto near = [&](const std::vector<float>& got, const std::vector<float>& want, double rel, double abs) {
+        int bad = 0; double worst = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double t = rel * std::fabs((double) want[i]) + abs;
+            const double e = std::fabs((double) got[i] - (double) want[i]);
+            if (e > t) ++bad;
+            worst = std::max(worst, e / t);
+        }
+        return std::pair<int, double>{bad, worst};
+    };
+    const auto o = ref[1];
+    {
+        int bad = 0; double worst = 0;
+        for (auto& pr : {near(g_Ro, o.Rout, 2e-3, 1e-4), near(g_LQ, o.lo, 2e-3, 1e-4),
+                         near(g_MX, o.mixed, 2e-3, 1e-4), near(g_IN, o.inject, 2e-3, 1e-4)}) {
+            bad += pr.first; worst = std::max(worst, pr.second);
+        }
+        verdict("fused_gr_read entry: wrapper vs the engine's own rule (double, FP32 activations)",
+                bad == 0, bad, hc_dim + hc_lr + n_embd + hc, worst,
+                "outside tolerance vs the CUDA fused rule; R_out is compared by the fold arm below");
+    }
+    // (3) multi == n x single, BITWISE (the header's own contract).
+    //     EVERY output the multi MUST write is SENTINELLED first: without that, a multi that silently wrote
+    //     only token 0's outputs would leave tokens 1/2 holding the singles' values and the arm would pass
+    //     vacuously (measured: the `fused-gr-multi-token0-args` injection did exactly that).  R_out is
+    //     sentinelled only for the apply==true tokens, which are the ones the read writes it for.
+    strata::kernels::FusedGrArgs fa[3] = {mk_args(0, true), mk_args(1, true), mk_args(2, true)};
+    for (int t = 0; t < 3; ++t) {                     // single-token read into the SAME slots
+        strata::kernels::FusedGrArgs a = fa[t];
+        strata::kernels::fused_gr_read(a, s);
+    }
+    std::vector<float> sg_LQ[3], sg_MX[3], sg_IN[3], sg_Ro[3], sg_RS[3];
+    for (int t = 0; t < 3; ++t) {
+        sg_LQ[t].resize(hc_lr); sg_MX[t].resize(n_embd); sg_IN[t].resize(hc); sg_Ro[t].resize(hc_dim); sg_RS[t].resize(hc);
+        strata::vulkan::stream_read(*s, sl[t].LQ, sg_LQ[t].data(), (size_t) hc_lr * 4);
+        strata::vulkan::stream_read(*s, sl[t].MX, sg_MX[t].data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_read(*s, sl[t].IN, sg_IN[t].data(), (size_t) hc * 4);
+        strata::vulkan::stream_read(*s, sl[t].Ro, sg_Ro[t].data(), (size_t) hc_dim * 4);
+        strata::vulkan::stream_read(*s, sl[t].RS, sg_RS[t].data(), (size_t) hc * 4);
+    }
+    {   // the sentinels: a huge finite value no computed output can equal
+        std::vector<float> SL(hc_lr, DEADF), SM(n_embd, DEADF), SI(hc, DEADF), SRS(hc, DEADF), SR(hc_dim, DEADF);
+        for (int t = 0; t < 3; ++t) {
+            strata::vulkan::stream_write(*s, sl[t].LQ, SL.data(), (size_t) hc_lr * 4);
+            strata::vulkan::stream_write(*s, sl[t].MX, SM.data(), (size_t) n_embd * 4);
+            strata::vulkan::stream_write(*s, sl[t].IN, SI.data(), (size_t) hc * 4);
+            strata::vulkan::stream_write(*s, sl[t].RS, SRS.data(), (size_t) hc * 4);
+            if (APPLY[t]) strata::vulkan::stream_write(*s, sl[t].Ro, SR.data(), (size_t) hc_dim * 4);
+        }
+    }
+    strata::kernels::fused_gr_read_multi(fa, 3, nullptr, s, nullptr, 0);
+    int bad_multi = 0;
+    for (int t = 0; t < 3; ++t) {
+        std::vector<float> mLQ(hc_lr), mMX(n_embd), mIN(hc), mRo(hc_dim), mRS(hc);
+        strata::vulkan::stream_read(*s, sl[t].LQ, mLQ.data(), (size_t) hc_lr * 4);
+        strata::vulkan::stream_read(*s, sl[t].MX, mMX.data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_read(*s, sl[t].IN, mIN.data(), (size_t) hc * 4);
+        strata::vulkan::stream_read(*s, sl[t].RS, mRS.data(), (size_t) hc * 4);
+        bad_multi += bits_differ(sg_LQ[t], mLQ) + bits_differ(sg_MX[t], mMX) + bits_differ(sg_IN[t], mIN) +
+                     bits_differ(sg_RS[t], mRS);
+        if (APPLY[t]) {                              // R_out is written only for the apply==true tokens
+            strata::vulkan::stream_read(*s, sl[t].Ro, mRo.data(), (size_t) hc_dim * 4);
+            bad_multi += bits_differ(sg_Ro[t], mRo);
+        }
+    }
+    verdict("fused_gr_read_multi entry: 3 tokens == 3 x fused_gr_read, BITWISE (fused_gr.hpp:47)",
+            bad_multi == 0, bad_multi, 3 * (hc_lr + n_embd + hc + hc_dim + hc), 0.0,
+            "words differ between the multi and the single read");
+    // (4) the FINAL MIXER arm: w_inject == null leaves inject_out UNTOUCHED
+    {
+        strata::kernels::FusedGrArgs a = mk_args(1, false);
+        std::vector<float> sent(hc, 1.5f);
+        strata::vulkan::stream_write(*s, sl[1].IN, sent.data(), (size_t) hc * 4);
+        strata::kernels::fused_gr_read(a, s);
+        std::vector<float> got(hc);
+        strata::vulkan::stream_read(*s, sl[1].IN, got.data(), (size_t) hc * 4);
+        verdict("fused_gr_read entry: the FINAL MIXER (w_inject == null) leaves inject_out untouched",
+                bits_differ(sent, got) == 0, bits_differ(sent, got), hc, 0.0, "elements written with no weight");
+    }
+    // (5) the fold arm: apply == false leaves R_out untouched and normalises the UNFOLDED R
+    {
+        strata::kernels::FusedGrArgs a = mk_args(0, true);       // token 0 is apply == false
+        std::vector<float> sent(hc_dim, 7.25f);
+        strata::vulkan::stream_write(*s, sl[0].Ro, sent.data(), (size_t) hc_dim * 4);
+        strata::kernels::fused_gr_read(a, s);
+        std::vector<float> gotRo(hc_dim), gotLQ(hc_lr), gotMX(n_embd);
+        strata::vulkan::stream_read(*s, sl[0].Ro, gotRo.data(), (size_t) hc_dim * 4);
+        strata::vulkan::stream_read(*s, sl[0].LQ, gotLQ.data(), (size_t) hc_lr * 4);
+        strata::vulkan::stream_read(*s, sl[0].MX, gotMX.data(), (size_t) n_embd * 4);
+        const auto p0 = near(gotLQ, ref[0].lo, 2e-3, 1e-4);
+        const auto p0m = near(gotMX, ref[0].mixed, 2e-3, 1e-4);
+        verdict("fused_gr_read entry: apply == false leaves R_out untouched and uses the UNFOLDED R",
+                bits_differ(sent, gotRo) == 0 && p0.first == 0 && p0m.first == 0,
+                bits_differ(sent, gotRo) + p0.first + p0m.first, hc_dim + hc_lr + n_embd,
+                std::max(p0.second, p0m.second), "R_out moved, or the unfolded R was not the input");
+    }
+    // (6) the RIVALS must MOVE the reference
+    {
+        const auto whole = run_oracle(Rt[1], BOt[1], INJt[1], true, true, false, false, false);
+        const auto sumst = run_oracle(Rt[1], BOt[1], INJt[1], true, false, true, false, false);
+        const auto nofold = run_oracle(Rt[1], BOt[1], INJt[1], true, false, false, true, false);
+        const auto unfused = run_oracle(Rt[1], BOt[1], INJt[1], true, false, false, false, true);
+        const double m_whole = rel_l1_f(whole.mixed, o.mixed);
+        const double m_sum = rel_l1_f(sumst.mixed, o.mixed);
+        const double m_fold = rel_l1_f(nofold.mixed, o.mixed) + rel_l1_f(nofold.Rout, o.Rout);
+        const double m_bf16 = rel_l1_f(unfused.mixed, o.mixed) + rel_l1_f(unfused.lo, o.lo);
+        verdict("fused_gr_read entry: rivals MOVE the reference (whole-stack RMS / SUM / fold dropped / BF16 act)",
+                m_whole > 1e-3 && m_sum > 1e-3 && m_fold > 1e-3 && m_bf16 > 1e-3, 0, 4,
+                std::min(std::min(m_whole, m_sum), std::min(m_fold, m_bf16)),
+                "relative-L1 margins vs the rule: whole-stack RMS / SUM-over-streams / fold-dropped / BF16-activations");
+        std::printf("      fused_gr_read rivals (rel-L1 vs the rule): whole-stack RMS %.4e | SUM %.4e | fold dropped %.4e"
+                    " | BF16 activations %.4e -> the UNFUSED read is NOT bitwise-equal, by measurement\n",
+                    m_whole, m_sum, m_fold, m_bf16);
+    }
+    // (7) CAPTURE: a recorded block records (does not run), replays bitwise equal, and re-reads its buffers
+    {
+        const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+        // direct reference: token pair (1,2) into the slots
+        strata::kernels::FusedGrArgs cap[2] = {mk_args(1, true), mk_args(2, true)};
+        // sentinel the outputs, then record; the recording must not have run them
+        std::vector<float> sentM(n_embd, DEADF), sentL(hc_lr, DEADF);
+        strata::vulkan::stream_write(*s, sl[1].MX, sentM.data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_write(*s, sl[1].LQ, sentL.data(), (size_t) hc_lr * 4);
+        const cudaError_t be = cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal);
+        if (be == cudaSuccess) strata::kernels::fused_gr_read_multi(cap, 2, nullptr, s, nullptr, 0);
+        cudaGraph_t graph = nullptr;
+        const cudaError_t ee = cudaStreamEndCapture(cs, &graph);
+        cudaGraphExec_t exec = nullptr;
+        if (ee == cudaSuccess && graph != nullptr) { cudaGraphInstantiate(&exec, graph, 0); cudaGraphDestroy(graph); }
+        std::vector<float> afterM(n_embd), afterL(hc_lr);
+        strata::vulkan::stream_read(*s, sl[1].MX, afterM.data(), (size_t) n_embd * 4);
+        strata::vulkan::stream_read(*s, sl[1].LQ, afterL.data(), (size_t) hc_lr * 4);
+        verdict("fused_gr_read_multi entry: a capture RECORDS, it does not run",
+                bits_differ(sentM, afterM) == 0 && bits_differ(sentL, afterL) == 0,
+                bits_differ(sentM, afterM) + bits_differ(sentL, afterL), n_embd + hc_lr, 0.0,
+                "the captured block ran at capture time");
+        int bad_rep = (exec == nullptr) ? (n_embd + hc_lr) : 0;
+        if (exec != nullptr) {
+            cudaGraphLaunch(exec, cs);
+            std::vector<float> rM(n_embd), rL(hc_lr);
+            strata::vulkan::stream_read(*s, sl[1].MX, rM.data(), (size_t) n_embd * 4);
+            strata::vulkan::stream_read(*s, sl[1].LQ, rL.data(), (size_t) hc_lr * 4);
+            bad_rep = bits_differ(rM, sg_MX[1]) + bits_differ(rL, sg_LQ[1]);
+        }
+        verdict("fused_gr_read_multi entry: a recorded block REPLAYS bitwise equal to direct execution",
+                bad_rep == 0, bad_rep, n_embd + hc_lr, 0.0, "words differ between the replay and the direct read");
+        // a SECOND replay after R MOVES must see the NEW R (the recorded step re-reads its buffers)
+        int bad_live = (exec == nullptr) ? hc_lr : 0;
+        if (exec != nullptr) {
+            std::vector<float> R2 = Rt[1];
+            for (auto& x : R2) x = 0.5f * x + 0.03f;                 // a different residual
+            strata::vulkan::stream_write(*s, sl[1].R, R2.data(), (size_t) hc_dim * 4);
+            const auto ref2 = run_oracle(R2, BOt[1], INJt[1], APPLY[1], false, false, false, false);
+            cudaGraphLaunch(exec, cs);
+            std::vector<float> l2(hc_lr);
+            strata::vulkan::stream_read(*s, sl[1].LQ, l2.data(), (size_t) hc_lr * 4);
+            bad_live = near(l2, ref2.lo, 2e-3, 1e-4).first;
+        }
+        verdict("fused_gr_read_multi entry: a replay after R moves sees the NEW R (the buffers are re-read)",
+                bad_live == 0, bad_live, hc_lr, 0.0, "a replay froze its input at capture time");
+    }
+    // (8) THE SHARED-WEIGHT PRECONDITION IS A LOUD REFUSAL, not a silent reuse of token 0's weights for every
+    //     token - the exact bug a shared-weight kernel could have.  A child process, because the wrapper exits.
+    {
+        char self[4096];
+        const ssize_t sn = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (sn <= 0) {
+            skip("fused_gr_read_multi entry: mismatched weights are REFUSED", "cannot resolve /proc/self/exe");
+        } else {
+            self[sn] = '\0';
+            const std::string cmd = std::string(self) + " --expect-fused-gr-multi-refusal 2>&1";
+            FILE* f = popen(cmd.c_str(), "r");
+            if (f == nullptr) {
+                skip("fused_gr_read_multi entry: mismatched weights are REFUSED", "could not spawn the child");
+            } else {
+                std::string out; char buf[256];
+                while (fgets(buf, sizeof buf, f) != nullptr) out += buf;
+                const int code = pclose(f);
+                const int status = WIFEXITED(code) ? WEXITSTATUS(code) : -1;
+                verdict("fused_gr_read_multi entry: mismatched per-token weights are REFUSED (child exits 1)",
+                        status == 1 && out.find("invalid arguments for token") != std::string::npos,
+                        status == 1 ? 0 : 1, 1, (double) status,
+                        "child exit status / the message naming the token (fused_gr.cu:1066-1071)");
+            }
+        }
+    }
+    free_w(ws);
+    strata::vulkan::stream_close(s);
+}
+
+// 3. `fused_gr_supported` -> the engine's OWN geometry predicate (layer.cpp:1188/:1328, verify.cpp:336).
+// PURE HOST, `fused_gr.cu:1164-1166`: (n_embd, hc, hc_lr) == (2560, 4, 320).  The previous batch asserted the
+// OPPOSITE (the backend's capability answer FALSE everywhere) because the fused kernels were missing; that was
+// the right answer then and it is the wrong one now - `verify.cpp:336`'s FIRST disjunct is a fused-GR
+// capability failure, and the P6 verify window is a native pack's only decode path.  The case now asserts that
+// the backend's answer IS the rule, on six geometries (one true, five false), so a capability flag that drifted
+// from the kernels' geometry - or a reversion to the constant - fails.
 void case_fused_gr_supported_entry(Ctx& ctx, const std::string& dir) {
     (void) ctx; (void) dir;
-    // **THIS CASE NOW ASSERTS THE CAPABILITY CONTRACT, NOT THE GEOMETRY PREDICATE** (this batch).  The previous
-    // batch pinned the CUDA's geometry rule here on the theory that a backend "cannot return false without lying
-    // about the geometry", and that `fused_gr_read` leaves the path because `g_fused_gr` is forced false.  The
-    // second half of that was FALSE of the code: under the shipped `--native` launch `g_fused_gr` IS true
-    // (generate.cpp:1804/2284), so the ONLY input selecting the branch is this predicate, and a backend with no
-    // fused_gr shader must answer FALSE - the `native_mmvq_supported` shape.  The case keeps BOTH readings as
-    // distinct observables: the backend's answer must be FALSE everywhere, while the CUDA GEOMETRY rule (computed
-    // here, not called) is TRUE at (2560,4,320) and FALSE elsewhere - so a change that swapped them would fail.
     struct Arm { int64_t n_embd, hc, hc_lr; };
     const Arm arms[] = {{2560, 4, 320}, {2561, 4, 320}, {2560, 5, 320},
                         {2560, 4, 321}, {512, 1, 64},   {0, 0, 0}};
     const int n = (int) (sizeof arms / sizeof arms[0]);
-    int cap_true = 0, geom_true = 0, geom_false = 0;
+    int bad = 0, true_arm = 0, false_arm = 0, geom_true = 0;
     for (const Arm& a : arms) {
-        if (strata::kernels::fused_gr_supported(a.n_embd, a.hc, a.hc_lr)) ++cap_true;
         const bool geom = (a.n_embd == 2560 && a.hc == 4 && a.hc_lr == 320);   // fused_gr.cu:1164-1166
-        if (geom) ++geom_true; else ++geom_false;
+        const bool cap = strata::kernels::fused_gr_supported(a.n_embd, a.hc, a.hc_lr);
+        if (cap != geom) ++bad;
+        if (cap) ++true_arm; else ++false_arm;
+        if (geom) ++geom_true;
     }
-    verdict("fused_gr_supported entry: the backend reports the FUSED read unsupported (no fused_gr shader) - "
-            "vs the CUDA geometry rule, a distinct observable",
-            cap_true == 0 && geom_true > 0 && geom_false > 0, cap_true, n, 0.0,
-            "the capability answer must be FALSE everywhere (selecting the ported gr_read) while the geometry rule "
-            "is TRUE at (2560,4,320); a swapped pair of readings fails this arm");
+    verdict("fused_gr_supported entry: the backend's answer == the engine's own geometry predicate",
+            bad == 0 && true_arm == 1 && false_arm == 5 && geom_true == 1, bad, n, 0.0,
+            "a geometry where the answer disagrees with fused_gr.cu:1164-1166; the fused kernels' three "
+            "constants (fused_gr_vk.cpp) must equal this rule");
 }
 
 // 4. `shared_expert_scratch_bytes` -> the MoE workspace size (layer.cpp:347).  PURE HOST,
@@ -22625,9 +23051,12 @@ void case_prefill_prompt_path(Ctx& ctx, const std::string& dir) {
 //   (A) BEFORE the check a caller gets the plain read - the engine's "0 = not checked yet" sentinel
 //       (fused_gr.cu:829/1330-1333) must never read as a fused variant;
 //   (B) the check RECORDS the plain read (1);
-//   (C) the recorded outcome AGREES with what the port actually runs - the recorded variant is the plain read
-//       IFF `fused_gr_supported()` is false (the capability answer that keeps the ported `gr_read` on the path);
-//       a "staged"/"split" reading here would be a claim about a kernel the backend does not have;
+//   (C) the recorded outcome AGREES with what the port actually runs - the recorded variant is the PLAIN
+//       variant of the fused read, which this port has ONE of (fused_gr_vk.cpp: the fold+norm, the down, the
+//       fused gate+mean, the inject), and `fused_gr_supported()` now answers the engine's geometry predicate
+//       TRUE because those kernels exist.  A "staged"/"split" reading here would be a claim about a variant
+//       the backend does not have, and a `false` capability would be the lie that refused a native pack's
+//       only decode path at verify.cpp:336.
 //   (D) it is ONCE PER CARD: a second call does not re-characterise.
 // No shader, no stream: a pure host probe, so it cannot be skipped for a missing .spv.
 void case_fused_gr_check_entry(Ctx& ctx, const std::string& dir) {
@@ -22640,9 +23069,9 @@ void case_fused_gr_check_entry(Ctx& ctx, const std::string& dir) {
     verdict("fused_gr_check: the check records the plain read", after == 1, after == 1 ? 0 : 1, 1,
             (double) after, "variant id (1 = plain)");
     const bool supported = strata::kernels::fused_gr_supported(2560, 4, 320);
-    const bool agrees = (after == 1) && !supported;
-    verdict("fused_gr_check: the outcome matches fused_gr_supported() == false", agrees, agrees ? 0 : 1, 1,
-            (double) after, "variant vs capability (plain must pair with an unsupported fused read)");
+    const bool agrees = (after == 1) && supported;
+    verdict("fused_gr_check: the outcome matches fused_gr_supported() == true", agrees, agrees ? 0 : 1, 1,
+            (double) after, "variant vs capability (the plain fused variant pairs with a SUPPORTED fused read)");
     strata::kernels::fused_gr_check();
     const int again = strata::kernels::fused_gr_variant();
     verdict("fused_gr_check: once per card (a second call is a no-op)", again == after, again == after ? 0 : 1, 1,
@@ -22663,6 +23092,7 @@ int main(int argc, char** argv) {
     bool expect_doorbell_wait_refusal = false;
     bool expect_null_stream_default = false;
     bool expect_bad_stream_refusal = false;
+    bool expect_fused_gr_multi_refusal = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--list") list = true;
@@ -22674,6 +23104,7 @@ int main(int argc, char** argv) {
         else if (a == "--expect-doorbell-wait-refusal") expect_doorbell_wait_refusal = true;  // doorbell_wait's
         else if (a == "--expect-null-stream-default") expect_null_stream_default = true;      // the stream seam
         else if (a == "--expect-bad-stream-refusal") expect_bad_stream_refusal = true;
+        else if (a == "--expect-fused-gr-multi-refusal") expect_fused_gr_multi_refusal = true;
         else if (a == "--expect-ledger-refuse") expect_ledger_refuse = true;
         else if (a == "--expect-ledger-ok") expect_ledger_ok = true;
         else if (a == "--expect-rope-table") expect_rope_table = true;   // case_rope_table_set_entry's child
@@ -22757,6 +23188,23 @@ int main(int argc, char** argv) {
         std::vector<float> junk(64, 1.0f);                        // not a cudaHostAlloc mapping
         strata::kernels::copy_from_mapped(dst, junk.data(), 64, (void*) cs);   // must exit(2)
         return 5;   // reached only if the wrapper did NOT refuse
+    }
+    if (expect_fused_gr_multi_refusal) {
+        // The child for `case_fused_gr_read_entry`'s refusal arm: tokens that do NOT share the weight pointers
+        // must make `fused_gr_read_multi` REFUSE (exit 1) rather than silently using token 0's weights for
+        // every token - the refusal is `fused_gr.cu:1066-1071`, and it is checked BEFORE any stream is touched,
+        // so the pointers below are never dereferenced.
+        strata::kernels::FusedGrArgs a[2];
+        for (auto& x : a) {
+            x.R = (const float*) (uintptr_t) 0x1000; x.R_out = (float*) (uintptr_t) 0x1000; x.apply = false;
+            x.w_norm = (const float*) (uintptr_t) 0x2000; x.lo = (float*) (uintptr_t) 0x3000;
+            x.rs = (float*) (uintptr_t) 0x4000; x.mixed = (float*) (uintptr_t) 0x5000;
+            x.w_up = (const uint16_t*) (uintptr_t) 0x6000;
+        }
+        a[0].w_down = (const uint16_t*) (uintptr_t) 0x7000;
+        a[1].w_down = (const uint16_t*) (uintptr_t) 0x8000;      // MISMATCHED -> exit(1)
+        strata::kernels::fused_gr_read_multi(a, 2, nullptr, nullptr, nullptr, 0);
+        return 5;   // reached only if the mismatch was NOT refused
     }
     if (expect_doorbell_wait_refusal) {
         // The child for `case_doorbell_ring_replay`'s refusal arm: OUTSIDE capture, an un-answered handoff
@@ -23040,6 +23488,7 @@ int main(int argc, char** argv) {
     case_qsa_step_fill_entry(ctx, dir);              // qsa_step_fill             (layer.cpp:908, PURE HOST)
     case_indexer_key_append_entry(ctx, dir);         // indexer_key_append        -> indexer_key_append.spv (layer.cpp:948)
     case_fused_gr_supported_entry(ctx, dir);         // fused_gr_supported        (layer.cpp:1189/:1328, PURE HOST)
+    case_fused_gr_read_entry(ctx, dir);              // fused_gr_read/_multi      -> fused_gr_rs/down/mix/inject (layer.cpp:1253, verify.cpp:693)
     case_shared_expert_scratch_bytes_entry(ctx, dir);// shared_expert_scratch_bytes (layer.cpp:347, PURE HOST)
     case_moe_combine_entry(ctx, dir);                // moe_combine               -> moe_combine_f32.spv   (layer.cpp:464)
     case_ngram_rows_entry(ctx, dir);                 // ngram_rows                (layer.cpp:1293, PURE HOST - the PLE hash)

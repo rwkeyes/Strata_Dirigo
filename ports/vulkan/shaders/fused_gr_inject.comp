@@ -1,0 +1,42 @@
+#version 450
+// ports/vulkan/shaders/fused_gr_inject.comp - stage 4 of the FUSED hyper-connection read: the per-stream
+// injection, `inject[c] = w_inject[c] . xn` over the FP32 activation.
+//
+// Transcribed from `gr_down_kernel`'s inject block (src/kernels/cuda/fused_gr.cu:89-101:
+// `if (inject_block) a.inject_out[row] = acc;`) with the same dot the CUDA's `dot8` performs against the f32
+// `xn`.  The port's unfused `gr_inject.spv` is the same dot against `bf16(xn)`; the activation contract is the
+// difference, and the activation is FP32 here (fused_gr.hpp:15).
+//
+// THE FINAL MIXER PASSES `w_inject == nullptr`: the caller SKIPS this dispatch and the output buffer is left
+// untouched, exactly as `gr.cu:387-389` and `fused_gr.cu`'s `w_inject == nullptr` guard require.
+//
+// ONE WORKGROUP PER STREAM.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer RF { float v[]; } rf;     // (hc, n_embd) the FOLDED R
+layout(set = 0, binding = 1, std430) readonly buffer WN { float v[]; } wn;     // (hc*n_embd)
+layout(set = 0, binding = 2, std430) readonly buffer RS { float v[]; } rsb;    // (hc)
+layout(set = 0, binding = 3, std430) readonly buffer WI { uint  v[]; } wi;     // row c as uint32 bf16 PAIRS
+layout(set = 0, binding = 4, std430) buffer INJ { float v[]; } inj;           // (hc)
+layout(push_constant, std430) uniform PC { int n_embd; int hc; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    if (c >= uint(pc.hc)) return;
+    const uint n = uint(pc.n_embd);
+    const uint np = uint(pc.hc) * n / 2u;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float acc = 0.0f;
+    for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
+        const uint packed = wi.v[c * np + p];
+        const uint i0 = 2u * p, i1 = i0 + 1u;
+        const uint cc = i0 / n;
+        acc += (rf.v[i0] * wn.v[i0] * rsb.v[cc]) * bf16_to_f32(packed & 0xFFFFu);
+        acc += (rf.v[i1] * wn.v[i1] * rsb.v[cc]) * bf16_to_f32(packed >> 16u);
+    }
+    const float t = wg_sum(acc);              // OUTSIDE any divergent guard
+    if (lid == 0u) inj.v[c] = t;
+}

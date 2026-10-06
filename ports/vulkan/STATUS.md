@@ -1,5 +1,59 @@
 # Status — what is done, what is verified, what is not
 
+## THE FUSED HYPER-CONNECTION READ IS WIRED; the P6 verify window opens and stops at `broadcast_streams` (2026-10-05, `vega`)
+
+**THE `verify.cpp:336` CAPABILITY REFUSAL IS CLEARED AND THE WINDOW RUNS ITS BODY.**  On `coder-iq1_m` (no
+`--no-pool`, `--expert-profile /tmp/expert-profile-coder-built.bin`, `--expert-cache 2048`) the run reaches
+`strata verify: window up to 6 tokens, 74.0 MiB of device buffers` — `Verifier::init` SUCCEEDED past
+`fused_gr_supported` — and stops at the NEXT named refusal in the window's body (`/tmp/run_real_pool4.log`, `RC=2`,
+two runs identical):
+
+```
+strata::kernels::broadcast_streams: NOT PORTED and NOT REACHED by the shipped configuration - REFUSING.
+  The only configuration that reaches it: the P6 verifier (verify.cpp); Verifier::init refuses (layer.cpp:476-491)
+```
+
+`broadcast_streams` is the window's embedding broadcast (`verify.cpp:592/606`; CUDA `broadcast_streams_kernel`,
+`verify_kernels.cu:256`) — a flat `R[(t*hc+c)*n_embd+d] = x[t*n_embd+d]`.  **Its "NOT REACHED" text is now STALE,
+and that is the next increment.**  **NO TOKEN.**
+
+**PORTED (NEW TU `vulkan/src/kernels/fused_gr_vk.cpp` + 4 shaders):** `fused_gr_read` / `fused_gr_read_multi`, the
+verify window's per-layer GR read (`verify.cpp:693/:1142`) and the decode path's (`layer.cpp:1253/1276`).  The fused
+read = the previous half's write FOLDED IN + **FP32 ACTIVATIONS** (`fused_gr.hpp:15`) — `gr.cu`'s
+`<true>`/`<float>` branch, NOT the ported unfused `gr_read`'s `<uint16_t>` one, so the two are **NOT bitwise-equal
+and the case MEASURES them apart (rel-L1 2.52e-3)**.  Four dispatches per token over the port's ONE barrier tree and
+ONE bf16 widen: `fused_gr_rs` (fold + per-stream RMS + `rs`), `fused_gr_down` (`lo`), `fused_gr_mix` (gate+mean
+FUSED), `fused_gr_inject`.  The activation is NOT materialised (the CUDA recomputes it; so does this port).  **One
+defect the gate found and fixed at the cause:** with `apply == false` `R_out` is untouched, so the stages must read
+`a.R` — bound explicitly now, not assumed (`R_out == R` holds in the engine but the case passes distinct buffers).
+
+**`fused_gr_supported` NOW ANSWERS THE ENGINE'S OWN PREDICATE** (`2560,4,320`, `fused_gr.cu:1164-1166`) — TRUE
+because the kernels exist and are gate-proven.  It has been wrong in BOTH directions now: the rule while the kernel
+was missing selected an unwired branch; FALSE (last batch) refused a native pack's only decode path at `:336`.
+**Paths that select it:** DECODE (`layer.cpp:1188`, `:1328` stops calling `gr_write` for interior layers) and the
+VERIFY WINDOW.  `gr_write` stays for the last layer / head.  **The DECODE selection is gate-proved, not run-proved**
+(a native pack breaks the token loop, `generate.cpp:7578-7579`).
+
+**PROVEN.**  `case_fused_gr_read_entry` (10 verdicts) + a reworked `case_fused_gr_supported_entry`: wrapper == ported
+shader path **BITWISE** 13128/13128; wrapper vs the engine's own rule (double, FP32 act) 13124/13124 worst 0.000889;
+multi == 3 x single **BITWISE** 39384/39384; the final mixer / `apply == false` / rivals / **3 CAPTURE arms**
+(records-not-runs, replay == direct bitwise, a replay re-reads moved `R`) / a child-process refusal.  Rivals MOVE
+(whole-stack RMS 8.36e-1, SUM 3.00e+0, fold dropped 3.06e-1, BF16 act 2.52e-3).  **SIX injections, ALL BITE**
+(`fused-gr-supported-false`, `-rs-drop-fold`, `-mix-sum-not-mean`, `-down-swap-halves`, `-inject-drop-rs`,
+`-multi-token0-args`).  **The multi arm was VACUOUS on first writing** — an injection that read token 0's args for
+every token did NOT falsify it, because unwritten slots kept the singles' values; every output the multi must write
+is now sentinelled.  `fused-gr-supported-true` is RETIRED (the rule is the truth now).
+
+**MAP:** `168 = 83 kernel + 0 shader + 46 host + 0 todo + 39 refused` (was `81/0/46/0/41`; the two fused-read rows
+moved `refused -> kernel`); `check_port_map.py` passes, `make_port_map.py` regenerates byte-identically.  **ENGINE
+BAR: 0 undefined — 0 BY CONSTRUCTION**, not a porting gain.  **GATE (vega): Arc `intel_icd` 816/0/0** (was 806),
+llvmpipe 804/0/3; the radeon arm carried the documented platform-level non-determinism (`budget: independent
+requery`, `cvec_apply entry point` 6047/6144 — RECORDED, new instance, not chased, and not this batch's case:
+Arc read 0 failed in the same run).  **A LATER RUN put the SAME class on THIS batch's case**: radeon
+`fused_gr_read entry (apply=true): engine wrapper == the ported shader path, BITWISE` **13127/13128 (ONE word)** —
+recorded with kernel name and element count, Arc 0 failed in that run too, llvmpipe green; NOT chased.
+`z820b` untouched.
+
 ## THE PREFILL PATH RUNS TO COMPLETION on the REAL pack; the stop is the verifier's residency table (2026-10-05, `vega`)
 
 **8 -> 5 prefill refusals, and the prompt path now executes every stage.**  `coder-iq1_m` with

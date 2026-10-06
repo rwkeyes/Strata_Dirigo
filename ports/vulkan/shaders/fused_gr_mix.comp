@@ -1,0 +1,52 @@
+#version 450
+// ports/vulkan/shaders/fused_gr_mix.comp - stage 3 of the FUSED hyper-connection read: the per-stream gate and
+// the mean over streams, in ONE dispatch.
+//
+// Transcribed from `gr_up_kernel` (src/kernels/cuda/fused_gr.cu:107-138):
+//
+//     mixed[d] = mean_c  xn[c][d] * sigmoid( w_up[c*n_embd + d] . lo )      xn = R_out * w_norm * rs
+//
+// THE GATE AND THE MEAN ARE FUSED HERE because the CUDA fuses them: `g[c][dd] = x * sigmoid(acc)` lives in the
+// up kernel's shared memory and the `/ hc` mean follows in the same block.  The port's UNFUSED chain spends two
+// dispatches (`gr_gate.spv` then `gr_mean.spv`) and needs a `gated` buffer of hc*n_embd floats between them; the
+// fused read has no such buffer in its argument set, and does not need one - the sum over streams is kept in a
+// register.
+//
+// ONE WORKGROUP PER OUTPUT COLUMN `d` (the CUDA is one block per 32-column tile, 128 rows = 4 streams x 32
+// columns).  The reduction over hc_lr is the workgroup barrier tree, called ONCE PER STREAM - the `c` loop is
+// uniform, so every invocation reaches every barrier.
+//
+// THE ACTIVATION IS FP32: `x = R_out[i]*w_norm[i]*rs[c]`, the CUDA up kernel's own recompute, NOT a bf16(xn).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer RF { float v[]; } rf;     // (hc, n_embd) the FOLDED R
+layout(set = 0, binding = 1, std430) readonly buffer WN { float v[]; } wn;     // (hc*n_embd)
+layout(set = 0, binding = 2, std430) readonly buffer RS { float v[]; } rsb;    // (hc)
+layout(set = 0, binding = 3, std430) readonly buffer LQ { float v[]; } lq;     // (hc_lr) lo, FP32
+layout(set = 0, binding = 4, std430) readonly buffer WU { uint  v[]; } wu;     // row i as uint32 bf16 PAIRS
+layout(set = 0, binding = 5, std430) buffer MX { float v[]; } mx;              // (n_embd)
+layout(push_constant, std430) uniform PC { int n_embd; int hc; int hc_lr; } pc;
+
+#include "common/wg_reduce.glsl"
+#include "common/bf16.glsl"
+
+void main() {
+    const uint d = gl_WorkGroupID.x;
+    if (d >= uint(pc.n_embd)) return;          // workgroup-uniform: every barrier below is reached
+    const uint n = uint(pc.n_embd);
+    const uint np = uint(pc.hc_lr) / 2u;
+    const uint lid = gl_LocalInvocationIndex;
+
+    float sum = 0.0f;
+    for (uint c = 0u; c < uint(pc.hc); ++c) {
+        const uint i = c * n + d;
+        float acc = 0.0f;
+        for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
+            const uint packed = wu.v[i * np + p];
+            acc += lq.v[2u * p]      * bf16_to_f32(packed & 0xFFFFu);
+            acc += lq.v[2u * p + 1u] * bf16_to_f32(packed >> 16u);
+        }
+        const float s = 1.0f / (1.0f + exp(-wg_sum(acc)));      // SIGMOID (not SiLU)
+        sum += (rf.v[i] * wn.v[i] * rsb.v[c]) * s;
+    }
+    mx.v[d] = sum / float(pc.hc);              // the MEAN, not the sum
+}

@@ -1,0 +1,55 @@
+#version 450
+// ports/vulkan/shaders/fused_gr_rs.comp - stage 1 of the FUSED hyper-connection read: the folded write, the
+// per-stream RMS, and `rs`.
+//
+// Transcribed from the FIRST HALF of `gr_down_kernel` (src/kernels/cuda/fused_gr.cu:49-86) - the fold and the
+// RMS the fused read performs on the way in, which the UNFUSED chain does in `gr_write` + `gr_norm`:
+//
+//     gw[c] = apply ? 2*sigmoid(inj_prev[c] / hc) : 0
+//     R'[i] = R[i] + bo_prev[d] * gw[c]          (i = c*n_embd + d)   [written to R_out when apply]
+//     ss[c] = sum_d R'[c][d]^2
+//     rs[c] = rsqrt(ss[c] / n_embd + eps)
+//
+// ONE WORKGROUP PER STREAM - the CUDA is `hc` blocks, one per stream, and the RMS is PER STREAM (ne[0] is
+// n_embd).  The rival reading (one RMS over the whole hc*n_embd stack) keeps every shape and is checked
+// host-side by the gate case before it judges the kernel.
+//
+// THE FOLD IS HERE AND NOT A SEPARATE `gr_write`: in the fused read the previous half's write has no materialised
+// intermediate - it is folded into `R'` on the way to the norm, exactly as the CUDA does it.  `R_out` is written
+// only when `apply`, which is the CUDA's own rule (`gr_up_kernel` writes `a.R_out[i]` inside `if (a.apply)`).
+//
+// WHY THE ACTIVATION IS NOT STORED: the fused read's contract is FP32 ACTIVATIONS (fused_gr.hpp:15), so every
+// consumer (`fused_gr_down`, `fused_gr_mix`, `fused_gr_inject`) recomputes `xn = R'*w_norm*rs` from `R_out`,
+// `w_norm` and `rs` - the CUDA's `gr_up_kernel` does the same recompute (`x = rv * w_norm[i] * rs[c]`) rather
+// than re-reading a stored `xn`.  That is why this read needs NO scratch buffer larger than `hc_lr`.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer RB { float v[]; } r;     // (hc, n_embd)
+layout(set = 0, binding = 1, std430) readonly buffer BO { float v[]; } bo;    // (n_embd)  previous half's block out
+layout(set = 0, binding = 2, std430) readonly buffer INJ { float v[]; } inj;  // (hc)      previous half's injection
+layout(set = 0, binding = 3, std430) buffer RO { float v[]; } ro;             // (hc, n_embd) R' when apply
+layout(set = 0, binding = 4, std430) buffer RS { float v[]; } rsb;            // (hc)
+layout(push_constant, std430) uniform PC { int n_embd; int hc; float eps; int apply; } pc;
+
+#include "common/wg_reduce.glsl"
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    if (c >= uint(pc.hc)) return;              // workgroup-uniform: every barrier below is reached
+    const uint n = uint(pc.n_embd);
+    const uint base = c * n;
+    const uint lid = gl_LocalInvocationIndex;
+    const bool ap = pc.apply != 0;
+    const float gw = ap ? 2.0f / (1.0f + exp(-inj.v[c] / float(pc.hc))) : 0.0f;   // 2*sigmoid(inj/hc)
+
+    float ss = 0.0f;
+    for (uint d = lid; d < n; d += gl_WorkGroupSize.x) {
+        const float rp = r.v[base + d] + (ap ? bo.v[d] * gw : 0.0f);
+        ss += rp * rp;
+    }
+    const float rs = inversesqrt(wg_sum(ss) / float(n) + pc.eps);
+    if (lid == 0u) rsb.v[c] = rs;
+    if (ap) {
+        for (uint d = lid; d < n; d += gl_WorkGroupSize.x)
+            ro.v[base + d] = r.v[base + d] + bo.v[d] * gw;
+    }
+}

@@ -228,8 +228,12 @@ TABLE = {
     'fused_gdn_ab':                   ('kernel', 'fused_gdn_ab'),          # replaces 2x bf16 mmvf + beta_gate + gate
     'fused_gdn_conv_l2':              ('kernel', 'fused_gdn_conv_l2'),     # replaces native_gdn_conv_silu + 2x l2_norm
     'fused_gdn_step_norm':            ('kernel', 'fused_gdn_step_norm'),   # replaces native_gdn_step + native_gdn_out_norm
-    'fused_gr_read':                  ('todo', 'a DEVICE op (fused_gr.cu:1168 launches gr_down/gr_up), mis-kinded host before; the FUSED alternative the gr branch policy removes'),
-    'fused_gr_read_multi':            ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
+    # THE FUSED HYPER-CONNECTION READ (this batch): `fused_gr.cu:1168`'s device op, WIRED in
+    # `vulkan/src/kernels/fused_gr_vk.cpp` over four shaders, and reached on BOTH the decode path
+    # (layer.cpp:1253/1276) and the P6 verify window (verify.cpp:693/:1142) now that
+    # `fused_gr_supported` answers the engine's geometry predicate TRUE.
+    'fused_gr_read':                  ('kernel', 'fused_gr_rs fused_gr_down fused_gr_mix fused_gr_inject'),
+    'fused_gr_read_multi':            ('kernel', 'fused_gr_rs fused_gr_down fused_gr_mix fused_gr_inject'),
     'gdn_ab_multi':                   ('todo', 'no shader in this tree yet'),
     'gdn_conv_commit':                ('todo', 'no shader in this tree yet'),
     'gdn_conv_l2_multi':              ('todo', 'no shader in this tree yet'),
@@ -269,11 +273,11 @@ assert not extra, f"table rows that src/core/ does not reach: {extra}"
 REFUSED = {
     # the QSA/flash-attention tail
     'native_flash_attn_short_step', 'qsa_attend_step', 'qsa_index_step', 'topk_512_step',
-    'fused_gr_read',
+    # (fused_gr_read retired from REFUSED this batch: it is DEFINED, not refused)
     # the KV streaming resident tier
     'kv_stream_reset', 'kv_ring_table', 'kv_stream_resolve', 'kv_ring_restore',
     # the speculative drafter (class C)
-    'add_streams_broadcast', 'fused_gr_read_multi', 'moe_grouped_s2', 'moe_group_resident', 'coupled_draft_sample',
+    'add_streams_broadcast', 'moe_grouped_s2', 'moe_group_resident', 'coupled_draft_sample',
     'coupled_draft_stage', 'coupled_draft_scratch_bytes', 'row_top_prob', 'map_ids', 'window_ids', 'mtp_select',
     'embedding_gather_dev',
     # the A/B arm defaulting off (class C)

@@ -109,19 +109,14 @@ void topk_512_step(const float*, const QsaShapes&, int64_t, const int32_t*, int3
 // that branch is the shipped one.  Nothing is refusen here for it any more.
 
 // ---- the fused hyper-connection read -------------------------------------------------------------------------
-// `fused_gr_read` (layer.cpp:1253/1276): inside `if (fused)` where `fused = g_fused_gr &&
-// fused_gr_supported(g.n_embd, g.hc, g.hc_lr)` (layer.cpp:1188/1328).  `g_fused_gr` IS TRUE under the shipped
-// `--native` launch (generate.cpp:1804 sets `gr_native_mmvf`, :2284 `layer_set_fused_gr(...)`) - the earlier
-// note that "the backend forces g_fused_gr false" was FALSE of the code (there is no such call).  So the branch
-// is selected by the OTHER input, `fused_gr_supported`, which the BACKEND defines: this backend has no fused_gr
-// shader, so it now answers FALSE (ple_vk.cpp), keeping the ported `gr_read` on the path.  This is the
-// `native_mmvq_supported` shape - "the backend reports what it implements".
-void fused_gr_read(const FusedGrArgs&, void*) {
-    refuse_unreachable("fused_gr_read",
-                       "fused_gr_supported(n_embd,hc,hc_lr) == true (layer.cpp:1188/1328) with g_fused_gr true "
-                       "(--native, generate.cpp:1804/2284); the backend ANSWERS fused_gr_supported false (no "
-                       "fused_gr shader in this tree), selecting the ported gr_read (layer.cpp:1255)");
-}
+// **BOTH SYMBOLS ARE NOW DEFINED (this batch), NOT REFUSED.**  `fused_gr_read` / `fused_gr_read_multi` live in
+// `vulkan/src/kernels/fused_gr_vk.cpp` over four new shaders (`fused_gr_rs/down/mix/inject`), and the backend
+// now ANSWERS `fused_gr_supported` with the engine's own geometry predicate (ple_vk.cpp) - so the branch
+// `fused = g_fused_gr && fused_gr_supported(...)` (layer.cpp:1188) IS the selected one, on the decode path AND
+// in the P6 verify window (verify.cpp:693/:1142), which is a native pack's only decode path.  The two rows move
+// `refused -> kernel` in PORT-MAP.tsv.  The refusals that used to sit here said the branch was unreachable
+// because the backend answered FALSE; that was the correct answer while the kernels were missing, and it is the
+// wrong answer now that they exist.  Nothing is refused here any more.
 
 // ---- the KV streaming resident tier -------------------------------------------------------------------------
 // `--kv-resident N` (generate.cpp:1319 -> qsa_set_kv_resident, layer.cpp:554) sets a nonzero resident-cell
@@ -178,9 +173,6 @@ void coupled_draft_sample(float*, int, const int32_t*, const int32_t*, int, cons
 }
 void add_streams_broadcast(const float*, const float*, float*, int64_t, int, int, void*) {
     refuse_unreachable("add_streams_broadcast", "--spec 4 --mtp (mtp.cpp:497), the drafter's embedding branch");
-}
-void fused_gr_read_multi(const FusedGrArgs*, int, float*, void*, unsigned long long*, int) {
-    refuse_unreachable("fused_gr_read_multi", "--spec 4 --mtp (mtp.cpp:510/571/620) AND the backend answering fused_gr_supported TRUE");
 }
 void moe_grouped_s2(const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int64_t,
                     int64_t, const uint8_t*, const float*, void*, float*, void*) {

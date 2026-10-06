@@ -18,8 +18,10 @@
 //   6. `native_moe_combine`  layer.cpp:463  (`moe_combine_parts`, the DEFAULT combine)       -> native_moe_combine.spv
 //
 // `gr_write` is reached on BOTH branches of the fused/unfused GR choice (:1261 unfused, :1328 post/head) so it
-// cannot be dodged; `gr_read` is the UNFUSED member of the pair the `gr_set_native_mmvf(false)` contract
-// selects.  The fused `fused_gr_read`/`fused_gr_supported` are the flag-removed alternative; they stay unwired.
+// `gr_read` is the UNFUSED member of the pair; the FUSED read (`fused_gr_read` / `fused_gr_read_multi`) is
+// WIRED this batch in `vulkan/src/kernels/fused_gr_vk.cpp`, and `fused_gr_supported` answers the engine's own
+// geometry predicate TRUE - so this backend now runs the fused read on BOTH the decode path and the P6 verify
+// window.  See that file's header and `fused_gr_supported` below for which paths select it.
 // `native_router_top10` (the router's native member) is already wired in qsa_vk.cpp; `native_moe_combine` is
 // the DEFAULT combine because `native_moe_combine_enabled()` answers true (native_caps_vk.cpp).
 //
@@ -555,35 +557,41 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
 }
 
 // fused_gr.hpp: `bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);`  (layer.cpp:1188/1328,
-//     the `fused = g_fused_gr && fused_gr_supported(...)` test in `block_layer_pre`/`block_layer_post`).
+//     the `fused = g_fused_gr && fused_gr_supported(...)` test in `block_layer_pre`/`block_layer_post`;
+//     verify.cpp:336, the P6 verify window's geometry precondition).
 //
-// **A REACHABILITY DEFECT FOUND WHILE WIRING `shared_expert` (this batch), AND FIXED AT ITS CAUSE.**  The
-// previous batch left this returning the CUDA's GEOMETRY predicate (`n_embd==2560 && hc==4 && hc_lr==320`) on
-// the reasoning that "a backend cannot return false without lying about the geometry", and recorded that
-// `fused_gr_read` "leaves the forward path" because `g_fused_gr` "is forced false by the GR contract".
-// **THAT CLAIM WAS FALSE OF THE CODE.**  `g_fused_gr` (layer.cpp:42) DEFAULTS false, but generate.cpp:2284
-// calls `layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && dump_layers.empty() &&
-// dump_halves.empty() && !o.stage_timing)`, and the shipped `--native` launch sets `o.gr_native_mmvf = true`
-// (generate.cpp:1804) with `no_fused_gr` false (its default) - so on the shipped run `g_fused_gr` IS TRUE, and
-// with this predicate TRUE the fused branch (`fused_gr_read`, layer.cpp:1253/1276) IS the one the layer
-// reaches, while the ported `gr_read` is the NON-selected branch.  **This is the exact shape of the
-// `qsa_decode_attn_step` defect: a class label that was true of a PLAN and false of the CODE.**
+// **HISTORY, because this predicate has been wrong in BOTH directions and each direction cost a batch.**
 //
-// THE FIX, and why it is this predicate rather than a shader port: the branch is selected by the BACKEND's own
-// answer here, and this backend has NO fused_gr shader.  Answering "the fused read is supported" while having no
-// kernel for it is the lie; answering FALSE is the capability truth, and it is the SAME discipline as
-// `native_mmvq_supported` (matvec_vk.cpp: true only for the six types this tree has shaders for).  With FALSE
-// the engine takes the PORTED unfused read (`gr_read`) - the branch the port's whole GR contract was built
-// against - and `fused_gr_read` becomes genuinely unreachable under every shipped configuration, which is what
-// its LOUD REFUSAL (refusals_vk.cpp) names.  A future batch that ports `fused_gr_down`/`fused_gr_up` flips this
-// to `return n_embd == 2560 && hc == 4 && hc_lr == 320;` and retires the refusal.
+//   1. The port originally answered the CUDA's GEOMETRY rule on the reasoning that "a backend cannot return
+//      false without lying about the geometry", and recorded that `fused_gr_read` "leaves the forward path"
+//      because `g_fused_gr` "is forced false by the GR contract".  **THAT CLAIM WAS FALSE OF THE CODE.**
+//      `g_fused_gr` (layer.cpp:42) DEFAULTS false, but generate.cpp:2284 sets it to
+//      `o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && ...`, and the shipped `--native` launch sets
+//      `o.gr_native_mmvf = true` (generate.cpp:1804) with `no_fused_gr` false (its default) - so on the
+//      shipped run `g_fused_gr` IS TRUE and the predicate ALONE selects the branch, whose kernel was unwired.
 //
-// (The GEOMETRY predicate itself is preserved as a distinct observable: `case_fused_gr_supported_entry` asserts
-// that the CUDA geometry rule would answer TRUE at (2560,4,320) and FALSE elsewhere, and that the backend's
-// capability answer is FALSE everywhere - so the two readings are told apart, not conflated.)
+//   2. The correction answered FALSE (the `native_mmvq_supported` discipline: a backend must not claim a
+//      kernel it does not have), which is right for an unwired kernel - but it made `verify.cpp:336`'s FIRST
+//      disjunct fire, and the P6 verify window IS A NATIVE PACK'S ONLY DECODE PATH (`generate.cpp:7578-7579`
+//      breaks the token loop for a native pack), where the per-layer GR read is `fused_gr_read_multi` called
+//      UNCONDITIONALLY (:693, :1142).  FALSE there is not a safe default; it is the refusal that stops a token.
+//
+// THE ANSWER IS NOW THE ENGINE'S OWN RULE, and it is TRUE because the kernels exist and are gate-proven:
+// `fused_gr_read` / `fused_gr_read_multi` are DEFINED by `vulkan/src/kernels/fused_gr_vk.cpp` over four new
+// shaders (`fused_gr_rs/down/mix/inject`), and those four carry the SAME compile-time geometry the CUDA's
+// `fused_gr.cu:20-23` carries.  So the predicate and the kernels cannot disagree: TRUE exactly where the
+// shaders can run, FALSE everywhere else.
+//
+// WHICH PATHS THIS SELECTS (stated, because a true answer is not inert):
+//   * DECODE: layer.cpp:1188 `fused` becomes true, so `block_layer_pre` runs `fused_gr_read` (the fold lives
+//     inside) instead of `gr_read`, and layer.cpp:1328 stops calling `gr_write` for interior layers.  Proved by
+//     `case_fused_gr_read_entry`'s wrapper arms against the engine's own rule.
+//   * VERIFY WINDOW: verify.cpp:336 passes and :693/:1142 call `fused_gr_read_multi`.  Proved by the same
+//     case's multi==single bitwise arm and the capture arm.
+//   * `gr_write` is STILL on the path for the last layer and for the head (`layer.cpp:1330`, verify.cpp:1095),
+//     and for the unfused branch when `g_fused_gr` is off.
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
-    (void) n_embd; (void) hc; (void) hc_lr;
-    return false;   // no fused_gr shader in this tree: the backend reports what it implements
+    return n_embd == 2560 && hc == 4 && hc_lr == 320;
 }
 
 // fused_gr.hpp: `void fused_gr_check();` and `int fused_gr_variant();`  (verify.cpp:311; fused_gr.cu:1336/1326).

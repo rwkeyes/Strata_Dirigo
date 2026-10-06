@@ -120,13 +120,33 @@
 #                                       Q8_K image -> must FAIL  "s_gemv_q8k_split entry"
 #   inject-verify.sh shared-expert-silu-on-up  vulkan/src/kernels/shared_expert_vk.cpp  put the SiLU on `up`
 #                                       instead of the GATE -> must FAIL  "shared_expert entry"
-#   inject-verify.sh fused-gr-supported-true   vulkan/src/kernels/ple_vk.cpp  answer the CUDA geometry rule TRUE
-#                                       (claiming the fused read the backend has no shader for) -> must FAIL
+#   (THE FUSED HYPER-CONNECTION READ - the P6 verify window's per-layer GR read, a native pack's ONLY decode
+#    path.  `fused_gr_read` / `fused_gr_read_multi` are now WIRED (vulkan/src/kernels/fused_gr_vk.cpp) over four
+#    shaders, and `fused_gr_supported` answers the engine's own geometry predicate TRUE.  Six falsifications,
+#    each of them a rule of the fused read: the capability going FALSE while the kernels exist, the fold dropped,
+#    the mean read as a sum, the bf16 pair halves swapped, the inject's `rs` dropped, and the multi reading
+#    token 0's arguments for every token.)
+#   inject-verify.sh fused-gr-supported-false  vulkan/src/kernels/ple_vk.cpp  answer the capability FALSE while
+#                                       the four fused_gr shaders exist (the exact state that refused a native
+#                                       pack's only decode path at verify.cpp:336) -> must FAIL
 #                                       "fused_gr_supported entry"
-#   inject-verify.sh fused-gr-check-records-staged  vulkan/src/kernels/ple_vk.cpp  record a fused hyper-connection
-#                                       variant the backend has no shader for (the card characterisation
-#                                       reached at Verifier::init, verify.cpp:311) -> must FAIL
-#                                       "fused_gr_check: the check records the plain read"
+#   inject-verify.sh fused-gr-rs-drop-fold   fused_gr_rs.comp  force `ap` false (the previous half's write no
+#                                       longer folded, R_out no longer written) -> must FAIL "fused_gr_read entry:
+#                                       wrapper vs the engine's own rule"
+#   inject-verify.sh fused-gr-mix-sum-not-mean  fused_gr_mix.comp  drop the `/ hc` (a SUM over streams) -> must
+#                                       FAIL "fused_gr_read entry: wrapper vs the engine's own rule"
+#   inject-verify.sh fused-gr-down-swap-halves  fused_gr_down.comp  swap the BF16 pair halves of the down dot
+#                                       -> must FAIL "fused_gr_read entry: wrapper vs the engine's own rule"
+#   inject-verify.sh fused-gr-inject-drop-rs  fused_gr_inject.comp  drop the `rs[c]` factor of the inject's
+#                                       activation -> must FAIL "fused_gr_read entry: wrapper vs the engine's own
+#                                       rule"
+#   inject-verify.sh fused-gr-multi-token0-args  vulkan/src/kernels/fused_gr_vk.cpp  read token 0's arguments
+#                                       for every token of the window -> must FAIL "fused_gr_read_multi entry:
+#                                       3 tokens == 3 x fused_gr_read, BITWISE"
+#
+#   (the earlier `fused-gr-supported-true` injection is RETIRED: it answered the CUDA geometry rule TRUE while
+#    no fused_gr shader existed, which was the lie THEN; the rule IS the answer now, so the mirror lie
+#    `fused-gr-supported-false` above is the one that falsifies.)
 #
 #   (the DEFAULT QSA decode attention: the KV pools read through the PAGE TABLE, `qsa_decode_attn_step`)
 #   inject-verify.sh qsa-decode-attn-drop-kv-head  qsa_decode_attn.comp  drop the KV head term from the pool
@@ -620,14 +640,54 @@ case "$name" in
     old=$'    strata::vulkan::swiglu_f32(s, gate, up, gate, n_ff);'
     new=$'    strata::vulkan::swiglu_f32(s, up, gate, gate, n_ff);   // INJECTION: SILU on UP instead of GATE'
     want="FAIL  shared_expert entry" ;;
-  fused-gr-supported-true)
-    # THE REACHABILITY DEFECT'S falsification: the backend must report the fused read UNSUPPORTED (it has no
-    # fused_gr shader), which keeps the ported `gr_read` on the path.  Answering the CUDA geometry rule TRUE
-    # re-selects the unported `fused_gr_read` (a HOLE under the shipped `--native` launch) and must FAIL.
+  fused-gr-supported-false)
+    # THE CAPABILITY'S OWN falsification, in the same form as the other `native-caps-*-false` injections.  This
+    # batch WIRES the fused hyper-connection read (`fused_gr_vk.cpp`, four shaders) and the backend's answer must
+    # BE the engine's geometry predicate (fused_gr.cu:1164-1166).  The lie the invariant must catch now is the
+    # answer going FALSE while the kernels exist - which is exactly the state that made `verify.cpp:336`'s first
+    # disjunct refuse a native pack's only decode path.  (The pre-batch injection that answered the rule TRUE
+    # while the kernels were MISSING was the lie THEN; it is the truth NOW and is retired here.)
     file="$TREE/vulkan/src/kernels/ple_vk.cpp"
-    old=$'    return false;   // no fused_gr shader in this tree: the backend reports what it implements'
-    new=$'    return n_embd == 2560 && hc == 4 && hc_lr == 320;   // INJECTION: the fused read claimed supported (a HOLE)'
+    old=$'    return n_embd == 2560 && hc == 4 && hc_lr == 320;'
+    new=$'    (void) n_embd; (void) hc; (void) hc_lr; return false;   // INJECTION: the fused kernels exist but the capability answers FALSE'
     want="FAIL  fused_gr_supported entry" ;;
+  fused-gr-rs-drop-fold)
+    # `fused_gr_rs` folds the previous half's write into R'.  Dropping the fold (ap forced false) makes the read
+    # a plain normalise - and also stops `R_out` being written.  The case's rule arm uses an apply==true token,
+    # whose R' differs from R by ~gw*bo, so every output moves.
+    file="$SH/fused_gr_rs.comp"; spv="fused_gr_rs"
+    old=$'    const bool ap = pc.apply != 0;'
+    new=$'    const bool ap = false;   // INJECTION: the fold dropped'
+    want="FAIL  fused_gr_read entry: wrapper vs the engine's own rule" ;;
+  fused-gr-mix-sum-not-mean)
+    # The fused gate+mean's last step is the MEAN over the streams.  Dropping the `/ hc` leaves a SUM - a factor
+    # of hc that reads as a scale problem.  The case host-checks that the sum reading moves `mixed`.
+    file="$SH/fused_gr_mix.comp"; spv="fused_gr_mix"
+    old=$'    mx.v[d] = sum / float(pc.hc);              // the MEAN, not the sum'
+    new=$'    mx.v[d] = sum;   // INJECTION: the /hc dropped - a SUM over the streams'
+    want="FAIL  fused_gr_read entry: wrapper vs the engine's own rule" ;;
+  fused-gr-down-swap-halves)
+    # The port reads each BF16 weight row as 32-bit PAIRS: element 2p in the LOW half, 2p+1 in the HIGH half.
+    # Swapping them is the plausible slip and is O(1) on independent random weights.
+    file="$SH/fused_gr_down.comp"; spv="fused_gr_down"
+    old=$'        acc += (rf.v[i0] * wn.v[i0] * rsb.v[c0]) * bf16_to_f32(packed & 0xFFFFu);\n        acc += (rf.v[i1] * wn.v[i1] * rsb.v[c0]) * bf16_to_f32(packed >> 16u);'
+    new=$'        acc += (rf.v[i0] * wn.v[i0] * rsb.v[c0]) * bf16_to_f32(packed >> 16u);   // INJECTION: pair halves swapped\n        acc += (rf.v[i1] * wn.v[i1] * rsb.v[c0]) * bf16_to_f32(packed & 0xFFFFu);'
+    want="FAIL  fused_gr_read entry: wrapper vs the engine's own rule" ;;
+  fused-gr-inject-drop-rs)
+    # The inject dot reads the SAME activation the up projection does: `R' * w_norm * rs`.  Dropping the `rs[c]`
+    # factor reads the un-normalised residual - a pure scale error, invisible to any shape check.
+    file="$SH/fused_gr_inject.comp"; spv="fused_gr_inject"
+    old=$'        acc += (rf.v[i0] * wn.v[i0] * rsb.v[cc]) * bf16_to_f32(packed & 0xFFFFu);\n        acc += (rf.v[i1] * wn.v[i1] * rsb.v[cc]) * bf16_to_f32(packed >> 16u);'
+    new=$'        acc += (rf.v[i0] * wn.v[i0]) * bf16_to_f32(packed & 0xFFFFu);   // INJECTION: rs dropped\n        acc += (rf.v[i1] * wn.v[i1]) * bf16_to_f32(packed >> 16u);'
+    want="FAIL  fused_gr_read entry: wrapper vs the engine's own rule" ;;
+  fused-gr-multi-token0-args)
+    # `fused_gr_read_multi` iterates the window's tokens, each with ITS OWN R/bo/inj and its own outputs.  Reading
+    # token 0's arguments for every token is exactly the bug a shared-weight kernel invites - and the case's
+    # three-token bitwise arm (token 2 has different weights than token 0's apply/inj) must catch it.
+    file="$TREE/vulkan/src/kernels/fused_gr_vk.cpp"
+    old=$'    for (int t = 0; t < n_tok; ++t) strata::vulkan::fused_gr_read_one(*s, a[t]);'
+    new=$'    for (int t = 0; t < n_tok; ++t) strata::vulkan::fused_gr_read_one(*s, a[0]);   // INJECTION: every token reads token 0 args'
+    want="FAIL  fused_gr_read_multi entry: 3 tokens == 3 x fused_gr_read, BITWISE" ;;
   fused-gr-check-records-staged)
     # `fused_gr_check` is the hyper-connection read's CARD CHARACTERISATION (no tensors).  On this backend the
     # ported plain read is what runs (`fused_gr_supported()` false), so the honest recorded variant is the plain
