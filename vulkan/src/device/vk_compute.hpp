@@ -272,6 +272,13 @@ public:
     // on the AMD iGPU (it lands in the system heap), and either way it refuses rather than over-commits - which
     // is the whole point of the display contract.
     Buf alloc_device(uint64_t bytes);
+    // A HOST allocation: what `cudaHostAlloc`/`cudaMallocHost` hands out.  HOST_VISIBLE | HOST_COHERENT and,
+    // where the device has one, a type whose HEAP is NOT device-local - i.e. SYSTEM RAM.  The old rule reused
+    // `alloc()`'s DEVICE_LOCAL-preferred type, so a "host" buffer came out of VRAM (the Arc's BAR-mapped type):
+    // the engine's PCIe probe then timed a BAR READ of VRAM (0.06 GB/s) instead of a link transfer (1.8 GB/s
+    // from system RAM), and every host-tier allocation silently spent device memory.  Falls back to `alloc()`'s
+    // type only where no non-local host type exists (llvmpipe: one heap, device-local and mappable).
+    Buf alloc_host(uint64_t bytes);
     // A TRANSFER buffer: host-visible and coherent, so it can be mapped, memcpy'd and copied from.  NOT model
     // memory, so it is charged to the host account (unless, as above, the device has nowhere else to put it).
     Buf alloc_staging(uint64_t bytes);
@@ -408,6 +415,10 @@ private:
     uint32_t vram_type_ = UINT32_MAX;
     bool vram_unmappable_ = false;   // the chosen VRAM type has NO mapping: cheap to know here, invisible later
     uint32_t staging_type_ = UINT32_MAX;
+    // The HOST allocation type: HOST_VISIBLE | HOST_COHERENT in a heap that is NOT device-local where the device
+    // offers one (system RAM), else `mem_type_` (llvmpipe).  Used by `alloc_host`/`cudaHostAlloc` only - kernel
+    // scratch and the engine arena keep `alloc`/`alloc_device`, so this cannot move a device-side binding.
+    uint32_t host_type_ = UINT32_MAX;
     std::vector<MemTypeInfo> mem_types_;
     uint64_t allocated_device_local_ = 0;   // the VRAM account (see the account rule in the public block)
     uint64_t allocated_host_ = 0;           // the host account: staging/transfer allocations

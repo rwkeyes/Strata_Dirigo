@@ -1,5 +1,102 @@
 # Start here next session
 
+## THE HOST-ALLOCATION TYPE IS FIXED AND THE ALL-RESIDENT FIT NOW CLOSES: the window reaches its ALL-RESIDENT ARM and stops at ONE unported symbol, `resident_plan` (2026-10-06, `vega`)
+
+**THE STOP MOVED OFF `native_quant_act` AND IS NOW ONE SYMBOL FROM THE LAUNCH.**  With the fit closed the missed
+experts are GONE, so `kd = 0` for every entry, `any_cpu` is false, and the engine never asks for the CPU verb.  The
+run now prints, in order (`/tmp/tok_run2.log`, `/tmp/ar28365_mmap.log`):
+
+```
+strata generate: pre-filled 12288 of 12288 slots from the profile; slot 0 verified
+strata generate: token graph hit path: 12288 resident experts, decided on the device
+strata generate: prefill 1 tokens in 1 chunks, 1064.2 ms (0.9 tok/s); experts streamed 0 (0 by DMA, host 0.0 ms), resident 480; PLE 6.3 ms
+strata verify: window up to 6 tokens, 74.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata::kernels::resident_plan: NOT PORTED on the Vulkan backend - REFUSING.
+```
+
+**`resident_plan` (`verify.cpp:938`, the `if (all_resident_)` branch) IS THE NEXT AND LAST INCREMENT.**  12288 =
+48 layers x 256 experts, so `--expert-cache 12288` is EVERY expert; the refusal text that said `all_resident_` is
+unreachable "against a few-thousand-slot `--expert-cache`" was TRUE of every config anyone had run and FALSE of the
+code - corrected this batch (`refusals_vk.cpp`), and the row joins the REACHED list.  The CUDA is a ONE-BLOCK,
+128-thread plan build (`verify_kernels.cu:507-594`, `kResidentPlanMax = 128`): per entry, look up `res[eid]` -> slot
+(slot < 0 sets a bad flag and returns with `*skip = 0`), find each expert's first occurrence and its rank, then write
+the host pool's layout (`counts | start | dst | tok | pad | ptr | ptr2 | start2`, the `ptr_off` alignment from
+`:559`).  The all-resident call passes `skip = nullptr, ring = 0`; `ptr[grp] = cache_base + slot_off[slot]` is a
+DEVICE ADDRESS, which is where a careless port mis-binds (a shader writing a raw host address into the group-pointer
+table yields a silently wrong expert - the worst class here).  Port it device-side and gate it against a host
+transcription of the loops with a rival that MOVES and a vacuity arm, per the port's rules.
+
+**DELIVERABLE A - THE HOST-ALLOCATION TYPE FIX IS SHIPPED AND PROVEN FROM BOTH ENDS.**  `cudaHostAlloc` now hands
+out a HOST_VISIBLE | HOST_COHERENT type in a heap that is NOT DEVICE_LOCAL (`Ctx::alloc_host`, `vk_compute.cpp`;
+`alloc_host` charges it to the HOST account - "charged where it lands"), falling back to `Ctx::alloc`'s
+DEVICE_LOCAL-preferred type only where no such type exists (llvmpipe).  The choice stays observable:
+`STRATA_VK_MEM_TRACE=1` now prints `arena/vram type 0 | cudaHostAlloc type 2 (heap 1: system RAM (fixed)) | alloc()
+type 3 | staging type 2`, and each allocation prints its size and heap (`vk_host: cudaHostAlloc ... MiB -> type 2`).
+* THE PROBE MOVED, MEASURED AGAINST THE INDEPENDENT ORACLE `ports/vulkan/tools/probe_mem.cpp` (256 MiB, Arc Pro
+  B70, ONE run so the machine is held fixed): `cpu_read` of the old block `4574.7 ms -> 0.06 GB/s`;
+  `h2d_from_alloc()` (the OLD type, same run) `4833.0 ms -> 0.06 GB/s`; `h2d_from_alloc_host()` (the NEW type)
+  `160.6 ms -> **1.67 GB/s**`; from a plain system-RAM source `157.4 ms -> 1.71 GB/s`.  BEFORE (previous batch):
+  `h2d_from_mapped 4537.9 ms -> 0.06 GB/s` vs `h2d_from_sysram 137.9 ms -> 1.95 GB/s`.  The engine's OWN probe
+  agrees: `PCIe probe: 0.1 GB/s -> pcie_frac 0.00` becomes `PCIe probe: 1.9 GB/s host->device (best of 1.8 1.9 1.9
+  1.9) -> pcie_frac 0.05`.  **`pcie_frac 0.00` was a wrong decision input; that defect is closed with a number on
+  both sides.**
+* DEVICE MEMORY FREED - the host tier's own footprint, summed from the trace on a real run: `256.000 MiB` (the PCIe
+  probe's `cudaMallocHost`) + `322.070 MiB` (the token embedding) + `8` + `16` MiB + a few sub-MiB = **~602 MiB
+  (0.588 GiB)** that used to sit in the device-local heap.  (It does NOT widen the arena - see B.)  WHAT CHANGED FOR
+  EACH MAPPED-REGION CONSUMER: `copy_from_mapped`, `copy_rows_from_mapped`, `copy_indexed`, `iq_embed_rows`, the
+  doorbell/mapped handshake word, `sample_tokens`' mapped `out`, and the verify seam all read the SAME host pointer
+  they did; only its backing heap changed (VRAM->system RAM), and every gate mapped-region case stays green.  No
+  consumer needed device-local host memory, so there is no per-consumer exception to name.
+
+**DELIVERABLE B - THE ALL-RESIDENT FIT CLOSES, BUT NOT VIA THE TYPE FIX (that was the wrong expectation, corrected).**
+The type fix does NOT widen the arena: the arena is the FIRST device allocation (`ensure_device` -> `stream_open` ->
+`alloc_device`, `cuda_runtime.cpp:84`) and the host tier is allocated AFTER it (`vk_host: cudaHostAlloc 256.000 MiB`
+is the NEXT line in the log), so the 0.588 GiB freed is not present at arena-sizing time - the run at `arena 27 GiB`
+is exhausted at the IDENTICAL offset as before (`wanted 25146163200 at offset 4510555648`).  What closes it is the
+ARENA SIZE, and the whole-GiB knob `STRATA_VK_ARENA_GIB` cannot express it, so this batch added a sub-GiB form:
+`STRATA_VK_ARENA_MIB` (integer MiB) and a fractional `STRATA_VK_ARENA_GIB` (`cuda_runtime.cpp`).  THE NUMBERS:
+* usable ceiling is `28,593 MiB` (driver free 28.42 GiB - the 512 MiB desktop reserve FLOOR; the reserve is already
+  at its floor, so there is nothing to give there).
+* the layout needs `29,757,609,216` bytes at the prompt-path buffers = `28,379.07 MiB`; `28,365 MiB` is short by
+  `14.07 MiB`.  At `28,500 MiB` the run gets FURTHER and the need reads `29,915,815,168` = `28,530.24 MiB` (the
+  74.0 MiB verify window), short by `31.4 MiB`.  **The need TRACKS the arena and CLAMPS rather than diverging** -
+  record the `(wanted, offset)` pairs and do not read the two as one scaling region; they are successive
+  allocations, and `28,560 MiB` (`29,947,330,560` bytes) FITS, with all 12288 experts resident.
+* the LAYOUT, not the pointer scheme: `28,560 MiB` of the `28,593 MiB` ceiling, no region-ID extension, no second
+  buffer, no mis-bind risk.  The region-ID route is NOT live.
+
+**DELIVERABLE B2 - THE HOST SIDE WAS THE SECOND BLOCKER, AND `--mmap-experts` IS THE FIX (measured, not assumed).**
+The config keeps the expert bytes on the host AND fills the arena, and the host copy is ANONYMOUS: the log's
+`MAP_HUGETLB unavailable (needed 11992 2 MiB pages)` names a 23.42 GiB anon expert arena.  Two runs died to it, and
+`dmesg -T` names both: a `Memory cgroup out of memory` (`constraint=CONSTRAINT_MEMCG`, the `memguard 40G` scope)
+killing `strata_vulkan` at `anon-rss 41.86 GB`, and a `global_oom` (`constraint=CONSTRAINT_NONE`) at `anon-rss
+40.5 GB` with swap at 15 GB.  `--mmap-experts` (the engine's own flag, NO port change) turns the anon copy into
+file-backed pages: `RssAnon=19,130,000 kB -> 614,920 kB` with `RssFile=6,689,916 kB`, and the box goes from
+`avail=1,647 MB` to `avail=42,316 MB`.  Two more wins fall out: the PREFILL is `947.5 / 1064.2 ms` with
+`experts streamed 0` (was ~22,500 ms with 375 streamed - ~24x, zero streaming), and the window reports
+`100% VRAM resident: zero-doorbell graph`, so the handshake seam and the doorbell machinery are BYPASSED, not used.
+
+**A CONSEQUENCE OF THE FIXED PROBE, STATED BECAUSE IT CHANGES WHICH ROUTE IS LIVE:** at `pcie_frac 0.05` the engine
+stages `m = (nmiss * 13) >> 8`, i.e. ~5% of the missed experts, leaving ~95% to the CPU path this port forbids.  So
+a PARTIAL-residency run still reaches `native_quant_act`; the ALL-RESIDENT configuration is the ONLY route that
+avoids the CPU path entirely, which is why the host-RAM question was worth solving rather than sidestepping.
+
+**THE radeon `fused_gr_read_multi` ARM IS SETTLED - IT DID NOT REPRODUCE, SO IT IS THE INTERMITTENT AT A LARGER
+COUNT, NOT A REPLAY DEFECT.**  The previous batch's `1367/2880` read `0/2880` (PASS) on radeon in this batch's gate
+(`/tmp/gate_b13.log`), and radeon failed three DIFFERENT cases instead (`budget: independent requery` `0/1`,
+`fused_gdn_ab entry` `95/96`, `bf16_gemv_fp32_mmvf_cols entry` `2492/2496`).  A deterministic replay defect fails
+the SAME case at the SAME count; a failing SET that MOVES run to run is the platform intermittent's signature.  No
+arm of its own; the note exists so the next reader does not re-hunt it.  **DESCRIPTOR POOLS: the ALL-RESIDENT window
+creates exactly ONE extra pool (`descriptor pool 2 created`) - the `2..93` seen before belong to the
+`--expert-cache 2048` config, whose doorbell/fetch machinery this arm bypasses; that `2..93` stays OPEN.**
+
+**MAP / ENGINE BAR / GATE:** `168 = 96 kernel + 0 shader + 47 host + 0 todo + 25 refused` (145 shaders built; no row
+moved this batch - `resident_plan` stays `todo`); `check_port_map.py` passes, `make_port_map.py` byte-identical.
+Engine bar **0 undefined, BY CONSTRUCTION**.  Gate (vega, `/tmp/gate_b13.log`): **intel_icd 869/0/0** (the port's
+green), lvp `853/0/5`, radeon `857/3/2`; `run_gate.sh` exits 1 because of the radeon arm (documented).
+
+# Start here next session
+
 ## THE MISSED EXPERTS CANNOT BE MADE GPU WORK ON THIS PORT: REGISTRATION (the pinned host tier) is the BINDING condition, and the PCIe probe is a WRONG DECISION INPUT (2026-10-06, `vega`)
 
 **THE STOP IS UNCHANGED AND IS NOW NAMED: the LAUNCH stops at `native_quant_act` (`expert_source.cpp:2147`), exit 2.**

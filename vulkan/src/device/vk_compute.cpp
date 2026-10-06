@@ -440,6 +440,26 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     }
     if (staging_type_ == UINT32_MAX) staging_type_ = mem_type_;
 
+    // HOST ALLOCATIONS (`cudaHostAlloc`/`cudaMallocHost`): host-visible and coherent, and - the defect this
+    // selection fixes - in a heap that is NOT device-local, i.e. SYSTEM RAM, wherever the device offers one.
+    // The old rule reused `mem_type_`, which PREFERS a DEVICE_LOCAL host-visible type; on the Arc that is the
+    // BAR-mapped VRAM type (heap 0), so a "host" buffer came out of VRAM.  Two consequences, both measured:
+    // the engine's PCIe probe (`probe_pcie_h2d_gbps`) times an H2D copy whose SOURCE is a `cudaMallocHost`
+    // block, so it timed a BAR read of VRAM (~0.06 GB/s) instead of a link transfer (~1.8 GB/s from system RAM)
+    // and produced `pcie_frac 0.00` - a WRONG decision input where the engine's own default (0.55) is right; and
+    // every host-tier allocation silently consumed device memory.  The selection mirrors `staging_type_` and
+    // FALLS BACK to `mem_type_` only where no non-device-local host type exists (llvmpipe: one heap, device-local
+    // and mappable), so nothing that used to work is left without a type.
+    for (int pass = 0; pass < 2 && host_type_ == UINT32_MAX; ++pass) {
+        for (const MemTypeInfo& t : mem_types_) {
+            if (!t.host_visible || !t.host_coherent) continue;
+            if (pass == 0 && t.heap_device_local) continue;
+            host_type_ = t.index;
+            break;
+        }
+    }
+    if (host_type_ == UINT32_MAX) host_type_ = mem_type_;
+
     // WHICH TYPE WENT WHERE, OBSERVABLE (STRATA_VK_MEM_TRACE=1).  This is the guard for the "a setting that
     // silently does nothing" class: the three chosen types decide whether a `cudaHostAlloc` block is system RAM
     // or VRAM behind the BAR, and that choice is not visible anywhere else.  A probe that times a copy out of a
@@ -456,9 +476,13 @@ Ctx::Ctx(int want_device, bool need_16bit) {
                              (double) t.heap_bytes / 1073741824.0, (int) t.device_local, (int) t.host_visible,
                              (int) t.host_coherent, (int) t.host_cached);
             std::fprintf(stderr,
-                         "vk_mem: arena/vram type %u | cudaHostAlloc type %u%s | staging type %u%s\n", vram_type_,
-                         mem_type_, mem_type_ == vram_type_ ? "" : " (HOST_VISIBLE, DEVICE_LOCAL preferred)",
-                         staging_type_, staging_type_ == mem_type_ ? " (no non-local host type: staging == host)" : "");
+                         "vk_mem: arena/vram type %u | cudaHostAlloc type %u (heap %u: %s) | alloc() type %u | "
+                         "staging type %u\n",
+                         vram_type_, host_type_, mem_types_[host_type_].heap,
+                         mem_types_[host_type_].heap_device_local
+                             ? "DEVICE_LOCAL - a host buffer from VRAM (the defect)"
+                             : "system RAM (fixed)",
+                         mem_type_, staging_type_);
         }
     }
 
@@ -688,6 +712,18 @@ Buf Ctx::alloc_impl(uint64_t bytes, uint32_t type_index, bool vram_account, cons
 Buf Ctx::alloc(uint64_t bytes) {
     // The gate's path, and the engine arena's: charged to the VRAM account whatever heap the driver puts it in.
     return alloc_impl(bytes, mem_type_, /*vram_account=*/true, "buffer");
+}
+
+Buf Ctx::alloc_host(uint64_t bytes) {
+    // `cudaHostAlloc`/`cudaMallocHost`: HOST_VISIBLE | HOST_COHERENT in the NON-device-local host type where the
+    // device has one, and charged to the HOST account when it lands there - the account rule, "charged where it
+    // lands", the same one `alloc_staging` follows.  Where the only mappable heap is device-local (llvmpipe) it
+    // falls back to `mem_type_` and is charged to VRAM, which is the truth about that device rather than a
+    // policy.  The two effects of the old type (a BAR-timed PCIe probe, and host tiers spending device memory)
+    // are both consequences of landing in VRAM; this is the one decision that moves them.
+    const uint32_t type = host_type_ == UINT32_MAX ? mem_type_ : host_type_;
+    const bool vram = type >= mem_types_.size() || mem_types_[type].heap_device_local;
+    return alloc_impl(bytes, type, vram, "host buffer");
 }
 
 Buf Ctx::alloc_device(uint64_t bytes) {

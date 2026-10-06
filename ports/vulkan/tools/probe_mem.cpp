@@ -33,22 +33,31 @@ int main() {
     if (s == nullptr) { std::fprintf(stderr, "probe_mem: no stream\n"); return 2; }
     const size_t N = 256ull << 20;
 
-    Buf hostb = s->ctx->alloc(N);          // the port's "host" type: host-visible, DEVICE_LOCAL preferred
+    Buf hostb = s->ctx->alloc(N);          // alloc()'s type: DEVICE_LOCAL preferred (the OLD cudaHostAlloc type)
+    Buf hostb2 = s->ctx->alloc_host(N);    // the NEW cudaHostAlloc path: NON-device-local host type (system RAM)
     Buf dev = s->ctx->alloc_device(N);     // VRAM (the arena type)
-    std::fprintf(stderr, "probe_mem: hostbuf.mapped=%p devbuf.mapped=%p\n", hostb.mapped, dev.mapped);
+    std::fprintf(stderr, "probe_mem: hostbuf.mapped=%p hostbuf2.mapped=%p devbuf.mapped=%p\n", hostb.mapped,
+                 hostb2.mapped, dev.mapped);
+    std::fprintf(stderr, "probe_mem: alloc() type %u (device_local=%d) | alloc_host() type %u (device_local=%d)\n",
+                 hostb.mem_type, (int) hostb.device_local, hostb2.mem_type, (int) hostb2.device_local);
     if (hostb.mapped == nullptr) { std::fprintf(stderr, "probe_mem: host alloc has no mapping\n"); return 2; }
+    if (hostb2.mapped == nullptr) { std::fprintf(stderr, "probe_mem: host alloc (fixed type) has no mapping\n"); return 2; }
 
     std::memset(hostb.mapped, 0x5a, N);    // fault the pages in, as the engine's probe does
+    std::memset(hostb2.mapped, 0x5a, N);
     s->ctx->write(dev, hostb.mapped, N);   // warmup: the engine's probe warms once too
+    s->ctx->write(dev, hostb2.mapped, N);
 
-    // (a) CPU WRITE into the mapped "host" block
+    // (a) CPU WRITE into the mapped OLD \"host\" block
     const double ms_w = ms_of([&] { std::memset(hostb.mapped, 0x3c, N); });
-    // (b) CPU READ of the mapped "host" block (one byte per cache line: line-fetch bandwidth)
+    // (b) CPU READ of the mapped OLD \"host\" block (one byte per cache line: line-fetch bandwidth)
     volatile unsigned long long acc = 0;
     unsigned char* p = (unsigned char*) hostb.mapped;
     const double ms_r = ms_of([&] { unsigned long long a = 0; for (size_t i = 0; i < N; i += 64) a += p[i]; acc = a; });
-    // (c) THE PROBE'S OWN OPERATION: host->device copy whose source is the mapped "host" block
+    // (c) THE PROBE'S OWN OPERATION with the OLD (alloc()) source
     const double ms_c = ms_of([&] { s->ctx->write(dev, hostb.mapped, N); });
+    // (c2) THE PROBE'S OWN OPERATION with the NEW cudaHostAlloc source (system RAM)
+    const double ms_c2 = ms_of([&] { s->ctx->write(dev, hostb2.mapped, N); });
     // (d) the same copy with a plain SYSTEM-RAM source
     void* sys = std::malloc(N);
     std::memset(sys, 0x11, N);
@@ -57,7 +66,9 @@ int main() {
 
     std::fprintf(stderr,
                  "probe_mem: 256 MiB | cpu_write_mapped=%.1f ms (%.2f GB/s) | cpu_read_mapped=%.1f ms (%.2f GB/s) | "
-                 "h2d_from_mapped=%.1f ms (%.2f GB/s) | h2d_from_sysram=%.1f ms (%.2f GB/s) | readacc=%llu\n",
-                 ms_w, gbps(N, ms_w), ms_r, gbps(N, ms_r), ms_c, gbps(N, ms_c), ms_s, gbps(N, ms_s), acc);
+                 "h2d_from_alloc()=%.1f ms (%.2f GB/s) | h2d_from_alloc_host()=%.1f ms (%.2f GB/s) | "
+                 "h2d_from_sysram=%.1f ms (%.2f GB/s) | readacc=%llu\n",
+                 ms_w, gbps(N, ms_w), ms_r, gbps(N, ms_r), ms_c, gbps(N, ms_c), ms_c2, gbps(N, ms_c2), ms_s,
+                 gbps(N, ms_s), acc);
     return 0;
 }

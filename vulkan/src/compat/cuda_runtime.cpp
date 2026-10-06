@@ -75,17 +75,34 @@ Stream* current_or(Stream* s) {
 // kernel wrapper: no dispatch, no capture node, no shader.
 Stream* ensure_device() {
     if (g_current != nullptr) return g_current;
-    const char* gib = std::getenv("STRATA_VK_ARENA_GIB");
-    if (gib == nullptr || *gib == '\0') return nullptr;      // not asked to bring the device up
-    const long v = std::strtol(gib, nullptr, 10);
-    if (v <= 0) return nullptr;
+    // THE ARENA SIZE, AND WHY IT HAS A SUB-GiB FORM.  Whole-GiB steps cannot express the all-resident fit on
+    // this box: the layout needs 29,656,718,848 bytes (27.62 GiB) and the reserve-bounded usable is 27.92 GiB
+    // (28,593 MiB), so 27 GiB is 635 MiB short and 28 GiB is 79 MiB over.  `STRATA_VK_ARENA_MIB` (integer MiB)
+    // and a fractional `STRATA_VK_ARENA_GIB` ("27.7") both exist for that gap; without them the only lever left
+    // is the desktop reserve, which is already at its 512 MiB floor.
+    uint64_t arena_bytes = 0;
+    const char* mib = std::getenv("STRATA_VK_ARENA_MIB");
+    if (mib != nullptr && *mib != '\0') {
+        const double m = std::strtod(mib, nullptr);
+        if (m > 0.0) arena_bytes = (uint64_t) (m * 1048576.0);
+    }
+    if (arena_bytes == 0) {
+        const char* gib = std::getenv("STRATA_VK_ARENA_GIB");
+        if (gib == nullptr || *gib == '\0') return nullptr;   // not asked to bring the device up
+        const double g = std::strtod(gib, nullptr);           // fractional GiB accepted ("27.7")
+        if (!(g > 0.0)) return nullptr;
+        arena_bytes = (uint64_t) (g * 1073741824.0);
+    }
+    if (arena_bytes == 0) return nullptr;
     const char* dir = std::getenv("STRATA_VK_SPV_DIR");
     const std::string spv = (dir != nullptr && *dir != '\0') ? dir : "ports/vulkan/shaders";
-    Stream* s = strata::vulkan::stream_open((uint64_t) v << 30, spv);
+    Stream* s = strata::vulkan::stream_open(arena_bytes, spv);
     if (s == nullptr) return nullptr;
     g_current = s;
-    std::fprintf(stderr, "strata vulkan shim: device up, one arena of %ld GiB (STRATA_VK_ARENA_GIB; every "
-                         "cudaMalloc/cudaHostAlloc carves from it)\n", v);
+    std::fprintf(stderr, "strata vulkan shim: device up, one arena of %.3f GiB (%llu bytes; "
+                         "STRATA_VK_ARENA_MIB/STRATA_VK_ARENA_GIB - every cudaMalloc/cudaHostAlloc carves "
+                         "from it)\n",
+                 (double) arena_bytes / 1073741824.0, (unsigned long long) arena_bytes);
     return s;
 }
 
@@ -297,9 +314,19 @@ cudaError_t cudaHostAlloc(void** hostPtr, size_t count, unsigned int flags) {
     Stream* s = current_or(nullptr);
     if (s == nullptr) s = ensure_device();     // a stream-less engine allocation (STRATA_VK_ARENA_GIB)
     if (s == nullptr || s->ctx == nullptr) return fail(cudaErrorInvalidValue);
-    Buf b = s->ctx->alloc(count == 0 ? 1 : count);      // HOST_VISIBLE | HOST_COHERENT (Ctx::alloc's type)
+    Buf b = s->ctx->alloc_host(count == 0 ? 1 : count);   // HOST_VISIBLE | HOST_COHERENT, SYSTEM RAM where offered
     if (b.mapped == nullptr)
         return fail(cudaErrorMemoryAllocation);         // the device offered no mappable type: refuse
+    // THE HOST TIER'S FOOTPRINT, MEASURED.  `cudaHostAlloc` used to hand out a DEVICE_LOCAL (BAR VRAM) block and
+    // spend device memory on it; with STRATA_VK_MEM_TRACE=1 each allocation prints its size and its heap, so the
+    // freed device memory is a SUM rather than a claim, and the type trace alone cannot be mistaken for it.
+    {
+        const char* mt = std::getenv("STRATA_VK_MEM_TRACE");
+        if (mt != nullptr && *mt != '\0')
+            std::fprintf(stderr, "vk_host: cudaHostAlloc %.3f MiB -> type %u (heap %u, device_local=%d)\n",
+                         (double) b.bytes / 1048576.0, b.mem_type, s->ctx->type_of(b).heap,
+                         (int) b.device_local);
+    }
     HostRegion r;
     r.host = b.mapped;
     r.bytes = count;

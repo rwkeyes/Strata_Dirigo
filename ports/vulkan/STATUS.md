@@ -1,5 +1,52 @@
 # Status — what is done, what is verified, what is not
 
+## THE TYPE FIX IS SHIPPED AND THE ALL-RESIDENT FIT CLOSES; the window reaches its ALL-RESIDENT ARM and stops at `resident_plan` (2026-10-06, `vega`)
+
+**WHAT IS DONE.**  (1) `cudaHostAlloc` no longer hands out DEVICE_LOCAL (BAR VRAM) memory: a new `Ctx::alloc_host`
+(`vulkan/src/device/vk_compute.{hpp,cpp}`) selects a HOST_VISIBLE | HOST_COHERENT type in a NON-device-local heap
+(system RAM), falls back to the old type only where no such type exists, and charges it to the HOST account; the
+choice stays observable via `STRATA_VK_MEM_TRACE=1`, which now also prints each allocation's size and heap.
+(2) `STRATA_VK_ARENA_MIB` (+ a fractional `STRATA_VK_ARENA_GIB`) is added (`vulkan/src/compat/cuda_runtime.cpp`)
+because the all-resident fit (28,379.07 MiB, then 28,530.24 MiB) cannot be expressed in whole GiB between the 27 GiB
+step and the 28,593 MiB reserve-bounded ceiling.  (3) The stale refusal text/comment for `resident_plan` is
+corrected - `all_resident_` IS reached with `--expert-cache 12288`.
+
+**WHAT IS VERIFIED.**  Gate (vega, `/tmp/gate_b13.log`, this commit): **intel_icd == 869 passed, 0 failed, 0 skipped**
+(the port's green), lvp `853/0/5`, radeon `857/3/2`; `run_gate.sh` exits 1 BECAUSE of the radeon arm (documented -
+the Arc read is the port's green).  The three radeon failures are `budget: independent requery` `0/1`,
+`fused_gdn_ab entry` `95/96`, `bf16_gemv_fp32_mmvf_cols entry` `2492/2496` - the documented platform intermittent
+family, and the set MOVES run to run.  `check_port_map.py` passes; `make_port_map.py` regenerates byte-identically.
+Map unchanged: `168 = 96 kernel + 0 shader + 47 host + 0 todo + 25 refused`.  Engine bar 0, by construction.  THE
+PROBE, both ends: the independent oracle `probe_mem` reads `h2d_from_alloc_host() 160.6 ms -> 1.67 GB/s` against the
+SAME run's `h2d_from_alloc() 4833.0 ms -> 0.06 GB/s` and `h2d_from_sysram 1.71 GB/s`; the engine's own probe reads
+`1.9 GB/s -> pcie_frac 0.05` (was `0.1 GB/s -> 0.00`).  Device memory freed: **~602 MiB (0.588 GiB)** of the
+device-local heap, the host tier's summed footprint.
+
+**DELIVERABLE D - THE radeon `1367/2880` INSTANCE IS THE INTERMITTENT, SETTLED BY NON-REPRODUCTION.**  The previous
+batch's `fused_gr_read_multi entry: a recorded block REPLAYS bitwise equal to direct execution` `1367/2880` did NOT
+reproduce: on THIS gate run the case read `0/2880` (`PASS`) on radeon, and radeon failed three DIFFERENT cases
+instead.  A deterministic replay defect would fail the SAME case at the SAME count; the failing SET moving between
+runs is the platform-level intermittent's signature (it already moves between `bf16_gemv_fp32_mmvf_cols`,
+`bf16_gemv_fp32_mmvf_multi`, `cvec_apply`, `fused_gr_read`, `budget: independent requery`).  So the ~half-the-words
+magnitude is the same intermittent at a larger count, NOT a new replay defect, and the case needs no arm of its own
+beyond this.  **DESCRIPTOR POOLS - NOW A NUMBER, AND IT DEPENDS ON THE ARM:** the ALL-RESIDENT window creates exactly
+ONE extra pool (`descriptor pool 2 created`); the earlier `pools 2..93` were the `--expert-cache 2048` (non-
+all-resident) config, whose doorbell/fetch machinery the all-resident arm BYPASSES (`zero-doorbell graph`).  The
+`2..93` count for THAT config stays OPEN as recorded.
+
+**WHAT IS NOT.**  A TOKEN - **one unported symbol short.**  The all-resident arm now runs: `12288 of 12288 slots`,
+`token graph hit path: 12288 resident experts`, `prefill ... 947.5 / 1064.2 ms ... experts streamed 0`,
+`100% VRAM resident: zero-doorbell graph`, then `resident_plan` REFUSES.  The host-side blocker (a 23.42 GiB anon
+expert arena + the 27.7 GiB VRAM arena = two OOM kills, `anon-rss 41.86 GB` under `memguard 40G` and `40.5 GB`
+global) is solved with the engine's own `--mmap-experts` (anon 18.2 GiB -> 0.6 GiB, file-backed).  The type fix did
+NOT widen the arena (the arena is allocated before the host tier) - the ARENA SIZE did, and 28,560 MiB of the
+28,593 MiB ceiling fits.  At `pcie_frac 0.05` a partial-residency run still sends ~95% of missed experts to the CPU
+path the port forbids, so all-resident remains the only CPU-free route.  The radeon `1367/2880` instance did NOT
+reproduce (see DELIVERABLE D) and is settled as the intermittent; the `2..93` pool count for the 2048-slot config
+stays OPEN.  `z820b` untouched.
+
+# Status — what is done, what is verified, what is not
+
 ## THE BINDING CONDITION IS THE PINNED HOST TIER, NOT THE SHARE OR A KERNEL — the PCIe probe is a BAR read, measured (2026-10-06, `vega`)
 
 **WHAT IS DONE.**  The stop at LAUNCH is now NAMED and its two conditions settled.  The PLAN branch IS taken

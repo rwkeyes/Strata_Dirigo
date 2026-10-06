@@ -238,10 +238,9 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t*, const int32_t*, const int32_t*
 // blanket "NOT REACHED" is gone (see the `refuse_not_ported` note above).
 //
 // GENUINELY NOT REACHED, with the deciding condition (still a loud refusal, still a hole):
-//   * `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`, `resident_plan`
-//     (`verify.cpp:1039-1063`) - all four are inside `if (device_plan_)`, and `device_plan_` needs
-//     `STRATA_VERIFY_DEVICE_PLAN` (verify.cpp:512-515).  `all_resident_` (the other branch into `resident_plan`)
-//     needs EVERY expert of ALL 48 layers resident, against an `--expert-cache` of a few thousand slots.
+//   * `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`
+//     (`verify.cpp:1039-1063`) - inside `if (device_plan_)`, and `device_plan_` needs
+//     `STRATA_VERIFY_DEVICE_PLAN` (verify.cpp:512-515).
 //   * `fetch_blobs`/`rebase_ptrs` (`verify.cpp:1053/:1054`) - inside `if (sink_.pcie_mode == 2)`, and the PCIe
 //     probe on this box reads 0.1 GB/s -> `pcie_frac 0.00`.
 //   * `gpu_stamp` (`verify.cpp:564/:565`) - guarded by `prof_on_` / `trace_m_`, i.e. `STRATA_VERIFY_PROFILE` /
@@ -253,6 +252,15 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t*, const int32_t*, const int32_t*
 //   * `wait_flag_ge` (`verify.cpp:1042/:1049/:1066`) - the `else` of `if (all_resident_)` in `post`, the FIRST
 //     symbol the window reaches once `pre` completes.  A translating spin is forbidden here (the port's
 //     no-spinning rule), so the window's next stop is this symbol; its chain string says so.
+//   * `resident_plan` (`verify.cpp:938`, the `if (all_resident_)` branch of the window's per-group plan) -
+//     REACHED ONCE THE ALL-RESIDENT FIT CLOSES, and MEASURED REACHED on `vega` 2026-10-06:
+//     `--expert-cache 12288` is EVERY expert of all 48 layers (12288 = 48 x 256), the profile fills all 12288
+//     slots, the window prints `token graph hit path: 12288 resident experts, decided on the device` and
+//     `window up to 6 tokens, 74.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)`, and this is
+//     the symbol it stops at.  THE OLD TEXT HERE SAID `all_resident_` was not reachable "against a few-thousand
+//     slot --expert-cache" - that was TRUE of the configs anyone had run and FALSE as a property of the code,
+//     which is why it is corrected rather than deleted.  **This row is the NEXT increment: the last unported
+//     symbol on the all-resident arm.**
 //   * `copy_rows_from_mapped` (`verify.cpp:1071`) - the `dec_batch` arm of the CPU-share copy, with `dec_batch`
 //     TRUE by default (`STRATA_DEC_BATCH` unset).
 //   * `copy_indexed` (`verify.cpp:1311`, the commit graph) - reached whenever the PLE stage is ready, which it
@@ -333,9 +341,14 @@ void ple_block_projected(const float*, const float*, const float*, const float*,
 void resident_plan(const int32_t*, int, int, const int32_t*, int, const uint8_t*, const unsigned long long*, long long,
                    int32_t*, long long, uint32_t*, uint32_t, void*) {
     refuse_not_ported("resident_plan",
-                      "NOT reached - the P6 verifier's all-resident / device-plan arms (verify.cpp:938/:943): "
-                      "`all_resident_` needs EVERY expert of ALL 48 layers resident against a few-thousand-slot "
-                      "`--expert-cache`, and `device_plan_` needs STRATA_VERIFY_DEVICE_PLAN");
+                      "REACHED - the P6 verify window's per-group plan on the ALL-RESIDENT arm (verify.cpp:938, "
+                      "`if (all_resident_)`), MEASURED on vega 2026-10-06 with `--expert-cache 12288` (EVERY "
+                      "expert of all 48 layers = 12288 slots, `token graph hit path: 12288 resident experts, "
+                      "decided on the device`, `100% VRAM resident: zero-doorbell graph`).  Also reached by the "
+                      "device-plan arm (`verify.cpp:943`) under STRATA_VERIFY_DEVICE_PLAN.  THE OLD TEXT SAID "
+                      "`all_resident_` needed no more than 'a few-thousand-slot --expert-cache' - the fit, not "
+                      "the arm, was what stopped it.  Unported shader: this is the LAST symbol between the "
+                      "window and the launch on this route.");
 }
 // `wait_flag_ge` is NOW DEFINED (the handshake seam) in `vulkan/src/kernels/verify_vk.cpp`: under capture it
 // records a HOST BOUNDARY that CUTS the window into segments, and the segment that follows is submitted only once
