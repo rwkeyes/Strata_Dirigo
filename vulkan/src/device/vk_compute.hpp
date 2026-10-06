@@ -315,12 +315,19 @@ public:
     void dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                   uint32_t groups, uint32_t groups_y = 1);
 
+    // Device-side completion of everything dispatched so far on this Ctx.  `dispatch()` BATCHES (see the live
+    // batch below): it returns after ENCODING, so a caller that needs the work DONE - the doorbell handoff's
+    // publish, which `sync.cpp` rests on - calls this.  `read`/`write`/transfers flush implicitly, so this is for
+    // the explicit cases, and it costs nothing when nothing is pending.
+    void flush();
+
     // ---- RECORDED STEPS: the CUDA-graph replacement (see NEXT.md's stage-3 note) ------------------------
-    // The engine's decode step is a fixed sequence of dispatches re-issued every token, and `dispatch()` above
-    // submits and waits per call, so it cannot express that.  These calls record a sequence into ONE persistent
-    // command buffer and then RE-SUBMIT it, which is what a graph was buying.  `record_dispatch` inserts a
-    // compute -> compute barrier (in a step one kernel's output is the next one's input); the host-read barrier
-    // goes once, at the end.  `replay_recorded()` must not re-record - that is the property a case has to prove.
+    // The engine's decode step is a fixed sequence of dispatches re-issued every token, and the live path's
+    // batch above is flushed at every observer, so it cannot re-issue a sequence without re-encoding it.  These
+    // calls record a sequence into ONE persistent command buffer and then RE-SUBMIT it, which is what a graph
+    // was buying.  `record_dispatch` inserts a compute -> compute barrier (in a step one kernel's output is the
+    // next one's input); the host-read barrier goes once, at the end.  `replay_recorded()` must not re-record -
+    // that is the property a case has to prove.
     void record_begin();
     void record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push, uint32_t push_bytes,
                          uint32_t groups, uint32_t groups_y = 1);
@@ -449,6 +456,29 @@ private:
     void stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offset);
     void stage_download(const Buf& src, void* dst, uint64_t bytes, uint64_t offset);
 
+    // ---- THE LIVE DISPATCH BATCH: the prompt path's submit model ----------------------------------------------
+    // Every live (non-capture) dispatch used to be its OWN command buffer, its OWN fence, its OWN submit AND its
+    // OWN wait.  Measured on the Arc Pro B70 at 249,878 of each for 233,768 dispatches, with the fence `wait`
+    // 88.7% of the dispatch layer (54,674 of 61,662 ms) - i.e. the GPU idled while the host returned from the
+    // fence, and every phase inflated together.  Now dispatches accumulate into ONE command buffer and are
+    // submitted ONCE, so the round trip is paid per BATCH, not per dispatch.  The batch is flushed before
+    // anything that must observe the device (a host read, a host write, a transfer, a capture begin, a recorded
+    // step's submit, teardown) and when it reaches `kLiveBatchMax` dispatches, which bounds the work in one
+    // submission well under the Battlemage GuC preemption timeout (the batch's own kernels are ~us each).
+    // One FRESH descriptor set per encoded dispatch is REQUIRED (execution is deferred to submit, so a shared set
+    // would leave every dispatch in the batch reading the last binding - the trap the recorded step already
+    // documents); the sets come from `live_pool_`, which is RESET at each flush so they are recycled rather than
+    // grown (the pool churn the gate prints is the recording's, not this path's).
+    static constexpr uint32_t kLiveBatchMax = 128;
+    VkCommandBuffer live_cb_ = VK_NULL_HANDLE;
+    VkFence live_fence_ = VK_NULL_HANDLE;
+    VkDescriptorPool live_pool_ = VK_NULL_HANDLE;
+    uint32_t live_n_ = 0;
+    bool live_open_ = false;
+    void flush_live();
+    void live_ensure();
+    VkDescriptorSet set_alloc_in(VkDescriptorPool pool, VkDescriptorSetLayout layout);
+
     // Shared encoding half of a dispatch: the pipes_ lookup, the descriptor update, the binds, the push constants
     // and vkCmdDispatch.  `chain_barrier` adds a compute -> compute barrier, which a recorded STEP needs between
     // its dispatches (one kernel's output is the next one's input); the single-shot path passes false and does
@@ -457,7 +487,7 @@ private:
     // dispatches run at submit time, so one shared set would leave them all reading the last binding).
     void encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push,
                          uint32_t push_bytes, uint32_t groups, uint32_t groups_y, bool chain_barrier,
-                         bool fresh_set);
+                         bool fresh_set, VkDescriptorSet forced_set);
     void submit_recorded();   // submit the recorded buffer and wait: used by the first submit AND by every replay
 
     VkCommandBuffer rec_cb_ = VK_NULL_HANDLE;

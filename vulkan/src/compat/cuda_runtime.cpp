@@ -433,9 +433,12 @@ cudaError_t cudaMemsetAsync(void* devPtr, int value, size_t count, cudaStream_t 
 
 // ---- the fence ---------------------------------------------------------------------------------------------
 cudaError_t cudaDeviceSynchronize(void) {
-    // Every Ctx::dispatch submits with a fence and WAITS it, so nothing is in flight here: a real barrier,
-    // vacuously satisfied (see the header).  It is NOT a wait for asynchronous work, because there is none -
-    // EXCEPT a segmented verify-window launch, whose remaining segments must be driven out first.
+    // The LIVE dispatch path BATCHES (Ctx::dispatch encodes; the batch is submitted and fenced lazily), so a
+    // synchronize is now a REAL completion point: it must submit the pending batch and wait on its fence.  It
+    // used to be vacuous because every dispatch was its own submit+wait - that is exactly what changed, and a
+    // host read of device output after this call (the prefill's routing ids) depends on this flush.
+    if (Stream* s0 = current_or(nullptr); s0 != nullptr && s0->ctx != nullptr) s0->ctx->flush();
+    // ...and a segmented verify-window launch, whose remaining segments must be driven out first.
     if (inflight().active) drain_inflight("cudaDeviceSynchronize");
     g_last = cudaSuccess;
     return cudaSuccess;
@@ -443,6 +446,11 @@ cudaError_t cudaDeviceSynchronize(void) {
 
 cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     if (stream != nullptr) g_current = reinterpret_cast<Stream*>(stream);
+    // THE LIVE BATCH FLUSH.  `Ctx::dispatch` returns after ENCODING, so anything the engine does AFTER a
+    // synchronize - above all a host read of a device-written buffer, like the prefill's `ids_h` - is only
+    // correct if the batch is on the device and fenced first.  (Measured failure when this was missing:
+    // `prefill: routed id out of range` at the very first grouped layer, /tmp/perf_batch2_199.log.)
+    if (Stream* s0 = current_or(nullptr); s0 != nullptr && s0->ctx != nullptr) s0->ctx->flush();
     // A segmented verify-window launch in flight is drained here: the engine calls this AFTER its host loop has
     // raised every handshake flag, so the remaining boundaries are satisfied and the segments submit back to back.
     // A boundary that is nevertheless unsatisfied is a LOUD REFUSAL inside `drain_inflight` - never a hang.

@@ -1,12 +1,13 @@
 // vulkan/src/device/sync.cpp - the handoff's implementation (see sync.hpp for the design and the reasoning;
 // this file is only the code that realises it).
 //
-// THE ONE ORDERING FACT THIS FILE RESTS ON, stated where the code is: `Ctx::dispatch` submits a one-shot
-// command buffer with a fence and `vkWaitForFences(..., UINT64_MAX)` before it returns (`vk_compute.cpp`,
-// `end_oneshot_and_wait`).  So a function that ends in `ctx.dispatch(...)` has, by the time it returns,
-// (a) the device's writes COMPLETE and (b) them ordered against any host read of coherent memory.  That is
-// the whole replacement for `__threadfence_system()` + the mapped ring, and it is why no counter is polled
-// and no kernel spins here.
+// THE ORDERING FACT THIS FILE RESTS ON, stated where the code is: the handshake's primitive (`copy_body`, below)
+// ends in `ctx.flush()`, which submits the batch's one command buffer with a fence and
+// `vkWaitForFences(..., UINT64_MAX)` before it returns.  So a function that ends in a handshake copy has, by the
+// time it returns, (a) the device's writes COMPLETE and (b) them ordered against any host read of coherent
+// memory.  That is the whole replacement for `__threadfence_system()` + the mapped ring, and it is why no counter
+// is polled and no kernel spins here.  (`Ctx::dispatch` itself BATCHES and returns after ENCODING - the explicit
+// flush in `copy_body` is what keeps THIS contract true.)
 #include "sync.hpp"
 
 #include <cstdio>
@@ -53,6 +54,11 @@ void copy_body(Ctx& ctx, const std::string& spv_dir, const Buf& src, const Buf& 
     } pc{};
     pc.n = (int32_t) n;
     ctx.dispatch(copy_pipeline(ctx, spv_dir), {&src, &dst}, &pc, sizeof(pc), groups_for(n));
+    // THE HANDOFF REST ON THIS.  `Ctx::dispatch` now BATCHES (it returns after encoding, not after the work), so
+    // the handshake's `sync.cpp`-level contract - "the copy is complete and visible to the host when this
+    // returns" - is realised by this explicit flush, which submits the batch and waits on the fence.  Without it
+    // the publish would be the one place the old per-dispatch submit+wait was load-bearing.
+    ctx.flush();
 }
 
 void copy_regions(Handoff& h, const Buf& src, const Buf& dst, uint64_t bytes, const char* what) {

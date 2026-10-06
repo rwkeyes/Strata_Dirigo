@@ -1,5 +1,61 @@
 # Start here next session
 
+## THE DISPATCH LAYER WAS THE GAP — 5.14 → 16.17 tok/s prefill; DECODE IS UNMOVED AT 7.25 AND IS THE NEXT TARGET (2026-10-06, `vega`)
+
+**WHAT WAS MEASURED, IN ORDER.** `STRATA_PREFILL_TIMING=1` (199-token arm): the largest single phase was
+`router+shared` at 24.3% and the expert path 28.4%, but the 8-token arm showed `router+shared`/`gdn`/`qsa proj`/
+`gdn out proj` all scale **exactly** with token count while `dequant` scales with expert count — i.e. most of the
+prompt path is a per-token loop of decode kernels, and the biggest phase was WAITING. The host was never the
+bottleneck (`host staging 52 ms`, `host grouping 16 ms`, `waiting for each chunk 0 ms`).
+
+**THE INSTRUMENT THAT NAMED IT: `STRATA_VK_DISP_STAT=1`** (new; `vulkan/src/device/vk_compute.cpp`). It prices the
+submission layer and prints at exit, including a per-shader dispatch histogram and a by-arm submit split. Its first
+reading, 199-token arm: **233,768 dispatches, 249,878 submits = 249,878 host waits = 249,878 cb allocs = 249,878
+fences created**, `wait` = 54,674 of 61,662 ms of dispatch-layer time (**88.7%**), 0.2638 ms/dispatch — and
+**50.8% of all dispatches were two pure-overhead shaders** (`pf_f16_to_f32` 59,400 + `quantize_q8_1` 59,400) from
+`prefill::Gemm::native`, which quantised and GEMV'd ONE TOKEN AT A TIME (3 dispatches × T per matrix; 160,380
+dispatches = 68.7% of the run).
+
+**WHAT LANDED.**
+1. **`Gemm::native` is batched** (`vulkan/src/kernels/prefill_vk.cpp`): the port's mmvq shaders already walked
+   `ncols` and the q8_1 quantiser already laid column `c` at `c*(n_in/32)*36`, so the whole T-token projection is
+   **three dispatches** instead of 3·T. Per column it is BIT-IDENTICAL (same widening, same blocks, same dot
+   order). 5.14 → 13.12 tok/s; dispatches 233,768 → 56,468.
+2. **The live dispatch path BATCHES** (`Ctx::dispatch` + `flush_live`/`live_ensure`): one command buffer, one
+   fence, one (RECYCLED) descriptor pool, flushed when it fills (128) and before anything that must observe the
+   device (a host read/write, a transfer, a capture begin, a recorded step's submit, teardown). 13.12 → 17.38.
+3. **THE HOST-VISIBLE COMPLETION RULE** (the gate fix, and it cost 17.38 → 16.17): a dispatch that touches a
+   MAPPED host region must be complete when `dispatch` returns, because the engine and the gate read those regions
+   directly with no `Ctx::read` to flush for them. Device-local buffers still batch.
+
+**THE RED GATE IS PART OF THE RECORD, NOT TIDIED OUT.** The first batching version was **`881 passed, 5 failed, 0
+skipped`** on the Arc (from 886/0/0 in the same batch's earlier runs): `sample_tokens entry (mapped out)` ×2 and
+`doorbell ring` ×3 (direct / capture-does-not-run / replay-advances). Three removed orderings, each fixed at the
+cause: (a) `chain_barrier` was conditional on `live_n_ > 0`, so the FIRST dispatch of each batch had no
+compute→compute barrier → the router's `m.ids` was copied out unsynchronised → **`prefill: routed id out of
+range`**, 2 of 2 runs, against a known-good 13.12 baseline (NOT the interstitial at `NEXT.md:490`; the retro-test
+is what separates them); (b) `cudaStreamSynchronize`/`cudaDeviceSynchronize` were vacuous and must flush the pending
+batch; (c) the host-visible rule above. Final: **Arc `886/0/0`** (same case count — nothing skipped, no bound
+widened), lvp 868/0/6, radeon 875/2/2 (the documented `bf16_gemv_fp32_mmvf` family). **Ids unchanged throughout:
+`198 1 198 1 …` md5 `56a0b28d2de6`; 8-token `4653 8 15 …` md5 `3aed108cceee`.**
+
+**WHAT IS LEFT, IN ORDER, AND ALL OF IT MEASURED.**
+1. **THE DECODE ARM: 7.25 tok/s in every run tonight — before, during and after all of the above.** 5.04× off the
+   same-card reference and untouched. It is NOT the recorded path: **`submit_recorded` is called ZERO times**. The
+   by-arm split (`live-batch 13619 | transfer 16110 | recorded-submit 0 | segment 42` on 199; `4293 | 13774 | 0 |
+   57` on 8) shows the decode cost is **13,774 `begin_oneshot` transfers ≈ 430 per decode token**, each still
+   paying a cb allocate + fence create + submit + wait — the SAME round trip just removed for dispatches, still on
+   the transfer path. Target: one submit per token.
+2. The remaining **78% `wait`** (29,308 of 37,569 ms).
+3. Fold `pf_f16_to_f32` + `quantize_q8_1` into their consumers.
+4. Expert batching last, and only if the counts still justify it (`gemm gate/up` is now 0.1% of the prefill).
+
+**DELIBERATELY NOT DONE / APPROXIMATE.** `cudaStreamQuery` still reports a pending batch as done — no live batch is
+pending on the paths it is used from (verify.cpp's captured handshake), but that is REASONED, not measured. The
+decode arm has no phase table (the timing instrument is prefill-only). The `wait` ms is not split by arm. The
+descriptor-pool churn the gate prints (250 pools, 71,152 sets) is the RECORDING's — one set per recorded dispatch,
+which must stay valid at replay — and is hygiene (0.13–0.66% of the run), not the fix.
+
 ## THE PREFILL GEMM IS TILED AND SHARED-MEMORY NOW - AND THE ENGINE SAYS THE MATMUL IS NOT THE GAP (2026-10-06, `vega`)
 
 **What `prefill::Gemm::f16` WAS.** The prompt path's expert projection (`src/prefill/prefill.cpp:2792`/`:2795`) ran

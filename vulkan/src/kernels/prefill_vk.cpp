@@ -392,6 +392,25 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (ldy <= 0) ldy = N;
     if (K % 32 != 0) refuse("prefill::Gemm::native", "K is not a multiple of 32 (the q8_1 activation block)");
     Stream* s = need(strata::vulkan::stream_of(stream_), "prefill::Gemm::native");
+    // THE BATCHED FORM.  `Ctx::dispatch` is a FULL submit+fence round trip per dispatch (measured on the Arc Pro
+    // B70: 233,768 dispatches, 249,878 submits/waits, `wait` = 54,674 of 61,662 ms at the dispatch layer, 0.264
+    // ms/dispatch).  The per-token loop below pays that THREE times per token per matrix; for the 300 dense
+    // projections of a 198-token chunk it is 160,380 of the 233,768 dispatches - pf_f16_to_f32 59,400,
+    // quantize_q8_1 59,400, native_k_mmvq 41,580.  The port's own shaders already handle all T columns at once:
+    // `native_quantize_q8_1` lays column `c` at `c*(n_in/32)*36`, every mmvq shader walks `for c < ncols` with
+    // `y[c*n_out + row]`.  So the whole projection is THREE dispatches.  THE ARITHMETIC IS UNCHANGED AND PER
+    // COLUMN BIT-IDENTICAL - the same widening, the same q8_1 blocks (one workgroup per column), the same dot
+    // with the same accumulation order - which is why the output token ids must not move.  It needs the mmvq
+    // output stride to be `n_out` (ldy == N, which every engine caller passes) and beta == 0; otherwise the
+    // general per-token loop below runs unchanged.
+    if (beta == 0.0f && ldy == N) {
+        float* xf = (float*) xf32(*s, (uint64_t) T * K * 4).p;
+        f16_to_f32(*s, X, xf, T * K);
+        uint8_t* qb = q8(*s, strata::kernels::native_q8_1_bytes((int) K, (int) T)).p;
+        strata::kernels::native_quantize_q8_1(xf, qb, (int) K, (int) T, stream_);
+        strata::kernels::native_mmvq(ggml_type, W_blocks, qb, Y, (int) K, (int) N, (int) T, stream_);
+        return;
+    }
     float* xf = (float*) xf32(*s, (uint64_t) K * 4).p;
     uint8_t* qb = q8(*s, (uint64_t) strata::kernels::native_q8_1_bytes((int) K, 1)).p;
     float* t = (beta != 0.0f) ? (float*) tempf(*s, (uint64_t) N * 4).p : nullptr;

@@ -1,5 +1,107 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE DISPATCH LAYER — 5.14 → 16.17 tok/s prefill, and decode did not move (later, same day, `vega`)
+
+**THE MEASUREMENT THAT DECIDED IT, AND IT WAS NOT ARITHMETIC.** `STRATA_PREFILL_TIMING=1` on the 199-token arm
+(`/tmp/perf_timing_199.log`, 198 tokens, GPU timeline 36,976 ms, host staging **52 ms**):
+
+```
+embed+steps 145 (0.4%)  hc read 1249 (3.4%)  gdn 6198 (16.8%)  qsa proj 4054 (11.0%)  qsa indexer 486 (1.3%)
+qsa select 4  qsa attn 648 (1.8%)  router+shared 8976 (24.3%)  host grouping 16 (0.0%)  gather 32 (0.1%)
+wait copy 0  dequant 2175 (5.9%)  gemm gate/up 5513 (14.9%)  gemm down 2804 (7.6%)  combine 17
+ple 256 (0.7%)  gdn conv+gates 16  gdn recurrence 1553 (4.2%)  gdn out proj 2831 (7.7%)
+host: chunk setup 145 ms, waiting for each chunk 0 ms, after each chunk 0 ms, PLE 257 ms
+```
+
+The 8-token arm (`/tmp/perf_timing_8.log`, 7 tokens, 2,509 ms) says the rest: `router+shared` 317 ms, `gdn` 222,
+`qsa proj` 135, `gdn out proj` 83 all scale **exactly** with token count (28.0×, 27.9×, 30×, 34× from 7 to 198
+tokens), while `dequant` scales with EXPERT count (3.5×) — so most of the prompt path is a per-token loop of
+decode kernels, and the largest single phase (`router+shared`, 24.3%) was **waiting**, not computing.
+
+**THE NUMBER THAT NAMED THE CAUSE: `STRATA_VK_DISP_STAT=1` (NEW, this batch; `vulkan/src/device/vk_compute.cpp`),
+prices the submission layer itself and prints at exit.** Priced on the Arc Pro B70, 199-token arm:
+
+```
+vk disp stat: 233768 live dispatches | 249878 recorded dispatches | 249878 submits | 249878 host waits |
+              249878 cb allocs | 249878 fences created | 14684 descriptor sets | 250 descriptor pools
+vk disp stat ms: total 61662 = cb-alloc 198 + encode 158 + fence-create 274 + submit 5982 + wait 54674 +
+                 cb-free/fence-destroy 376   (0.2638 ms/dispatch)
+by shader (top): pf_f16_to_f32 59400  quantize_q8_1 59400  native_k_mmvq 41580  iq_dequant_f32 10833
+                 iq4nl_mmvq 9306  iq4xs_mmvq 8316  gemm_prefill_fma_small 7702  native_gdn_out_norm 7128
+                 native_gdn_step 7128  pf_swiglu16 3659  f32_to_f16 3647  pf_gu_interleave_f16 3611
+```
+
+**EVERY dispatch was its own command buffer, its own fence, its own submit AND its own wait — 249,878 of each for
+233,768 dispatches** (`Ctx::dispatch` → `begin_oneshot` + `end_oneshot_and_wait`). The fence `wait` is **88.7%**
+of the dispatch layer; and **50.8% of all dispatches were two pure-overhead shaders** (`pf_f16_to_f32` +
+`quantize_q8_1`, 59,400 each) from one loop: `prefill::Gemm::native` quantised and GEMV'd **one token at a time**,
+so the 300 dense projections of a 198-token chunk cost 160,380 dispatches (68.7% of the run).
+
+**THE TWO FIXES, EACH MEASURED, AND `SUB/Ms` IS NOT WHAT THE SPEED CAME FROM.**
+
+| | prefill 198 tok | tok/s | decode | dispatches | submits |
+|---|---:|---:|---:|---:|---:|
+| before | 38,513.8 ms | **5.14** | 7.25 | 233,768 | 249,878 |
+| + batched `Gemm::native` (3 dispatches per matrix, T columns per dispatch — the shaders already walked `ncols`) | 15,095.9 ms | **13.12** | 7.24 | 56,468 | 72,620 |
+| + the live dispatch BATCH (one command buffer, flushed at observers) | 11,391.2 ms | **17.38** | 7.25 | 56,468 | 19,048 |
+| + the host-visible completion rule (the gate fix below) | 12,245.7 ms | **16.17** | 7.25 | 56,468 | 29,771 |
+
+TTFT 38.9 s → 12.8 s. Against the same-card reference (llama.cpp Vulkan, pp512 913.36, tg128 36.52): prefill
+**16.17/913.36 = 1.8%** (56× off, was 157×), decode **7.25/36.52 = 19.9%** (5.04× off, UNCHANGED). 8-token arm:
+prefill 2.79 → **4.45** tok/s, decode 6.65.
+
+### THE RED GATE, ON THE RECORD — 881/5/0 before 886/0/0
+
+The FIRST batching version was **`== 881 passed, 5 failed, 0 skipped`** on the Arc against 886/0/0 in this
+batch's own earlier runs, all five in the machinery the change touches:
+
+```
+FAIL sample_tokens entry (mapped out): the id lands in the MAPPED out (verify.cpp:1170 shape)   0/1  worst -1.23e+04
+FAIL sample_tokens entry (mapped out): a second call reproduces the id (a live write)            0/1
+FAIL doorbell ring: direct increments the ring                 0/2  worst 0  the ring did not read 1 then 2
+FAIL doorbell ring: capture records, does not run              0/1        the ring moved during the capture
+FAIL doorbell ring: a replayed block advances the ring each replay 0/3    the ring did not read 3, 6, 9
+```
+
+THREE CAUSES, each a removed ordering, each fixed at the cause (not retried, not skipped):
+
+1. **`chain_barrier` was conditional on `live_n_ > 0`**, so the FIRST dispatch in each batch had no compute→compute
+   barrier. The router wrote `m.ids`, the next dispatch (`pf_copy_u32`) copied it out unsynchronised, and the host
+   read garbage: **`prefill: routed id out of range`**, twice out of two runs, against a known-good 13.12 tok/s
+   baseline. The engine's own validation caught it. Fix: a barrier after every dispatch in the batch. (The
+   pre-A gate runs before this fix were NOT the documented interstitial — `NEXT.md:490` — and are not recorded as
+   one: 2 of 2 failing before, 2 of 2 clean after, same binary otherwise.)
+2. **`cudaStreamSynchronize`/`cudaDeviceSynchronize` were vacuous** — they assumed "every dispatch submits with a
+   fence and waits". With batching they must FLUSH the pending batch; the prefill's `ids_h` host read depends on it.
+3. **THE HOST-VISIBLE RULE (the gate fix).** A dispatch that touches a **mapped host region** keeps the documented
+   contract — COMPLETE when `dispatch` returns — because the engine and the gate read those regions DIRECTLY, with
+   no `Ctx::read` to flush for them. Without it, `doorbell_ring`'s pending increment ran at the NEXT flush (inside
+   the capture: "the ring moved during the capture"), the replay case read a stale ring, and `sample_tokens` read
+   its `-12345` sentinel. Device-local buffers (the engine's 27.9 GiB arena) still batch. Cost of the rule: 17.38 →
+   16.17 tok/s prefill. **The 17.38 was real but it was not a real increment** — it depended on breaking a
+   documented contract, so the landed number is 16.17.
+
+**EQUIVALENCE, AND IT HELD THROUGH THE CONTRACT FIX.** `output  : 198 1 198 1 ...` is md5 **`56a0b28d2de6`** on
+the pre-change run and on both post-fix runs (`/tmp/perf_before_199.log`, `/tmp/perf_A_199_r3.log`,
+`/tmp/perf_final2_199.log`); the 8-token arm's `4653 8 15 15 ...` is **`3aed108cceee`** before and after
+(`/tmp/perf_before_8.log`, `/tmp/perf_final2_8.log`). A faster path that changes the answer is a defect.
+
+**THE HONEST HALF — DECODE, AND THE ARM BREAKDOWN.** `STRATA_VK_DISP_STAT` now splits submits by arm:
+
+```
+199-token arm:  live-batch 13619 | transfer 16110 | recorded-submit 0 (replays 0) | segment 42
+8-token arm:    live-batch  4293 | transfer 13774 | recorded-submit 0 (replays 0) | segment 57
+```
+
+**Decode is 7.25 tok/s in EVERY run tonight — before fix A, after fix A, after the contract fix.** Its cost is not
+the recorded path: `submit_recorded` is called **ZERO** times. The 8-token arm (7 prefill + 32 decode tokens) shows
+**13,774 `begin_oneshot` TRANSFERS — ≈430 per decode token** — each still paying a command-buffer allocate, a
+fence create, a submit and a wait. That is the same per-operation round trip just removed for dispatches, still
+present on the transfer path, and it is the named next target (not fix #1 above, which it superficially resembles).
+Unmeasured: the per-arm split of `wait` ms; the decode arm's phase table (the instrument is prefill-only);
+`cudaStreamQuery` still reports a pending batch as done (no live batch is pending on the paths it is used from —
+verify.cpp's captured handshake — but that is REASONED, not measured).
+
 This is the measured performance record for the Vulkan backend on the Intel Arc Pro B70 (`BMG G31`), on branch
 `vulkan-arc-port`, from commit `2cc38c8` (the tag `v0.1.39-with-arc`) through `b98e2ba`. Every number here was
 taken on vega with the card otherwise idle; each one names what it was measured on. Nothing in this file is

@@ -1,5 +1,28 @@
 # Status — what is done, what is verified, what is not
 
+## THE DISPATCH LAYER: PREFILL 5.14 → 16.17 tok/s, AND DECODE UNMOVED AT 7.25 (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** A new instrument (`STRATA_VK_DISP_STAT=1`) priced the submission layer: every dispatch was its own
+command buffer, fence, submit and wait — 249,878 of each for 233,768 dispatches, with the fence `wait` 88.7% of the
+dispatch layer and 50.8% of dispatches coming from `Gemm::native`'s per-token loop. Two changes landed:
+`Gemm::native` batched to three dispatches per projection (the shaders already walked `ncols`; bit-identical per
+column), and the live dispatch path batched into one command buffer flushed at every observer. Prefill
+38,513.8 ms / 5.14 tok/s → 12,245.7 ms / **16.17 tok/s** (11,391 ms / 17.38 in the run before the gate fix); TTFT
+38.9 → 12.8 s; submits 249,878 → 29,771.
+
+**VERIFIED.** Gate on the Arc **886 passed / 0 failed / 0 skipped** — the SAME case count as before the change
+(nothing skipped, no bound widened); lvp 868/0/6; radeon 875/2/2 (the documented `bf16_gemv_fp32_mmvf` family).
+Equivalence: `198 1 198 1 …` md5 **`56a0b28d2de6`** and the 8-token arm `4653 8 15 …` md5 **`3aed108cceee`**, both
+identical to the pre-change runs. The red gate on the way (881/5/0, `doorbell ring` ×3 + `sample_tokens (mapped
+out)` ×2) and its three causes are recorded in `NEXT.md` and `PERFORMANCE-B70-2026-10-06.md`.
+
+**NOT DONE — AND IT IS THE BIG ONE.** **Decode is 7.25 tok/s in every run tonight**, 5.04× off the same-card
+reference (llama.cpp Vulkan, 36.52), and untouched by any of the above. `submit_recorded` is called ZERO times; the
+by-arm submit split shows the decode cost is ~13,774 `begin_oneshot` transfers (≈430 per decode token) still paying
+the per-call round trip removed for dispatches. Also unmeasured: the per-arm `wait` split, a decode phase table
+(the timing instrument is prefill-only), and `cudaStreamQuery`'s treatment of a pending batch (reasoned, not
+measured).
+
 ## THE ARITHMETIC IS CHECKED AGAINST AN INDEPENDENT IMPLEMENTATION (not a transcription): 10 mmvq formats vs ggml-cpu's own `vec_dot` on the pack's REAL weight rows (`coder-iq1_m`, Intel Arc Pro B70) (2026-10-06, `vega`)
 
 **WHAT IS DONE.** The gate's numeric oracles for the quantised mmvq shaders are HOST TRANSCRIPTIONS of the same

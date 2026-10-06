@@ -2,12 +2,16 @@
 // prints and exits, because a gate that cannot build its device must not look like a gate that passed.
 #include "vk_compute.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 namespace strata::vulkan {
 
@@ -39,6 +43,67 @@ std::vector<uint8_t> read_file(const std::string& path) {
     return out;
 }
 
+}  // namespace
+
+// ---- STRATA_VK_DISP_STAT: the live dispatch/submit accounting -----------------------------------------------
+// The prompt path calls `Ctx::dispatch`, which is a FULL submit+fence ROUND TRIP per dispatch, with a command
+// buffer allocated and freed and a fence created and destroyed around it.  This instrument prices each of those
+// steps separately, plus the encode, so the next change is aimed at the step that actually costs - not at a
+// theory.  Measurement-only: off unless the env var is set, and it never changes a dispatch.
+namespace {
+struct DispStat {
+    bool on = false;
+    uint64_t n = 0;                 // live (non-capture) dispatches
+    uint64_t recorded = 0;          // dispatches ENCODED into a recorded step (capture/replay)
+    uint64_t submits = 0, waits = 0, cb_allocs = 0, fences_created = 0, sets_alloc = 0, pools_made = 0, batches = 0;
+    // BY ARM: a live batch flush (the prompt path), a transfer (begin_oneshot), a recorded-step submit (a replay,
+    // i.e. the decode/verify arm) and a segment submit (that replay cut at a handshake boundary).
+    uint64_t sub_live = 0, sub_transfer = 0, sub_rec = 0, sub_seg = 0, replays = 0;
+    double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
+    std::vector<std::pair<std::string, uint64_t>> by_pipe;   // per-spv dispatch counts
+};
+DispStat g_ds;
+inline double vk_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void disp_stat_count(const std::string& spv) {
+    for (auto& kv : g_ds.by_pipe) {
+        if (kv.first == spv) { ++kv.second; return; }
+    }
+    g_ds.by_pipe.push_back({spv, 1});
+}
+bool g_ds_printed = false;
+void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx still reports
+    if (!g_ds.on || g_ds_printed) return;
+    g_ds_printed = true;
+    const double total = g_ds.t_alloc + g_ds.t_encode + g_ds.t_fence + g_ds.t_submit + g_ds.t_wait + g_ds.t_free;
+    std::fprintf(stderr,
+                 "vk disp stat: %llu live dispatches | %llu recorded dispatches | %llu submits | %llu host waits | "
+                 "%llu live batches | %llu cb allocs | %llu fences created | %llu descriptor sets | %llu pools\n",
+                 (unsigned long long) g_ds.n, (unsigned long long) g_ds.recorded, (unsigned long long) g_ds.submits,
+                 (unsigned long long) g_ds.waits, (unsigned long long) g_ds.batches,
+                 (unsigned long long) g_ds.cb_allocs, (unsigned long long) g_ds.fences_created,
+                 (unsigned long long) g_ds.sets_alloc, (unsigned long long) g_ds.pools_made);
+    std::fprintf(stderr,
+                 "vk disp stat ms: total %.0f = cb-alloc %.0f + encode %.0f + fence-create %.0f + submit %.0f + "
+                 "wait %.0f + cb-free/fence-destroy %.0f  (%.4f ms/dispatch)\n",
+                 total, g_ds.t_alloc, g_ds.t_encode, g_ds.t_fence, g_ds.t_submit, g_ds.t_wait, g_ds.t_free,
+                 g_ds.n ? total / (double) g_ds.n : 0.0);
+    std::vector<std::pair<std::string, uint64_t>> v = g_ds.by_pipe;
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string line;
+    for (size_t i = 0; i < v.size() && i < 14; ++i) {
+        const size_t slash = v[i].first.find_last_of('/');
+        line += " " + v[i].first.substr(slash == std::string::npos ? 0 : slash + 1) + " " +
+                std::to_string(v[i].second);
+    }
+    std::fprintf(stderr, "vk disp stat by shader (top):%s\n", line.c_str());
+    std::fprintf(stderr, "vk disp stat by arm: live-batch %llu | transfer %llu | recorded-submit %llu (replays %llu) | "
+                         "segment %llu\n",
+                 (unsigned long long) g_ds.sub_live, (unsigned long long) g_ds.sub_transfer,
+                 (unsigned long long) g_ds.sub_rec, (unsigned long long) g_ds.replays,
+                 (unsigned long long) g_ds.sub_seg);
+}
 }  // namespace
 
 // The desktop reserve, as a pure function so the policy can be tested without a GPU.  Rules: at least the
@@ -241,6 +306,8 @@ std::vector<DeviceInfo> Ctx::list_devices() {
 }
 
 Ctx::Ctx(int want_device, bool need_16bit) {
+    g_ds.on = std::getenv("STRATA_VK_DISP_STAT") != nullptr;
+    if (g_ds.on) std::atexit(disp_stat_dump);
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "strata-vulkan-port-gate";
@@ -491,6 +558,11 @@ Ctx::Ctx(int want_device, bool need_16bit) {
 }
 
 Ctx::~Ctx() {
+    disp_stat_dump();
+    flush_live();   // the last batch must reach the device before the device goes away
+    if (live_fence_ && dev_) vkDestroyFence(dev_, live_fence_, nullptr);
+    if (live_cb_ && cmd_pool_) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &live_cb_);
+    if (live_pool_ && dev_) vkDestroyDescriptorPool(dev_, live_pool_, nullptr);
     if (dev_ != VK_NULL_HANDLE) vkDeviceWaitIdle(dev_);
     for (Pipe& pv : pipes_) {
         if (pv.pipe) vkDestroyPipeline(dev_, pv.pipe, nullptr);
@@ -786,6 +858,7 @@ VkDescriptorPool Ctx::new_desc_pool() {
     dpci.pPoolSizes = &ps;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &pool));
+    if (g_ds.on) ++g_ds.pools_made;
     return pool;
 }
 
@@ -811,10 +884,83 @@ VkDescriptorSet Ctx::set_alloc(VkDescriptorSetLayout layout) {
                      (unsigned) desc_pools_.size());
     }
     VK_CHECK(r);
+    if (g_ds.on) ++g_ds.sets_alloc;
     return set;
 }
 
+// A set out of a GIVEN pool.  The live batch's sets must each be distinct (its dispatches run at SUBMIT, so one
+// shared set would leave them all reading the last binding) but are only needed for one submission, so the pool
+// is RESET at each flush and the sets are recycled instead of growing the pool per dispatch.
+VkDescriptorSet Ctx::set_alloc_in(VkDescriptorPool pool, VkDescriptorSetLayout layout) {
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateDescriptorSets(dev_, &dsai, &set));
+    if (g_ds.on) ++g_ds.sets_alloc;
+    return set;
+}
+
+// The live batch's ONE command buffer, ONE fence and ONE (recycled) descriptor pool.
+void Ctx::live_ensure() {
+    if (live_cb_ != VK_NULL_HANDLE) return;
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = cmd_pool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(dev_, &cbai, &live_cb_));
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VK_CHECK(vkCreateFence(dev_, &fci, nullptr, &live_fence_));
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps.descriptorCount = kLiveBatchMax * 16u;   // 16 = the widest binding set any shader here takes
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = kLiveBatchMax;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &live_pool_));
+    if (g_ds.on) ++g_ds.pools_made;
+}
+
+// Submit the open batch and wait ONCE for all of it.  Cheap when nothing is open.  The host-read barrier is the
+// one the old per-dispatch path added after every dispatch, hoisted to the end of the batch.
+void Ctx::flush_live() {
+    if (!live_open_) return;
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(live_cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                         nullptr, 0, nullptr);
+    VK_CHECK(vkEndCommandBuffer(live_cb_));
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &live_cb_;
+    VK_CHECK(vkResetFences(dev_, 1, &live_fence_));
+    const double _ts = vk_ms();
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, live_fence_));
+    const double _tw = vk_ms();
+    VK_CHECK(vkWaitForFences(dev_, 1, &live_fence_, VK_TRUE, UINT64_MAX));
+    const double _td = vk_ms();
+    live_open_ = false;
+    if (g_ds.on) {
+        g_ds.t_submit += _tw - _ts;
+        g_ds.t_wait += _td - _tw;
+        ++g_ds.submits; ++g_ds.waits; ++g_ds.batches; ++g_ds.sub_live;
+    }
+}
+
 VkCommandBuffer Ctx::begin_oneshot() {
+    // Every other submission path (the staging transfers) starts here: the live batch must be on the device
+    // BEFORE this transfer is submitted, or the queue order the fence used to give us is lost.
+    flush_live();
+    const double _t0 = vk_ms();
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -826,6 +972,7 @@ VkCommandBuffer Ctx::begin_oneshot() {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+    if (g_ds.on) { g_ds.t_alloc += vk_ms() - _t0; ++g_ds.cb_allocs; }
     return cb;
 }
 
@@ -838,11 +985,22 @@ void Ctx::end_oneshot_and_wait(VkCommandBuffer cb) {
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence = VK_NULL_HANDLE;
+    const double _tf = vk_ms();
     VK_CHECK(vkCreateFence(dev_, &fci, nullptr, &fence));
+    const double _ts = vk_ms();
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence));
+    const double _tw = vk_ms();
     VK_CHECK(vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX));
+    const double _td = vk_ms();
     vkDestroyFence(dev_, fence, nullptr);
     vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
+    if (g_ds.on) {
+        g_ds.t_fence += _ts - _tf;
+        g_ds.t_submit += _tw - _ts;
+        g_ds.t_wait += _td - _tw;
+        g_ds.t_free += vk_ms() - _td;
+        ++g_ds.submits; ++g_ds.waits; ++g_ds.fences_created; ++g_ds.sub_transfer;
+    }
 }
 
 // ---- the staging transfers (stage 4).  THE BARRIERS ARE THE WHOLE DIFFICULTY ---------------------------------
@@ -903,6 +1061,9 @@ void Ctx::stage_download(const Buf& src, void* dst, uint64_t bytes, uint64_t off
 }
 
 void Ctx::write(Buf& b, const void* src, uint64_t bytes, uint64_t offset) {
+    // A host store into a buffer a PENDING batch reads must not land after the batch is submitted (the old
+    // per-dispatch submit+wait made that impossible; with the batch it would be a real race).
+    flush_live();
     if (offset + bytes > b.bytes) {
         std::fprintf(stderr, "write past end of buffer (%llu+%llu > %llu)\n", (unsigned long long) offset,
                      (unsigned long long) bytes, (unsigned long long) b.bytes);
@@ -918,6 +1079,8 @@ void Ctx::write(Buf& b, const void* src, uint64_t bytes, uint64_t offset) {
 }
 
 void Ctx::read(const Buf& b, void* dst, uint64_t bytes, uint64_t offset) {
+    // The host read must see a pending batch's writes, so the batch has to be ON the device first.
+    flush_live();
     if (offset + bytes > b.bytes) {
         std::fprintf(stderr, "read past end of buffer\n");
         std::exit(1);
@@ -995,7 +1158,7 @@ VkPipeline Ctx::pipeline(const std::string& spv_path, uint32_t nbufs, uint32_t p
 
 void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector<const Buf*>& bufs, const void* push,
                           uint32_t push_bytes, uint32_t groups, uint32_t groups_y, bool chain_barrier,
-                          bool fresh_set) {
+                          bool fresh_set, VkDescriptorSet forced_set) {
     // Find the pipeline layout/set that belongs to this pipeline handle.
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -1016,7 +1179,8 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     // reading whatever the LAST one bound.  (The same class of trap the grouped-expert wave hit with one buffer
     // pointer standing in for two.)  A real backend pools these sets; the gate allocates them out of desc_pool_,
     // which the device destroys with the pool, so a re-recording leaks a handful of sets and nothing else.
-    if (fresh_set) set = set_alloc(set_layout);
+    if (forced_set != VK_NULL_HANDLE) set = forced_set;
+    else if (fresh_set) set = set_alloc(set_layout);
 
     check_offsets(bufs);
 
@@ -1062,23 +1226,64 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
         record_dispatch(pipe, bufs, push, push_bytes, groups, groups_y);
         return;
     }
-    VkCommandBuffer cb = begin_oneshot();
-    encode_dispatch(cb, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/false,
-                    /*fresh_set=*/false);
-    // Shader writes -> host reads.  Vulkan requires this barrier; without it a coherent mapping may still
-    // show the pre-dispatch contents, which would read as "the kernel wrote nothing".
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
-                         nullptr, 0, nullptr);
-    end_oneshot_and_wait(cb);
+    live_ensure();
+    if (!live_open_) {
+        VK_CHECK(vkResetCommandBuffer(live_cb_, 0));
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(live_cb_, &bi));
+        // The previous batch was submitted and waited on in flush_live(), so its sets are dead and the pool can
+        // be reset: the sets are RECYCLED, not grown (this path allocates kLiveBatchMax per batch, forever).
+        VK_CHECK(vkResetDescriptorPool(dev_, live_pool_, 0));
+        live_open_ = true;
+        live_n_ = 0;
+    }
+    VkDescriptorSetLayout sl = VK_NULL_HANDLE;
+    for (const Pipe& p : pipes_) {
+        if (p.pipe == pipe) { sl = p.set_layout; break; }
+    }
+    if (sl == VK_NULL_HANDLE) {
+        std::fprintf(stderr, "dispatch: unknown pipeline\n");
+        std::exit(1);
+    }
+    VkDescriptorSet set = set_alloc_in(live_pool_, sl);
+    const double _te0 = vk_ms();
+    // A compute -> compute barrier after EVERY dispatch in the batch.  The old path got the ordering from the
+    // submit+wait between two dispatches; batching removes that, so the barrier must be explicit.  It cannot be
+    // conditional on `live_n_ > 0`: the FIRST dispatch's writes would then be unprotected, and the very next
+    // dispatch reading them (the router writing the routing ids, `pf_copy_u32` copying them out) reads garbage -
+    // measured as `prefill: routed id out of range` at the first grouped layer.
+    encode_dispatch(live_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,
+                    /*fresh_set=*/false, set);
+    if (g_ds.on) {
+        g_ds.t_encode += vk_ms() - _te0;
+        ++g_ds.n;
+        for (const Pipe& p : pipes_) {
+            if (p.pipe == pipe) { disp_stat_count(p.spv_path); break; }
+        }
+    }
+    if (++live_n_ >= kLiveBatchMax) flush_live();
+    // THE HOST-VISIBLE RULE, and it is the port's documented contract rather than a tuning choice.  A dispatch
+    // that touches a HOST-VISIBLE (mapped) region must be COMPLETE when `dispatch` returns, because the engine
+    // and the gate read those regions DIRECTLY - with no `Ctx::read` to flush for them.  Measured when this was
+    // missing: the gate's `doorbell ring` case read the ring as 0 (its pending increment then ran at the NEXT
+    // flush, which was inside the capture, so "the ring moved during the capture"), the replay case read a stale
+    // ring, and `sample_tokens entry (mapped out)` read the -12345 sentinel - 881 passed / 5 failed / 0 skipped
+    // on the Arc.  Device-local buffers (the engine's arena) still batch.
+    for (const Buf* b : bufs) {
+        if (b != nullptr && b->mapped != nullptr) { flush_live(); break; }
+    }
 }
+
+void Ctx::flush() { flush_live(); }
 
 // ---- recorded steps: the CUDA-graph replacement (NEXT.md's stage-3 note) -----------------------------------
 // The command buffer and fence live for the life of the Ctx and are re-submitted, never re-recorded by a replay.
 void Ctx::record_begin() {
+    // The recording SUBMITS on its own; a pending live batch must be on the device before the recording's
+    // command buffer (its dispatches would otherwise run out of the order the caller observed).
+    flush_live();
     if (rec_cb_ == VK_NULL_HANDLE) {
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1106,8 +1311,14 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
         std::exit(1);
     }
     encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,
-                    /*fresh_set=*/true);
+                    /*fresh_set=*/true, VK_NULL_HANDLE);
     ++recorded_;
+    if (g_ds.on) {
+        ++g_ds.recorded;
+        for (const Pipe& p : pipes_) {
+            if (p.pipe == pipe) { disp_stat_count(p.spv_path); break; }
+        }
+    }
 }
 
 void Ctx::record_end() {
@@ -1227,6 +1438,7 @@ void Ctx::discard_recording() {
 
 void Ctx::submit_segment(const CaptureSeg& seg) {
     if (seg.cb == VK_NULL_HANDLE) return;
+    flush_live();
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
@@ -1234,6 +1446,7 @@ void Ctx::submit_segment(const CaptureSeg& seg) {
     VK_CHECK(vkResetFences(dev_, 1, &seg.fence));   // the fence was signalled by the previous submission
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, seg.fence));
     VK_CHECK(vkWaitForFences(dev_, 1, &seg.fence, VK_TRUE, UINT64_MAX));
+    if (g_ds.on) { ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_seg; }
 }
 
 void Ctx::destroy_owned(const CaptureSeg& seg) {
@@ -1250,6 +1463,7 @@ void Ctx::submit_recorded() {
         std::fprintf(stderr, "submit_recorded: nothing recorded\n");
         std::exit(1);
     }
+    flush_live();
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
@@ -1257,6 +1471,7 @@ void Ctx::submit_recorded() {
     VK_CHECK(vkResetFences(dev_, 1, &rec_fence_));   // the fence was signalled by the previous submission
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, rec_fence_));
     VK_CHECK(vkWaitForFences(dev_, 1, &rec_fence_, VK_TRUE, UINT64_MAX));
+    if (g_ds.on) { ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_rec; }
 }
 
 void Ctx::replay_recorded() { submit_recorded(); }   // re-submits the RECORDING; it never re-records
