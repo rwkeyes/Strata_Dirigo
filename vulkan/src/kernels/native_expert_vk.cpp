@@ -135,10 +135,16 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     std::fprintf(stderr,
                  "strata::kernels::cpu::%s: the ggml-cpu native (IQ) expert rows are NOT built in the Vulkan "
                  "configuration - this port has no CPU-hybrid execution path, and the token must come from the GPU "
-                 "backend.  The GPU expert tier is the only path here: it needs `native_expert_grouped` (a LOUD "
-                 "REFUSAL in this tree - the grouped gate/up + down kernels are unported) and the P6 verify window "
-                 "(`--native SHARD1 --spec T --expert-cache N --expert-profile P`), which refuses at "
-                 "`Verifier::init`.  Refusing rather than computing a subset of the experts.\n",
+                 "backend.  REACHED BECAUSE THE PLAN BRANCH LEFT `kind[i] == -1` FOR A MISSED EXPERT "
+                 "(expert_source.cpp:2043-2067): a missed expert becomes GPU work (`kind = 1`) only when BOTH "
+                 "`d.pcie_num > 0` AND `d.src->pinned(l, e)` holds (a blob in the registered/pinned host tier).  "
+                 "On this port NOTHING is registered: `cudaHostRegister` is `cudaErrorNotSupported` (the port has "
+                 "no shader-addressable view of the engine's host expert arena - a shader binds only the single "
+                 "arena VkBuffer, and `fetch_blobs`/`native_expert_grouped` rebase every source by "
+                 "`ptr - kArenaBase`), so `pinned()` is false for every expert and `d.src->pcie_layer()` is false "
+                 "too, which pins `m = 0` as well.  `native_expert_grouped` IS ported (PORT-MAP.tsv `kernel`); "
+                 "the P6 verify window RUNS and RECORDS to its capture.  What is missing is the pinned host tier, "
+                 "not the grouped kernels.  Refusing rather than computing a subset of the experts.\n",
                  who);
     std::exit(2);
 }

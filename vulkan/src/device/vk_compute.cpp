@@ -440,6 +440,28 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     }
     if (staging_type_ == UINT32_MAX) staging_type_ = mem_type_;
 
+    // WHICH TYPE WENT WHERE, OBSERVABLE (STRATA_VK_MEM_TRACE=1).  This is the guard for the "a setting that
+    // silently does nothing" class: the three chosen types decide whether a `cudaHostAlloc` block is system RAM
+    // or VRAM behind the BAR, and that choice is not visible anywhere else.  A probe that times a copy out of a
+    // BAR-mapped block reads ~0.06 GB/s where the same copy from system RAM reads ~1.95 GB/s (measured on the
+    // Arc B70) - so the choice must be inspectable, not assumed.  No behaviour changes: this only prints.
+    {
+        const char* mt = std::getenv("STRATA_VK_MEM_TRACE");
+        if (mt != nullptr && *mt != '\0') {
+            for (const MemTypeInfo& t : mem_types_)
+                std::fprintf(stderr,
+                             "vk_mem[%u]: heap %u (%s, %.2f GiB) device_local=%d host_visible=%d "
+                             "host_coherent=%d host_cached=%d\n",
+                             t.index, t.heap, t.heap_device_local ? "DEVICE_LOCAL" : "host",
+                             (double) t.heap_bytes / 1073741824.0, (int) t.device_local, (int) t.host_visible,
+                             (int) t.host_coherent, (int) t.host_cached);
+            std::fprintf(stderr,
+                         "vk_mem: arena/vram type %u | cudaHostAlloc type %u%s | staging type %u%s\n", vram_type_,
+                         mem_type_, mem_type_ == vram_type_ ? "" : " (HOST_VISIBLE, DEVICE_LOCAL preferred)",
+                         staging_type_, staging_type_ == mem_type_ ? " (no non-local host type: staging == host)" : "");
+        }
+    }
+
     const char* fs = std::getenv("STRATA_VK_FORCE_STAGING");
     force_staging_ = fs != nullptr && *fs && std::strcmp(fs, "0") != 0;
 }

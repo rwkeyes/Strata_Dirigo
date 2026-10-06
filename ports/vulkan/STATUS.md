@@ -1,5 +1,38 @@
 # Status — what is done, what is verified, what is not
 
+## THE BINDING CONDITION IS THE PINNED HOST TIER, NOT THE SHARE OR A KERNEL — the PCIe probe is a BAR read, measured (2026-10-06, `vega`)
+
+**WHAT IS DONE.**  The stop at LAUNCH is now NAMED and its two conditions settled.  The PLAN branch IS taken
+(`STRATA_POOL_TRACE=1`: `pool trace: layer 0 publish 0 / fetch 0`), so a missed expert stays `kind = -1` on this
+port.  The two conditions for `kind = 1` were tested apart: `--pcie-frac 1.0` (`pcie_num = 256`, `m = nmiss`) still
+gives `publish 0 / fetch 0`, and `pcie_layer()` itself requires the same registration as `pinned()`, so REGISTRATION
+alone binds both.  The PCIe probe's method was established from the engine's code and its number MEASURED two ways.
+
+**WHAT IS VERIFIED.**  `STRATA_VK_MEM_TRACE=1` (new instrument, `vk_compute.cpp`) prints, on the real device through
+the port: `cudaHostAlloc type 3` = heap 0 `DEVICE_LOCAL|HOST_VISIBLE` (BAR VRAM), `arena/vram type 0`,
+`staging type 2`.  The independent oracle `ports/vulkan/tools/probe_mem.cpp` (built against the port's device layer,
+Arc Pro B70, 256 MiB): CPU read of the mapped `cudaMallocHost` block `4280.7 ms -> 0.06 GB/s`; the probe's exact op
+`4537.9 ms -> 0.06 GB/s`; the same copy from system RAM `137.9 ms -> 1.95 GB/s`.  So the engine's `0.1 GB/s` times a
+BAR read of VRAM, not a link - **the probe is a wrong decision input; the default 0.55 is right.**  Map unchanged:
+`168 = 96 kernel + 0 shader + 47 host + 0 todo + 25 refused`, 145 shaders; `check_port_map.py` passes and
+`make_port_map.py` is byte-identical.  Engine bar 0, by construction.  GATE (vega, `/tmp/gate_b12.log`): **intel
+`869/0/0`** (green), lvp `853/0/5`, radeon `857/3/2` - the documented intermittent family
+(`bf16_gemv_fp32_mmvf_cols` 2491/2496, `bf16_gemv_fp32_mmvf_multi` 622/624) plus ONE NEW instance,
+`fused_gr_read_multi entry: a recorded block REPLAYS bitwise equal to direct execution` **1367/2880** (Ryzen
+iGPU; ~half the words, not the 1-6-word documented shape; intel read 0 failed in the same run) - recorded with
+its count, not chased.
+
+**WHAT IS NOT.**  A TOKEN.  **The staging path (`kind = 1`) is UNREACHABLE BY CONSTRUCTION** while the engine's
+expert arena is host memory outside the single arena `VkBuffer`: `fetch_blobs` and `native_expert_grouped` rebase
+every source by `ptr - kArenaBase` and window into that buffer, and `VK_EXT_external_memory_host` (present on this
+driver) would yield a second buffer the rebase mis-binds.  Reaching it needs a region-ID extension of the pointer
+scheme, not a one-line registration.  Even a correct probe does not reach a token: the engine's 0.55 leaves 45% CPU,
+and all-resident is ~2 GiB short.  The probe-type fix (hand out the non-device-local host type in `cudaHostAlloc`)
+is recorded for its own batch, not shipped.  The intermittent `prefill: routed id out of range` and the descriptor
+pools (2..93) are RECORDED, not chased.  `z820b` untouched.
+
+# Status — what is done, what is verified, what is not
+
 ## THE RECORDING COMPLETES AND THE GRAPH CAPTURES; the stop moved to the engine's host expert verb at LAUNCH (2026-10-05, `vega`)
 
 **WHAT IS DONE.**  The P6 verify window's RECORDING now runs to completion and the token graph is captured -

@@ -1,5 +1,93 @@
 # Start here next session
 
+## THE MISSED EXPERTS CANNOT BE MADE GPU WORK ON THIS PORT: REGISTRATION (the pinned host tier) is the BINDING condition, and the PCIe probe is a WRONG DECISION INPUT (2026-10-06, `vega`)
+
+**THE STOP IS UNCHANGED AND IS NOW NAMED: the LAUNCH stops at `native_quant_act` (`expert_source.cpp:2147`), exit 2.**
+The window still RECORDS and CAPTURES (`/tmp/b12_mem.log`): `captured the 1-token window (upload no error, sync no
+error)` then the refusal.  The code question the last section left open ("WHICH dispatch saw `d.plan == nullptr`") is
+ANSWERED BY MEASUREMENT: the PLAN branch IS taken - with `STRATA_POOL_TRACE=1` the log prints
+`pool trace: layer 0 begin / begun / publish 0 / fetch 0`, and `pt("publish",...)` exists ONLY in the plan branch
+(`expert_source.cpp:2020`).  So the plan branch produces `kind[i] == -1` for every missed expert, and the previous
+batch's statement that "the PLAN branch never produces `-1`" is WRONG.
+
+**kd=1 NEEDS BOTH `d.pcie_num > 0` (with `pcie_layer()`) AND `d.src->pinned(l,e)`, AND THE BINDING ONE IS REGISTRATION.**
+Measured discrimination: the SAME run with `--pcie-frac 1.0` (so `pcie_num = 256`, `m = nmiss`) still prints
+`publish 0 / fetch 0` (`/tmp/b12_frac1.log`) - the share is NOT sufficient.  The reason is that `<` in the first
+condition is really `d.src->pcie_layer(layer)` = `device_alias(layer,0) != nullptr` (`expert_source.hpp:149`), which
+itself requires `dev_slice_` non-empty, i.e. `registered_bytes > 0` from `cudaHostRegister` (`expert_source.cpp:2884`).
+So REGISTRATION is the single binding gate: it makes `pcie_layer()` false (so `m = 0`) AND makes `pinned()` false (so
+`src == nullptr`).  Fixing the probe's number alone therefore moves nothing.
+
+**AND REGISTRATION IS UNREACHABLE BY CONSTRUCTION FOR THIS SOURCE - stated as a claim someone will rely on.**  The
+port's ONLY shader-addressable memory is the single arena `VkBuffer`; `fetch_blobs` rebases every source pointer by
+`ptr - kArenaBase` and binds the arena at `win_id * kWinBytes` (`verify_vk.cpp:547-559`), and
+`native_expert_grouped` rebases the group pointers the same way (`native_expert_grouped_vk.cpp`).  The engine's
+expert bytes live in `PinnedArena`'s HOST allocation, OUTSIDE that buffer, and `cudaHostRegister` cannot move 23.42
+GiB of already-allocated host pages into it.  `VK_EXT_external_memory_host` IS present on this driver (Mesa 25.2.8,
+`vulkaninfo`), but importing the host pages yields a SEPARATE buffer whose pointers the `ptr - kArenaBase` rebase and
+the 4 GiB window scheme would MIS-BIND - a silently wrong expert, the worst class here.  So the honest answer stays
+`cudaErrorNotSupported`, and making `kd = 1` reachable needs a multi-buffer / region-ID extension of the pointer
+scheme (a `ptr_to_off` that emits a REGION ID, and gu/down shaders that select the region buffer from a set), not a
+one-line registration.  **This is the honest NEXT increment.**  (The map's `native_expert_grouped` is a `kernel`
+row and IS ported; the refusal message that said it was unported was STALE and is FIXED this batch.)
+
+**THE PROBE MEASURES A BAR READ OF VRAM, NOT A PCIe LINK - method and number, measured two independent ways.**
+* METHOD (from the engine's own code): `probe_pcie_h2d_gbps` (`generate.cpp:1159`) allocates the source with
+  `cudaMallocHost(256 MiB)`, the destination with `cudaMalloc(256 MiB)`, then times 4 back-to-back
+  `cudaMemcpyAsync(H2D)` bursts with `cudaEventElapsedTime` and keeps the best.
+* WHAT THE SOURCE IS ON THIS PORT: the shim's `cudaHostAlloc` calls `Ctx::alloc` (`cuda_runtime.cpp:300`), which
+  selects the first HOST_VISIBLE|HOST_COHERENT type and PREFERS a DEVICE_LOCAL one (`vk_compute.cpp:399-406`).
+  The new instrument `STRATA_VK_MEM_TRACE=1` printed it on the real card THROUGH THE PORT:
+  `vk_mem[3]: heap 0 (DEVICE_LOCAL, 31.89 GiB) device_local=1 host_visible=1 host_coherent=1` and
+  `vk_mem: arena/vram type 0 | cudaHostAlloc type 3 (HOST_VISIBLE, DEVICE_LOCAL preferred) | staging type 2`.
+  So the probe's "pinned host" buffer is VRAM behind the PCIe BAR, and the timed "H2D copy" reads it on the CPU.
+* THE NUMBER, independent oracle `ports/vulkan/tools/probe_mem.cpp` (built against the port's device layer, run on
+  the Arc Pro B70, 256 MiB): **CPU read of the mapped `cudaMallocHost` block = 4280.7 ms -> 0.06 GB/s**; the probe's
+  exact op (host->device copy with that source) = 4537.9 ms -> **0.06 GB/s**; the SAME copy from a plain system-RAM
+  source = 137.9 ms -> **1.95 GB/s**.  The engine's own probe reports `0.1 GB/s` (best of 4) - the same operation,
+  the same order.
+* CONCLUSION: `pcie_frac 0.00` is a WRONG DECISION INPUT; the engine's default 0.55 is the right figure.  The defect
+  is the source's memory TYPE: `cudaHostAlloc` should hand out the non-device-local host type (heap 1, type 2) when
+  the device has one, not `Ctx::alloc`'s DEVICE_LOCAL-preferred type.  **The fix is one type-selection decision in
+  `Ctx::alloc`/`cudaHostAlloc`, but it touches the mapped-region machinery every `copy_from_mapped` /
+  `iq_embed_rows` / doorbell-mapped path uses, so it is left for its own batch with the gate as the guard** -
+  recorded here, not shipped.  A future run must re-measure the probe after it.
+
+**A TOKEN ALSO NEEDS ~100% OF THE ROUTED EXPERTS ON THE GPU, WHICH IS WHY EVEN A CORRECT PROBE DOES NOT REACH ONE.**
+`m = (nmiss * pcie_num) >> 8`, so the engine's own default 0.55 leaves 45% of the missed experts `kind = -1`
+(a CPU share by design) and the port forbids that path.  The two GPU-only routes both fail: ALL-RESIDENT needs
+~29.66 GiB of arena (the last measurement: "wanted 25146163200 bytes at offset 4510555648") against 27.4 GiB usable,
+and 100% STAGING needs the pinned tier that does not exist.  **So the exact new stop is the SAME `native_quant_act`
+refusal, quoted above, and it is gated by the pinned host tier (registration), not by any kernel.**
+
+**RECORDED, NOT CHASED (both required this batch):**
+* **INTERMITTENT PREFILL FAILURE.**  `prefill: routed id out of range` (`src/prefill/prefill.cpp:2354`) appeared
+  ONCE (`/tmp/run_real_pool8.log`, with this batch's diff) and did NOT reproduce in three later runs with the same
+  code (`full2`/`run9`/`run11`, all passing the prefill at ~22.6 s) - and this batch ran it green TWICE more
+  (`/tmp/b12_base.log`, `/tmp/b12_mem.log`, prefill ~22.5 s).  **A green prefill means "NO FAILURE OBSERVED", not
+  "deterministic".**  The previous batch's conclusion that it was a deterministic regression from
+  `elementwise_vk.cpp` was WRONG (the stash run did not discriminate); `elementwise_vk.cpp` is NOT reverted.
+* **DESCRIPTOR POOLS.**  The window creates pools 2..93 (`descriptor pool N created: the previous one was full`);
+  this batch's `fetch_blobs` adds one dispatch per 4 GiB arena window per call - 7 for a 26 GiB arena - but with
+  `fetches = 0` those dispatches do NOT run on this configuration, so the exact dispatch count behind pool 93 is
+  left OPEN rather than claimed.
+
+**MAP: `168 = 96 kernel + 0 shader + 47 host + 0 todo + 25 refused`; 145 shaders built.**  No row moved (no symbol
+changed kind).  `check_port_map.py` passes; `make_port_map.py` regenerates byte-identically (idempotent).
+**ENGINE BAR: 0 undefined, BY CONSTRUCTION** (the refusals define the unported symbols).  **GATE (vega,
+`/tmp/gate_b12.log`, this commit): `intel_icd == 869 passed, 0 failed, 0 skipped`** (the port's green);
+`lvp_icd == 853 passed, 0 failed, 5 skipped` (the documented skips); `radeon_icd == 857 passed, 3 failed, 2
+skipped`.  Two of the three radeon failures are the DOCUMENTED platform-level intermittent family
+(`bf16_gemv_fp32_mmvf_cols entry` 2491/2496, `bf16_gemv_fp32_mmvf_multi entry` 622/624).  **The third is a NEW
+INSTANCE and is NOT of the documented small-count shape: `fused_gr_read_multi entry: a recorded block REPLAYS
+bitwise equal to direct execution` 1367/2880 on the Ryzen iGPU arm** — ~half the words differ, where the
+documented family disagrees by 1-6 words.  The Arc arm read 0 failed in the SAME run and this case touches no
+shader this batch changed (the diff is a trace + a refusal message).  **Recorded with the kernel name and the
+count, NOT chased** (the rule: never loop the gate for a clean arm); whether it is the iGPU intermittent at a
+larger magnitude or a real replay defect is LEFT OPEN and must be settled by a dedicated arm, not assumed.
+
+# Start here next session
+
 ## THE RECORDING COMPLETES AND THE GRAPH CAPTURES; the stop is now AT LAUNCH, in the engine's own host expert path (`native_quant_act`) (2026-10-05, `vega`)
 
 **THE P6 VERIFY WINDOW'S WHOLE RECORDING RUNS AND THE TOKEN GRAPH IS CAPTURED.**  On `coder-iq1_m` (NO
