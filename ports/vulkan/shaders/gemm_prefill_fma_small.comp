@@ -1,0 +1,61 @@
+// ports/vulkan/shaders/gemm_prefill_fma_small.comp - the prefill GEMM for a SMALL token tile.
+//
+// SAME CONTRACT as gemm_prefill_f16_m8.comp / gemm_prefill_fma.comp:
+//     Y[T x ldy] = X[T x K] . W[N x K]^T          (f16 operands, f32 accumulate)
+// and the SAME ARITHMETIC (k in increasing order, f32 accumulate); only the memory schedule differs.
+//
+// ---- WHY THIS IS A SECOND KERNEL AND NOT "THE SLOW ONE" ------------------------------------------------
+// `gemm_prefill_fma.comp` is a SQUARE-ish shared-memory tile: a workgroup stages W[TN x TK] and reuses it for
+// TM token rows, so a weight byte is read from global once per TM-token tile instead of once per output
+// element.  That is a large win when T is large, and a LOSS when T is small - measured on the Arc Pro B70
+// (2026-10-06, /tmp/gemm_sweep.log):
+//
+//   gate/up  N=1280 K=2560   T=8 : untiled 0.190 ms   tiled 0.234 ms
+//   gate/up  N=1280 K=2560   T=16: untiled 0.276 ms   tiled 0.234 ms
+//   gate/up  N=1280 K=2560   T=199: untiled 6.51 ms   tiled 1.05 ms   (6.2x)
+//   down     N=2560 K=640    T=8 : untiled 0.064 ms   tiled 0.079 ms
+//   down     N=2560 K=640    T=199: untiled 3.29 ms   tiled 0.48 ms   (6.9x)
+//
+// The tiled kernel's K loop carries two barriers per TK step and the workgroup count is N/TN, so on a small
+// tile it has too few independent workgroups to hide its own serial K-latency - the barrier pair and the
+// global-load round trip are not amortised.  THIS kernel has no barrier, no shared memory and one invocation
+// per output element, so a small dispatch is a large grid of independent latency-hiding threads instead of a
+// handful of barrier-chained workgroups.
+//
+// THE SPLIT IS BY T, AND IT IS THE WRAPPER'S (`vulkan/src/kernels/prefill_vk.cpp::gemm_f16`): the tiled kernel
+// takes T >= 16, this one takes T < 16, and both cover every N and K.  Neither has a shape precondition, so a
+// ragged N or K is simply guarded per element.
+//
+// The GRID is T*N invocations, so T*ldy must stay under 2^32; the caller sizes it and this kernel guards the
+// top edge.  Y rows are independent, which is what makes the split safe: the two kernels write disjoint rows.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+// X: [T x K] row-major.  W: [N x K] row-major.  Y: [T x ldy] row-major.
+layout(set = 0, binding = 0, std430) readonly buffer Xbuf { float16_t x[]; } X;
+layout(set = 0, binding = 1, std430) readonly buffer Wbuf { float16_t w[]; } W;
+layout(set = 0, binding = 2, std430) buffer Ybuf { float y[]; } Y;
+
+layout(push_constant) uniform Pc {
+    uint t;      // tokens in X (rows written here): the caller passes the REMAINDER rows on a split
+    uint n;      // output features
+    uint k;      // reduction length
+    uint ldy;    // row stride of Y in floats (>= n)
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.t * pc.n) return;                  // the grid is rounded up; surplus invocations exit
+    const uint row = idx / pc.n;                     // token
+    const uint col = idx % pc.n;                     // output feature
+    float acc = 0.0;
+    // The reduction runs over the CONTIGUOUS axis of both operands - W's row and X's row - which is the engine's
+    // (OP_T, OP_N) layout.  fp16 -> fp32 is exact, so the widening below costs nothing but the load.
+    for (uint i = 0u; i < pc.k; ++i) {
+        acc += float(X.x[row * pc.k + i]) * float(W.w[col * pc.k + i]);
+    }
+    Y.y[row * pc.ldy + col] = acc;
+}

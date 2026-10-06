@@ -1,5 +1,99 @@
 # Start here next session
 
+## THE PREFILL GEMM IS TILED AND SHARED-MEMORY NOW - AND THE ENGINE SAYS THE MATMUL IS NOT THE GAP (2026-10-06, `vega`)
+
+**What `prefill::Gemm::f16` WAS.** The prompt path's expert projection (`src/prefill/prefill.cpp:2792`/`:2795`) ran
+ONE shader for every shape: `gemm_prefill_fma.spv`, whose own header said *"one invocation per output element
+(gemm_prefill_fma, no shape precondition)"*. An output element is a dot of length K read straight from global
+memory, so the same weight byte was read once per output TOKEN. That is the kernel the 188x prefill gap was
+attributed to.
+
+**What exists now.** Three kernels, one arithmetic (f16 operands, f32 accumulate, k in increasing order):
+
+| shader | role | default? |
+|---|---|---|
+| `gemm_prefill_fma_small.comp` (NEW) | the untiled, one-invocation-per-output kernel. Its BODY is byte-identical to the old `gemm_prefill_fma.comp` (`git show HEAD:...` vs the new file from `#version` down - diff clean). | **YES, for every T** - the shipped behaviour is unchanged |
+| `gemm_prefill_fma.comp` (REWRITTEN) | TILED, shared-memory: TM=16 x TN=64 output tile, W and X staged in shared memory once per TK=16 of K, so a weight byte is read from global once per 16-row tile and the loads coalesce along K. `GP_TM/GP_TN/GP_TK` are compile-time knobs. | opt-in: `STRATA_VK_PREFILL_TILED=1`, T >= 16 |
+| `gemm_prefill_f16_m8.spv` (PRE-EXISTING) | cooperative matrix / XMX, 8x16 tile per subgroup | opt-in: `STRATA_VK_PREFILL_COOPMAT=1` |
+
+**THE ISOLATED MEASUREMENT - the tiling does what it was supposed to (Arc Pro B70, `/tmp/gemm_sweep.log`, tool
+`/home/bob/forktest/vk_gemm_probe.cpp`, median of recorded batches, ms per kernel dispatch):**
+
+| shape | untiled | tiled TN=64 TK=16 | coopmat |
+|---|---|---|---|
+| gate/up N=1280 K=2560, T=8 | 0.190 | 0.234 | 0.399 |
+| gate/up, T=16 | 0.276 | 0.234 | 0.400 |
+| gate/up, T=24 | 0.435 | 0.284 | 0.402 |
+| gate/up, T=199 | 6.426 | **1.053** | 3.334 |
+| down N=2560 K=640, T=8 | 0.064 | 0.079 | 0.105 |
+| down, T=199 | 3.291 | **0.477** | 1.602 |
+
+TK=32 and TK=64 are worse than TK=16 at every shape (0.245/0.347 ms at T=8); TN=32 and TN=128 are worse than
+TN=64 at small T (0.256/0.316), and TN=128 only wins past T=64. So the tiled kernel is a **6.2x** win at T=199 and
+a **1.2x LOSS at T=8** - a tile that small has too few independent workgroups (N/64 = 20) to hide its own
+barrier-chained K latency, while the untiled kernel is a large grid of independent streams.
+
+**THE COOPERATIVE-MATRIX VERDICT, AND IT IS A REFUSAL.** The shaders ARE dispatchable (the gate's own probe:
+`cooperative matrix SUPPORTED - OpCooperativeMatrixMulAddKHR is emitted`), the device reports the config
+(`coopmat=1 cm=8x16x16 subgroup=32`), and the shape precondition is `t % 8 == 0 && n % 16 == 0 && k % 16 == 0`
+with NO ragged edge (`tiles_t = t / TM` rounds down and the output is left as found - which is why a split is
+required). **Measured, `gemm_prefill_f16_m8` is SLOWER than the tiled FMA kernel at every shape tried** (0.399 vs
+0.234 at T=8; 3.334 vs 1.053 at T=199 gate/up; 1.602 vs 0.477 down) - this kernel loads its operands with
+`coopMatLoad` straight from global memory with no shared-memory staging, so each 8x16 output tile re-reads its
+full K-slab. llama.cpp's Xe2 XMX win is a property of ITS kernel (staged operands, larger tiles); this port has
+not built that kernel, so coopmat is reachable but OFF. Enabling it on "Xe2 likes XMX" would be selection by
+vendor, which this port refuses.
+
+**THE ENGINE MEASUREMENT DOES NOT CONFIRM THE ISOLATED ONE, AND THAT IS THE HEADLINE.** Same card, same flags,
+same session, a 199-token prompt of `1`s (198 prefilled, 1 chunk), `/tmp/perf_before_199.log` vs
+`/tmp/perf_after_199.log` / `/tmp/perf_after2_199.log`:
+
+| run | prefill | decode |
+|---|---|---|
+| pre-change (untiled) | **5.81 tok/s** (34069 ms) | 7.24 tok/s |
+| tiled split r1 | 3.88 tok/s (50871 ms) | 7.22 tok/s |
+| tiled split r2 | 3.25 tok/s (60757 ms) | 7.20 tok/s |
+
+**The tiled path made the engine SLOWER end to end**, so it is not the default: the default run is
+`gemm_prefill_fma_small.spv` for every T, which is the pre-change kernel. WHY the isolated 6.2x does not transfer
+is NOT answered - the engine's per-expert T distribution is not instrumented, and run-to-run spread on this box is
+already ~20% (the same binary gave 3.88 and 3.25). The honest next step is to instrument the prefill's per-expert
+T histogram and per-stage ms (`kPfDequant`/`kPfGemmGU`/`kPfGemmD` marks already exist in `prefill.cpp`), not to
+tune the tile blind.
+
+**Against the reference (llama.cpp Vulkan on the SAME card, `/tmp/ref_llamacpp_vulkan.log`: pp512 913.36 +-289.06
+t/s, tg128 36.52 +-0.02):** the default port measures prefill **5.81/913.36 = 0.64%** (156x off) and decode
+**7.24/36.52 = 19.8%** (5.05x off). The reference's own pp512 carries a +-32% interval, so the ratio is the
+only honest form. NOTHING in this batch closed that gap, and the isolated numbers say the GEMM is not where it is.
+
+**DELIVERABLE B (remove the FP16 staging pass) - NOT DONE, AND THE REASON IS STRUCTURAL.** The staging is
+`iq_dequant_gu_f16`/`iq_dequant_f16` (`vulkan/src/kernels/iq_vk.cpp`), called by the ENGINE (`prefill.cpp:2783-
+2785`) and followed by a separate `Gemm::f16`; "dequantize in registers across a chunk" is llama.cpp's MMQ, which
+in this engine is its own whole path: `strata::prefill::mmq::` (`Context::run`, `Product`, `gather_native`,
+`gather_native_group`, `quantize`, `swiglu`, `iota`, ... 20+ entry points plus the group/bounds bookkeeping and a
+q8_1 ACTIVATION contract, not f16). The Vulkan build stubs every one of them to a no-op at
+`src/prefill/prefill.cpp:46-67` (`#ifndef STRATA_PREFILL_MMQ`, defined only with `STRATA_NATIVE_EXPERTS` - the
+ggml/CPU half this port's CMake deliberately excludes), so `mmq::built()` is FALSE by construction and the engine
+takes the FP16 path. Implementing it is a second engine path, not "the same shape" as a GEMM swap - and the
+card's own probe reports `int dot: 0`, so the dp4a form MMQ prefers is unavailable here anyway. **The measured
+reason to deprioritize it**: the whole staging chain costs **~0.18 ms per expert** (iq_dequant_f32 0.052 +
+f32_to_f16 0.031 + gu_interleave 0.044 for gate/up; 0.034 + 0.021 for down, `/tmp/gemm_sweep.log`), i.e. ~4% of
+the prefill's per-expert budget - removing it would not close a 156x gap.
+
+**EVIDENCE.** Gate on `vega`: Arc (`intel_icd`) **886 passed / 0 failed / 0 skipped** (was 883/0/0; +3 = the three
+new `prefill_small` arms, same bounds, same oracle), llvmpipe 868/0/6, radeon iGPU 875/2/2 (the documented
+moving-failing-set intermittent - the two failures are `ple_block` and `bf16_gemv_fp32_mmvf_multi`, neither
+touched here). `gates/inject-verify.sh pf-gemm-fma-wrong-ldy` **FALSIFIES** it: `FAIL prefill Gemm::f16 entry ...
+16/21 worst 1e+30` (the anchor moved to `gemm_prefill_fma_small.comp` because the entry case runs T=3, the
+small-T path). `check_port_map.py` passes and `make_port_map.py` is byte-identical. **Equivalence:** the same
+prompt on the pre-change binary and on the new default binary produce the same output ids - `1 2 3 4 5 6 7 8` ->
+`4653 8 15 15 15 ...` (`/tmp/perf_before_8.log` vs `/tmp/perf_default_8.log`), and `198 x 1` -> `198 1 198 1 ...`.
+**THE RECORDED ANCHOR `4653 10 15 15 15` DOES NOT REPRODUCE ON EITHER BINARY, and the log says why:** that run's
+prompt path took the *"allocates its own buffers (no cache slots to borrow)"* branch and chunked 7 tokens into 7
+chunks (`/tmp/perf_eq_pf1.log:38`); today the same command takes *"borrows 124 cache slots"* and chunks 1 -> 1,
+and batching changes the conditioning enough to flip a greedy token. That is a run-MODE difference, not an
+equivalence break, and the pre-change binary reproduces `8` in the same mode.
+
 ## THE ARITHMETIC IS CHECKED AGAINST AN INDEPENDENT IMPLEMENTATION: the port's mmvq shaders vs ggml-cpu's `vec_dot`, 10 formats on the pack's REAL weight rows, 1e-8..2e-6 (2026-10-06, `vega`)
 
 **THE GATE AGREES WITH ITS ORACLES; THIS AGREES WITH ggml - and the difference matters.** Every numeric case in

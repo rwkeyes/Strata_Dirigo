@@ -833,8 +833,9 @@ case "$name" in
   # ==========================================================================================================
   pf-gemm-fma-wrong-ldy)
     # The FMA GEMM's row stride: writing `row * pc.n` instead of `row * pc.ldy` smears the columns between n
-    # and ldy - exactly the `ldy > N` arm the case runs (T=3 N=5 K=8 ldy=7).
-    file="$SH/gemm_prefill_fma.comp"; spv="gemm_prefill_fma"
+    # and ldy - exactly the `ldy > N` arm the case runs (T=3 N=5 K=8 ldy=7).  The `prefill Gemm::f16 entry` case
+    # runs T=3, which the wrapper routes to the SMALL-T kernel (T < 16), so the anchor lives THERE.
+    file="$SH/gemm_prefill_fma_small.comp"; spv="gemm_prefill_fma_small"
     old=$'    Y.y[row * pc.ldy + col] = acc;'
     new=$'    Y.y[row * pc.n + col] = acc;   // INJECTION: the row stride taken as n, not ldy'
     want="FAIL  prefill Gemm::f16 entry" ;;

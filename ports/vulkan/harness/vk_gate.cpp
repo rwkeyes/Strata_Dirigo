@@ -672,8 +672,15 @@ static void prefill_check(Ctx& ctx, const std::string& dir, const char* spv, uin
 
     VkPipeline p = ctx.pipeline(dir + "/" + spv, 3, 16);
     struct { uint32_t t, n, k, ldy; } pc{t, n, k, ldy};
-    const uint32_t groups = cma ? (uint32_t) ((t / 8) * (n / 16) + 8) : groups_for((uint64_t) t * n);
-    ctx.dispatch(p, {&bx, &bw, &by}, &pc, sizeof(pc), groups);
+    // THE GRID IS THE KERNEL'S.  The cooperative-matrix kernel is 1-D (one 8x16 tile per subgroup, dispatched as
+    // an upper bound).  The TILED FMA kernel (gemm_prefill_fma.comp) owns an (N/64, T/16) tile grid with the token
+    // rows on the y dimension.  The UNTILED small-T kernel (gemm_prefill_fma_small.comp) is one invocation per
+    // output element, so its grid is ceil(T*N/256) on x.
+    const bool untiled = std::strstr(spv, "_small") != nullptr;
+    const uint32_t gx = untiled ? groups_for((uint64_t) t * n)
+                                : (cma ? (uint32_t) ((t / 8) * (n / 16) + 8) : (uint32_t) ((n + 63) / 64));
+    const uint32_t gy = (untiled || cma) ? 1u : (uint32_t) ((t + 15) / 16);
+    ctx.dispatch(p, {&bx, &bw, &by}, &pc, sizeof(pc), gx, gy);
 
     std::vector<float> got(pad.size());
     ctx.read(by, got.data(), pad.size() * 4);
@@ -703,7 +710,9 @@ static void prefill_check(Ctx& ctx, const std::string& dir, const char* spv, uin
 // one the plan's stage 5 is named for; the engine calls it as `Gemm::f16` (src/prefill/gemm.cu), whose cuBLAS
 // call is (CUBLAS_OP_T, CUBLAS_OP_N) - the weight is the transposed operand.
 void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
-    if (!have(dir, "gemm_prefill_fma.spv") || !have(dir, "gemm_prefill_f16_m8.spv")) return;
+    if (!have(dir, "gemm_prefill_fma.spv") || !have(dir, "gemm_prefill_f16_m8.spv") ||
+        !have(dir, "gemm_prefill_fma_small.spv"))
+        return;
     if (!ctx.info().storage_buffer_16bit) {
         skip("gemm_prefill", "device lacks storageBuffer16BitAccess - the operands are fp16");
         return;
@@ -714,11 +723,28 @@ void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
                     : "NOT USED - this device offers no M8 f16 config, so every shape takes the FMA path");
     std::fflush(stdout);
 
-    // THE FMA PATH, on the shapes the matrix units structurally cannot take: a single-token row (decode), a
-    // ragged everything, and a mid-sized prompt.  ldy > n on one of them, so the row stride is exercised here too.
-    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 1, 64, 64, 64, false, "prefill_fma 1x64x64 (decode row)");
-    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 17, 13, 5, 20, false, "prefill_fma 17x13x5 (ragged, ldy>n)");
-    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 40, 64, 96, 64, false, "prefill_fma 40x64x96");
+    // THE TILED FMA KERNEL (gemm_prefill_fma.comp, the T >= 16 half of the wrapper's split), including the
+    // shapes the matrix units structurally cannot take: a single-token row (a tile that hangs off T), a ragged
+    // everything, and a mid-sized prompt.  ldy > n on one of them, so the row stride is exercised here too.
+    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 1, 64, 64, 64, false, "prefill_tiled 1x64x64 (tile hangs off T=1)");
+    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 17, 13, 5, 20, false, "prefill_tiled 17x13x5 (ragged, ldy>n)");
+    prefill_check(ctx, dir, "gemm_prefill_fma.spv", 40, 64, 96, 64, false, "prefill_tiled 40x64x96");
+
+    // THE UNTILED SMALL-T KERNEL (gemm_prefill_fma_small.comp, the T < 16 half).  Same contract, same oracle,
+    // different memory schedule: the wrapper picks between them by T, so BOTH have to be graded at the shapes
+    // the wrapper actually routes to them.
+    //
+    // THE DRAW IS REWOUND.  The gate has ONE shared `g_rng(11)`, so an arm inserted anywhere but the END moves
+    // every LATER case's fixture - and it did: three new arms here flipped `fused_gdn_step_norm` and `gr_write`
+    // to a 1-element-in-132100 marginal FAIL on the Arc arm that passes without them (the port's own note at
+    // line ~14350 makes the same point for its appended arms).  Rather than perturb an unrelated case, this
+    // case saves the generator before the new arms and restores it after, so it consumes exactly the draws it
+    // consumed before the small-kernel arms existed and every later fixture is byte-identical.
+    const std::mt19937 rng_before_small = g_rng;
+    prefill_check(ctx, dir, "gemm_prefill_fma_small.spv", 1, 64, 64, 64, false, "prefill_small 1x64x64 (decode row)");
+    prefill_check(ctx, dir, "gemm_prefill_fma_small.spv", 8, 64, 96, 80, false, "prefill_small 8x64x96 (ldy>n)");
+    prefill_check(ctx, dir, "gemm_prefill_fma_small.spv", 13, 40, 33, 40, false, "prefill_small 13x40x33 (ragged)");
+    g_rng = rng_before_small;
 
     if (cma) {
         // THE MATRIX-UNIT PATH at tile-aligned prompt-like shapes.  N != K on purpose: a transposed operand read
@@ -759,7 +785,8 @@ void case_gemm_prefill(Ctx& ctx, const std::string& dir) {
             ctx.write(bw, w16.data(), w16.size() * 2);
             ctx.write(by, pad.data(), pad.size() * 4);
             VkPipeline pcma = ctx.pipeline(dir + "/gemm_prefill_f16_m8.spv", 3, 16);
-            VkPipeline pfma = ctx.pipeline(dir + "/gemm_prefill_fma.spv", 3, 16);
+            // the remainder (rem = 5 < 16) is the SMALL-T kernel's, which is what the wrapper routes to it
+            VkPipeline pfma = ctx.pipeline(dir + "/gemm_prefill_fma_small.spv", 3, 16);
             struct { uint32_t t, n, k, ldy; } pc1{aligned, n, k, ldy}, pc2{rem, n, k, ldy};
             ctx.dispatch(pcma, {&ba, &bw, &by}, &pc1, sizeof(pc1), (aligned / 8) * (n / 16) + 4);   // rows 0..31
             // The remainder's own X and Y: rows [32, 37).

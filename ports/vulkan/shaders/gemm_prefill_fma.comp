@@ -3,21 +3,59 @@
 // SAME CONTRACT as gemm_prefill_f16_m8.comp: Y[T x ldy] = X[T x K] . W[N x K]^T, f16 operands, f32 accumulate.
 // Different everything else, on purpose:
 //
-//   * NO SHAPE PRECONDITION.  One invocation per output element, so T, N and K can be anything - a single-token
-//     decode row, a prompt whose length is not a multiple of the tile, a K below one chunk.  This is the kernel
-//     that finishes a prefill the cooperative-matrix path cannot cover, which is why the gate exercises the SPLIT
-//     (aligned rows on the matrix units, the remainder here) and not each half alone.
-//   * No cooperative matrix, no subgroup op, no barrier: it needs 16-bit storage and nothing else, so it runs on
-//     a device whose config list has no usable f16 entry at all (llvmpipe, RADV here).
-//   * It is a correctness floor, not a fast kernel: the K loop reads global memory every time.  The tiled
-//     shared-memory version is the optimisation to make when this path carries real work.
+//   * NO SHAPE PRECONDITION.  Every dimension is guarded individually, so T, N and K can be anything - a
+//     single-token decode row, a prompt whose length is not a multiple of the tile, a K below one reduction
+//     step.  This is the kernel that finishes a prefill the cooperative-matrix path cannot cover, which is why
+//     the gate exercises the SPLIT (aligned rows on the matrix units, the remainder here) and not each half
+//     alone.
+//   * No cooperative matrix and no subgroup op: it needs 16-bit storage and shared memory and nothing else, so
+//     it runs on a device whose config list has no usable f16 entry at all (llvmpipe, RADV here).
 //
-// The GRID is M*N invocations, so T*ldy must stay under 2^32; the caller sizes it and this kernel guards the top
-// edge.  Y rows are independent, which is what makes the aligned/remainder split safe: the two kernels write
-// disjoint rows of the same buffer.
+// ---- THE TILING (2026-10-06 - this is what changed, and why) -------------------------------------------------
+// THIS KERNEL WAS UNTILED: one invocation per output element, and its own header said so.  That reads W from
+// global memory ONCE PER OUTPUT TOKEN - for an expert row-batch of T tokens every weight byte was read T times,
+// at a stride of K, so the loads were both redundant AND strided.
+//
+// The replacement is a shared-memory tile: a workgroup owns a TM x TN block of Y and walks K in TK steps,
+// staging X[TM x TK] and W[TN x TK] in shared memory once per step.  Every weight byte is then read from
+// GLOBAL memory once per TM-token tile instead of once per output element, and the loads a workgroup issues are
+// contiguous along K - coalesced.  The summation order per output element is UNCHANGED (k in increasing order,
+// f32 accumulate), so the change is a different memory schedule, not different arithmetic.
+//
+//   TM = 16  token rows of Y per tile      (one workgroup covers TM rows)
+//   TN = 64  output features per tile      (16 thread columns x 4 features each)
+//   TK = 16  reduction per shared-memory step        <- a compile-time knob (GP_TK)
+//
+// 256 threads = 16 x 16.  Thread (ty, tx) accumulates 4 outputs on row ty at columns tx*4 .. tx*4+3.  Shared
+// memory is (TM + TN) x TK fp16, and the W row stride is padded by one element so the thread columns land on
+// distinct banks.
+//
+// THE TILE IS A PERFORMANCE CHOICE, NOT A CORRECTNESS ONE: the bounds below are checked per element, so a tile
+// that hangs off T, N or K loads a zero (which contributes nothing to the f32 sum) and a store past T or N is
+// skipped.  A zero-product is exact for finite operands.
+//
+// TK AND THE BARRIER COUNT.  The K loop issues two barriers per TK step, so the barrier count is K/TK - and a
+// workgroup that finishes a K loop is serialised on those barriers.  Measured on the Arc Pro B70 (this box,
+// 2026-10-06, /tmp/gemm_sweep.log): at T=8 a TK of 16 costs MORE than the untiled kernel, because 160 barrier
+// pairs on a tile that small is pure overhead; TK=64 (40 barrier pairs) closes most of that gap and keeps the
+// large-T win.  TK is therefore a compile-time knob rather than a constant of the algorithm.
+//
+// The GRID is (ceil(N/TN), ceil(T/TM)): x over the feature tiles, y over the token-row tiles - the row grid is
+// the y dimension (a dispatch supports it directly) so no index division is needed, and it bounds T at
+// TM * 65535 rows.  Y rows are independent, which is what makes the aligned/remainder split safe.
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+
+#ifndef GP_TM
+#define GP_TM 16
+#endif
+#ifndef GP_TN
+#define GP_TN 64
+#endif
+#ifndef GP_TK
+#define GP_TK 16
+#endif
 
 layout(local_size_x = 256) in;
 
@@ -33,16 +71,63 @@ layout(push_constant) uniform Pc {
     uint ldy;    // row stride of Y in floats (>= n)
 } pc;
 
+const uint TM = uint(GP_TM);
+const uint TN = uint(GP_TN);
+const uint TK = uint(GP_TK);
+const uint TX = 16u;                 // thread columns (TN / CP)
+const uint CP = TN / TX;             // features per thread
+const uint XLOAD = TM * TK / 256u;   // X elements per thread per K step
+const uint WLOAD = TN * TK / 256u;   // W elements per thread per K step
+
+shared float16_t xs[TM][TK];
+shared float16_t ws[TN][TK + 1];  // +1: the W stride is padded so the thread columns hit distinct banks
+
 void main() {
-    const uint idx = gl_GlobalInvocationID.x;
-    if (idx >= pc.t * pc.n) return;                  // the grid is rounded up; surplus invocations exit
-    const uint row = idx / pc.n;                     // token
-    const uint col = idx % pc.n;                     // output feature
-    float acc = 0.0;
-    // The reduction runs over the CONTIGUOUS axis of both operands - W's row and X's row - which is the engine's
-    // (OP_T, OP_N) layout.  fp16 -> fp32 is exact, so the widening below costs nothing but the load.
-    for (uint i = 0u; i < pc.k; ++i) {
-        acc += float(X.x[row * pc.k + i]) * float(W.w[col * pc.k + i]);
+    const uint tid = gl_LocalInvocationIndex;
+    const uint ty = tid / TX;                     // 0..15  row within the tile
+    const uint tx = tid % TX;                     // 0..15  feature column group
+    const uint row0 = gl_WorkGroupID.y * TM;      // first token row of this tile
+    const uint col0 = gl_WorkGroupID.x * TN;      // first output feature of this tile
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+
+    // The reduction runs over the CONTIGUOUS axis of both operands - W's row and X's row - which is the
+    // engine's (OP_T, OP_N) layout.  fp16 -> fp32 is exact, so the widening below costs nothing but the load.
+    for (uint k0 = 0u; k0 < pc.k; k0 += TK) {
+        // ---- stage X: TM x TK elements, XLOAD per thread.  Consecutive threads read consecutive K. ----
+        for (uint jx = 0u; jx < XLOAD; ++jx) {
+            const uint xi = tid + jx * 256u;
+            const uint xr = xi / TK;              // 0..TM-1
+            const uint xc = xi % TK;              // 0..TK-1
+            const bool live = (row0 + xr) < pc.t && (k0 + xc) < pc.k;
+            xs[xr][xc] = live ? X.x[(row0 + xr) * pc.k + (k0 + xc)] : float16_t(0.0);
+        }
+        // ---- stage W: TN x TK elements, WLOAD per thread.  A row past N stages a zero. ----
+        for (uint jw = 0u; jw < WLOAD; ++jw) {
+            const uint wi = tid + jw * 256u;
+            const uint wr = wi / TK;              // 0..TN-1  feature row within the tile
+            const uint wc = wi % TK;              // 0..TK-1
+            const bool live = (col0 + wr) < pc.n && (k0 + wc) < pc.k;
+            ws[wr][wc] = live ? W.w[(col0 + wr) * pc.k + (k0 + wc)] : float16_t(0.0);
+        }
+        barrier();
+
+        // ---- accumulate this thread's CP outputs on its row ----
+        for (uint kk = 0u; kk < TK; ++kk) {
+            const float xv = float(xs[ty][kk]);
+            acc0 += xv * float(ws[tx * CP + 0u][kk]);
+            acc1 += xv * float(ws[tx * CP + 1u][kk]);
+            acc2 += xv * float(ws[tx * CP + 2u][kk]);
+            acc3 += xv * float(ws[tx * CP + 3u][kk]);
+        }
+        barrier();
     }
-    Y.y[row * pc.ldy + col] = acc;
+
+    const uint row = row0 + ty;
+    if (row >= pc.t) return;                       // the tile hangs off T: this row is not an output
+    const uint base = col0 + tx * CP;
+    if (base + 0u < pc.n) Y.y[row * pc.ldy + base + 0u] = acc0;
+    if (base + 1u < pc.n) Y.y[row * pc.ldy + base + 1u] = acc1;
+    if (base + 2u < pc.n) Y.y[row * pc.ldy + base + 2u] = acc2;
+    if (base + 3u < pc.n) Y.y[row * pc.ldy + base + 3u] = acc3;
 }
