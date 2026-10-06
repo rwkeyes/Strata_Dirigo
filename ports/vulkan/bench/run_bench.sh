@@ -46,6 +46,19 @@ for k in "${KERNELS[@]}"; do
   fi
   printf '  OK   %s\n' "$k"
 done
+# THE UNROLL A/B VARIANTS: one source, three builds.  `gdn_step_unroll` compares the rolled order (KU=1) and a
+# KU=8 variant against the SHIPPED KU, so the arm never needs a saved .spv and cannot drift from the source it
+# claims to measure.  A failure here is a NAMED failure, not a missing row.
+for ku in 1 8; do
+  if ! glslc --target-env=vulkan1.3 -fshader-stage=compute -DKU=$ku "$SH/native_gdn_step.comp" \
+        -o "$SPV/native_gdn_step_u$ku.spv" 2>"$BUILD/native_gdn_step_u$ku.err"; then
+    echo "  FAIL glslc native_gdn_step -DKU=$ku"; sed -n '1,8p' "$BUILD/native_gdn_step_u$ku.err"; rc=1; continue
+  fi
+  if ! spirv-val --target-env vulkan1.3 "$SPV/native_gdn_step_u$ku.spv" 2>>"$BUILD/native_gdn_step_u$ku.err"; then
+    echo "  FAIL spirv-val native_gdn_step_u$ku"; rc=1; continue
+  fi
+  printf '  OK   %s\n' "native_gdn_step_u$ku (-DKU=$ku)"
+done
 [ $rc -eq 0 ] || { echo "== shader build FAILED"; exit 1; }
 
 echo "== building vk_bench (-O2 -Werror)"

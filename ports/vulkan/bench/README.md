@@ -125,6 +125,26 @@ The per-dispatch cost FALLS with the batch and flattens near the engine's unit: 
 per-dispatch costs for comparing two kernels — but a claim about the engine must be made at (or corrected to)
 the engine's batch, and the row's own `batch` column is the thing to read first.
 
+## A ROW'S POSITION IN THE PROCESS DECIDES ITS VALUE — so quote the batch AND the arm, not just the row
+
+`gdn_step_probe` measured the same `native_gdn_step` batch-8 row three times inside ONE process:
+**0.2641 ms** the first time it ran, then **0.0428 ms** twice more (and 0.4478 ms at batch 1).  That is a
+first-touch/warm artifact of the process, not a property of the kernel or its state, and it explains the
+port's own discrepancy (`gdn_step_pair`'s native row read 0.1072 where the batch sweep read 0.0427).  So:
+
+* **`gdn_step_probe` re-uploads the state before EVERY hot row**, so a state that decays across a long timed
+  region cannot confound a comparison, and it prints the batch beside each row.
+* **A `cold` row cycles 36 distinct 3 MiB states (108 MiB, over the 24 MB L2) at batch 128** — the engine
+  owns one state per GDN layer, so a single replayed buffer is L2-hot in a way the engine's never is.  The
+  footprint is worth **1.79x** on the Arc (0.0345 -> 0.0619 ms), and **device-local vs host-visible is not
+  the difference** (0.0619 vs 0.0636 ms).
+* **`gdn_step_unroll` compares BUILDS, bitwise.**  It dispatches the KU=1 (rolled), KU=8 and SHIPPED
+  `native_gdn_step` — all three compiled from the same source by `run_bench.sh` — onto identical inputs and
+  prints `BITEXACT <field> <n>/<N> differ`, naming the first mismatching index and both values.  It is
+  **demonstrated to fail**: substituting the legacy `gdn_step.spv` (the same rule, a different rounding
+  order) for the reference gives `615347/786432` and `6144/6144` differs.  A check whose failure path has
+  never been exercised is not a check.
+
 ## What is measured
 
 | kernel (shader) | shape | unit |
@@ -158,6 +178,8 @@ the engine's batch, and the row's own `batch` column is the thing to read first.
 | `fused_gdn_conv_l2` vs `native_gdn_conv_silu`+2× `native_gdn_l2_norm` | C=10240 qk_heads=32 d_conv=4 (the 3-dispatch native chain) | elements/s |
 | `fused_gdn_ab` vs 2× `bf16_mmvf_f32` + `native_gdn_beta_gate` + `native_gdn_gate` | h_v=48 n=2560 (the 4-dispatch chain) | elements/s |
 | `fused_gdn_step_norm` vs `native_gdn_step` + `native_gdn_out_norm` | S=128 h_k=16 h_v=48 (3 MiB state; the 2-dispatch chain) | GMAC/s |
+| `gdn_step_probe` — the grid shape printed against the card's lanes, the hot batch sweep (1/8/64/128) with the state RE-UPLOADED per row, and the engine's real **36-state (108 MiB) footprint** cycled at batch 128 in host-visible AND device-local memory | S=128 h_k=16 h_v=48 (3 MiB state) | ms/dispatch (GMAC/s) |
+| `gdn_step_unroll` — the KU=1 (rolled), KU=8 and SHIPPED builds of `native_gdn_step.comp` (all from the SAME source via `run_bench.sh`), compared **BITWISE** on state and `o` and then timed hot + through the 36-state footprint | S=128 h_k=16 h_v=48 (3 MiB state) | ms/dispatch + `BITEXACT n/N differ` |
 | `gemm_prefill` — the four prefill GEMM schedules: `gemm_prefill_f16_m8` (matrix units, operands loaded straight from GLOBAL memory), `gemm_prefill_f16_m8_staged` (same tile, operands staged in SHARED memory as `mul_mm.comp` does), `gemm_prefill_fma` (tiled FMA) and `gemm_prefill_fma_small` (untiled FMA) | `T=8/16/64/199 x { gate/up N=1280 K=2560, down N=2560 K=640 }` — the engine's own expert shapes, one arm per schedule per shape | GMAC/s (T·N·K) |
 
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole

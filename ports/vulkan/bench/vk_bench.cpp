@@ -1305,6 +1305,235 @@ void bench_gdn_rec_batch_sweep(Ctx& ctx, const std::string& dir, int reps, int w
 }
 
 // =========================================================================================================
+// THE STEP KERNEL'S OWN PROBE - parallelism in flight, the engine's batch, and the STATE FOOTPRINT.
+// Three questions the port has NOT answered for `native_gdn_step`, each with its own row:
+//   (1) SHAPE.  The dispatch is `groups_for(h_v*S)` = 24 workgroups x 256 lanes = 6,144 threads on a card
+//       whose device reports 4,096 fp32 lanes (32 Xe2 cores x 128) - so the grid offers under two waves and,
+//       at one workgroup per core, leaves 8 of 32 cores idle.  Printed so thread_count / lanes is a number.
+//   (2) THE ENGINE'S BATCH.  The hot single-buffer row at batch 1/8/64/128, with the STATE RE-UPLOADED before
+//       every row so a state that decays across a long timed region cannot confound the comparison (the
+//       port's `gdn_step_pair` native row read 0.1072 ms where the batch sweep read 0.0427 - factor 2.5 -
+//       and the one structural difference is how many times that buffer had already run when it was timed).
+//   (3) STATE FOOTPRINT.  The engine owns 36 distinct 3 MiB GDN states (one per GDN layer = 108 MiB, over the
+//       24 MB L2) and runs ONE dispatch per (token, layer), so a harness that replays a single buffer is
+//       L2-hot in a way the engine's never is.  The `cold` rows cycle through 36 states, same kernel, same
+//       grid - the direct test of the port's "8.5x engine-vs-bench" gap, and of whether the state must be
+//       DEVICE_LOCAL (the engine's arena type) rather than host-visible for the number to be comparable.
+// A row here is an IN-STREAM MARGINAL COST (the documented limit of this harness), NOT a bandwidth figure.
+// =========================================================================================================
+Timing time_cycle(Ctx& ctx, VkPipeline p, const std::vector<Buf>& states, const std::vector<const Buf*>& fixed_,
+                  const void* pc, uint32_t pc_bytes, uint32_t gx, uint32_t gy, int batch, int reps, int warmups) {
+    std::vector<const Buf*> bufs;
+    ctx.record_begin();
+    for (int i = 0; i < batch; ++i) {
+        bufs.clear();
+        bufs.push_back(&states[(size_t) i % states.size()]);
+        for (const Buf* b : fixed_) bufs.push_back(b);
+        ctx.record_dispatch(p, bufs, pc, pc_bytes, gx, gy);
+    }
+    ctx.record_end_and_submit();
+    for (int w = 0; w < warmups; ++w) ctx.replay_recorded();
+    std::vector<double> ms;
+    ms.reserve((size_t) reps);
+    for (int r = 0; r < reps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ctx.replay_recorded();
+        const auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / (double) batch);
+    }
+    std::sort(ms.begin(), ms.end());
+    Timing t;
+    t.reps = reps; t.batch = batch; t.med = ms[ms.size() / 2]; t.lo = ms.front(); t.hi = ms.back();
+    return t;
+}
+
+void bench_gdn_step_probe(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int S = 128, h_k = 16, h_v = 48;                  // the native wrapper requires S == 128
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st = floats(nstate), q = floats((size_t) h_k * S), k = floats((size_t) h_k * S),
+                        v = floats(no), gate = floats((size_t) h_v), beta = floats((size_t) h_v);
+    for (auto& g : gate) g = -std::fabs(g) - 0.5f;
+    const float scale = 1.0f / std::sqrt((float) S);
+    const uint32_t sg = (uint32_t) ((no + 255) / 256);
+    struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pcn{S, h_k, h_v, scale};
+    struct { int32_t S; int32_t h_k; int32_t h_v; } pcl{S, h_k, h_v};
+    const char* shape = "S=128 h_k=16 h_v=48 (3 MiB state)";
+
+    std::printf("PROBE gdn_step shape | %s | grid = %u workgroups x 256 lanes = %u threads | card = 32 Xe2 cores "
+                "x 128 = 4096 fp32 lanes (B70/BMG-G31)\n",
+                shape, sg, sg * 256u);
+
+    Buf bst = alloc(ctx, nstate * 4), bq = alloc(ctx, (size_t) h_k * S * 4), bk = alloc(ctx, (size_t) h_k * S * 4),
+        bv = alloc(ctx, no * 4), bg = alloc(ctx, (size_t) h_v * 4), bb2 = alloc(ctx, (size_t) h_v * 4),
+        bo = alloc(ctx, no * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    VkPipeline p = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+    const std::vector<const Buf*> fix = {&bq, &bk, &bv, &bg, &bb2, &bo};
+
+    // (2) the hot single-buffer sweep, state RE-UPLOADED before each row (decay cannot confound it).
+    double hot128 = 0.0;
+    const int hot_batches[] = {1, 8, 64, 128};
+    for (int b : hot_batches) {
+        ctx.write(bst, st.data(), nstate * 4);
+        std::vector<const Buf*> bf = {&bst, &bq, &bk, &bv, &bg, &bb2, &bo};
+        Timing t = time_kernel(ctx, p, bf, &pcn, sizeof(pcn), sg, 1, b, reps, warmups);
+        report("native_gdn_step hot", shape, t, (double) no, (double) no * 3.0 * (double) S);
+        if (b == 128) hot128 = t.med;
+    }
+    // the ORDER confound, measured: the SAME batch-8 row run twice more in the same process.  If they differ,
+    // a row's position in the process decides its value.
+    for (int r2 = 0; r2 < 2; ++r2) {
+        ctx.write(bst, st.data(), nstate * 4);
+        std::vector<const Buf*> bf = {&bst, &bq, &bk, &bv, &bg, &bb2, &bo};
+        Timing t = time_kernel(ctx, p, bf, &pcn, sizeof(pcn), sg, 1, 8, reps, warmups);
+        report("native_gdn_step hot8_repeat", shape, t, (double) no, (double) no * 3.0 * (double) S);
+    }
+
+    // (3) the STATE FOOTPRINT: 36 distinct 3 MiB states (108 MiB, over the 24 MB L2), cycled at the engine's
+    // batch of 128 dispatches - the same kernel and grid the hot rows above ran.
+    const int nlay = 36;
+    std::vector<Buf> cold, colddev;
+    for (int i = 0; i < nlay; ++i) {
+        Buf s = alloc(ctx, nstate * 4);
+        std::vector<float> si = st;                         // a DISTINCT state per layer, so it is a real 108 MiB
+        for (size_t z = (size_t) i; z < si.size(); z += (size_t) nlay) si[z] += (float) i;
+        ctx.write(s, si.data(), nstate * 4);
+        cold.push_back(s);
+    }
+    Timing tcold = time_cycle(ctx, p, cold, fix, &pcn, sizeof(pcn), sg, 1, 128, reps, warmups);
+    report("native_gdn_step cold36host", "36x3MiB host-visible, batch 128", tcold, (double) no,
+           (double) no * 3.0 * (double) S);
+
+    // the same footprint in DEVICE_LOCAL memory (the engine's arena type is not host-visible)
+    for (int i = 0; i < nlay; ++i) {
+        Buf s = ctx.alloc_device(nstate * 4);
+        ctx.write(s, st.data(), nstate * 4);
+        colddev.push_back(s);
+    }
+    Timing tcoldd = time_cycle(ctx, p, colddev, fix, &pcn, sizeof(pcn), sg, 1, 128, reps, warmups);
+    report("native_gdn_step cold36dev", "36x3MiB device-local, batch 128", tcoldd, (double) no,
+           (double) no * 3.0 * (double) S);
+
+    // the LEGACY kernel through the identical instrument (hot 128 vs cold 36 host), so the pair is ranked
+    VkPipeline pl = ctx.pipeline(dir + "/gdn_step.spv", 7, 12);
+    ctx.write(bst, st.data(), nstate * 4);
+    std::vector<const Buf*> bl = {&bst, &bq, &bk, &bv, &bg, &bb2, &bo};
+    Timing tlh = time_kernel(ctx, pl, bl, &pcl, sizeof(pcl), sg, 1, 128, reps, warmups);
+    report("gdn_step legacy hot", shape, tlh, (double) no, (double) no * 3.0 * (double) S);
+    Timing tlc = time_cycle(ctx, pl, cold, fix, &pcl, sizeof(pcl), sg, 1, 128, reps, warmups);
+    report("gdn_step legacy cold36host", "36x3MiB host-visible, batch 128", tlc, (double) no,
+           (double) no * 3.0 * (double) S);
+    std::printf("XPAIR gdn_step_probe | hot128 native %.4f vs cold36host %.4f = %.3f | legacy hot128 %.4f vs "
+                "cold36host %.4f = %.3f | cold36dev/native-hot128 %.3f\n",
+                hot128, tcold.med, tcold.med / (hot128 > 0 ? hot128 : 1e-9), tlh.med, tlc.med,
+                tlc.med / (tlh.med > 0 ? tlh.med : 1e-9), tcoldd.med / (hot128 > 0 ? hot128 : 1e-9));
+
+    ctx.free(bst); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2); ctx.free(bo);
+    for (Buf& s : cold) ctx.free(s);
+    for (Buf& s : colddev) ctx.free(s);
+}
+
+// =========================================================================================================
+// THE STEP KERNEL'S UNROLL A/B - and the bit-exactness check that has to pass before any timing matters.
+// The unroll (`native_gdn_step.comp`, KU) is a MEMORY-LEVEL-PARALLELISM change and must not touch a single
+// float: the same single accumulator, the same ascending `i` order.  This arm DISPATCHES the KU=1 (rolled)
+// .spv, the SHIPPED KU and a KU=8 variant onto IDENTICAL inputs and compares STATE and O BITWISE, naming the
+// first mismatching index when they differ - so "the same summation order" is a measurement, not a claim in a
+// comment.  Then it times all three at batch 128 hot and through the 36-state footprint.  All three .spv are
+// built from the SAME source by `run_bench.sh` (`-DKU=1/8/<shipped>`), so the arm is reproducible.
+// =========================================================================================================
+static constexpr int KU_SHIPPED = 16;
+void bench_gdn_step_unroll(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int S = 128, h_k = 16, h_v = 48;
+    const size_t nstate = (size_t) S * h_v * S, no = (size_t) h_v * S;
+    std::vector<float> st = floats(nstate), q = floats((size_t) h_k * S), k = floats((size_t) h_k * S),
+                        v = floats(no), gate = floats((size_t) h_v), beta = floats((size_t) h_v);
+    for (auto& g : gate) g = -std::fabs(g) - 0.5f;
+    const float scale = 1.0f / std::sqrt((float) S);
+    const uint32_t sg = (uint32_t) ((no + 255) / 256);
+    struct { int32_t S; int32_t h_k; int32_t h_v; float scale; } pc{S, h_k, h_v, scale};
+    Buf bq = alloc(ctx, (size_t) h_k * S * 4), bk = alloc(ctx, (size_t) h_k * S * 4), bv = alloc(ctx, no * 4),
+        bg = alloc(ctx, (size_t) h_v * 4), bb2 = alloc(ctx, (size_t) h_v * 4);
+    ctx.write(bq, q.data(), q.size() * 4);
+    ctx.write(bk, k.data(), k.size() * 4);
+    ctx.write(bv, v.data(), no * 4);
+    ctx.write(bg, gate.data(), (size_t) h_v * 4);
+    ctx.write(bb2, beta.data(), (size_t) h_v * 4);
+    const std::vector<const Buf*> fix = {&bq, &bk, &bv, &bg, &bb2};
+
+    VkPipeline pbase = ctx.pipeline(dir + "/native_gdn_step_u1.spv", 7, 16);
+    VkPipeline pun = ctx.pipeline(dir + "/native_gdn_step.spv", 7, 16);
+    VkPipeline pu16 = ctx.pipeline(dir + "/native_gdn_step_u8.spv", 7, 16);
+
+    // ---- BITWISE: baseline vs unrolled on identical inputs, ONE dispatch each ----
+    Buf stA = alloc(ctx, nstate * 4), stB = alloc(ctx, nstate * 4), stC = alloc(ctx, nstate * 4),
+        oA = alloc(ctx, no * 4), oB = alloc(ctx, no * 4), oC = alloc(ctx, no * 4);
+    ctx.write(stA, st.data(), nstate * 4);
+    ctx.write(stB, st.data(), nstate * 4);
+    ctx.write(stC, st.data(), nstate * 4);
+    auto one = [&](VkPipeline p, Buf& s, Buf& o) {
+        ctx.record_begin();
+        std::vector<const Buf*> b = {&s, &bq, &bk, &bv, &bg, &bb2, &o};
+        ctx.record_dispatch(p, b, &pc, sizeof(pc), sg, 1);
+        ctx.record_end_and_submit();
+    };
+    one(pbase, stA, oA);
+    one(pun, stB, oB);
+    one(pu16, stC, oC);
+    std::vector<float> rsA(nstate), rsB(nstate), rsC(nstate), roA(no), roB(no), roC(no);
+    ctx.read(stA, rsA.data(), nstate * 4);
+    ctx.read(stB, rsB.data(), nstate * 4);
+    ctx.read(stC, rsC.data(), nstate * 4);
+    ctx.read(oA, roA.data(), no * 4);
+    ctx.read(oB, roB.data(), no * 4);
+    ctx.read(oC, roC.data(), no * 4);
+    auto cmp = [](const char* tag, const std::vector<float>& a, const std::vector<float>& b) {
+        size_t bad = 0;
+        for (size_t z = 0; z < a.size(); ++z)
+            if (a[z] != b[z]) { if (bad == 0) std::printf("   BITEXACT first mismatch %s: idx %zu base %.9g new %.9g\n", tag, z, a[z], b[z]); ++bad; }
+        std::printf("   BITEXACT %s: %zu/%zu differ%s\n", tag, bad, a.size(), bad == 0 ? "" : "  <-- NOT BIT-EXACT");
+        return bad == 0;
+    };
+    bool ok8 = cmp("state shipped", rsA, rsB) & cmp("o shipped", roA, roB);
+    bool ok16 = cmp("state u8", rsA, rsC) & cmp("o u8", roA, roC);
+    std::printf("PROBE gdn_step_unroll | the ROLLED order (KU=1) vs the SHIPPED KU=%d bit-exact: %s | vs KU=8: %s | "
+                "shaders u1(rolled) native_gdn_step_u1.spv shipped native_gdn_step.spv u8 native_gdn_step_u8.spv\n",
+                KU_SHIPPED, ok8 ? "YES" : "NO", ok16 ? "YES" : "NO");
+    ctx.free(stA); ctx.free(stB); ctx.free(stC); ctx.free(oA); ctx.free(oB); ctx.free(oC);
+
+    // ---- TIMING: hot batch 128 and the 36-state footprint, each through the identical instrument ----
+    Buf bst = alloc(ctx, nstate * 4), bo = alloc(ctx, no * 4);
+    ctx.write(bst, st.data(), nstate * 4);
+    const int nlay = 36;
+    std::vector<Buf> cold;
+    for (int i = 0; i < nlay; ++i) {
+        Buf s = alloc(ctx, nstate * 4);
+        std::vector<float> si = st;
+        for (size_t z = (size_t) i; z < si.size(); z += (size_t) nlay) si[z] += (float) i;
+        ctx.write(s, si.data(), nstate * 4);
+        cold.push_back(s);
+    }
+    struct V { const char* name; VkPipeline p; };
+    const V vs[] = {{"u1(rolled)", pbase}, {"shipped", pun}, {"u8", pu16}};
+    for (const V& v : vs) {
+        ctx.write(bst, st.data(), nstate * 4);
+        std::vector<const Buf*> b = {&bst, &bq, &bk, &bv, &bg, &bb2, &bo};
+        Timing th = time_kernel(ctx, v.p, b, &pc, sizeof(pc), sg, 1, 128, reps, warmups);
+        std::string tag = std::string("hot128 ") + v.name;
+        report(("native_gdn_step " + std::string(v.name)).c_str(), tag, th, (double) no, (double) no * 3.0 * S);
+        Timing tc = time_cycle(ctx, v.p, cold, fix, &pc, sizeof(pc), sg, 1, 128, reps, warmups);
+        tag = std::string("cold36host ") + v.name;
+        report(("native_gdn_step " + std::string(v.name)).c_str(), tag, tc, (double) no, (double) no * 3.0 * S);
+    }
+    ctx.free(bst); ctx.free(bo); ctx.free(bq); ctx.free(bk); ctx.free(bv); ctx.free(bg); ctx.free(bb2);
+    for (Buf& s : cold) ctx.free(s);
+}
+
+// =========================================================================================================
 // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`, ONE shared shader) - the DEFAULT side of the
 // `native_bf16_projections` setting, ported so the setting cannot route the engine at an unported symbol.  There
 // is NO legacy sibling to compare against (this IS the non-native branch), so the pair is measured against the
@@ -1502,6 +1731,11 @@ int main(int argc, char** argv) {
     arm("fused_gdn_step_norm_pair", false, [&] { bench_fused_gdn_step_norm_pair(ctx, dir, reps, warmups); });
     // THE RECURRENCE'S BATCH SWEEP - see the function's header for why a batch-8 row cannot answer it.
     arm("gdn_rec_batch_sweep", false, [&] { bench_gdn_rec_batch_sweep(ctx, dir, reps, warmups); });
+    // THE STEP KERNEL'S OWN PROBE: shape (workgroups vs the card's lanes), the engine's batch with a fresh
+    // state, and the 36-state (108 MiB) footprint the engine actually runs against.
+    arm("gdn_step_probe", false, [&] { bench_gdn_step_probe(ctx, dir, reps, warmups); });
+    // THE UNROLL A/B: the baseline .spv vs the unrolled one, bitwise first and then timed hot/cold.
+    arm("gdn_step_unroll", false, [&] { bench_gdn_step_unroll(ctx, dir, reps, warmups); });
     // THE BF16-PROJECTION PAIR (`bf16_gemv` / `bf16_gemv_split`): the DEFAULT side of `native_bf16_projections`.
     arm("bf16_gemv_pair", false, [&] { bench_bf16_gemv_pair(ctx, dir, reps, warmups); });
     // THE PREFILL GEMM: the prompt path's own deep kernel, both cooperative-matrix schedules and both FMA
@@ -1525,7 +1759,7 @@ int main(int argc, char** argv) {
                              "router_pair moe_combine_pair rms_norm_pair qsa_gate_pair qsa_decode_attn "
                              "gdn_conv_silu_pair gdn_l2_norm_pair gdn_beta_gate_pair gdn_gate_pair "
                              "gdn_out_norm_pair gdn_step_pair fused_gdn_conv_l2_pair fused_gdn_ab_pair "
-                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep bf16_gemv_pair gemm_prefill sampler\n");
+                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill sampler\n");
         return 2;
     }
 

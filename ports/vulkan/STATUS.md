@@ -1,5 +1,63 @@
 # Status — what is done, what is verified, what is not
 
+## THE STEP KERNEL'S SERIAL WALK: MEASURED, THEN UNROLLED BIT-EXACT (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) **The parallelism in flight is measured and printed**, not assumed: `groups_for(h_v*S)` = **24
+workgroups x 256 lanes = 6,144 threads** against the card's **4,096 fp32 lanes** (Intel Arc Pro B70 / BMG-G31,
+32 Xe2 cores x 128, 24 MB L2, 608 GB/s — from `vulkaninfo` + `lspci`). (2) **The kernel is memory-LATENCY-bound,
+not ALU-bound**: the lane ceiling is ~8.2 TFMA/s and the kernel reads 55 GMAC/s (0.7%); its real 36-state
+footprint (108 MiB over a 24 MB L2) costs **0.0619 ms/dispatch against 0.0345 ms L2-hot** (1.79x) while the
+DRAM floor for its 6 MiB of state traffic is **10.3 µs** — ~6x off bandwidth. The new `gdn_step_probe` arm also
+caught an **instrument artifact**: a batch-8 row read **0.2641 ms** the first time it ran in a process and
+**0.0428 ms** twice later — a row's POSITION decides its value, which explains the port's own
+`gdn_step_pair` (0.1072) vs batch-sweep (0.0427) discrepancy. (3) **`native_gdn_step` is unrolled by KU**
+(`#define KU 16`), ONE accumulator per pass, terms added in the SAME ascending `i` order — bit-for-bit the
+rolled loop. Measured on three implementations at batch 128 (hot / 36-state footprint): Arc **0.0330/0.0603 ->
+0.0134/0.0221 (2.46x / 2.73x)**, llvmpipe 0.3827/0.5939 -> 0.2580/0.4574 (1.48x / 1.30x), RADV iGPU 0.4340/0.4747
+-> 0.4320/0.4704 (a wash). (4) **BIT-EXACT, MEASURED, ON THREE IMPLEMENTATIONS**: the new `gdn_step_unroll` arm
+dispatches the KU=1 (rolled), KU=8 and SHIPPED builds — all three from the SAME source via `run_bench.sh` — onto
+identical inputs and reports `0/786,432` state and `0/6,144` `o` elements differing on intel, lvp and radeon.
+**The check is DEMONSTRATED TO FAIL**: substituting the legacy `gdn_step.spv` (the same rule, a different
+rounding order) as the reference gives `615347/786432` and `6144/6144` differs with the first index named.
+(5) **A parallel scan was CONSIDERED and REJECTED**: associative in exact arithmetic is not associative in f32,
+and this recurrence is chaotic (the port's own -19-per-token eigenvalue), so a scan changes the answer. It was
+not attempted and not shipped; the unroll is the bit-exact maximum of the same idea.
+
+**VERIFIED.** Engine A/B (199-token prompt, `--spec 2 --prefill 256`, n=3 per arm interleaved, one config per
+invocation, every arm logging its own env + the sha256 of the shader it placed): prefill **10,072.5 -> 9,730.1
+ms** medians (**3.40% less time**, 19.76 -> **20.45 tok/s**, +3.5%), `gdn recurrence` **2,677 -> 2,542 ms
+(-5.0%)**, base and shipped ranges **DISJOINT**; ids **`56a0b28d2de6` in all eight arms**. Arc `intel_icd` **895
+passed / 0 failed / 0 skipped — the count did NOT fall and nothing was skipped** (the kernel's interface and
+arithmetic are unchanged, so the existing `case_native_gdn_step` + `case_prefill_gdn_recurrence` are the
+guards); `lvp_icd` 879/0/4; smoke 60/0/0. `check_port_map.py` passes (`168 — 97 kernel, 0 shader, 47 host, 0
+todo, 24 refused`) and `make_port_map.py` regenerates byte-identically.
+
+**THE HONEST READING — THIS IS A FALSIFICATION OF THE TARGET, NOT A BIG WIN.** A kernel 2.46-2.73x faster moves
+`gdn recurrence` by 5.0% and the prefill by 3.40%. Decomposing: 135 ms saved at a 2.7x speedup implies the
+step kernel's own cost is ~**212 ms of the 2,677 ms phase (~8%)**; the other **~92%** is the engine's
+per-dispatch cost in the recurrence's 128-dispatch batches (**0.16-0.17 ms/dispatch**), which the harness does
+NOT reproduce (its cold 36-state estimate is **0.0221 ms/dispatch**, 7.6x lower). **The step kernel's serial walk
+is not what the phase is bound by, and no kernel change reaches the ~92%.**
+
+**UPSTREAM CROSS-CHECK (READ-ONLY).** Of `0c86bbec` (fix: `gdn_step_norm_multi` takes its norm shuffles outside
+`rg == 0`) and `ae3b249f` (perf: double-buffered multi + all-outputs): **our port does NOT carry the `rg == 0`
+bug** — it bans subgroup ops and every barrier-tree `barrier()` sits outside the lane-conditional
+(`common/wg_reduce.glsl:59-65`, `fused_gdn_step_norm.comp:84-93`, `gdn_step_norm_multi.comp:102-111,118`,
+`fused_gdn_ab.comp:88-97`, `fused_gdn_conv_l2.comp:87-96`; `native_gdn_step` has no reduction at all). Nothing
+was changed on that account. The live `fused_gdn_ab entry` radeon failure is **NOT** that bug: the case compares
+two dispatches of the SAME `.spv`, so an in-kernel reduction bug would corrupt both identically and still PASS;
+four repeats of the full gate on radeon gave **6 / 3 / 1 / 2 failures with a MOVING set** — the documented
+W26-family RADV intermittent, now recorded in `fused_gdn_ab` (fired in 1 of 4 repeats) and two more cases,
+**left documented, not speculatively patched**. `ae3b249f`'s double-buffering hides q/k broadcast-load latency,
+not the state walk's memory-level parallelism, so it is not the shape this measurement calls for.
+
+**NOT DONE.** The coopmat GEMM's row-block height (Target 2) and the `T >= 8` switch (Target 3) were **NOT
+REACHED** and are not claimed. The engine's ~0.17 ms/dispatch recurrence cost is **NOT explained**. The phase
+table entry is HOST WALL-CLOCK (a ranking). `fused_gdn_step_norm` was not unrolled. n=3 per arm (n=2 for KU=16).
+Logs: `/tmp/gdnsweep/{b1,b2,b3,n1,n2,n3,x1,x2}.log`, `/tmp/gdnsweep/driver.log`, `/tmp/gdnsweep/gate_final.log`,
+`/tmp/gdnsweep/radeon_rep{1,2,3,4}.log`, `/tmp/gdnsweep/{probe,unroll}.log`,
+`ports/vulkan/harness/build/icd-{intel,lvp,radeon}_icd.log`.
+
 ## THE `gdn recurrence` PHASE, MEASURED — AND THE MEASUREMENT FALSIFIED THE OBVIOUS FIX (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** (1) **The phase measured, not assumed.** `gdn recurrence` is **2,675 ms = 27.3%** of a 9,786 ms GPU

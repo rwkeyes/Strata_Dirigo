@@ -1,5 +1,76 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE STEP KERNEL'S SERIAL WALK, MEASURED AND THEN UNROLLED BIT-EXACT: 2.46x/2.73x on the kernel, **3.40%** on the prefill — and the falsification of "the phase is the step kernel" (2026-10-06, `vega`, Arc Pro B70)
+
+**THE SHAPE, MEASURED BEFORE IT WAS TOUCHED.** New bench arm `gdn_step_probe`, intel ICD:
+
+```
+PROBE gdn_step shape | S=128 h_k=16 h_v=48 (3 MiB state) | grid = 24 workgroups x 256 lanes = 6144 threads |
+card = 32 Xe2 cores x 128 = 4096 fp32 lanes (B70/BMG-G31)
+```
+
+* **The card** (from `vulkaninfo` and `lspci`, not assumed): `Intel(R) Graphics (BMG G31)`, PCI `8086:e223`
+  `Battlemage G31 [Arc Pro B70]`, **32 Xe2 cores / 4,096 fp32 lanes**, **24 MB L2**, 256-bit GDDR6 at
+  **608 GB/s**, subgroup 32.
+* **The ceiling against the phase's measured row.** 6,144 threads is **1.5 waves** of 4,096 lanes, and at one
+  workgroup per core **8 of 32 cores get no workgroup**. The card's lane rate is ~8.2 TFMA/s at ~2 GHz; the
+  kernel's own row is **55 GMAC/s = 0.7% of it**. Not ALU-bound.
+* **The memory floor.** 3 MiB state read + 3 MiB written (pass 2's re-read hits L2: 3 MiB in 24 MB) = 6 MiB at
+  608 GB/s = **10.3 µs**; measured **61.8 µs** with the engine's real footprint — **6x off bandwidth**, i.e.
+  latency-bound.
+* **The footprint, isolated in one process:** `native_gdn_step hot128` **0.0345 ms** against `cold36host`
+  (36 distinct 3 MiB states cycled, 108 MiB) **0.0619 ms** — **1.79x**. The same 36 states in DEVICE_LOCAL
+  memory read 0.0636 ms, so the allocation TYPE is not the difference; the footprint is. The probe also caught
+  an instrument artifact worth keeping: a batch-8 row read **0.2641 ms** the FIRST time it ran in the process
+  and **0.0428 ms** twice later, which is the whole explanation of `gdn_step_pair`'s 0.1072 against the batch
+  sweep's 0.0427.
+
+**THE FIX AND ITS THREE-IMPLEMENTATION PROOF.** `native_gdn_step.comp` walks its row axis in chunks of `KU`
+(`#define KU 16`), ONE accumulator per pass, terms added in the same ascending `i` order. The new
+`gdn_step_unroll` arm builds KU=1 (rolled), KU=8 and SHIPPED from the SAME source (`run_bench.sh`) and compares
+STATE and `o` BITWISE on identical inputs, naming the first mismatching index:
+
+| build (batch 128) | Arc hot | Arc cold36 | lvp hot | lvp cold36 | radeon hot | radeon cold36 |
+|---|---:|---:|---:|---:|---:|---:|
+| KU=1 (rolled) | 0.0330 | 0.0603 | 0.3827 | 0.5939 | 0.4340 | 0.4747 |
+| KU=8 | 0.0148 | 0.0231 | 0.2554 | 0.4584 | 0.4312 | 0.4714 |
+| **KU=16 (SHIPPED)** | **0.0134** | **0.0221** | 0.2580 | 0.4574 | 0.4320 | 0.4704 |
+| shipped/rolled | **2.46x** | **2.73x** | 1.48x | 1.30x | 1.005x | 1.009x |
+
+`BITEXACT ... 0/786432 differ` and `0/6144 differ` on **intel, lvp AND radeon**. The check is demonstrated to
+fail: putting the legacy `gdn_step.spv` (same rule, different rounding order) in the reference slot gives
+`615347/786432` and `6144/6144` differs with the index named. **A parallel scan was considered and rejected** —
+associative in exact arithmetic is not associative in f32, and this recurrence is chaotic, so a scan changes the
+answer.
+
+**THE ENGINE A/B — AND WHY IT IS A FALSIFICATION.** 199-token prompt, `--spec 2 --prefill 256`, n=3 per arm
+interleaved, one config per invocation, each arm logging its own env and the sha256 of the shader it placed:
+
+| arm | mode | prefill ms | tok/s | `gdn recurrence` ms | ids md5 |
+|---|---|---|---:|---:|---:|---|
+| `b1,b2,b3` | base (rolled) | 9,940.6 / 10,072.5 / 10,181.9 | 20.02 / 19.76 / 19.54 | 2,677 / 2,678 / 2,670 | `56a0b28d2de6` |
+| `n1,n2,n3` | KU=8 | 9,742.9 / 9,884.1 / 9,765.7 | 20.43 / 20.13 / 20.38 | 2,552 / 2,540 / 2,555 | `56a0b28d2de6` |
+| `x1,x2` | **KU=16 (SHIPPED)** | **9,736.3 / 9,723.9** | **20.44 / 20.47** | **2,537 / 2,547** | `56a0b28d2de6` |
+
+Medians: prefill **10,072.5 -> 9,730.1 ms (3.40% less time)**, tok/s **19.76 -> 20.45 (+3.5%)**, `gdn recurrence`
+**2,677 -> 2,542 ms (-5.0%)**; the ranges **do not overlap**. **THE FALSIFICATION:** a 2.7x kernel speedup saving
+135 ms of a 2,677 ms phase puts the kernel's own cost at ~**212 ms (~8%)**; the other **~92%** is the engine's
+per-dispatch cost in the recurrence's 128-dispatch batches (**0.16-0.17 ms/dispatch**), which the harness does
+not reproduce (**0.0221 ms/dispatch** cold, 7.6x lower). **The step kernel's serial walk is not the phase's
+bottleneck.**
+
+**UPSTREAM (READ-ONLY).** `0c86bbec`'s `rg == 0` shuffle fix and `ae3b249f`'s double-buffered multi were read:
+**our port does not carry that bug** (subgroup ops are banned; every barrier sits outside the lane-conditional
+— `common/wg_reduce.glsl:59-65` and the four GDN shaders' line numbers above). The live `fused_gdn_ab entry`
+radeon failure is the documented RADV intermittent, not that bug: the case compares two dispatches of the SAME
+`.spv`, so an in-kernel reduction bug could not separate them, and four radeon repeats of the full gate gave
+**6 / 3 / 1 / 2 failures with a moving set**. Left documented, not speculatively patched.
+
+**GATE + IDS.** Arc `intel_icd` **895/0/0 — the count did NOT fall, nothing skipped**; `lvp_icd` 879/0/4;
+`radeon_icd` 882/2/2 (both in the documented moving-failing-set family); smoke 60/0/0; ids `56a0b28d2de6` in all
+eight arms. Logs: `/tmp/gdnsweep/{b1,b2,b3,n1,n2,n3,x1,x2}.log`, `/tmp/gdnsweep/driver.log`,
+`/tmp/gdnsweep/gate_final.log`, `/tmp/gdnsweep/radeon_rep{1,2,3,4}.log`, `/tmp/gdnsweep/{probe,unroll}.log`.
+
 ## THE `gdn recurrence` PHASE, MEASURED, AND THE MEASUREMENT FALSIFIED THE OBVIOUS FIX: it is GPU-bound and LATENCY-bound, but it is NOT dispatch-count-bound — so the port's own fused kernel stays an OPT-IN 3.7%-of-the-phase win, and the wrapper finally has a gate arm (2026-10-06, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH.** The phase was measured before it was touched, and it is **2,675 ms = 27.3% of a 9,786 ms GPU timeline** — the largest phase this port owns — made of **`native_gdn_step` 7,164 + `native_gdn_out_norm` 7,164 dispatches** (199 tokens x 36 GDN layers) plus `f32_to_f16` 3,644. It is **NOT host blocking**: the fence wait charged to the flush batches whose trigger sits inside `prefill::gdn_recurrence` is **2,651 ms of that phase over 15,616 dispatches**, while the host's ENTIRE prefill costs ~55 ms of encode and 15 ms of submit. It is **latency-bound, not throughput-bound** — a strict serial chain (state[t] <- state[t-1]) of 24-workgroup dispatches whose own bench row is 55 GMAC/s. So the obvious fix is FEWER DEPENDENT DISPATCHES, and the port already had the fused form of exactly this pair. **It was built, A/B'd in the engine, and the A/B falsified the hypothesis**: fusing the pair (2 dispatches -> 1, 14,328 -> 7,164) moved the phase **2,674 -> 2,574 ms (medians, ranges disjoint, ids identical in all six arms)** — **3.7% of the phase, not the ~50% a dispatch-count-bound phase would owe** — because `native_gdn_step` carries ~90% of the pair's cost and the fusion removes the other kernel. The end-to-end prefill cannot even resolve that much: a separate session's plain arms are **10,126.2 / 9,829.1 ms** on the fused path against **10,046.6 ms** on the chain. So `STRATA_PF_GDN_REC_FUSED=1` ships as **opt-in**, the chain stays the default exactly as `STRATA_VK_PREFILL_TILED` did, and the real target is now named: the step kernel's own serial walk, which the bench cannot justify changing.

@@ -39,9 +39,42 @@
 // carries the native body's ARITHMETIC and its fused readout scale.  The case's oracle is still the
 // native RULE transcribed in double.
 //
+// =========================================================================================================
+// WHY THE ROW WALK IS UNROLLED, AND WHY THAT IS NOT A SUMMATION-ORDER CHANGE (the second measurement that
+// decided this shader).  The phase this kernel carries is 2,675 ms of a 9,786 ms prefill timeline (27.3%,
+// GPU-bound by its own flush wait), and the shape is the reason: `groups_for(h_v*S)` offers the card
+// **24 workgroups x 256 = 6,144 threads**, i.e. under two waves on this card's 4,096 fp32 lanes (32 Xe2
+// cores x 128) and - at one workgroup per core - 8 of 32 cores with no workgroup at all.  Each thread then
+// walks S=128 rows TWICE with a load->FMA chain.  The bench's own probe (`gdn_step_probe`, this port's
+// harness) measures where the time goes: the SAME kernel and grid read **0.0345 ms** when the 3 MiB state
+// is L2-resident and **0.0619 ms** when the working set is the engine's real 36 states (108 MiB, over the
+// 24 MB L2), i.e. the kernel is memory-LATENCY-bound, not ALU-bound: 6,144 threads at one or two
+// outstanding loads each is ~24-49 KB of memory-level parallelism, and at this card's DRAM latency that
+// sustains ~16% of its 608 GB/s.  The fix that does NOT touch the arithmetic is to issue the NEXT row's
+// loads before the FMAs that consume them: the loop is unrolled by `kGdnKU` with the SAME single
+// accumulator, adding each term in the SAME ascending `i` order, so the sequence of floating-point
+// operations is bit-for-bit the rolled loop's (`(kv + t0) + t1` never becomes `kv + (t0 + t1)`).
+// THIS IS THE PROPERTY THAT MATTERS: the GDN recurrence is chaotic (the port measured an eigenvalue near
+// -19 per token on an un-normalised fixture), so any association change would move the ids.  A parallel
+// scan was considered and REJECTED on exactly this ground - it is associative in exact arithmetic but not
+// in f32, so it changes the answer.  The unroll does not, and the gate's `case_native_gdn_step` and the
+// engine's id hashes are the guards.
+// =========================================================================================================
+//
 // The head pairing is `src = h % h_k` (MODULO), the state layout is the port's (S, h_v, S) with j fastest
 // (`state[(i*h_v + h)*S + j]`).  The dispatch is one thread per column, `groups_for(h_v * S)`; the column
 // guard makes an over-dispatch harmless.  No barrier, no subgroup op, no atomic.
+//
+// THE UNROLL FACTOR, MEASURED ON THREE IMPLEMENTATIONS (`gdn_step_unroll`, batch 128, cold 36-state
+// footprint / hot single state): KU=8 vs KU=16 are BOTH bit-exact against the rolled baseline (0/786,432
+// state and 0/6,144 `o` elements differ on intel, lvp AND radeon).  Threads: intel cold 0.0618 -> 0.0231
+// (KU=8) -> 0.0221 (KU=16); lvp cold 0.5856 -> 0.4559 (KU=8) / 0.4531 (KU=16); **radeon cold 0.4170 ->
+// 0.4376 (KU=8) / 0.4167 (KU=16)** - the RADV iGPU is a wash at KU=8 and NEUTRAL at KU=16.  So KU=16 is the
+// shipped factor: it is the faster one on the target and the one that does not regress the third
+// implementation.  `-DKU=<n>` overrides it for the bench.
+#ifndef KU
+#define KU 16
+#endif
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;     // (S, h_v, S), j fastest, in place
 layout(set = 0, binding = 1, std430) readonly buffer Q { float v[]; } qb;   // (h_k, S)
@@ -62,15 +95,43 @@ void main() {
     const float g = exp(gb.v[h]);                       // the native body's `g_val = expf(gate[head])`
     const float b = bb.v[h];
 
-    // pass 1: the contract against the UNDECAYED state (the native body's `kv_col`).
+    // pass 1: the contract against the UNDECAYED state (the native body's `kv_col`).  ONE accumulator, terms
+    // added in ascending `i` order; the KU loads of a chunk are issued together, before the FMAs consume them.
     float kv = 0.0f;
-    for (uint i = 0u; i < S; ++i) kv += state.v[(i * hv + h) * S + j] * kb.v[src * S + i];
+    uint i = 0u;
+    for (; i + uint(KU) <= S; i += uint(KU)) {
+        float ss[KU], kk[KU];
+        for (uint u = 0u; u < uint(KU); ++u) {
+            ss[u] = state.v[(uint(i + u) * hv + h) * S + j];
+            kk[u] = kb.v[src * S + i + u];
+        }
+        for (uint u = 0u; u < uint(KU); ++u) kv += ss[u] * kk[u];
+    }
+    for (; i < S; ++i) kv += state.v[(i * hv + h) * S + j] * kb.v[src * S + i];
     const float delta = (vb.v[h * S + j] - g * kv) * b;
     // pass 2: the native body's single folded decay+rank-1 update, then the readout against the UPDATED state.
+    // Same ascending order and the same single `attn` accumulator; the stores are independent of each other
+    // and of the accumulation (each term is formed from a load, never from the previous row's result).
     float attn = 0.0f;
-    for (uint i = 0u; i < S; ++i) {
+    i = 0u;
+    for (; i + uint(KU) <= S; i += uint(KU)) {
+        float ss[KU], kk[KU], qq[KU];
+        uint idx[KU];
+        for (uint u = 0u; u < uint(KU); ++u) {
+            idx[u] = (uint(i + u) * hv + h) * S + j;
+            ss[u] = state.v[idx[u]];
+            kk[u] = kb.v[src * S + i + u];
+            qq[u] = qb.v[src * S + i + u];
+        }
+        for (uint u = 0u; u < uint(KU); ++u) {
+            const float s = g * ss[u] + kk[u] * delta;  // g*s + k*delta, one step
+            state.v[idx[u]] = s;
+            attn += s * qq[u];
+        }
+    }
+    for (; i < S; ++i) {
         const uint idx = (i * hv + h) * S + j;
-        const float s = g * state.v[idx] + kb.v[src * S + i] * delta;   // g*s + k*delta, one step
+        const float s = g * state.v[idx] + kb.v[src * S + i] * delta;
         state.v[idx] = s;
         attn += s * qb.v[src * S + i];
     }
