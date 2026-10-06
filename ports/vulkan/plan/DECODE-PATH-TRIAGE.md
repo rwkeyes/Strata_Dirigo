@@ -865,3 +865,62 @@ background prefetch whose result is "an estimate only".
 3. **The five remaining `shader`-row composites** (`coupled_draft_sample`, `moe_grouped_s2`,
    `moe_hit_grouped_s2_cpu_order`, `native_expert_grouped`, `shared_expert_multi`) — each a class-C/D composite;
    their shaders exist and are gated, the wrapper is missing for the same reason they are not on the decode trip.
+
+# THE P6 VERIFY WINDOW'S KERNELS ARE PORTED, AND THE CLASS-D SECTION IS CORRECTED (2026-10-05, `vega`)
+
+**THIS SECTION SUPERSEDES EVERY "the verifier cannot init" / "not reached" CLAIM ABOVE.**  The class-D
+classification was written on the assumption that `Verifier::init` refuses.  **That assumption is FALSE of the
+code as it now stands:** `verify.cpp:336`'s FIRST disjunct is `!fused_gr_supported(g.n_embd, g.hc, g.hc_lr)`,
+`fused_gr_supported` answers the engine's own geometry predicate TRUE (the fused read is ported), so
+`Verifier::init` SUCCEEDS and the window's BODY executes.  **A refusal whose text says "not reached" while being
+reached is a defect in the INSTRUMENT**, so `refusals_vk.cpp`'s shared body no longer makes that claim at all:
+it prints `NOT PORTED on the Vulkan backend - REFUSING. / Reached by: <chain>`, and each chain string says
+whether the shipped configuration reaches it.
+
+## The nine symbols this batch ported, in the order `verify.cpp` reaches them
+
+| # | symbol | call site | shape | proof |
+|---|---|---|---|---|
+| 1 | `broadcast_streams` | verify.cpp:592/:606 | NEW shader `bcast_streams.comp` (`mode 0`) | wrapper == the CUDA rule; a surplus group writes nothing; capture |
+| 2 | `gdn_conv_l2_multi` | verify.cpp:726/:730 | LOOP over the gated `fused_gdn_conv_l2`, on a WORKING history seeded by `gdn_conv_tail` | vs the CUDA window rule (double) at t_begin 0 AND 2; `history` NOT written; capture |
+| 3 | `gdn_ab_multi` | verify.cpp:732 | LOOP over the gated `fused_gdn_ab` | multi == 3 x single, BITWISE |
+| 4 | `gdn_step_norm_multi` | verify.cpp:743/:748/:1294 | NEW shader `gdn_step_norm_multi.comp` (the loop is IN the kernel: the bound is `*n_keep`, DEVICE data) | verify half == n_tok x single BITWISE + the STATE untouched; commit half == keep x single BITWISE with `n_keep` read from device memory; the `t_out_begin` y-guard; capture |
+| 5 | `native_router_top10_multi` | verify.cpp:920 | LOOP over the gated `native_router_top10` | multi == n_tok x single, BITWISE |
+| 6 | `shared_expert_multi` | verify.cpp:980 | LOOP over the single-token native chain (per token) | multi == n_tok x `shared_expert`, BITWISE |
+| 7 | `native_moe_combine_multi` | verify.cpp:1083 | LOOP over the gated `native_moe_combine` | multi == n_tok x single, BITWISE |
+| 8 | `gdn_conv_commit` | verify.cpp:1293/:1844 | NEW shader `gdn_conv_tail.comp` (`use_dev 1`) | wrapper == the CUDA window rule for n = 1..4; n <= 0 is a no-op |
+| 9 | `add_streams_broadcast` | mtp.cpp:497 (the DRAFTER) | the SAME `bcast_streams.comp` (`mode 1`) | wrapper == `h + e`; `mode` provably selects |
+
+`vulkan/src/kernels/verify_vk.cpp` holds all nine; `ports/vulkan/PORT-MAP.tsv` moves nine rows
+`refused -> kernel` (`168 = 92 kernel + 0 shader + 46 host + 0 todo + 30 refused`).
+
+## THE GENUINELY-UNREACHED SET, AND WHY (it is now load-bearing)
+
+**REACHED by the shipped configuration, and therefore HOLES:**
+* `wait_flag_ge` (`verify.cpp:1042`, the post of layer 0) - **THE WINDOW'S NEXT STOP.** A translating spin is
+  forbidden by this port's no-waiting-kernel rule, so the device/host handshake seam (the host-driven split
+  submission `sync.hpp` already carries) is what closes it.  This is the stopping point the run reports.
+* `copy_rows_from_mapped` (`verify.cpp:1071`) - the `dec_batch` CPU-share copy (`STRATA_DEC_BATCH` true by default).
+* `copy_indexed` (`verify.cpp:1311`) - the commit graph's PLE-history copy (a native pack's PLE key is native, so
+  the PLE stage is ready).
+
+**NOT reached, with the deciding condition (still loud refusals, still holes):**
+* `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`, `resident_plan`
+  (`verify.cpp:1039-1063`) - all four are inside `if (device_plan_)`, which needs `STRATA_VERIFY_DEVICE_PLAN`
+  (`verify.cpp:512-515`); `all_resident_`, the other way into `resident_plan`, needs EVERY expert of ALL 48
+  layers resident against a few-thousand-slot `--expert-cache`.
+* `fetch_blobs`, `rebase_ptrs` (`verify.cpp:1053/:1054`) - inside `if (sink_.pcie_mode == 2)`; the PCIe probe on
+  this box reads 0.1 GB/s -> `pcie_frac 0.00`.
+* `gpu_stamp` (`verify.cpp:564/:565`) - `STRATA_VERIFY_PROFILE` / `STRATA_VERIFY_TRACE`, both unset.
+* `ple_block_projected` (`verify.cpp:668`) - `ple_batch_kv`, which needs `ple_native_bf16_enabled()` AND
+  `ple_native_postops_enabled()`; the backend answers both FALSE.
+
+**The DRAFTER / file-tier symbols the brief asked to classify before porting** (`coupled_draft_*`, `mtp_select`,
+`fetch_blobs`, `resident_plan`, `kv_ring_*`, `moe_group_resident`): **none is on the verify window's path.**
+`coupled_draft_*` / `mtp_select` / `moe_group_resident` / `row_top_prob` / `map_ids` / `window_ids` are
+`mtp.cpp` (the `--spec 4 --mtp` draft loop; `setup.py` sets `--mtp`, this port's launch command does not, and
+`Verifier::init` is no longer the thing that blocks them - the DRAFT LOOP is simply not entered); the
+`kv_ring_*` / `moe_group_resident` / `fetch_blobs` / `resident_plan` file-tier and resident-plan paths are the
+`device_plan_` / `pcie_mode == 2` / `--kv-resident` conditions named above.  `add_streams_broadcast` is the one
+of that family that was PORTED (it shares `bcast_streams.comp`), so the pair is no longer split between a real
+symbol and a refusal.

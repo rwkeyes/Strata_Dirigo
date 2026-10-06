@@ -50,14 +50,23 @@
 
 namespace strata::kernels {
 
-// ONE refusal body: it names the symbol, the SHIPPED configuration that does NOT reach it, and the exact flag
-// chain that WOULD.  `std::exit(2)` (not an exception): a reach here is a configuration the backend does not
-// implement, and the port's rule is to refuse loudly rather than degrade.
-[[noreturn]] static void refuse_unreachable(const char* sym, const char* chain) {
+// ONE refusal body: it names the symbol, the configuration that reaches it, and REFUSES.  `std::exit(2)` (not
+// an exception): a reach here is a configuration the backend does not implement, and the port's rule is to
+// refuse loudly rather than degrade.
+//
+// **THE TEXT CHANGED IN THIS BATCH, AND THE CHANGE IS THE POINT.**  It used to read "NOT PORTED and NOT REACHED
+// by the shipped configuration", and that claim was FALSE OF THE CODE: `Verifier::init` now SUCCEEDS
+// (`verify.cpp:336`'s `fused_gr_supported` disjunct is true because the fused read is ported), so the P6
+// verify window's body EXECUTES and reaches its symbols in turn - and the window is a native pack's ONLY decode
+// path (`generate.cpp:7578-7579`).  **A refusal that says "not reached" while being reached is a defect in the
+// INSTRUMENT.**  So the body now states the symbol and the chain, and the CHAIN STRING says which it is:
+// `REACHED BY THE SHIPPED CONFIGURATION (<site>)` or `NOT reached (deciding condition: ...)`.  No row here is a
+// capability; every one is a HOLE.
+[[noreturn]] static void refuse_not_ported(const char* sym, const char* chain) {
     std::fprintf(stderr,
-                 "strata::kernels::%s: NOT PORTED and NOT REACHED by the shipped configuration - REFUSING.\n"
-                 "  The only configuration that reaches it: %s\n"
-                 "  This definition exists so the layer body LINKS; it is a LOUD REFUSAL, never a silent\n"
+                 "strata::kernels::%s: NOT PORTED on the Vulkan backend - REFUSING.\n"
+                 "  Reached by: %s\n"
+                 "  This definition exists so the engine LINKS; it is a LOUD REFUSAL, never a silent\n"
                  "  fallback.  The reachability audit is in ports/vulkan/plan/DECODE-PATH-TRIAGE.md.\n",
                  sym, chain);
     std::exit(2);
@@ -71,7 +80,7 @@ namespace strata::kernels {
 // set.  With it false the :978 `if` branch runs - `qsa_decode_attn_step`, ported.
 void native_flash_attn_short_step(const float*, const uint16_t*, const uint16_t*, const int32_t*, int64_t, int,
                                   const QsaShapes&, float*, int32_t*, const uint16_t*, void*) {
-    refuse_unreachable("native_flash_attn_short_step",
+    refuse_not_ported("native_flash_attn_short_step",
                        "--native-flash-attn-short (layer.cpp:92 default false; generate.cpp:2290; NOT set by --native)");
 }
 
@@ -82,7 +91,7 @@ void native_flash_attn_short_step(const float*, const uint16_t*, const uint16_t*
 // ported `qsa_decode_attn_step` runs.
 void qsa_attend_step(const float*, const uint16_t*, const uint16_t*, const int32_t*, int64_t, const QsaShapes&,
                      float*, float*, void*) {
-    refuse_unreachable("qsa_attend_step",
+    refuse_not_ported("qsa_attend_step",
                        "--no-fast-attn (g_fast_attn default true, layer.cpp:42) OR --native-flash-attn-short OR a "
                        "non-null dump - the `else` of `if (g_fast_attn && !native_flash_attn_short && dump == nullptr)` "
                        "(layer.cpp:978/1002); the selected branch is the ported qsa_decode_attn_step");
@@ -94,12 +103,12 @@ void qsa_attend_step(const float*, const uint16_t*, const uint16_t*, const int32
 // it true the selected branch is the ported `qsa_block_scores` + `qsa_block_topk`.
 void qsa_index_step(const float*, const float*, const float*, const QsaShapes&, const int32_t*, int64_t, float*,
                     void*) {
-    refuse_unreachable("qsa_index_step",
+    refuse_not_ported("qsa_index_step",
                        "--no-fast-select (g_fast_select default true, layer.cpp:42; generate.cpp:2282) - the `else` "
                        "of `if (g_fast_select)` (layer.cpp:968); the selected branch is the ported qsa_block_scores");
 }
 void topk_512_step(const float*, const QsaShapes&, int64_t, const int32_t*, int32_t*, void*) {
-    refuse_unreachable("topk_512_step",
+    refuse_not_ported("topk_512_step",
                        "--no-fast-select (g_fast_select default true, layer.cpp:42; generate.cpp:2282) - the `else` "
                        "of `if (g_fast_select)` (layer.cpp:968); the selected branch is the ported qsa_block_topk");
 }
@@ -125,18 +134,18 @@ void topk_512_step(const float*, const QsaShapes&, int64_t, const int32_t*, int3
 // (layer.cpp:515, generate.cpp:311), so `qsa_residency_plan` returns `p.mode == 0` and the state init takes the
 // IDENTITY page table (layer.cpp:702-705).  `kv_mode == 0` everywhere, so all three are unreachable.
 void kv_stream_reset(const KvStreamMap&, void*) {
-    refuse_unreachable("kv_stream_reset",
+    refuse_not_ported("kv_stream_reset",
                        "--kv-resident N>0 (g_kv_resident default 0, layer.cpp:515; generate.cpp:1319/1773) making "
                        "qsa_residency_plan set p.mode==1 (layer.cpp:538), so layer.cpp:707/:738 (kv_mode==1) run");
 }
 void kv_ring_table(int32_t*, int64_t, int64_t, void*) {
-    refuse_unreachable("kv_ring_table",
+    refuse_not_ported("kv_ring_table",
                        "--kv-resident N>0 with a ring smaller than the page count (layer.cpp:535 sets p.mode==2); "
                        "layer.cpp:709 is the `else` of the mode test, with g_kv_resident default 0 (layer.cpp:515)");
 }
 void kv_stream_resolve(const KvStreamMap&, const QsaAttnPools&, const KvHostPools&, int, const int32_t*,
                        const int32_t*, int64_t, int64_t, const QsaShapes&, void*) {
-    refuse_unreachable("kv_stream_resolve",
+    refuse_not_ported("kv_stream_resolve",
                        "--kv-resident N>0 (kv_mode==1); qsa_kv_resolve returns early `if (st.kv_mode != 1)` "
                        "(layer.cpp:756), and kv_mode is p.mode which is 0 by default (layer.cpp:515)");
 }
@@ -162,51 +171,52 @@ void kv_stream_resolve(const KvStreamMap&, const QsaAttnPools&, const KvHostPool
 // `layer_verify_compatible()` (layer.cpp:476-491) demands a conjunction the contract leaves false.  The port's
 // selected branch is a `--spec 0` run.
 size_t coupled_draft_scratch_bytes(int) {
-    refuse_unreachable("coupled_draft_scratch_bytes", "--spec 4 --mtp (mtp.cpp), a drafter config the contract refuses at Verifier::init");
+    refuse_not_ported("coupled_draft_scratch_bytes", "--spec 4 --mtp (mtp.cpp), a drafter config the contract refuses at Verifier::init");
 }
 void coupled_draft_stage(const SamplerParams*, const int32_t*, SamplerParams*, int32_t*, int, void*) {
-    refuse_unreachable("coupled_draft_stage", "--spec 4 --mtp (mtp.cpp:699), the coupled draft round's mapped staging");
+    refuse_not_ported("coupled_draft_stage", "--spec 4 --mtp (mtp.cpp:699), the coupled draft round's mapped staging");
 }
 void coupled_draft_sample(float*, int, const int32_t*, const int32_t*, int, const SamplerParams*, int32_t*, int, int,
                           const int32_t*, void*, int32_t*, float*, void*) {
-    refuse_unreachable("coupled_draft_sample", "--spec 4 --mtp (mtp.cpp:635), the coupled drafter's sampler");
+    refuse_not_ported("coupled_draft_sample", "--spec 4 --mtp (mtp.cpp:635), the coupled drafter's sampler");
 }
-void add_streams_broadcast(const float*, const float*, float*, int64_t, int, int, void*) {
-    refuse_unreachable("add_streams_broadcast", "--spec 4 --mtp (mtp.cpp:497), the drafter's embedding branch");
-}
+// `add_streams_broadcast` is now PORTED (`vulkan/src/kernels/verify_vk.cpp`, the same `bcast_streams.spv` as
+// `broadcast_streams` with `mode = 1`).  It is the MTP DRAFTER's embedding branch (mtp.cpp:497); the port's
+// shipped launch does not pass `--mtp`, but the symbol is real now, so a reader comparing the two names in the
+// map finds both.
 void moe_grouped_s2(const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int64_t,
                     int64_t, const uint8_t*, const float*, void*, float*, void*) {
-    refuse_unreachable("moe_grouped_s2", "--spec 4 --mtp (mtp.cpp:582) OR --expert-cache-remote N / --peer-device (remote_experts.cpp:314)");
+    refuse_not_ported("moe_grouped_s2", "--spec 4 --mtp (mtp.cpp:582) OR --expert-cache-remote N / --peer-device (remote_experts.cpp:314)");
 }
 void moe_group_resident(const int32_t*, int, int, const uint8_t*, int64_t, unsigned long long*, int32_t*, int32_t*,
                         int32_t*, int32_t*, void*) {
-    refuse_unreachable("moe_group_resident", "--spec 4 --mtp (mtp.cpp:579), the resident-plan group build");
+    refuse_not_ported("moe_group_resident", "--spec 4 --mtp (mtp.cpp:579), the resident-plan group build");
 }
 void row_top_prob(const float*, int, int, const int32_t*, float*, void*) {
-    refuse_unreachable("row_top_prob", "--spec 4 --mtp (mtp.cpp:643), the drafter's probability readout");
+    refuse_not_ported("row_top_prob", "--spec 4 --mtp (mtp.cpp:643), the drafter's probability readout");
 }
 void map_ids(int32_t*, const int32_t*, int, void*) {
-    refuse_unreachable("map_ids", "--spec 4 --mtp (mtp.cpp:644), the subset-index map");
+    refuse_not_ported("map_ids", "--spec 4 --mtp (mtp.cpp:644), the subset-index map");
 }
 void window_ids(int32_t*, int, int, int32_t*, int64_t, void*) {
-    refuse_unreachable("window_ids", "--spec 4 --mtp (mtp.cpp:551), the drafter's sliding window");
+    refuse_not_ported("window_ids", "--spec 4 --mtp (mtp.cpp:551), the drafter's sliding window");
 }
 void mtp_select(const float*, int64_t, const int32_t*, const int32_t*, float*, int32_t*, int32_t*, int, void*,
                 const float*, float*) {
-    refuse_unreachable("mtp_select", "--spec 4 --mtp (mtp.cpp:710/719/738), the draft chain's next input");
+    refuse_not_ported("mtp_select", "--spec 4 --mtp (mtp.cpp:710/719/738), the draft chain's next input");
 }
 void kv_ring_restore(const QsaAttnPools&, const KvHostPools&, int, int64_t, int64_t, int64_t, const QsaShapes&, void*) {
-    refuse_unreachable("kv_ring_restore", "--spec 4 --mtp (mtp.cpp:748) AND --kv-resident N>0 (kv_mode==2)");
+    refuse_not_ported("kv_ring_restore", "--spec 4 --mtp (mtp.cpp:748) AND --kv-resident N>0 (kv_mode==2)");
 }
 void embedding_gather_dev(const uint8_t*, const float*, const float*, const int32_t*, int, int64_t, int, int, int,
                           uint64_t, uint64_t, float*, void*) {
-    refuse_unreachable("embedding_gather_dev", "--spec 4 --mtp (mtp.cpp:485), the drafter's device-id gather");
+    refuse_not_ported("embedding_gather_dev", "--spec 4 --mtp (mtp.cpp:485), the drafter's device-id gather");
 }
 // `qsa_decode_attn_batch` (qsa_decode_attn.hpp) is now PORTED (qsa_vk.cpp: a per-query LOOP over the gated
 // `qsa_decode_attn_step`), so the prompt fallback, the P6 verifier and the MTP drafter all reach a real body.
 
 KvStreamCounters kv_stream_counters(const KvStreamMap&) {
-    refuse_unreachable("kv_stream_counters", "--kv-resident N>0 (g_kv_resident default 0, layer.cpp:515)");
+    refuse_not_ported("kv_stream_counters", "--kv-resident N>0 (g_kv_resident default 0, layer.cpp:515)");
 }
 
 // ---- CLASS C: the A/B arm defaulting OFF --------------------------------------------------------------------
@@ -214,56 +224,78 @@ KvStreamCounters kv_stream_counters(const KvStreamMap&) {
 // `--expert-cache-cpu-order` (`:1477`).  The DEFAULT is the PORTED `moe_hit_grouped_s2`.
 void moe_hit_grouped_s2_cpu_order(const uint8_t*, const int32_t*, const int32_t*, int64_t, int64_t, const uint8_t*,
                                   void*, float*, void*, const float*, float*) {
-    refuse_unreachable("moe_hit_grouped_s2_cpu_order", "--expert-cache-cpu-order (d.hit_cpu_order default false, generate.cpp:376/1477); the default is the PORTED moe_hit_grouped_s2");
+    refuse_not_ported("moe_hit_grouped_s2_cpu_order", "--expert-cache-cpu-order (d.hit_cpu_order default false, generate.cpp:376/1477); the default is the PORTED moe_hit_grouped_s2");
 }
 
-// ---- CLASS D: the P6 VERIFIER (src/core/verify.cpp), which cannot init under the contract ---------------------
-// Same conjunction as the drafter (`layer_verify_compatible`, layer.cpp:476-491).  `verify.cpp` is not on the
-// decode path.
-void broadcast_streams(const float*, float*, int64_t, int, int, void*) {
-    refuse_unreachable("broadcast_streams", "the P6 verifier (verify.cpp); Verifier::init refuses (layer.cpp:476-491)");
-}
+// ---- THE P6 VERIFIER (src/core/verify.cpp) - THE WINDOW NOW RUNS, AND THESE ROWS MOVED WITH IT --------------
+// **THE HEADING THAT USED TO SIT HERE SAID "which cannot init under the contract", AND THAT WAS FALSE OF THE
+// CODE.**  `Verifier::init` SUCCEEDS (`verify.cpp:336`; the fused read is ported and `fused_gr_supported`
+// answers the engine's own geometry predicate), so the window's body EXECUTES and calls each of its symbols in
+// turn.  This batch PORTED nine of them (`vulkan/src/kernels/verify_vk.cpp`): `broadcast_streams`,
+// `add_streams_broadcast`, `gdn_conv_l2_multi`, `gdn_ab_multi`, `gdn_step_norm_multi`, `gdn_conv_commit`,
+// `native_router_top10_multi`, `native_moe_combine_multi`, `shared_expert_multi`.  What is left below is the
+// rest of the window, and EACH CHAIN STRING NOW SAYS WHETHER THE SHIPPED CONFIGURATION REACHES IT - the old
+// blanket "NOT REACHED" is gone (see the `refuse_not_ported` note above).
+//
+// GENUINELY NOT REACHED, with the deciding condition (still a loud refusal, still a hole):
+//   * `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`, `resident_plan`
+//     (`verify.cpp:1039-1063`) - all four are inside `if (device_plan_)`, and `device_plan_` needs
+//     `STRATA_VERIFY_DEVICE_PLAN` (verify.cpp:512-515).  `all_resident_` (the other branch into `resident_plan`)
+//     needs EVERY expert of ALL 48 layers resident, against an `--expert-cache` of a few thousand slots.
+//   * `fetch_blobs`/`rebase_ptrs` (`verify.cpp:1053/:1054`) - inside `if (sink_.pcie_mode == 2)`, and the PCIe
+//     probe on this box reads 0.1 GB/s -> `pcie_frac 0.00`.
+//   * `gpu_stamp` (`verify.cpp:564/:565`) - guarded by `prof_on_` / `trace_m_`, i.e. `STRATA_VERIFY_PROFILE` /
+//     `STRATA_VERIFY_TRACE`, both unset.
+//   * `ple_block_projected` (`verify.cpp:668`) - guarded by `ple_batch_kv`, which needs
+//     `ple_native_bf16_enabled()` AND `ple_native_postops_enabled()`; the backend answers both FALSE.
+//
+// REACHED BY THE SHIPPED CONFIGURATION (and therefore a HOLE, not a note):
+//   * `wait_flag_ge` (`verify.cpp:1042/:1049/:1066`) - the `else` of `if (all_resident_)` in `post`, the FIRST
+//     symbol the window reaches once `pre` completes.  A translating spin is forbidden here (the port's
+//     no-spinning rule), so the window's next stop is this symbol; its chain string says so.
+//   * `copy_rows_from_mapped` (`verify.cpp:1071`) - the `dec_batch` arm of the CPU-share copy, with `dec_batch`
+//     TRUE by default (`STRATA_DEC_BATCH` unset).
+//   * `copy_indexed` (`verify.cpp:1311`, the commit graph) - reached whenever the PLE stage is ready, which it
+//     is for a native pack (the PLE key is native too).
 void copy_i32_from_mapped_unless(int32_t*, const int32_t*, long long, const uint32_t*, uint32_t, void*) {
-    refuse_unreachable("copy_i32_from_mapped_unless", "the P6 verifier (verify.cpp:624); Verifier::init refuses");
-}
-void copy_indexed(float*, const float*, int64_t, const int32_t*, int64_t, void*) {
-    refuse_unreachable("copy_indexed", "the P6 verifier (verify.cpp); Verifier::init refuses");
+    refuse_not_ported("copy_i32_from_mapped_unless",
+                      "NOT reached - the P6 verifier's DEVICE-PLAN arm (verify.cpp:1040, `if (device_plan_)`; "
+                      "STRATA_VERIFY_DEVICE_PLAN unset, verify.cpp:512-515)");
 }
 void copy_or_zero_from_mapped(float*, const float*, long long, const uint32_t*, uint32_t, void*) {
-    refuse_unreachable("copy_or_zero_from_mapped", "the P6 verifier (verify.cpp:630) OR the remote-expert opt (remote_expert_opt.cu:124)");
+    refuse_not_ported("copy_or_zero_from_mapped",
+                      "NOT reached - the P6 verifier's DEVICE-PLAN arm (verify.cpp:1063, `if (device_plan_)`) OR "
+                      "the remote-expert opt (remote_expert_opt.cu:124)");
 }
 void copy_rows_from_mapped(float*, const float*, int64_t, int64_t, const int32_t*, const int32_t*, void*) {
-    refuse_unreachable("copy_rows_from_mapped", "the P6 verifier (verify.cpp) and the device-plan expert source (expert_source.cpp:2131); not the decode path");
+    refuse_not_ported("copy_rows_from_mapped",
+                      "REACHED BY THE SHIPPED CONFIGURATION - the P6 verifier's `dec_batch` CPU-share copy "
+                      "(verify.cpp:1071; STRATA_DEC_BATCH is true by default) and the device-plan expert source "
+                      "(expert_source.cpp:2131)");
+}
+void copy_indexed(float*, const float*, int64_t, const int32_t*, int64_t, void*) {
+    refuse_not_ported("copy_indexed",
+                      "REACHED BY THE SHIPPED CONFIGURATION - the P6 verifier's COMMIT graph when the PLE stage "
+                      "is ready (verify.cpp:1311), which a native pack's PLE key makes true");
 }
 void fetch_blobs(const unsigned long long*, const int32_t*, uint8_t*, int64_t, int, void*) {
-    refuse_unreachable("fetch_blobs", "the P6 verifier (verify.cpp); Verifier::init refuses");
+    refuse_not_ported("fetch_blobs",
+                      "NOT reached - the P6 verifier's PCIe staging (verify.cpp:1053, `if (sink_.pcie_mode == 2)`); "
+                      "the PCIe probe reads 0.1 GB/s -> pcie_frac 0.00");
 }
 // `fused_gr_check` is DEFINED (not refused) in `vulkan/src/kernels/ple_vk.cpp`: it is a card CHARACTERISATION
 // (no tensors), and on this backend its honest outcome is "the plain read runs here".  It was a refusal here
 // until the shipped `--native` launch was measured to REACH it at `Verifier::init` (verify.cpp:311) - the
 // "NOT REACHED by the shipped configuration" claim was false.  See that definition and DECODE-PATH-TRIAGE.md.
-void gdn_ab_multi(const float*, const uint16_t*, const uint16_t*, const float*, const float*, float*, float*, int, int,
-                  int, void*) {
-    refuse_unreachable("gdn_ab_multi", "the P6 verifier (verify.cpp); Verifier::init refuses");
-}
-void gdn_conv_commit(float*, const float*, int, const int32_t*, void*) {
-    refuse_unreachable("gdn_conv_commit", "the P6 verifier (verify.cpp); Verifier::init refuses");
-}
-void gdn_conv_l2_multi(const float*, const float*, const float*, float*, int, int, float, int, void*, int) {
-    refuse_unreachable("gdn_conv_l2_multi", "the P6 verifier (verify.cpp); Verifier::init refuses");
-}
-void gdn_step_norm_multi(float*, const float*, int, const float*, const float*, const float*, const float*, float,
-                         float*, int, int, int, const int32_t*, void*, int) {
-    refuse_unreachable("gdn_step_norm_multi", "the P6 verifier (verify.cpp); Verifier::init refuses");
-}
+//
+// `gdn_ab_multi`, `gdn_conv_commit`, `gdn_conv_l2_multi`, `gdn_step_norm_multi`, `native_moe_combine_multi`,
+// `native_router_top10_multi` and `shared_expert_multi` were refusals here; **all seven are PORTED**
+// (`vulkan/src/kernels/verify_vk.cpp`) and their rows moved `refused -> kernel`.  The two loops and the two
+// shaders carry the per-token contract in their own header notes.
 void gpu_stamp(unsigned long long*, int, void*) {
-    refuse_unreachable("gpu_stamp", "the P6 verifier (verify.cpp), its stage profiler; Verifier::init refuses");
-}
-void native_moe_combine_multi(const float*, const float*, const float*, float*, int64_t, int64_t, int, void*) {
-    refuse_unreachable("native_moe_combine_multi", "the P6 verifier (verify.cpp:1081); Verifier::init refuses");
-}
-void native_router_top10_multi(const float*, int32_t*, float*, int, void*) {
-    refuse_unreachable("native_router_top10_multi", "the P6 verifier (verify.cpp:916); Verifier::init refuses");
+    refuse_not_ported("gpu_stamp",
+                      "NOT reached - the P6 verifier's stage profiler (verify.cpp:564/:565), guarded by "
+                      "`prof_on_` / `trace_m_` (`STRATA_VERIFY_PROFILE` / `STRATA_VERIFY_TRACE`, both unset)");
 }
 // `native_expert_grouped` is DEFINED (not refused) in vulkan/src/kernels/native_expert_grouped_vk.cpp: the grouped
 // IQ-expert launcher, over the port's byte-offset group table.  See that file's header note.
@@ -293,24 +325,34 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
            (((size_t) cap * (size_t) (n_ff / 32) * 36u + 255) & ~(size_t) 255);
 }
 void ple_block_projected(const float*, const float*, const float*, const float*, const PleWeights&, PleOut&, void*, void*) {
-    refuse_unreachable("ple_block_projected", "the P6 verifier (verify.cpp); Verifier::init refuses");
+    refuse_not_ported("ple_block_projected",
+                      "NOT reached - the PLE batch arm (verify.cpp:668), guarded by `ple_batch_kv` which needs "
+                      "`ple_native_bf16_enabled()` AND `ple_native_postops_enabled()`; the backend answers both "
+                      "FALSE (vulkan/src/kernels/ple_vk.cpp)");
 }
 void rebase_ptrs(unsigned long long*, const int32_t*, uint8_t*, int64_t, void*) {
-    refuse_unreachable("rebase_ptrs", "the P6 verifier (verify.cpp); Verifier::init refuses");
+    refuse_not_ported("rebase_ptrs",
+                      "NOT reached - the P6 verifier's PCIe staging (verify.cpp:1054, `if (sink_.pcie_mode == 2)`); "
+                      "the PCIe probe reads 0.1 GB/s -> pcie_frac 0.00");
 }
 void resident_plan(const int32_t*, int, int, const int32_t*, int, const uint8_t*, const unsigned long long*, long long,
                    int32_t*, long long, uint32_t*, uint32_t, void*) {
-    refuse_unreachable("resident_plan", "the P6 verifier (verify.cpp) - the all-resident device plan; Verifier::init refuses");
-}
-void shared_expert_multi(int, const float*, const uint16_t*, const NativeSharedWeights&, const uint16_t*, float*,
-                         float*, float*, float*, int64_t, int64_t, void*) {
-    refuse_unreachable("shared_expert_multi", "the P6 verifier (verify.cpp:980); Verifier::init refuses");
+    refuse_not_ported("resident_plan",
+                      "NOT reached - the P6 verifier's all-resident / device-plan arms (verify.cpp:938/:943): "
+                      "`all_resident_` needs EVERY expert of ALL 48 layers resident against a few-thousand-slot "
+                      "`--expert-cache`, and `device_plan_` needs STRATA_VERIFY_DEVICE_PLAN");
 }
 void wait_flag_ge(const uint32_t*, uint32_t, void*) {
-    refuse_unreachable("wait_flag_ge", "the P6 verifier's split window (verify.cpp); a translating spin is forbidden here and the verifier cannot init");
+    refuse_not_ported("wait_flag_ge",
+                      "REACHED BY THE SHIPPED CONFIGURATION - the P6 verify window's post of LAYER 0 "
+                      "(verify.cpp:1042, the `else` of `if (all_resident_)`), i.e. the window's NEXT STOP.  A "
+                      "translating spin is forbidden by this port's no-waiting-kernel rule, so this is a HOLE "
+                      "and the handshake seam (host-driven split submission) is what closes it");
 }
 void wait_flag_ge_or(const uint32_t*, uint32_t, const uint32_t*, void*) {
-    refuse_unreachable("wait_flag_ge_or", "the P6 verifier's split window (verify.cpp); see wait_flag_ge");
+    refuse_not_ported("wait_flag_ge_or",
+                      "NOT reached - the P6 verifier's DEVICE-PLAN arms (verify.cpp:1039/:1048/:1062, "
+                      "`if (device_plan_)`); see wait_flag_ge for the reached sibling");
 }
 
 // ---- the `kernels_cpu` half, deliberately OUT of the Vulkan build --------------------------------------------
@@ -320,10 +362,10 @@ void wait_flag_ge_or(const uint32_t*, uint32_t, const uint32_t*, void*) {
 // (generate.cpp:3676) - off on the packed-image launch, and "an estimate only" where it does run.
 namespace cpu {
 void bf16_rows_dot_multi(const uint16_t*, int, int, const float*, int, float*) {
-    refuse_unreachable("cpu::bf16_rows_dot_multi", "the FILE-tier RouterLookahead prefetch (expert_source.cpp:1228/1231, STRATA_LOOKAHEAD!=0, generate.cpp:3676); off on the packed-image launch");
+    refuse_not_ported("cpu::bf16_rows_dot_multi", "the FILE-tier RouterLookahead prefetch (expert_source.cpp:1228/1231, STRATA_LOOKAHEAD!=0, generate.cpp:3676); off on the packed-image launch");
 }
 void bf16_rows_dot_multi_avx1(const uint16_t*, int, int, const float*, int, float*) {
-    refuse_unreachable("cpu::bf16_rows_dot_multi_avx1", "the AVX-only arm of the same FILE-tier prefetch (expert_source.cpp:1231)");
+    refuse_not_ported("cpu::bf16_rows_dot_multi_avx1", "the AVX-only arm of the same FILE-tier prefetch (expert_source.cpp:1231)");
 }
 }  // namespace cpu
 

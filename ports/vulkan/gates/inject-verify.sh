@@ -881,6 +881,50 @@ case "$name" in
     old=$'    o_b.v[(2u * r) * ne + c]     = f16_from_f32_port(g_b.v[i]);\n    o_b.v[(2u * r + 1u) * ne + c] = f16_from_f32_port(u_b.v[i]);'
     new=$'    o_b.v[(2u * r) * ne + c]     = f16_from_f32_port(u_b.v[i]);   // INJECTION: gate/up roles swapped\n    o_b.v[(2u * r + 1u) * ne + c] = f16_from_f32_port(g_b.v[i]);'
     want="FAIL  pf_gu_interleave_f16" ;;
+  verify-bcast-mode-ignored)
+    # THIS BATCH: the verify window's embedding broadcast.  `mode` must SELECT the rule; making mode 1 emit the
+    # plain broadcast leaves the add_streams arm with the mode-0 answer.
+    file="$SH/bcast_streams.comp"; spv="bcast_streams"
+    old=$'                                        : (a.v[tbase + i] + b.v[ebase + d]);  // h + e'
+    new=$'                                        : emb;   // INJECTION: the add dropped (mode ignored)'
+    want="FAIL  add_streams_broadcast entry" ;;
+  verify-bcast-token-stride)
+    # The R token stride: every token writing at token 0's base leaves the later tokens sentinelled.
+    file="$SH/bcast_streams.comp"; spv="bcast_streams"
+    old=$'    const uint tbase = t * total;'
+    new=$'    const uint tbase = 0u;   // INJECTION: the R token stride dropped'
+    want="FAIL  broadcast_streams entry" ;;
+  verify-conv-tail-window)
+    # `gdn_conv_commit`: the window is [hist | qkv_0 .. qkv_{n-1}]; dropping `n` reads the FIRST three entries.
+    file="$SH/gdn_conv_tail.comp"; spv="gdn_conv_tail"
+    old=$'        const int src = n + j;                           // index into [hist(3) | qkv...]'
+    new=$'        const int src = j;   // INJECTION: the n offset dropped'
+    want="FAIL  gdn_conv_commit entry" ;;
+  verify-step-norm-ignore-nkeep)
+    # `gdn_step_norm_multi`: the loop bound is DEVICE data; using n_tok commits every token of the window.
+    file="$SH/gdn_step_norm_multi.comp"; spv="gdn_step_norm_multi"
+    old=$'    const int lim = (pc.has_nkeep != 0) ? min(nk.v[0], pc.n_tok) : pc.n_tok;   // the DEVICE loop bound (uniform)'
+    new=$'    const int lim = pc.n_tok;   // INJECTION: the DEVICE n_keep bound ignored'
+    want="FAIL  gdn_step_norm_multi entry (commit half" ;;
+  verify-step-norm-y-guard)
+    # The `t_out_begin` guard: a split window must not write the earlier group's y rows.
+    file="$SH/gdn_step_norm_multi.comp"; spv="gdn_step_norm_multi"
+    old=$'        if (live && t >= pc.t_out_begin) {'
+    new=$'        if (live) {   // INJECTION: the t_out_begin guard dropped'
+    want="FAIL  gdn_step_norm_multi entry: \`t_out_begin\` suppresses" ;;
+  verify-conv-l2-multi-writes-history)
+    # THE ENGINE-SIDE PROPERTY: `gdn_conv_l2_multi` must not advance the caller's conv history (the verify half
+    # may be REJECTED).  Sliding the caller's array keeps every OUTPUT right and breaks the contract.
+    file="$TREE/vulkan/src/kernels/verify_vk.cpp"; spv=""
+    old=$'        fused_gdn_conv_l2(work, qkv + row, conv_w, h + row, channels, qk_heads, eps, stream);'
+    new=$'        fused_gdn_conv_l2(const_cast<float*>(history), qkv + row, conv_w, h + row, channels, qk_heads, eps, stream);   // INJECTION'
+    want="FAIL  gdn_conv_l2_multi entry: the caller's HISTORY is NOT written" ;;
+  verify-step-norm-state-in-place)
+    # THE ENGINE-SIDE PROPERTY: the verify half must run on the working scratch, not in place.
+    file="$TREE/vulkan/src/kernels/verify_vk.cpp"; spv=""
+    old=$'    const int use_scratch = (n_keep == nullptr) ? 1 : 0;'
+    new=$'    const int use_scratch = 0;   // INJECTION: the verify half runs in place'
+    want="FAIL  gdn_step_norm_multi entry (verify half): the STATE is left untouched" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target

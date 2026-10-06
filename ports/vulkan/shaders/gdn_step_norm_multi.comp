@@ -1,0 +1,120 @@
+// ports/vulkan/shaders/gdn_step_norm_multi.comp - the GDN recurrence + closing norm for a WINDOW of tokens.
+//
+// WHY THIS IS NOT A LOOP IN THE WRAPPER (the one place in this family where the per-token loop cannot be used):
+// `verify_kernels.hpp`'s `gdn_step_norm_multi` takes `n_keep` as a DEVICE pointer and reads its loop bound
+// `n = n_keep ? *n_keep : T` ON THE DEVICE (`verify_kernels.cu:178`).  The commit half is captured once
+// (`verify.cpp`'s `capture_commit`) and replayed with a live `n_keep` - the accepted-token count differs per
+// window - so a host-side loop bound would bake the wrong count into the recording.  A device->host read inside
+// a capture is exactly what this port FORBIDS (`moe_hit_grouped_s2_dev` refuses under capture for it).  The
+// CUDA's answer, and therefore this port's, is the loop INSIDE the kernel.
+//
+// PER-TOKEN BITWISE EQUALITY IS BY CONSTRUCTION, NOT BY RE-DERIVATION.  The body of the token loop below is the
+// SAME enumeration as the ported single-token `fused_gdn_step_norm.spv`
+// (`ports/vulkan/shaders/fused_gdn_step_norm.comp`): one invocation per flattened column with `j` (the state's
+// column) fastest, the `kv` contract and the readout accumulated in the SAME sequential order over i = 0..S-1,
+// the folded `1/sqrt(S)` readout scale, and the closing RMS as a 128-LANE half-workgroup barrier tree that
+// reduces each head's own 128 lanes.  So `gdn_step_norm_multi` == T x `fused_gdn_step_norm` bit for bit, which
+// is the header's contract (`verify_kernels.hpp`: "Bitwise `fused_gdn_step_norm`").
+//
+// THE STATE IS THE ONE THING THAT IS NOT PER-TOKEN.  The verify half (`n_keep == nullptr`) must run all T tokens
+// in order and write ONLY the per-token outputs - "the state is left untouched".  The commit half
+// (`n_keep != nullptr`) runs the first *n_keep tokens and writes the state.  Both are expressed by WHERE the
+// working state lives:
+//
+//   * `use_scratch == 0` (the commit half): the working state IS `STATE`, in place - the first token reads
+//     STATE, every later token reads what the previous wrote, exactly as T single-token calls would.
+//   * `use_scratch == 1` (the verify half): token 0 READS `STATE` and WRITES `SCRATCH`; every later token
+//     reads and writes `SCRATCH`.  `STATE` is never written, so the half is side-effect free.
+//
+// `t_out_begin` is the CUDA's `need_out`: a token t < t_out_begin advances the state but writes NO `y` (the
+// engine's split window runs group B's recurrence with group A's rows already in `y`).
+//
+// GEOMETRY: S == 128 is REQUIRED (the wrapper refuses otherwise) - the closing-norm tree is the 128-lane
+// half-workgroup of the single-token shader, which needs a 256-lane group to cover exactly two heads.  The
+// dispatch is `ceil(h_v*S/256)` groups, the same shape (and therefore the same per-head reduction grouping) as
+// the single-token wrapper.  NO subgroup op, NO atomic; out-of-range columns contribute 0 to the reduction and
+// write nothing, so every barrier is reached by every invocation.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;      // (S, h_v, S), j fastest, in place
+layout(set = 0, binding = 1, std430) buffer SCRATCH { float v[]; } scratch;  // the verify half's working copy
+layout(set = 0, binding = 2, std430) readonly buffer H { float v[]; } hb;    // (n_tok, C): q | k | v
+layout(set = 0, binding = 3, std430) readonly buffer G { float v[]; } gb;    // (n_tok, h_v)
+layout(set = 0, binding = 4, std430) readonly buffer B { float v[]; } bb;    // (n_tok, h_v)
+layout(set = 0, binding = 5, std430) readonly buffer Z { float v[]; } zb;    // (n_tok, h_v*S)
+layout(set = 0, binding = 6, std430) readonly buffer GAMMA { float v[]; } gmb;// (S,)
+layout(set = 0, binding = 7, std430) buffer Y { float v[]; } yb;             // (n_tok, h_v*S)
+layout(set = 0, binding = 8, std430) readonly buffer NK { int v[]; } nk;     // *n_keep
+layout(push_constant, std430) uniform PC {
+    int S; int h_k; int h_v; float eps; int n_tok; int t_out_begin; int has_nkeep; int use_scratch;
+} pc;
+
+shared float red[256];
+
+void main() {
+    const uint S = uint(pc.S), hv = uint(pc.h_v), hk = uint(pc.h_k);
+    const uint qk = S * hk;                              // q at [0,qk), k at [qk,2qk), v at [2qk, ...) per token
+    const uint col = gl_GlobalInvocationID.x;            // flattened: col = head*S + j
+    const bool live = col < S * hv;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint hg = lid >> 7u;                           // which of the group's two heads
+    const uint lane = lid & 127u;
+    const int lim = (pc.has_nkeep != 0) ? min(nk.v[0], pc.n_tok) : pc.n_tok;   // the DEVICE loop bound (uniform)
+
+    uint head = 0, j = 0, src = 0;
+    if (live) {
+        head = col / S;
+        j = col % S;
+        src = head % hk;                                 // MODULO head pairing (the engine's own)
+    }
+
+    for (int t = 0; t < lim; ++t) {
+        uint idx = 0;
+        float oc = 0.0f;
+        if (live) {
+            const uint hbase = uint(t) * (2u * qk + S * hv);   // the token's row in h = (n_tok, C)
+            const float g = exp(gb.v[uint(t) * hv + head]);
+            const float b = bb.v[uint(t) * hv + head];
+            // pass 1: the contract against the UNDECAYED working state; token 0 of the verify half reads STATE.
+            const bool read_state = (pc.use_scratch == 0) || (t == 0);
+            float kv = 0.0f;
+            for (uint i = 0u; i < S; ++i) {
+                idx = (i * hv + head) * S + j;
+                const float s = read_state ? state.v[idx] : scratch.v[idx];
+                kv += s * hb.v[hbase + qk + src * S + i];
+            }
+            const float delta = (hb.v[hbase + 2u * qk + head * S + j] - g * kv) * b;
+            // pass 2: the folded decay + rank-1 update, the readout against the UPDATED state, and the write to
+            // whichever buffer this half owns.
+            const bool in_place = (pc.use_scratch == 0);
+            float attn = 0.0f;
+            for (uint i = 0u; i < S; ++i) {
+                idx = (i * hv + head) * S + j;
+                const float s = g * (read_state ? state.v[idx] : scratch.v[idx]) +
+                                hb.v[hbase + qk + src * S + i] * delta;      // g*s + k*delta, one step
+                if (in_place) state.v[idx] = s; else scratch.v[idx] = s;
+                attn += s * hb.v[hbase + src * S + i];
+            }
+            oc = attn * inversesqrt(float(S));               // the folded 1/sqrt(S) readout scale
+        }
+
+        // the per-head closing norm: each hg reduces the 128 lanes of ITS head (head = 2*gid + hg)
+        red[lid] = live ? oc * oc : 0.0f;
+        barrier();
+        for (uint step = 64u; step > 0u; step >>= 1u) {
+            if (lane < step) red[hg * 128u + lane] += red[hg * 128u + lane + step];
+            barrier();
+        }
+        if (lane == 0u) {
+            red[hg * 128u] = inversesqrt(red[hg * 128u] / float(S) + pc.eps);   // eps on the MEAN
+        }
+        barrier();
+        if (live && t >= pc.t_out_begin) {
+            const float scale = red[hg * 128u];
+            const uint ybase = uint(t) * (S * hv) + head * S + j;
+            const float weighted = (scale * oc) * gmb.v[j];
+            yb.v[ybase] = weighted * (1.0f / (1.0f + exp(-zb.v[ybase])));
+        }
+        barrier();       // the next token reuses red[]; every invocation must be past the read above
+    }
+}

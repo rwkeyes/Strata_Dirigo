@@ -1,5 +1,80 @@
 # Start here next session
 
+## THE P6 VERIFY WINDOW RUNS ELEVEN SYMBOLS DEEP; THE NEXT STOP IS `wait_flag_ge`, A 1-THREAD SPIN THE PORT CANNOT CARRY (2026-10-05, `vega`)
+
+**THE WINDOW'S BODY NOW RUNS PAST EVERY SYMBOL THIS BATCH PORTED AND STOPS AT A REAL, NAMED HOLE.**  On
+`coder-iq1_m` with the corrected launch (NO `--no-pool`, `--expert-profile /tmp/expert-profile-coder-built.bin`,
+`--expert-cache 2048`), `/tmp/run_real_pool5.log` prints, after `prefill 1 tokens in 1 chunks, 22247.8 ms` and
+`strata verify: window up to 6 tokens, 74.0 MiB of device buffers`:
+
+```
+strata::kernels::wait_flag_ge: NOT PORTED on the Vulkan backend - REFUSING.
+  Reached by: REACHED BY THE SHIPPED CONFIGURATION - the P6 verify window's post of LAYER 0
+  (verify.cpp:1042, the `else` of `if (all_resident_)`)
+RUN_RC=2
+```
+
+**THE SYMBOLS THIS BATCH PORTED, IN THE ORDER `verify.cpp` CALLS THEM, AND WHICH THE RUN PROVED EXECUTE:**
+`broadcast_streams` (592/606) - `gdn_conv_l2_multi` (726/730) - `gdn_ab_multi` (732) - `gdn_step_norm_multi`
+(743/748) - `native_router_top10_multi` (920) - `shared_expert_multi` (980).  `fused_gr_read_multi` (693) was
+already ported.  **PROVEN-IN-GATE BUT NOT YET EXECUTED BY THE RUN** (they sit after 1042): `native_moe_combine_multi`
+(1083), `gdn_conv_commit` (1293), `copy_indexed` (1311), the second `fused_gr_read_multi` (1142).
+
+**THE NEXT INCREMENT IS THE HANDSHAKE SEAM, NOT A KERNEL.**  `wait_flag_ge_kernel`
+(`verify_kernels.cu:496-499`) is `while (*flag < value) strata_spin_pause();` - a 1-thread SPIN on HOST-MAPPED
+memory, and the port's rule is NO KERNEL MAY SPIN OR WAIT (a Vulkan spin also cannot be preempted inside the 640 ms
+GuC budget).  The flag is raised by the expert POOL on the host while the window runs, so the correct shape is a
+HOST-side poll between SPLIT SUBMISSIONS: the window's single recorded buffer must be cut at 1042 and at 1066
+(`wait_flag_ge` twice on the shipped path; `wait_flag_ge_or` at 1039/1048/1062 is the `device_plan_` variant and is
+NOT taken - the run took the `else`), the host polls `m_flagA_`/`m_flag_` between the submits.  Until that exists,
+`wait_flag_ge` is an honest HOLE and its text says so.
+
+**THE ON-PATH QUEUE AFTER `wait_flag_ge`:** `native_moe_combine_multi` (1083, ported), the second
+`fused_gr_read_multi` (1142), `gdn_conv_commit` (1293), `copy_indexed` (1311).
+
+**THE OFF-PATH SET, ESTABLISHED FROM THE CODE (refusing these correctly is a result):**
+- **DRAFTER: `coupled_draft_sample`, `coupled_draft_stage`, `coupled_draft_scratch_bytes`, `mtp_select` - ZERO call
+  sites in `src/core/verify.cpp`.**  They are the drafter's own module; the P6 verify window does not carry them.
+- **FILE TIER / KV RING: `fetch_blobs`/`rebase_ptrs` (1053/1054) are behind `sink_.pcie_mode == 2`** (off in the
+  shipped configuration - the log says `experts streamed 375 (0 by DMA)`), and **`kv_ring_restore`, `kv_ring_table`,
+  `kv_stream_reset`, `kv_stream_resolve`, `moe_group_resident` have ZERO call sites in `verify.cpp`.**
+- **REACHED UNDER A DIFFERENT FLAG (must NOT be called "unreachable"): `resident_plan` (938/943, `device_plan_` -
+  FALSE at layer 0 in this run: 1039/1042 took the `else`), `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`,
+  `copy_rows_from_mapped`, `wait_flag_ge_or` (all `device_plan_`), `embedding_gather_dev` (604, only when there is
+  no NativeEmbed table - this run has `--native <shard1>`, so `native_embed()` is non-null and 604 is off-path).**
+
+**THE INSTRUMENT CORRECTIONS (deliverable B):**
+1. The refusal helper was already renamed `refuse_not_ported` (**"NOT PORTED on the Vulkan backend - REFUSING"**,
+   `std::exit(2)`) and eight of this batch's symbols are ported out of it; **every refusal that remains was
+   re-worded to name the configuration that REACHES it** rather than the false "NOT REACHED by the shipped
+   configuration".  `plan/DECODE-PATH-TRIAGE.md`'s class-D section - written on the assumption the verifier was
+   unreachable - now carries a closing **"THE P6 VERIFY WINDOW'S KERNELS ARE PORTED"** section with the call-order
+   evidence and the off-path set above.
+2. **TWO REAL INSTRUMENT DEFECTS THIS BATCH FOUND AND FIXED, both of the "settings that silently do nothing" class:**
+   (a) `shared_expert_multi` ran one `scalar_gate_f32` + one `scale_rows` PER TOKEN, which binds a `g + t` view
+   with a **4-BYTE descriptor offset** - unbindable on a device whose `minStorageBufferOffsetAlignment` is 16
+   (llvmpipe), where it KILLED the whole lvp gate arm mid-dispatch.  Both shaders are one-workgroup-per-token, so
+   each is now **ONE dispatch for the whole window** (fewer dispatches, and no per-token `g` view).
+   (b) The verify window's lazily-carved working scratch placed ONE region sized by the first caller; the capture's
+   first caller is `gdn_conv_l2_multi` (tens of KB) and the later `gdn_step_norm_multi` needs MEGABYTES of state
+   scratch - so the run stopped at `verify window scratch: this call needs more working scratch`.  It is now a
+   **bounded LIST of regions (4)**, one per distinct size.
+
+**THE HARD PORTABILITY LIMIT, STATED:** a `_multi` is a loop that hands the single-token wrapper `base + t*stride`,
+and the stride becomes a **storage-buffer descriptor offset** that must be a multiple of the device's
+`minStorageBufferOffsetAlignment` (the Arc: 4 B - everything binds; llvmpipe: 16 B).  `native_router_top10_multi`
+and `native_moe_combine_multi` stride by **10*4 = 40 B**, so on llvmpipe those two arms **SKIP with that reason**
+(and the wrappers `refuse` loudly for the same cause - `token_view_bindable`, `verify_vk.cpp`).  The CUDA has no such
+limit (it passes a pointer).  **The real run is unaffected: the Arc's limit is 4 B.**
+
+**GATE (vega, `/tmp/gate_final2.log`): `intel_icd == 842 passed, 0 failed, 0 skipped`** (green); `lvp_icd == 826
+passed, 0 failed, 5 skipped` (alive again - 3 pre-existing skips + the 2 alignment skips); `radeon_icd == 829 passed,
+4 failed, 2 skipped` where all four failures are the DOCUMENTED intermittent set (`bf16_gemv` n_in=2560,
+`bf16_gemv entry`, `fused_gdn_ab entry h_v=48`, `qsa_block_scores entry`) - recorded, not chased.  **FAIL count
+above the intermittent floor: 0.**
+
+# Start here next session
+
 ## THE FUSED HYPER-CONNECTION READ IS WIRED: the P6 verify window's `fused_gr_supported` gate now PASSES and the window RUNS ITS BODY, stopping at `broadcast_streams` (2026-10-05, `vega`)
 
 **THE CAPABILITY REFUSAL AT `verify.cpp:336` IS GONE, AND THE WINDOW RAN.**  On `coder-iq1_m` with the corrected

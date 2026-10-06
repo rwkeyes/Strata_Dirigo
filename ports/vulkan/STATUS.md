@@ -1,5 +1,30 @@
 # Status — what is done, what is verified, what is not
 
+## THE P6 VERIFY WINDOW RUNS ELEVEN SYMBOLS DEEP; `wait_flag_ge` IS THE NEXT STOP AND IT IS A HOLE (2026-10-05, `vega`)
+
+**WHAT IS DONE.**  Nine symbols of the window's body were ported in `verify.cpp` call order, as DECODE-equivalent
+arithmetic (per-token loops over already-gated decode kernels for the `_multi` variants):
+`broadcast_streams`/`add_streams_broadcast` (ONE shader, `mode` selects the rule), `gdn_conv_l2_multi` (a per-token
+loop over the gated `fused_gdn_conv_l2` over a WORKING COPY of the history), `gdn_ab_multi` (per-token
+`gdn_ab`), `gdn_step_norm_multi` (a single shader; BOTH halves - the commit's own write and the verify window's
+`n_keep`/`t_out_begin`/state-untouched form), `native_router_top10_multi` and `native_moe_combine_multi` (per-token
+loops), `shared_expert_multi` (per-token projections + ONE batched scalar-gate + ONE batched row-scale).
+
+**WHAT IS VERIFIED.**  Gate: `intel_icd == 842 passed, 0 failed, 0 skipped`; lvp `826/0/5`; radeon's 4 failures are
+the documented intermittent set.  The case `case_verify_window` proves each symbol against the engine's own rule
+with an independent double oracle, the SINGLE-TOKEN kernel called directly (bitwise) where the arithmetic is the
+same, a capture arm (record, replay, require bitwise equality) for every wrapper that records, rivals that MOVE, and
+a vacuity arm for each multi ("the single-token arm wrote every row").  Seven registered injections, all FALSIFYING
+(`/tmp/inject_final.log`).
+
+**WHAT IS NOT.**  The run stops at `wait_flag_ge` (verify.cpp:1042, layer 0's post) - a 1-thread SPIN on host-mapped
+memory, which this port's NO-KERNEL-SPINS rule forbids; the fix is a host-side poll between SPLIT SUBMISSIONS (the
+handshake seam).  `native_moe_combine_multi` (1083), the second `fused_gr_read_multi` (1142), `gdn_conv_commit`
+(1293) and `copy_indexed` (1311) are gate-proven but have NOT yet executed in a real run (they sit after the stop).
+No token yet: **the GPU has not produced a model token through the verify window.**
+
+# Status — what is done, what is verified, what is not
+
 ## THE FUSED HYPER-CONNECTION READ IS WIRED; the P6 verify window opens and stops at `broadcast_streams` (2026-10-05, `vega`)
 
 **THE `verify.cpp:336` CAPABILITY REFUSAL IS CLEARED AND THE WINDOW RUNS ITS BODY.**  On `coder-iq1_m` (no

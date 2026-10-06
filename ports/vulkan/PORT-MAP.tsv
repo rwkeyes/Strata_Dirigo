@@ -17,13 +17,13 @@
 # definition all fail.
 # symbol	kind	shader(s) or reason
 add_inplace	kernel	add
-add_streams_broadcast	refused	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
+add_streams_broadcast	kernel	bcast_streams
 bf16_gemv	kernel	bf16_gemv
 bf16_gemv_fp32_mmvf	kernel	bf16_mmvf_f32
 bf16_gemv_fp32_mmvf_cols	kernel	bf16_mmvf_f32
 bf16_gemv_fp32_mmvf_multi	kernel	bf16_mmvf_f32_multi
 bf16_gemv_split	kernel	bf16_gemv
-broadcast_streams	refused	no shader in this tree yet
+broadcast_streams	kernel	bcast_streams
 build_rope_table	host	the engine builds the table; rope_neox is the kernel that reads it
 copy_from_mapped	kernel	copy
 copy_i32_from_mapped	host	a mapped-buffer copy
@@ -58,16 +58,16 @@ fused_gr_read_multi	kernel	fused_gr_rs fused_gr_down fused_gr_mix fused_gr_injec
 fused_gr_supported	host	a capability check
 fwht256_inplace_cuda	kernel	fwht256
 gather_rows	kernel	gather_rows
-gdn_ab_multi	refused	no shader in this tree yet
+gdn_ab_multi	kernel	fused_gdn_ab
 gdn_beta_gate	kernel	gdn_beta_gate
-gdn_conv_commit	refused	no shader in this tree yet
-gdn_conv_l2_multi	refused	no shader in this tree yet
+gdn_conv_commit	kernel	gdn_conv_tail
+gdn_conv_l2_multi	kernel	fused_gdn_conv_l2 gdn_conv_tail
 gdn_conv_step	kernel	gdn_conv_step
 gdn_gate	kernel	gdn_gate
 gdn_l2_norm	kernel	gdn_l2_norm
 gdn_out_norm	kernel	gdn_out_norm
 gdn_step	kernel	gdn_step
-gdn_step_norm_multi	refused	no shader in this tree yet
+gdn_step_norm_multi	kernel	gdn_step_norm_multi
 gpu_stamp	refused	no shader in this tree yet
 gr_read	kernel	gr_norm gr_down gr_gate gr_mean gr_inject
 gr_workspace_bytes	host	a size
@@ -120,7 +120,7 @@ native_mmvq_supported	host	a capability check
 native_mmvq_weight_bytes	host	a size
 native_moe_combine	kernel	native_moe_combine
 native_moe_combine_enabled	host	a capability check
-native_moe_combine_multi	refused	no shader in this tree yet
+native_moe_combine_multi	kernel	native_moe_combine
 native_q5_k_f32	kernel	native_q5_k_f32
 native_q8_1_bytes	host	a size
 native_qsa_enabled	host	a capability check
@@ -133,7 +133,7 @@ native_rope_apply	kernel	native_rope_apply
 native_rope_enabled	host	a capability check
 native_router_enabled	host	a capability check
 native_router_top10	kernel	native_router_top10
-native_router_top10_multi	refused	no shader in this tree yet
+native_router_top10_multi	kernel	native_router_top10
 ngram_rows	host	host-side row bookkeeping
 penalty_rows	host	folded into the samplers in this port: see sampler_greedy/sampler_kernel
 ple_block	kernel	ple_bcast ple_conv ple_gate ple_gnorm
@@ -176,7 +176,7 @@ sample_tokens	kernel	sampler_greedy sampler_kernel sampler_kernel_f32 sampler_sp
 scale_inplace	kernel	scale
 scatter_rows_f32	kernel	scatter_rows_f32
 shared_expert	kernel	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32
-shared_expert_multi	refused	s2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32
+shared_expert_multi	kernel	swiglu_f32 scalar_gate_f32 scale_rows
 shared_expert_native_bf16_enabled	host	a capability check
 shared_expert_scratch_bytes	host	a size
 silu_inplace	kernel	silu_f32

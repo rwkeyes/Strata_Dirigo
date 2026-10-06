@@ -1,0 +1,46 @@
+// ports/vulkan/shaders/bcast_streams.comp - the verify window's EMBEDDING BROADCAST, and the MTP drafter's
+// embedding branch.  ONE shader, two rules, selected by `mode`:
+//
+//   mode 0  `broadcast_streams`      (verify_kernels.cu:256 `broadcast_streams_kernel`, verify.cpp:592/:606)
+//           R[t][c][d] = x[t][d]                     - the same prompt embedding in EVERY hc stream
+//   mode 1  `add_streams_broadcast`  (verify_kernels.cu:286 `add_streams_broadcast_kernel`, mtp.cpp:497)
+//           R[t][c][d] = h[t][c][d] + e[t][d]        - the drafter's stream stack plus the embedding
+//
+// THE CUDA'S OWN INDEX ARITHMETIC, transcribed (both kernels are flat over n*hc with the token in blockIdx.y):
+//
+//     i = blockIdx.x * blockDim.x + threadIdx.x;      if (i >= n*hc) return;
+//     R[(size_t)t*n*hc + i] = <body with d = i % n>
+//
+// So the shader reads `d = i % n` and writes the flat element `t*n*hc + i`; a dispatch of
+// (ceil(n*hc/256), n_tok) groups covers every element, and the `i < n*hc` guard keeps a surplus group from
+// writing past the stack (the gate dispatches one surplus group).  The grid-stride loop is the port's other
+// kernels' idiom and makes a small n_tok x small n dispatch one group wide without a ragged tail.
+//
+// BINDING: `b` is the SECOND input (the embedding `e` for mode 1); for mode 0 it is bound to `a` itself and
+// never read - a Vulkan descriptor cannot be null (the port's standing idiom, `ple_vk.cpp`).  Nothing here is
+// in place: `R` may alias `a` (mode 1's `h` is a different buffer in the engine) but the rule reads `a`/`b`
+// before writing `R`, elementwise, so either aliasing is safe.
+//
+// NO reduction, NO barrier, NO subgroup op, NO atomic - one thread per element, so the shader's op census is
+// empty (the gate requires that for every kernel whose CUDA body has none).
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer A { float v[]; } a;   // x (mode 0) / h (mode 1)
+layout(set = 0, binding = 1, std430) readonly buffer B { float v[]; } b;   // e (mode 1); == a for mode 0
+layout(set = 0, binding = 2, std430) buffer R { float v[]; } r;            // (n_tok, hc, n)
+layout(push_constant, std430) uniform PC { int n; int hc; int n_tok; int mode; } pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.y;
+    if (t >= uint(pc.n_tok)) return;
+    const uint total = uint(pc.n) * uint(pc.hc);            // n*hc, the CUDA's flat element count
+    const uint tbase = t * total;
+    const uint ebase = t * uint(pc.n);
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        const uint d = i % uint(pc.n);                       // the CUDA's `i % n`
+        const float emb = a.v[ebase + d];
+        r.v[tbase + i] = (pc.mode == 0) ? emb
+                                        : (a.v[tbase + i] + b.v[ebase + d]);  // h + e
+    }
+}

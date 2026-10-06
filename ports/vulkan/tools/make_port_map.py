@@ -144,7 +144,9 @@ TABLE = {
     'scale_inplace':                  ('kernel', 'scale'),
     'scatter_rows_f32':               ('kernel', 'scatter_rows_f32'),
     'shared_expert':                  ('kernel', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32'),
-    'shared_expert_multi':            ('shader', 's2expert_gu s2expert_swiglu quantize_q8_0 s2expert_down moe_combine_f32 scalar_gate_f32'),
+    # THE VERIFY WINDOW'S NEW ROWS (this batch): `shared_expert_multi` is a per-token LOOP over the same native
+    # chain the single-token entry point drives, so it names the three stages the multi dispatches directly.
+    'shared_expert_multi':            ('kernel', 'swiglu_f32 scalar_gate_f32 scale_rows'),
     'silu_inplace':                   ('kernel', 'silu_f32'),
     # ---- the engine's own host side: no dispatch for the port to supply ----
     'build_rope_table':               ('host', 'the engine builds the table; rope_neox is the kernel that reads it'),
@@ -222,8 +224,19 @@ TABLE = {
     'shared_expert_native_bf16_enabled': ('host', 'a capability check'),
     'shared_expert_scratch_bytes':    ('host', 'a size'),
     # ---- GPU work this port has NOT done: the honest hole list ----
-    'add_streams_broadcast':          ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
-    'broadcast_streams':              ('todo', 'no shader in this tree yet'),
+    # **THE P6 VERIFY WINDOW'S NINE MOVED OUT OF THIS LIST (this batch).**  `broadcast_streams`,
+    # `add_streams_broadcast`, `gdn_conv_l2_multi`, `gdn_ab_multi`, `gdn_step_norm_multi`, `gdn_conv_commit`,
+    # `native_router_top10_multi`, `native_moe_combine_multi` and `shared_expert_multi` now have real bodies in
+    # `vulkan/src/kernels/verify_vk.cpp` (two new shaders + one transcribed window kernel + four loops over the
+    # already-gated single-token kernels), so they are `kernel` rows, not `todo` and not `refused`.
+    'broadcast_streams':              ('kernel', 'bcast_streams'),
+    'add_streams_broadcast':          ('kernel', 'bcast_streams'),
+    'gdn_conv_l2_multi':              ('kernel', 'fused_gdn_conv_l2 gdn_conv_tail'),
+    'gdn_ab_multi':                   ('kernel', 'fused_gdn_ab'),
+    'gdn_step_norm_multi':            ('kernel', 'gdn_step_norm_multi'),
+    'gdn_conv_commit':                ('kernel', 'gdn_conv_tail'),
+    'native_router_top10_multi':      ('kernel', 'native_router_top10'),
+    'native_moe_combine_multi':       ('kernel', 'native_moe_combine'),
     'fetch_blobs':                    ('todo', 'no shader in this tree yet'),
     'fused_gdn_ab':                   ('kernel', 'fused_gdn_ab'),          # replaces 2x bf16 mmvf + beta_gate + gate
     'fused_gdn_conv_l2':              ('kernel', 'fused_gdn_conv_l2'),     # replaces native_gdn_conv_silu + 2x l2_norm
@@ -234,17 +247,11 @@ TABLE = {
     # `fused_gr_supported` answers the engine's geometry predicate TRUE.
     'fused_gr_read':                  ('kernel', 'fused_gr_rs fused_gr_down fused_gr_mix fused_gr_inject'),
     'fused_gr_read_multi':            ('kernel', 'fused_gr_rs fused_gr_down fused_gr_mix fused_gr_inject'),
-    'gdn_ab_multi':                   ('todo', 'no shader in this tree yet'),
-    'gdn_conv_commit':                ('todo', 'no shader in this tree yet'),
-    'gdn_conv_l2_multi':              ('todo', 'no shader in this tree yet'),
-    'gdn_step_norm_multi':            ('todo', 'no shader in this tree yet'),
     'gpu_stamp':                      ('todo', 'no shader in this tree yet'),
     'map_ids':                        ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'moe_group_resident':             ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'mtp_select':                     ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
-    'native_moe_combine_multi':       ('todo', 'no shader in this tree yet'),
     'native_qsa_indexer_append':      ('kernel', 'pf_indexer_native'),
-    'native_router_top10_multi':      ('todo', 'no shader in this tree yet'),
     'ple_block_projected':            ('todo', 'no shader in this tree yet'),
     'qsa_attend_step':                ('todo', 'no shader in this tree yet'),
     'qsa_decode_attn_batch':          ('kernel', 'qsa_decode_attn'),
@@ -277,17 +284,19 @@ REFUSED = {
     # the KV streaming resident tier
     'kv_stream_reset', 'kv_ring_table', 'kv_stream_resolve', 'kv_ring_restore',
     # the speculative drafter (class C)
-    'add_streams_broadcast', 'moe_grouped_s2', 'moe_group_resident', 'coupled_draft_sample',
+    'moe_grouped_s2', 'moe_group_resident', 'coupled_draft_sample',
     'coupled_draft_stage', 'coupled_draft_scratch_bytes', 'row_top_prob', 'map_ids', 'window_ids', 'mtp_select',
     'embedding_gather_dev',
     # the A/B arm defaulting off (class C)
     'moe_hit_grouped_s2_cpu_order',
-    # the P6 verifier (class D)
-    'broadcast_streams', 'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
-    'copy_rows_from_mapped', 'fetch_blobs', 'gdn_ab_multi', 'gdn_conv_commit', 'gdn_conv_l2_multi',
-    'gdn_step_norm_multi', 'gpu_stamp', 'native_moe_combine_multi', 'native_router_top10_multi',
+    # the P6 verifier: **THE NINE THAT MOVED OUT (this batch) are NOT HERE** - `broadcast_streams`,
+    # `add_streams_broadcast`, `gdn_conv_l2_multi`, `gdn_ab_multi`, `gdn_step_norm_multi`, `gdn_conv_commit`,
+    # `native_router_top10_multi`, `native_moe_combine_multi`, `shared_expert_multi` are DEFINED, not refused.
+    # What is left is the window's genuinely-unreached tail PLUS the one symbol it DOES reach (wait_flag_ge).
+    'copy_i32_from_mapped_unless', 'copy_indexed', 'copy_or_zero_from_mapped',
+    'copy_rows_from_mapped', 'fetch_blobs', 'gpu_stamp',
     'ple_block_projected',
-    'rebase_ptrs', 'resident_plan', 'shared_expert_multi', 'wait_flag_ge', 'wait_flag_ge_or',
+    'rebase_ptrs', 'resident_plan', 'wait_flag_ge', 'wait_flag_ge_or',
 }
 _stale_refusals = sorted(REFUSED - set(syms))
 assert not _stale_refusals, f"REFUSED names symbols src/core/ does not reach: {_stale_refusals}"

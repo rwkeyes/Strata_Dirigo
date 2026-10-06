@@ -72,6 +72,21 @@ struct Stream {
     // so a per-dispatch sentinel would exhaust the arena.  Placed lazily by qsa_vk.cpp.
     Buf dummy{};
 
+    // THE VERIFY WINDOW'S WORKING SCRATCH (vulkan/src/kernels/verify_vk.cpp).  `gdn_conv_l2_multi` runs its
+    // per-token loop over a WORKING COPY of the conv history (the multi's contract is "history is NOT written"),
+    // and `gdn_step_norm_multi`'s verify half runs the recurrence on a WORKING COPY of the state (the verify
+    // half must leave the state untouched).  Both are carved HERE, lazily and ONCE each: `arena_alloc` never
+    // decreases, so a per-call bump would exhaust the arena (the `iq_grids` precedent above).
+    //
+    // **A LIST OF REGIONS, NOT ONE REGION - AND THE RUN FOUND THAT THE HARD WAY.**  The first form placed ONE
+    // region sized by whichever caller ran first; the capture's first caller is `gdn_conv_l2_multi` (the conv
+    // history: channels*3 floats, tens of KB), and the LATER `gdn_step_norm_multi` (the recurrent state:
+    // h_v*S*S floats, megabytes) then refused.  The list keeps the two sizes apart and is BOUNDED, so a runaway
+    // allocation is a loud refusal rather than a silent arena exhaustion.
+    void* vscratch[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint64_t vscratch_bytes[4] = {0, 0, 0, 0};
+    int vscratch_n = 0;
+
     // The synthetic device-address base and the alignment every carving starts on.  The alignment is the
     // device's OWN storage-buffer-offset limit raised to 256, so a view computed from an allocation is
     // bindable on every implementation the port runs on (the Arc measures 4 bytes; the limit is still a

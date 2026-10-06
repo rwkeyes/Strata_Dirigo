@@ -68,6 +68,7 @@ strata_vulkan_resolve(_kernels src/kernels/fwht_vk.cpp src/kernels/native_caps_v
   src/kernels/qsa_vk.cpp
   src/kernels/ple_vk.cpp
   src/kernels/fused_gr_vk.cpp                  # THE FUSED hyper-connection read (fused_gr_read/_multi) - the P6 verify window's per-layer GR read
+  src/kernels/verify_vk.cpp                    # THE P6 VERIFY WINDOW'S KERNELS: broadcast_streams (its FIRST symbol), the four _multi loops, the two window shaders
   src/kernels/shared_expert_vk.cpp
   src/kernels/rope_vk.cpp                     # the RoPE host rows: build_rope_table + rope_table_set/_for/_release
   src/kernels/sampler_vk.cpp                  # sample_tokens - the step that PRODUCES A TOKEN (the decode tail)

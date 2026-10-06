@@ -23078,6 +23078,635 @@ void case_fused_gr_check_entry(Ctx& ctx, const std::string& dir) {
             (double) again, "variant id");
 }
 
+// ============================================================================================================
+// THE P6 VERIFY WINDOW'S KERNELS (this batch): `broadcast_streams` / `add_streams_broadcast` (ONE shader),
+// `gdn_conv_l2_multi`, `gdn_ab_multi`, `gdn_step_norm_multi`, `gdn_conv_commit`, `native_router_top10_multi`,
+// `native_moe_combine_multi`, `shared_expert_multi`.
+//
+// EVERY multi is held to its header's contract - "bitwise the single-token kernel per token" - by running BOTH
+// paths on the SAME fixture and comparing BITWISE, with every output the multi must write SENTINELLED first (a
+// multi that wrote only token 0's outputs would otherwise pass vacuously off the singles' values - the
+// `fused-gr-multi-token0-args` lesson).  The two SIDE-EFFECT properties a loop can silently break are checked
+// as properties, not as outputs: `gdn_conv_l2_multi` must NOT write the caller's history, and
+// `gdn_step_norm_multi`'s verify half must leave the state untouched.
+// ============================================================================================================
+void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
+    for (const char* spv : {"bcast_streams.spv", "gdn_conv_tail.spv", "gdn_step_norm_multi.spv"})
+        if (!have(dir, spv)) return;
+    const float DEAD = 1.0e30f;
+    // THE DESCRIPTOR-OFFSET LIMIT.  A multi is a loop that hands the single-token wrapper `base + t*stride`; the
+    // stride becomes a storage-buffer DESCRIPTOR OFFSET, which must be a multiple of the device's
+    // `minStorageBufferOffsetAlignment` (the Arc: 4 bytes - every stride binds; llvmpipe: 16).  Two of the
+    // engine's strides are NOT multiples of 16 (`native_router_top10_multi`/`native_moe_combine_multi`: 10*4 =
+    // 40 B), so on such a device those arms SKIP with the reason rather than dying mid-dispatch - and the
+    // wrappers refuse loudly for the same reason (`token_view_bindable`, verify_vk.cpp).
+    const uint32_t ALIGN = ctx.info().min_storage_offset_align;
+
+    // =====================================================================================
+    // (A)/(B) broadcast_streams and add_streams_broadcast - ONE shader, `mode` selects the rule
+    // =====================================================================================
+    {
+        const int N = 40, HC = 4, NT = 2;            // n*hc = 160: the direct dispatch below adds a surplus group
+        std::vector<float> x((size_t) NT * N), h((size_t) NT * HC * N);
+        for (auto& v : x) v = rndf(1.0f);
+        for (auto& v : h) v = rndf(1.0f);
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+        if (s == nullptr) { verdict("verify window: engine stream", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HC * N);
+        float* dR = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HC * N);
+        float* dR2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HC * N);
+        strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 4);
+        strata::vulkan::stream_write(*s, dh, h.data(), h.size() * 4);
+        for (float* p : {dR, dR2}) {
+            std::vector<float> dead((size_t) NT * HC * N, DEAD);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        strata::kernels::broadcast_streams(dx, dR, N, HC, NT, s);
+        strata::kernels::add_streams_broadcast(dh, dx, dR2, N, HC, NT, s);
+        std::vector<float> gR((size_t) NT * HC * N), gR2((size_t) NT * HC * N);
+        strata::vulkan::stream_read(*s, dR, gR.data(), gR.size() * 4);
+        strata::vulkan::stream_read(*s, dR2, gR2.data(), gR2.size() * 4);
+        int bad = 0, bad2 = 0, moved = 0;
+        for (int t = 0; t < NT; ++t)
+            for (int c = 0; c < HC; ++c)
+                for (int d = 0; d < N; ++d) {
+                    const size_t i = ((size_t) t * HC + c) * N + d;
+                    if (gR[i] != x[(size_t) t * N + d]) ++bad;                 // R[t][c][d] = x[t][d]
+                    if (gR2[i] != h[i] + x[(size_t) t * N + d]) ++bad2;        // R[t][c][d] = h + e
+                }
+        for (size_t i = 0; i < gR.size(); ++i) if (gR[i] != gR2[i]) ++moved;   // the modes must DIFFER
+        verdict("broadcast_streams entry: wrapper == the CUDA rule R[t][c][d] = x[t][d]", bad == 0, bad,
+                (int) gR.size(), 0, "elements differ");
+        verdict("add_streams_broadcast entry: wrapper == the CUDA rule R[t][c][d] = h[t][c][d] + e[t][d]",
+                bad2 == 0, bad2, (int) gR2.size(), 0, "elements differ");
+        verdict("broadcast_streams vs add_streams_broadcast: `mode` SELECTS the rule (a rival that MOVES)",
+                moved == (int) gR.size(), (int) gR.size() - moved, (int) gR.size(), moved, "elements equal - mode ignored?");
+        // ---- CAPTURE: the wrapper records and replays bitwise
+        auto stage = [&] {
+            std::vector<float> dead((size_t) NT * HC * N, DEAD);
+            strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 4);
+            strata::vulkan::stream_write(*s, dh, h.data(), h.size() * 4);
+            strata::vulkan::stream_write(*s, dR, dead.data(), dead.size() * 4);
+        };
+        auto run = [&] { strata::kernels::broadcast_streams(dx, dR, N, HC, NT, s); };
+        const int capbad = capture_replay_arm(s, stage, run, dR, (size_t) NT * HC * N * 4);
+        verdict("broadcast_streams entry: records under capture, replay == direct (bitwise)", capbad == 0,
+                capbad < 0 ? 1 : capbad, (int) (NT * HC * N * 4), capbad,
+                "capbad<0 = the capture failed; else differing bytes");
+        // ---- the DIRECT shader dispatch with a SURPLUS group (the CUDA's grid is exact; the guard is what
+        //      protects the stack, and this arm is the one that would catch a missing `i < n*hc`)
+        {
+            const uint32_t need = (uint32_t) ((NT * HC * N + 255) / 256);
+            int over = 0;
+            Buf ba = ctx.alloc((size_t) NT * N * 4);
+            Buf br = ctx.alloc((size_t) NT * HC * N * 4 + 512 * 4);
+            ctx.write(ba, x.data(), x.size() * 4);
+            std::vector<float> sink((size_t) NT * HC * N + 512, DEAD);
+            ctx.write(br, sink.data(), sink.size() * 4);
+            struct { int32_t n, hc, n_tok, mode; } pc{N, HC, NT, 0};
+            VkPipeline p = ctx.pipeline(dir + "/bcast_streams.spv", 3, (int) sizeof(pc));
+            ctx.dispatch(p, {&ba, &ba, &br}, &pc, sizeof(pc), need + 1, (uint32_t) NT);   // ONE surplus group
+            std::vector<float> got(sink.size());
+            ctx.read(br, got.data(), got.size() * 4);
+            for (size_t i = (size_t) NT * HC * N; i < got.size(); ++i) if (got[i] != DEAD) ++over;
+            verdict("broadcast_streams: a SURPLUS dispatched group writes NOTHING past n*hc", over == 0, over, 512,
+                    0, "elements past the stack were written");
+            ctx.free(ba); ctx.free(br);
+        }
+        strata::vulkan::stream_close(s);
+    }
+
+    // =====================================================================================
+    // (C) gdn_conv_l2_multi - the loop over the gated fused_gdn_conv_l2, its SEED, and
+    //     "the caller's history is NOT written"
+    // =====================================================================================
+    {
+        const int C = 768, QK = 2, NT = 3, TB = 2;   // 6 head-blocks of 128; qk_heads = 2; t_begin arm = 2
+        const float EPS = 1e-6f;
+        std::vector<float> hist((size_t) C * 3), w((size_t) C * 4);
+        for (auto& v : hist) v = rndf(1.0f);
+        for (auto& v : w) v = rndf(1.0f);
+        const int TOT = NT + TB;
+        std::vector<float> qkv((size_t) TOT * C);
+        for (auto& v : qkv) v = rndf(1.0f);
+        // THE INDEPENDENT ORACLE: the CUDA multi's window rule in DOUBLE (`verify_kernels.cu:33-49`), from the
+        // UNTOUCHED history and the full qkv - NOT from the port's loop (the "oracle from the thing under test"
+        // trap).  eps on the SQUARED NORM, q/k heads only.
+        auto want_h = [&](int t0, std::vector<float>& out) {
+            out.assign((size_t) C, 0.0f);
+            std::vector<double> y((size_t) C, 0.0);
+            for (int c = 0; c < C; ++c) {
+                double win[3];
+                for (int j = 0; j < 3; ++j) {
+                    const int src = t0 + j;
+                    win[j] = src < 3 ? (double) hist[(size_t) c * 3 + src] : (double) qkv[(size_t) (src - 3) * C + c];
+                }
+                const double x = qkv[(size_t) t0 * C + c];
+                const double sum = win[0] * w[(size_t) c * 4] + win[1] * w[(size_t) c * 4 + 1] +
+                                   win[2] * w[(size_t) c * 4 + 2] + x * w[(size_t) c * 4 + 3];
+                y[(size_t) c] = sum / (1.0 + std::exp(-sum));
+            }
+            for (int h = 0; h < QK; ++h) {
+                double ss = 0;
+                for (int i = 0; i < 128; ++i) ss += y[(size_t) h * 128 + i] * y[(size_t) h * 128 + i];
+                const double sc = 1.0 / std::sqrt(ss + (double) EPS);
+                for (int i = 0; i < 128; ++i) y[(size_t) h * 128 + i] *= sc;
+            }
+            for (int c = 0; c < C; ++c) out[(size_t) c] = (float) y[(size_t) c];
+        };
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+        if (s == nullptr) { verdict("gdn_conv_l2_multi entry", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* dhist = strata::vulkan::arena_alloc<float>(*s, (size_t) C * 3);
+        float* dqkv = strata::vulkan::arena_alloc<float>(*s, (size_t) TOT * C);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) C * 4);
+        float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) TOT * C);
+        float* dh2 = strata::vulkan::arena_alloc<float>(*s, (size_t) TOT * C);
+        strata::vulkan::stream_write(*s, dhist, hist.data(), hist.size() * 4);
+        strata::vulkan::stream_write(*s, dqkv, qkv.data(), qkv.size() * 4);
+        strata::vulkan::stream_write(*s, dw, w.data(), w.size() * 4);
+        for (int t = 0; t < TOT; ++t) {
+            std::vector<float> dead((size_t) C, DEAD);
+            strata::vulkan::stream_write(*s, dh + (size_t) t * C, dead.data(), (size_t) C * 4);
+            strata::vulkan::stream_write(*s, dh2 + (size_t) t * C, dead.data(), (size_t) C * 4);
+        }
+        strata::kernels::gdn_conv_l2_multi(dhist, dqkv, dw, dh, C, QK, EPS, NT, s, 0);
+        strata::kernels::gdn_conv_l2_multi(dhist, dqkv, dw, dh2, C, QK, EPS, NT, s, TB);
+        std::vector<float> g0((size_t) TOT * C), g2((size_t) TOT * C), gh((size_t) C * 3);
+        strata::vulkan::stream_read(*s, dh, g0.data(), g0.size() * 4);
+        strata::vulkan::stream_read(*s, dh2, g2.data(), g2.size() * 4);
+        strata::vulkan::stream_read(*s, dhist, gh.data(), gh.size() * 4);
+        int hist_moved = 0;
+        for (size_t i = 0; i < hist.size(); ++i) if (gh[i] != hist[i]) ++hist_moved;
+        verdict("gdn_conv_l2_multi entry: the caller's HISTORY is NOT written (the header's contract)",
+                hist_moved == 0, hist_moved, (int) hist.size(), 0, "elements of `history` changed");
+        // THE ROW INDEX IS ABSOLUTE: the CUDA's token is `t_begin + t` (`verify_kernels.cu:30`) and it writes
+        // `h[(t_begin+t)*C + c]`, so this arm must read the ABSOLUTE row it wrote - the first form of this arm
+        // read rows 0..NT-1 and reported 1e35 (the sentinel), i.e. the ARM was wrong and the kernel was right.
+        auto vs_rule = [&](const std::vector<float>& g, int t0, double& worst) {
+            int bad = 0;
+            for (int t = 0; t < NT; ++t) {
+                std::vector<float> want;
+                want_h(t0 + t, want);
+                for (int c = 0; c < C; ++c) {
+                    const double got = g[(size_t) (t0 + t) * C + c], ref = want[(size_t) c];
+                    const double tol = 1e-3 * std::fabs(ref) + 1e-5;
+                    if (std::fabs(got - ref) > tol) ++bad;
+                    worst = std::max(worst, std::fabs(got - ref) / tol);
+                }
+            }
+            return bad;
+        };
+        {
+            double worst0 = 0, worst2 = 0;
+            const int b0 = vs_rule(g0, 0, worst0), b2 = vs_rule(g2, TB, worst2);
+            verdict("gdn_conv_l2_multi entry (t_begin=0): wrapper vs the CUDA window rule (double)", b0 == 0, b0,
+                    NT * C, worst0, "outside tolerance");
+            verdict("gdn_conv_l2_multi entry (t_begin=2, the split window): same rule at the ABSOLUTE token "
+                    "(the SEED is what this arm tests)", b2 == 0, b2, NT * C, worst2, "outside tolerance");
+        }
+        // ---- CAPTURE: the multi records and replays bitwise (the history property must survive a replay too)
+        auto stage = [&] {
+            strata::vulkan::stream_write(*s, dhist, hist.data(), hist.size() * 4);
+            std::vector<float> dead((size_t) TOT * C, DEAD);
+            strata::vulkan::stream_write(*s, dh, dead.data(), dead.size() * 4);
+        };
+        auto run = [&] { strata::kernels::gdn_conv_l2_multi(dhist, dqkv, dw, dh, C, QK, EPS, NT, s, 0); };
+        const int capbad = capture_replay_arm(s, stage, run, dh, (size_t) TOT * C * 4);
+        verdict("gdn_conv_l2_multi entry: records under capture, replay == direct (bitwise)", capbad == 0,
+                capbad < 0 ? 1 : capbad, (int) (TOT * C * 4), capbad,
+                "capbad<0 = the capture failed; else differing bytes");
+        strata::vulkan::stream_close(s);
+    }
+
+    // =====================================================================================
+    // (D) gdn_ab_multi == n_tok x fused_gdn_ab, BITWISE
+    // =====================================================================================
+    if (ALIGN != 0 && (16u % ALIGN) != 0) {
+        skip("gdn_ab_multi entry", "the device's descriptor-offset alignment cannot bind the per-token 16-byte view");
+    } else {
+        const int N = 64, HV = 4, NT = 3;   // h_v = 4 -> the gate/beta view stride is 16 B, bindable everywhere
+        std::vector<float> x((size_t) NT * N);
+        for (auto& v : x) v = rndf(1.0f);
+        std::vector<uint16_t> wa((size_t) HV * N), wb((size_t) HV * N);
+        for (auto& v : wa) v = (uint16_t) (0x3c00u + (rnd() % 64u));
+        for (auto& v : wb) v = (uint16_t) (0x3c00u + (rnd() % 64u));
+        std::vector<float> dt((size_t) HV), ssm_a((size_t) HV);
+        for (auto& v : dt) v = 0.1f * rndf(1.0f);
+        for (auto& v : ssm_a) v = 0.5f + 0.1f * rndf(1.0f);
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) { verdict("gdn_ab_multi entry", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        uint16_t* dwa = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) HV * N);
+        uint16_t* dwb = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) HV * N);
+        float* ddt = strata::vulkan::arena_alloc<float>(*s, (size_t) HV);
+        float* dsa = strata::vulkan::arena_alloc<float>(*s, (size_t) HV);
+        float* dgate = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+        float* dbeta = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+        float* dg2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+        float* db2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+        strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 4);
+        strata::vulkan::stream_write(*s, dwa, wa.data(), wa.size() * 2);
+        strata::vulkan::stream_write(*s, dwb, wb.data(), wb.size() * 2);
+        strata::vulkan::stream_write(*s, ddt, dt.data(), dt.size() * 4);
+        strata::vulkan::stream_write(*s, dsa, ssm_a.data(), ssm_a.size() * 4);
+        for (float* p : {dgate, dbeta, dg2, db2}) {
+            std::vector<float> dead((size_t) NT * HV, DEAD);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        strata::kernels::gdn_ab_multi(dx, dwa, dwb, ddt, dsa, dgate, dbeta, N, HV, NT, s);
+        for (int t = 0; t < NT; ++t)
+            strata::kernels::fused_gdn_ab(dx + (size_t) t * N, dwa, dwb, ddt, dsa, dg2 + (size_t) t * HV,
+                                          db2 + (size_t) t * HV, N, HV, s);
+        std::vector<float> gg((size_t) NT * HV), gb((size_t) NT * HV), sg((size_t) NT * HV), sb((size_t) NT * HV);
+        strata::vulkan::stream_read(*s, dgate, gg.data(), gg.size() * 4);
+        strata::vulkan::stream_read(*s, dbeta, gb.data(), gb.size() * 4);
+        strata::vulkan::stream_read(*s, dg2, sg.data(), sg.size() * 4);
+        strata::vulkan::stream_read(*s, db2, sb.data(), sb.size() * 4);
+        int bad = 0, distinct = 0;
+        for (size_t i = 0; i < gg.size(); ++i) {
+            if (gg[i] != sg[i] || gb[i] != sb[i]) ++bad;
+            if (sg[i] != DEAD) ++distinct;
+        }
+        verdict("gdn_ab_multi entry: multi == 3 x fused_gdn_ab, BITWISE (gate + beta)", bad == 0, bad,
+                (int) (gg.size() + gb.size()), 0, "elements differ from the single-token loop");
+        verdict("gdn_ab_multi entry: the single-token arm wrote every row (the arm is not vacuous)",
+                distinct == (int) sg.size(), (int) sg.size() - distinct, (int) sg.size(), 0, "unwritten rows");
+        strata::vulkan::stream_close(s);
+    }
+
+    // =====================================================================================
+    // (E) native_router_top10_multi == n_tok x native_router_top10, BITWISE
+    // =====================================================================================
+    if (ALIGN != 0 && (40u % ALIGN) != 0) {
+        skip("native_router_top10_multi entry",
+             "the device's descriptor-offset alignment cannot bind the per-token 40-byte ids/weights view");
+    } else {
+        const int NT = 3;
+        std::vector<float> logits((size_t) NT * 512);
+        for (auto& v : logits) v = rndf(1.0f);
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) { verdict("native_router_top10_multi entry", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* dl = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * 512);
+        int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * 10);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * 10);
+        int32_t* di2 = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * 10);
+        float* dw2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * 10);
+        strata::vulkan::stream_write(*s, dl, logits.data(), logits.size() * 4);
+        for (int32_t* p : {di, di2}) {
+            std::vector<int32_t> dead((size_t) NT * 10, -7);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        for (float* p : {dw, dw2}) {
+            std::vector<float> dead((size_t) NT * 10, DEAD);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        strata::kernels::native_router_top10_multi(dl, di, dw, NT, s);
+        for (int t = 0; t < NT; ++t)
+            strata::kernels::native_router_top10(dl + (size_t) t * 512, di2 + (size_t) t * 10,
+                                                 dw2 + (size_t) t * 10, s);
+        std::vector<int32_t> gi((size_t) NT * 10), gi2((size_t) NT * 10);
+        std::vector<float> gw((size_t) NT * 10), gw2((size_t) NT * 10);
+        strata::vulkan::stream_read(*s, di, gi.data(), gi.size() * 4);
+        strata::vulkan::stream_read(*s, di2, gi2.data(), gi2.size() * 4);
+        strata::vulkan::stream_read(*s, dw, gw.data(), gw.size() * 4);
+        strata::vulkan::stream_read(*s, dw2, gw2.data(), gw2.size() * 4);
+        int bad = 0, moved = 0;
+        for (size_t i = 0; i < gi.size(); ++i) {
+            if (gi[i] != gi2[i] || gw[i] != gw2[i]) ++bad;
+            if (gi2[i] != gi2[i % 10]) ++moved;                        // rows must differ from each other
+        }
+        verdict("native_router_top10_multi entry: multi == n_tok x native_router_top10, BITWISE (ids + weights)",
+                bad == 0, bad, (int) (gi.size() * 2), 0, "elements differ from the single-token loop");
+        verdict("native_router_top10_multi entry: the rows are NOT all the same (the arm is not vacuous)",
+                moved > 0, moved == 0 ? 1 : 0, (int) NT, moved, "every row's ids equal row 0's");
+        strata::vulkan::stream_close(s);
+    }
+
+    // =====================================================================================
+    // (F) native_moe_combine_multi == n_tok x native_moe_combine, BITWISE
+    // =====================================================================================
+    if (ALIGN != 0 && ((10u * 4u) % ALIGN) != 0) {
+        skip("native_moe_combine_multi entry",
+             "the device's descriptor-offset alignment cannot bind the per-token 40-byte weights view");
+    } else {
+        const int N = 128, K = 10, NT = 3;
+        std::vector<float> parts((size_t) NT * K * N), wt((size_t) NT * K), sh((size_t) NT * N);
+        for (auto& v : parts) v = rndf(1.0f);
+        for (int t = 0; t < NT; ++t) { float s = 0; for (int j = 0; j < K; ++j) { wt[(size_t) t * K + j] = 0.1f; s += 0.1f; } (void) s; }
+        for (auto& v : sh) v = rndf(1.0f);
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) { verdict("native_moe_combine_multi entry", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* dp = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K * N);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K);
+        float* dsh = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        float* dout2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        strata::vulkan::stream_write(*s, dp, parts.data(), parts.size() * 4);
+        strata::vulkan::stream_write(*s, dw, wt.data(), wt.size() * 4);
+        strata::vulkan::stream_write(*s, dsh, sh.data(), sh.size() * 4);
+        for (float* p : {dout, dout2}) {
+            std::vector<float> dead((size_t) NT * N, DEAD);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        strata::kernels::native_moe_combine_multi(dp, dw, dsh, dout, N, K, NT, s);
+        for (int t = 0; t < NT; ++t)
+            strata::kernels::native_moe_combine(dp + (size_t) t * K * N, dw + (size_t) t * K,
+                                                dsh + (size_t) t * N, dout2 + (size_t) t * N, N, K, s);
+        std::vector<float> go((size_t) NT * N), go2((size_t) NT * N);
+        strata::vulkan::stream_read(*s, dout, go.data(), go.size() * 4);
+        strata::vulkan::stream_read(*s, dout2, go2.data(), go2.size() * 4);
+        int bad = 0, moved = 0;
+        for (size_t i = 0; i < go.size(); ++i) {
+            if (go[i] != go2[i]) ++bad;
+            if (std::fabs(go2[i] - go2[i % N]) > 1e-4f) ++moved;
+        }
+        verdict("native_moe_combine_multi entry: multi == n_tok x native_moe_combine, BITWISE", bad == 0, bad,
+                (int) go.size(), 0, "elements differ from the single-token loop");
+        verdict("native_moe_combine_multi entry: the rows MOVE (the arm is not vacuous)", moved > 0,
+                moved == 0 ? 1 : 0, (int) (NT * N), moved, "every row equals row 0");
+        strata::vulkan::stream_close(s);
+    }
+
+    // =====================================================================================
+    // (G) shared_expert_multi == n_tok x shared_expert (all three projections native), BITWISE
+    // =====================================================================================
+    if (ALIGN != 0 && (64u % ALIGN) != 0) {
+        skip("shared_expert_multi entry", "the device's descriptor-offset alignment cannot bind the per-token views");
+    } else {
+        const int N = 64, FF = 64, NT = 3;                 // strides 256/128/256 B: multiples of 16
+        const int GG = 8;                                  // ggml Q8_0: 34 B per 32 values
+        auto q8row = [&](int n, std::vector<uint8_t>& out) {
+            out.resize((size_t) (n / 32) * 34);
+            for (size_t b = 0; b < (size_t) (n / 32); ++b) {
+                const uint16_t d = 0x2400;                 // fp16 0.015625
+                std::memcpy(&out[b * 34], &d, 2);
+                for (int i = 0; i < 32; ++i) out[b * 34 + 2 + i] = (uint8_t) ((int) (rnd() % 11) - 5);
+            }
+        };
+        std::vector<uint8_t> wg, wu, wd;
+        { std::vector<uint8_t> row; q8row(N, row); for (int o = 0; o < FF; ++o) wg.insert(wg.end(), row.begin(), row.end()); }
+        { std::vector<uint8_t> row; q8row(N, row); for (int o = 0; o < FF; ++o) wu.insert(wu.end(), row.begin(), row.end()); }
+        { std::vector<uint8_t> row; q8row(FF, row); for (int o = 0; o < N; ++o) wd.insert(wd.end(), row.begin(), row.end()); }
+        std::vector<float> x((size_t) NT * N);
+        for (auto& v : x) v = 0.5f * rndf(1.0f);
+        std::vector<uint16_t> xb((size_t) NT * N), ginp((size_t) N);
+        for (size_t i = 0; i < xb.size(); ++i) { const uint16_t b = bf16_from_f32(x[i]); xb[i] = b; }
+        for (size_t i = 0; i < ginp.size(); ++i) { const uint16_t b = bf16_from_f32(0.2f * rndf(1.0f)); ginp[i] = b; }
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+        if (s == nullptr) { verdict("shared_expert_multi entry", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        uint8_t* dg = strata::vulkan::arena_alloc<uint8_t>(*s, wg.size());
+        uint8_t* du = strata::vulkan::arena_alloc<uint8_t>(*s, wu.size());
+        uint8_t* dd = strata::vulkan::arena_alloc<uint8_t>(*s, wd.size());
+        const size_t q81 = strata::kernels::native_q8_1_bytes(N > FF ? N : FF, 1);
+        uint8_t* dq81 = strata::vulkan::arena_alloc<uint8_t>(*s, q81);
+        uint8_t* dq81b = strata::vulkan::arena_alloc<uint8_t>(*s, q81);
+        float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        uint16_t* dxb = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) NT * N);
+        uint16_t* dginp = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) N);
+        float* dgate = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * FF);
+        float* dup = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * FF);
+        float* dgs = strata::vulkan::arena_alloc<float>(*s, (size_t) NT);
+        float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        float* dlogit2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
+        float* dscratch = strata::vulkan::arena_alloc<float>(*s, (size_t) (strata::kernels::shared_expert_scratch_bytes(FF) / 4 + 16));
+        strata::vulkan::stream_write(*s, dg, wg.data(), wg.size());
+        strata::vulkan::stream_write(*s, du, wu.data(), wu.size());
+        strata::vulkan::stream_write(*s, dd, wd.data(), wd.size());
+        strata::vulkan::stream_write(*s, dx, x.data(), x.size() * 4);
+        strata::vulkan::stream_write(*s, dxb, xb.data(), xb.size() * 2);
+        strata::vulkan::stream_write(*s, dginp, ginp.data(), ginp.size() * 2);
+        for (float* p : {dout, dlogit2}) {
+            std::vector<float> dead((size_t) NT * N, DEAD);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        strata::kernels::NativeSharedWeights nw;
+        nw.gate_type = GG; nw.gate_data = dg;
+        nw.up_type = GG; nw.up_data = du;
+        nw.down_type = GG; nw.down_data = dd;
+        nw.q8_1 = dq81b;
+        strata::kernels::shared_expert_multi(NT, dx, dxb, nw, dginp, dgate, dup, dgs, dout, N, FF, s);
+        // the single-token path: the SAME native chain, one token at a time, in a second scratch
+        strata::kernels::NativeSharedWeights nw2;
+        nw2.gate_type = GG; nw2.gate_data = dg;
+        nw2.up_type = GG; nw2.up_data = du;
+        nw2.down_type = GG; nw2.down_data = dd;
+        nw2.q8_1 = dq81;
+        const strata::kernels::SForm sf{};
+        for (int t = 0; t < NT; ++t)
+            strata::kernels::shared_expert(nullptr, nullptr, dxb + (size_t) t * N, sf, nullptr, nullptr, nullptr, sf,
+                                           nullptr, nullptr, nullptr, sf, nullptr, nullptr, nullptr, dginp, dscratch,
+                                           dlogit2 + (size_t) t * N, N, FF, 0, s,
+                                           dx + (size_t) t * N, &nw2);
+        std::vector<float> go((size_t) NT * N), go2((size_t) NT * N);
+        strata::vulkan::stream_read(*s, dout, go.data(), go.size() * 4);
+        strata::vulkan::stream_read(*s, dlogit2, go2.data(), go2.size() * 4);
+        int bad = 0, moved = 0;
+        for (size_t i = 0; i < go.size(); ++i) {
+            if (go[i] != go2[i]) ++bad;
+            if (std::fabs(go2[i] - go2[i % N]) > 1e-5f) ++moved;
+        }
+        verdict("shared_expert_multi entry: multi == n_tok x shared_expert (all-native), BITWISE", bad == 0, bad,
+                (int) go.size(), 0, "elements differ from the single-token entry point");
+        verdict("shared_expert_multi entry: the oracle wrote every row and the rows MOVE", moved > 0,
+                moved == 0 ? 1 : 0, (int) (NT * N), moved, "every row equals row 0 / unwritten");
+        strata::vulkan::stream_close(s);
+    }
+
+    // =====================================================================================
+    // (H) gdn_conv_commit + gdn_step_norm_multi (verify half: state untouched; commit half: state written)
+    // =====================================================================================
+    if (ALIGN != 0 && (2048u % ALIGN) != 0) {
+        skip("gdn_step_norm_multi entry", "the device's descriptor-offset alignment cannot bind the per-token views");
+    } else {
+        const int S = 128, HK = 2, HV = 4, NT = 3;
+        const int C = 2 * S * HK + S * HV;                      // the q|k|v layout, 2*128*2 + 128*4 = 1024
+        const int ZV = S * HV;
+        const float EPS = 1e-6f;
+        std::vector<float> hh((size_t) NT * C), gate((size_t) NT * HV), beta((size_t) NT * HV);
+        std::vector<float> z((size_t) NT * ZV), gamma((size_t) S);
+        for (auto& v : hh) v = rndf(1.0f);
+        for (auto& v : gate) v = -0.5f + 0.1f * rndf(1.0f);
+        for (auto& v : beta) v = 0.25f + 0.25f * rndf(1.0f);
+        for (auto& v : z) v = rndf(1.0f);
+        for (auto& v : gamma) v = 1.0f + 0.1f * rndf(1.0f);
+        const size_t SN = (size_t) S * HV * S;
+        std::vector<float> st0(SN);
+        for (auto& v : st0) v = 0.5f * rndf(1.0f);
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(64ull << 20, dir); }
+        if (s == nullptr) { verdict("gdn_step_norm_multi entry", false, 1, 1, 0, "no stream"); return; }
+        strata::vulkan::cuda_compat_set_stream(s);
+        float* dstate = strata::vulkan::arena_alloc<float>(*s, SN);
+        float* dstate2 = strata::vulkan::arena_alloc<float>(*s, SN);
+        float* dh = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * C);
+        float* dgate = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+        float* dbeta = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * HV);
+        float* dz = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * ZV);
+        float* dgamma = strata::vulkan::arena_alloc<float>(*s, (size_t) S);
+        float* dy = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * ZV);
+        float* dy2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * ZV);
+        int32_t* dn = strata::vulkan::arena_alloc<int32_t>(*s, 4);
+        for (float* p : {dstate, dstate2}) strata::vulkan::stream_write(*s, p, st0.data(), SN * 4);
+        strata::vulkan::stream_write(*s, dh, hh.data(), hh.size() * 4);
+        strata::vulkan::stream_write(*s, dgate, gate.data(), gate.size() * 4);
+        strata::vulkan::stream_write(*s, dbeta, beta.data(), beta.size() * 4);
+        strata::vulkan::stream_write(*s, dz, z.data(), z.size() * 4);
+        strata::vulkan::stream_write(*s, dgamma, gamma.data(), gamma.size() * 4);
+        for (float* p : {dy, dy2}) {
+            std::vector<float> dead((size_t) NT * ZV, DEAD);
+            strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
+        }
+        // ---- the VERIFY half (n_keep == nullptr): outputs y, the state READ and NOT written
+        strata::kernels::gdn_step_norm_multi(dstate, dh, C, dgate, dbeta, dz, dgamma, EPS, dy, HK, HV, NT, nullptr,
+                                             s, 0);
+        std::vector<float> gstate(SN), gy((size_t) NT * ZV);
+        strata::vulkan::stream_read(*s, dstate, gstate.data(), SN * 4);
+        strata::vulkan::stream_read(*s, dy, gy.data(), gy.size() * 4);
+        int st_moved = 0;
+        for (size_t i = 0; i < SN; ++i) if (gstate[i] != st0[i]) ++st_moved;
+        verdict("gdn_step_norm_multi entry (verify half): the STATE is left untouched (the header's contract)",
+                st_moved == 0, st_moved, (int) SN, 0, "the state changed - the verify half must not commit");
+        // the oracle: n_tok SINGLE-TOKEN calls on a COPY of the state - the header's own contract, BITWISE
+        const int QK = S * HK;
+        std::vector<float> yref((size_t) NT * ZV, DEAD);
+        strata::vulkan::stream_write(*s, dstate2, st0.data(), SN * 4);
+        for (int t = 0; t < NT; ++t)
+            strata::kernels::fused_gdn_step_norm(dstate2, dh + (size_t) t * C,
+                                                 dh + (size_t) t * C + QK,
+                                                 dh + (size_t) t * C + 2 * QK,
+                                                 dgate + (size_t) t * HV, dbeta + (size_t) t * HV,
+                                                 dz + (size_t) t * ZV, dgamma, EPS, dy2 + (size_t) t * ZV,
+                                                 HK, HV, s);
+        strata::vulkan::stream_read(*s, dy2, yref.data(), yref.size() * 4);
+        {
+            int bad = 0, written = 0;
+            for (size_t i = 0; i < yref.size(); ++i) {
+                if (gy[i] != yref[i]) ++bad;
+                if (yref[i] != DEAD) ++written;
+            }
+            verdict("gdn_step_norm_multi entry (verify half): multi == n_tok x fused_gdn_step_norm, BITWISE",
+                    bad == 0, bad, (int) gy.size(), 0, "elements differ from the single-token loop");
+            verdict("gdn_step_norm_multi entry: the single-token oracle wrote every y element (not vacuous)",
+                    written == (int) yref.size(), (int) yref.size() - written, (int) yref.size(), 0, "unwritten");
+        }
+        // ---- the COMMIT half: n_keep is a DEVICE value, the loop bound comes from memory
+        {
+            strata::vulkan::stream_write(*s, dstate, st0.data(), SN * 4);
+            strata::vulkan::stream_write(*s, dstate2, st0.data(), SN * 4);
+            const int32_t keep = 2;
+            strata::vulkan::stream_write(*s, dn, &keep, 4);
+            std::vector<float> d2((size_t) NT * ZV, DEAD);
+            strata::vulkan::stream_write(*s, dy, d2.data(), d2.size() * 4);       // y must NOT be written
+            strata::kernels::gdn_step_norm_multi(dstate, dh, C, dgate, dbeta, dz, dgamma, EPS, dy, HK, HV, NT, dn,
+                                                 s, NT);
+            for (int t = 0; t < keep; ++t)
+                strata::kernels::fused_gdn_step_norm(dstate2, dh + (size_t) t * C,
+                                                     dh + (size_t) t * C + QK,
+                                                     dh + (size_t) t * C + 2 * QK,
+                                                     dgate + (size_t) t * HV, dbeta + (size_t) t * HV,
+                                                     dz + (size_t) t * ZV, dgamma, EPS, dy2 + (size_t) t * ZV,
+                                                     HK, HV, s);
+            std::vector<float> cs(SN), cs2(SN), yc((size_t) NT * ZV);
+            strata::vulkan::stream_read(*s, dstate, cs.data(), SN * 4);
+            strata::vulkan::stream_read(*s, dstate2, cs2.data(), SN * 4);
+            strata::vulkan::stream_read(*s, dy, yc.data(), yc.size() * 4);
+            int bad = 0, ymoved = 0;
+            for (size_t i = 0; i < SN; ++i) if (cs[i] != cs2[i]) ++bad;
+            for (float v : yc) if (v != DEAD) ++ymoved;
+            verdict("gdn_step_norm_multi entry (commit half, n_keep read from DEVICE memory): state == keep x "
+                    "fused_gdn_step_norm, BITWISE", bad == 0, bad, (int) SN, 0, "state elements differ");
+            verdict("gdn_step_norm_multi entry (commit half): no y is written (t_out_begin >= n_tok)",
+                    ymoved == 0, ymoved, (int) yc.size(), 0, "y elements were written");
+        }
+        // ---- the t_out_begin arm: tokens BEFORE it advance the state but must not write their y row
+        {
+            strata::vulkan::stream_write(*s, dstate, st0.data(), SN * 4);
+            std::vector<float> d3((size_t) NT * ZV, DEAD);
+            strata::vulkan::stream_write(*s, dy, d3.data(), d3.size() * 4);
+            strata::kernels::gdn_step_norm_multi(dstate, dh, C, dgate, dbeta, dz, dgamma, EPS, dy, HK, HV, NT, nullptr,
+                                                 s, 1);
+            std::vector<float> yk((size_t) NT * ZV);
+            strata::vulkan::stream_read(*s, dy, yk.data(), yk.size() * 4);
+            int row0 = 0, later = 0;
+            for (int i = 0; i < ZV; ++i) if (yk[(size_t) i] != DEAD) ++row0;
+            for (size_t i = ZV; i < yk.size(); ++i) if (yk[i] != yref[i]) ++later;
+            verdict("gdn_step_norm_multi entry: `t_out_begin` suppresses the earlier row's y and ONLY that row",
+                    row0 == 0 && later == 0, row0 + later, ZV + (int) (yk.size() - ZV), 0,
+                    "a suppressed row was written / a later row moved");
+        }
+        // ---- CAPTURE: the wrapper records and replays bitwise (the verify half)
+        {
+            auto stage = [&] {
+                strata::vulkan::stream_write(*s, dstate, st0.data(), SN * 4);
+                std::vector<float> dead((size_t) NT * ZV, DEAD);
+                strata::vulkan::stream_write(*s, dy, dead.data(), dead.size() * 4);
+                strata::vulkan::stream_write(*s, dh, hh.data(), hh.size() * 4);
+            };
+            auto run = [&] {
+                strata::kernels::gdn_step_norm_multi(dstate, dh, C, dgate, dbeta, dz, dgamma, EPS, dy, HK, HV, NT,
+                                                     nullptr, s, 0);
+            };
+            const int capbad = capture_replay_arm(s, stage, run, dy, (size_t) NT * ZV * 4);
+            verdict("gdn_step_norm_multi entry: records under capture, replay == direct (bitwise)", capbad == 0,
+                    capbad < 0 ? 1 : capbad, (int) (NT * ZV * 4), capbad,
+                    "capbad<0 = the capture failed; else differing bytes");
+        }
+        // ---- gdn_conv_commit: history <- the last three of [history | qkv_0 .. qkv_{n-1}], n a DEVICE value
+        {
+            const int CH = 96;
+            std::vector<float> hst((size_t) CH * 3), qkv((size_t) 4 * CH);
+            for (auto& v : hst) v = rndf(1.0f);
+            for (auto& v : qkv) v = rndf(1.0f);
+            float* dhst = strata::vulkan::arena_alloc<float>(*s, (size_t) CH * 3);
+            float* dq = strata::vulkan::arena_alloc<float>(*s, (size_t) 4 * CH);
+            int32_t* dk = strata::vulkan::arena_alloc<int32_t>(*s, 4);
+            int bad = 0, noop_bad = 0;
+            for (int n : {1, 2, 3, 4}) {
+                strata::vulkan::stream_write(*s, dhst, hst.data(), hst.size() * 4);
+                strata::vulkan::stream_write(*s, dq, qkv.data(), qkv.size() * 4);
+                int32_t keep = n;
+                strata::vulkan::stream_write(*s, dk, &keep, 4);
+                strata::kernels::gdn_conv_commit(dhst, dq, CH, dk, s);
+                std::vector<float> got((size_t) CH * 3);
+                strata::vulkan::stream_read(*s, dhst, got.data(), got.size() * 4);
+                for (int c = 0; c < CH; ++c)
+                    for (int j = 0; j < 3; ++j) {
+                        const int src = n + j;                       // the CUDA's own index
+                        const float want = src < 3 ? hst[(size_t) c * 3 + src]
+                                                   : qkv[(size_t) (src - 3) * CH + c];
+                        if (got[(size_t) c * 3 + j] != want) ++bad;
+                    }
+            }
+            // n <= 0 leaves the history AS IT WAS (the CUDA returns before writing)
+            strata::vulkan::stream_write(*s, dhst, hst.data(), hst.size() * 4);
+            int32_t zero = 0;
+            strata::vulkan::stream_write(*s, dk, &zero, 4);
+            strata::kernels::gdn_conv_commit(dhst, dq, CH, dk, s);
+            std::vector<float> got((size_t) CH * 3);
+            strata::vulkan::stream_read(*s, dhst, got.data(), got.size() * 4);
+            for (size_t i = 0; i < hst.size(); ++i) if (got[i] != hst[i]) ++noop_bad;
+            verdict("gdn_conv_commit entry (n = 1..4, device count): wrapper == the CUDA window rule", bad == 0, bad,
+                    4 * CH * 3, 0, "elements differ");
+            verdict("gdn_conv_commit entry: n <= 0 leaves the history untouched", noop_bad == 0, noop_bad,
+                    (int) hst.size(), 0, "the history changed");
+        }
+        strata::vulkan::stream_close(s);
+    }
+}
+
 int main(int argc, char** argv) {
     // Nothing absolute is baked in: the environment overrides, the argument overrides that, and an empty set
     // of .spv files is an ERROR - a gate that runs zero cases must never report success.
@@ -23549,6 +24178,10 @@ int main(int argc, char** argv) {
     // `Verifier::init` (verify.cpp:311).  A pure host probe (no shader, no stream).  APPENDED last for the
     // shared-RNG reason every batch above names.
     case_fused_gr_check_entry(ctx, dir);
+    // THIS BATCH: THE P6 VERIFY WINDOW'S KERNELS - the nine symbols the window reaches after the fused
+    // read (`broadcast_streams` is the FIRST, at verify.cpp:592).  Every multi is held BITWISE to the
+    // already-gated single-token kernel it is a loop over.
+    case_verify_window_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders
     // need) is not a suite that agreed with the reference, and it must not look like one.

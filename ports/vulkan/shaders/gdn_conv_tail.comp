@@ -1,0 +1,38 @@
+#version 450
+// ports/vulkan/shaders/gdn_conv_tail.comp - the LAST THREE entries of the concatenated stream
+// [hist(3) | qkv_0 .. qkv_{n-1}], written to a DESTINATION.  ONE shader, two entry points, because the two are
+// the same rule (verify_kernels.cu:53-68 `gdn_conv_commit_kernel`):
+//
+//   `gdn_conv_commit`  (verify.cpp:1293/:1844): DEST == HIST, n = *NKEEP (a DEVICE int32: the commit graph is
+//       captured once and replayed with a live `n_keep`, so the count cannot be a push constant).
+//   the verify window's `gdn_conv_l2_multi` SEED (verify_vk.cpp): DEST = the stream's working-history scratch,
+//       n = a HOST constant (the group's `t_begin`, fixed at capture), so the window's per-token loop starts
+//       from [hist | qkv_0 .. qkv_{t_begin-1}] WITHOUT writing the caller's history - which the multi's
+//       contract forbids ("history is NOT written").
+//
+// THE RULE, per channel c (the CUDA's own expression, `src = n + j`):
+//
+//     seq[j] = (n + j < 3) ? hist[c*3 + n + j] : qkv[(n + j - 3)*C + c]      j = 0,1,2
+//     DEST[c*3 + j] = seq[j]
+//
+// `n <= 0` returns WITHOUT writing (the CUDA's `if (n <= 0) return;`).  With DEST == HIST the reads and the
+// writes never overlap in a way that matters: for n >= 1, `src = n + j >= j + 1 > j`, so the loop reads index
+// `src` before any write to index `j` could have changed it (and index `j` is written only by iteration j,
+// after its own read).  NO barrier, NO subgroup op, NO atomic; one thread per channel.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer HIST { float v[]; } hist;   // (channels, 3), oldest first
+layout(set = 0, binding = 1, std430) readonly buffer QKV { float v[]; } qkv;     // (n, channels)
+layout(set = 0, binding = 2, std430) readonly buffer NK { int v[]; } nk;         // *n_keep
+layout(set = 0, binding = 3, std430) buffer DEST { float v[]; } dst;             // (channels, 3)
+layout(push_constant, std430) uniform PC { int channels; int n; int use_dev; } pc;
+
+void main() {
+    const int c = int(gl_GlobalInvocationID.x);
+    if (c >= pc.channels) return;
+    const int n = (pc.use_dev != 0) ? nk.v[0] : pc.n;    // the device count, or the caller's host constant
+    if (n <= 0) return;                                  // the CUDA returns before writing anything
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;                           // index into [hist(3) | qkv...]
+        dst.v[c * 3 + j] = (src < 3) ? hist.v[c * 3 + src] : qkv.v[(src - 3) * pc.channels + c];
+    }
+}
