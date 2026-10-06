@@ -253,14 +253,11 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t*, const int32_t*, const int32_t*
 //     symbol the window reaches once `pre` completes.  A translating spin is forbidden here (the port's
 //     no-spinning rule), so the window's next stop is this symbol; its chain string says so.
 //   * `resident_plan` (`verify.cpp:938`, the `if (all_resident_)` branch of the window's per-group plan) -
-//     REACHED ONCE THE ALL-RESIDENT FIT CLOSES, and MEASURED REACHED on `vega` 2026-10-06:
-//     `--expert-cache 12288` is EVERY expert of all 48 layers (12288 = 48 x 256), the profile fills all 12288
-//     slots, the window prints `token graph hit path: 12288 resident experts, decided on the device` and
-//     `window up to 6 tokens, 74.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)`, and this is
-//     the symbol it stops at.  THE OLD TEXT HERE SAID `all_resident_` was not reachable "against a few-thousand
-//     slot --expert-cache" - that was TRUE of the configs anyone had run and FALSE as a property of the code,
-//     which is why it is corrected rather than deleted.  **This row is the NEXT increment: the last unported
-//     symbol on the all-resident arm.**
+//     REACHED ONCE THE ALL-RESIDENT FIT CLOSES, and MEASURED REACHED on `vega` 2026-10-06 with
+//     `--expert-cache 12288`.  **NOW PORTED** (`vulkan/src/kernels/verify_vk.cpp`, shader `resident_plan.spv`):
+//     it was the LAST unported symbol between the all-resident window and the launch.  The refusal here was the
+//     corrected text the 2026-10-06 batch shipped (the old text wrongly claimed `all_resident_` was
+//     unreachable); it is gone because the symbol is now a real body.
 //   * `copy_rows_from_mapped` (`verify.cpp:1071`) - the `dec_batch` arm of the CPU-share copy, with `dec_batch`
 //     TRUE by default (`STRATA_DEC_BATCH` unset).
 //   * `copy_indexed` (`verify.cpp:1311`, the commit graph) - reached whenever the PLE stage is ready, which it
@@ -338,23 +335,12 @@ void ple_block_projected(const float*, const float*, const float*, const float*,
 // `ptr[k] = base + k*blob_bytes` for `k < *n`, the lo/hi write the CUDA does (`verify_kernels.cu:281`).  At
 // `pcie_frac 0.00` `*n == 0`, so it writes nothing (the rebase is the IDENTITY); the shader carries the general
 // case, not a host-side shortcut.
-void resident_plan(const int32_t*, int, int, const int32_t*, int, const uint8_t*, const unsigned long long*, long long,
-                   int32_t*, long long, uint32_t*, uint32_t, void*) {
-    refuse_not_ported("resident_plan",
-                      "REACHED - the P6 verify window's per-group plan on the ALL-RESIDENT arm (verify.cpp:938, "
-                      "`if (all_resident_)`), MEASURED on vega 2026-10-06 with `--expert-cache 12288` (EVERY "
-                      "expert of all 48 layers = 12288 slots, `token graph hit path: 12288 resident experts, "
-                      "decided on the device`, `100% VRAM resident: zero-doorbell graph`).  Also reached by the "
-                      "device-plan arm (`verify.cpp:943`) under STRATA_VERIFY_DEVICE_PLAN.  THE OLD TEXT SAID "
-                      "`all_resident_` needed no more than 'a few-thousand-slot --expert-cache' - the fit, not "
-                      "the arm, was what stopped it.  Unported shader: this is the LAST symbol between the "
-                      "window and the launch on this route.");
-}
-// `wait_flag_ge` is NOW DEFINED (the handshake seam) in `vulkan/src/kernels/verify_vk.cpp`: under capture it
-// records a HOST BOUNDARY that CUTS the window into segments, and the segment that follows is submitted only once
-// the engine's host loop has raised the flag - polled on the HOST thread between the split submissions, never a
-// spinning kernel.  The refusal that used to sit here was correct while the seam was missing; it is now false of
-// the code (the symbol is a real body), so the row moves `refused -> kernel` in PORT-MAP.tsv.
+// `resident_plan` is NOW DEFINED (not refused) in `vulkan/src/kernels/verify_vk.cpp` (shader
+// `resident_plan.spv`): the P6 verify window's per-group plan on the ALL-RESIDENT arm (verify.cpp:938), the
+// group-by over the routed ids producing `ptr[grp] = cache_base + slot_off[slot]` and the per-entry
+// (thread,token) map.  Its refusal here was the LAST symbol between the all-resident window and the launch;
+// the row moves `refused -> kernel` in PORT-MAP.tsv.  The `else if (device_plan_)` arm (verify.cpp:943) passes
+// `skip + grp` and a ring, which this definition also carries (the skip word is written when given).
 void wait_flag_ge_or(const uint32_t*, uint32_t, const uint32_t*, void*) {
     refuse_not_ported("wait_flag_ge_or",
                       "NOT reached - the P6 verifier's DEVICE-PLAN arms (verify.cpp:1039/:1048/:1062, "

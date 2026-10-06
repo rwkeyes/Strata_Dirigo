@@ -23569,6 +23569,405 @@ void case_blob_stage_entry(Ctx& ctx, const std::string& dir) {
     strata::vulkan::stream_close(s);
 }
 
+// *** `resident_plan` - the P6 verify window's ALL-RESIDENT per-group plan (verify.cpp:938, THIS batch) ***
+//
+// THE ENGINE'S RULE (verify_kernels.cu:507-594) is transcribed INDEPENDENTLY below as `ref_resident_plan`: a
+// host C++ group-by over the same (ids, res, slot_off, cache_base) inputs, producing the same plan fields.  The
+// ORACLE IS THE CUDA BODY, not a re-derivation of the shader, and the POINTER VALUES - `ptr[grp] = cache_base +
+// slot_off[slot]`, the base+offset arithmetic that has produced a defect in EVERY batch of this port - are
+// compared BITWISE, not counted as "changed".  The pointers are then fed through `ptr_to_off.spv` so the NEXT
+// stage (the grouped-expert launcher) is proved to read them as the right byte offsets.
+struct RefPlan {
+    bool bad = false;
+    int counts[3] = {0, 0, 0};
+    int start2 = 0;
+    std::vector<int32_t> start, dst, tok;
+    std::vector<uint64_t> ptr;
+};
+
+// Transcribed from `resident_plan_kernel` (src/kernels/cuda/verify_kernels.cu:507-594), line for line.
+static RefPlan ref_resident_plan(const std::vector<int32_t>& ids, int k, const std::vector<int32_t>& res,
+                                 int n_expert, uint64_t cache_base, const std::vector<uint64_t>& slot_off,
+                                 int capx) {
+    const int n = (int) ids.size();
+    RefPlan o;
+    o.start.assign((size_t) capx + 1, 0);
+    o.dst.assign((size_t) capx, 0);
+    o.tok.assign((size_t) capx, 0);
+    o.ptr.assign((size_t) capx, 0);
+    std::vector<uint64_t> sptr((size_t) n, 0);
+    for (int t = 0; t < n; ++t) {
+        const int eid = ids[(size_t) t];
+        const int slot = (eid >= 0 && eid < n_expert) ? res[(size_t) eid] : -1;
+        if (slot < 0) { o.bad = true; return o; }            // s_bad: the CUDA writes NOTHING and returns
+        sptr[(size_t) t] = cache_base + slot_off[(size_t) slot];
+    }
+    std::vector<int> first((size_t) n), cnt((size_t) n), isf((size_t) n);
+    for (int t = 0; t < n; ++t) {
+        int f = t, c = 0;
+        for (int j = 0; j < n; ++j) if (ids[(size_t) j] == ids[(size_t) t]) { if (j < f) f = j; ++c; }
+        first[(size_t) t] = f; cnt[(size_t) t] = c; isf[(size_t) t] = (f == t);
+    }
+    int groups = 0;
+    std::vector<int> gstart((size_t) n, 0);
+    for (int t = 0; t < n; ++t) if (isf[(size_t) t]) {
+        int grp = 0, ent = 0;
+        // s_cnt[j] = is_first ? count : 0 (verify_kernels.cu:545) - NOT the raw per-entry count
+        for (int j = 0; j < t; ++j) { grp += isf[(size_t) j]; ent += isf[(size_t) j] ? cnt[(size_t) j] : 0; }
+        o.ptr[(size_t) grp] = sptr[(size_t) t];
+        o.start[(size_t) grp] = ent;
+        gstart[(size_t) t] = ent;
+        ++groups;
+    }
+    for (int t = 0; t < n; ++t) {
+        int rank = 0;
+        for (int j = 0; j < t; ++j) if (ids[(size_t) j] == ids[(size_t) t]) ++rank;
+        const int out = gstart[(size_t) first[(size_t) t]] + rank;
+        o.dst[(size_t) out] = t;
+        o.tok[(size_t) out] = t / k;
+    }
+    o.start[(size_t) groups] = n;
+    o.start2 = n;
+    o.counts[0] = groups; o.counts[1] = n; o.counts[2] = 0;
+    return o;
+}
+
+void case_resident_plan_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "resident_plan.spv")) return;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(24ull << 20, dir); }
+    if (s == nullptr) { verdict("resident_plan: engine stream", false, 1, 1, 0, "no stream"); return; }
+    strata::vulkan::cuda_compat_set_stream(s);
+    const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+    strata::vulkan::Stream& st = *s;
+    const uint32_t ALIGN = ctx.info().min_storage_offset_align;
+
+    const int K = 10, NEXP = 32, NSLOT = 16, CAPX = 2 * K, NE = 2 * K;   // a 2-token window: NE = n_entries
+    const int64_t STRIDE = 4096;
+    const int64_t CACHE = (int64_t) NSLOT * STRIDE;
+    const int64_t PTR_OFF = ((4 + (CAPX + 1) + 2 * CAPX + 1) & ~1ll);     // verify.cpp:386, i32 units
+    const int64_t DST_OFF = 4 + (CAPX + 1), TOK_OFF = DST_OFF + CAPX;
+    const int64_t PLAN_I32 = PTR_OFF + 4 * (int64_t) CAPX + (CAPX + 1) + 1;
+    const int32_t SEN = (int32_t) 0x5A5A5A5A;
+
+    // the fixture: an id list with a repeat INSIDE a token and ACROSS tokens, all in [0, NEXP)
+    const int32_t idsv[NE] = {3, 7, 3, 11, 7, 0, 3, 25, 11, 7,
+                              7, 3, 11, 9, 25, 3, 11, 7, 7, 9};
+    std::vector<int32_t> ids(idsv, idsv + NE);
+    std::vector<int32_t> res((size_t) NEXP);
+    for (int e = 0; e < NEXP; ++e) res[(size_t) e] = (e * 7 + 3) % NSLOT;   // scrambled slots (slot != eid)
+    std::vector<uint64_t> slot_off((size_t) NSLOT);
+    for (int sl = 0; sl < NSLOT; ++sl) slot_off[(size_t) sl] = (uint64_t) sl * (uint64_t) STRIDE;
+
+    uint8_t* cache = strata::vulkan::arena_alloc<uint8_t>(st, (uint64_t) CACHE);
+    uint8_t* pad = strata::vulkan::arena_alloc<uint8_t>(st, 4096);        // so cache2's address differs
+    uint8_t* cache2 = strata::vulkan::arena_alloc<uint8_t>(st, (uint64_t) CACHE);
+    std::vector<uint8_t> fill((size_t) CACHE, 0x3C), fill2((size_t) CACHE, 0xC3);
+    strata::vulkan::stream_write(st, cache, fill.data(), fill.size());
+    strata::vulkan::stream_write(st, cache2, fill2.data(), fill2.size());
+    (void) pad;
+    int32_t* d_ids = strata::vulkan::arena_alloc<int32_t>(st, NE);
+    int32_t* d_res = strata::vulkan::arena_alloc<int32_t>(st, NEXP);
+    auto* d_so = strata::vulkan::arena_alloc<unsigned long long>(st, NSLOT);
+    int32_t* d_plan = strata::vulkan::arena_alloc<int32_t>(st, (uint64_t) PLAN_I32);
+    uint32_t* d_skip = strata::vulkan::arena_alloc<uint32_t>(st, 1);
+    strata::vulkan::stream_write(st, d_res, res.data(), (size_t) NEXP * 4);
+
+    auto write_ids = [&](const std::vector<int32_t>& ii) {
+        strata::vulkan::stream_write(st, d_ids, ii.data(), (size_t) ii.size() * 4);
+    };
+    auto write_so = [&](const std::vector<uint64_t>& so) {
+        strata::vulkan::stream_write(st, d_so, so.data(), (size_t) NSLOT * 8);
+    };
+    auto sentinel_plan = [&]() {
+        std::vector<int32_t> sen((size_t) PLAN_I32, SEN);
+        strata::vulkan::stream_write(st, d_plan, sen.data(), (size_t) PLAN_I32 * 4);
+    };
+    auto read_plan = [&]() {
+        std::vector<int32_t> v((size_t) PLAN_I32, 0);
+        strata::vulkan::stream_read(st, d_plan, v.data(), (size_t) PLAN_I32 * 4);
+        return v;
+    };
+    auto run = [&](const void* cb) {
+        strata::kernels::resident_plan(d_ids, NE, K, d_res, NEXP, (const uint8_t*) cb,
+                                       (const unsigned long long*) d_so, /*blob*/ 0, d_plan, CAPX,
+                                       /*skip*/ nullptr, /*ring*/ 0, (void*) cs);
+    };
+    auto fetch = [&](const std::vector<int32_t>& v) {
+        RefPlan g;
+        for (int i = 0; i < 3; ++i) g.counts[i] = v[(size_t) i];
+        g.start.assign((size_t) CAPX + 1, 0);
+        for (int i = 0; i <= CAPX; ++i) g.start[(size_t) i] = v[(size_t) (4 + i)];
+        g.dst.assign((size_t) CAPX, 0);
+        for (int i = 0; i < CAPX; ++i) g.dst[(size_t) i] = v[(size_t) (DST_OFF + i)];
+        g.tok.assign((size_t) CAPX, 0);
+        for (int i = 0; i < CAPX; ++i) g.tok[(size_t) i] = v[(size_t) (TOK_OFF + i)];
+        g.ptr.assign((size_t) CAPX, 0);
+        for (int i = 0; i < CAPX; ++i) {
+            const uint64_t lo = (uint32_t) v[(size_t) (PTR_OFF + 2 * i)];
+            const uint64_t hi = (uint32_t) v[(size_t) (PTR_OFF + 2 * i + 1)];
+            g.ptr[(size_t) i] = (hi << 32) | lo;
+        }
+        g.start2 = v[(size_t) (PTR_OFF + 4 * (int64_t) CAPX)];
+        return g;
+    };
+
+    // ---------------- (A) the rule: the pointers BITWISE, plus start/dst/tok and the counts ----------------
+    const uint64_t CB = (uint64_t) (uintptr_t) cache;
+    write_ids(ids);
+    write_so(slot_off);
+    run(cache);
+    const RefPlan ref = ref_resident_plan(ids, K, res, NEXP, CB, slot_off, CAPX);
+    const RefPlan base = fetch(read_plan());
+    const int G = ref.counts[0];
+    {
+        int bad = 0; double worst = 0;
+        for (int g = 0; g < G; ++g) {
+            if (base.ptr[(size_t) g] != ref.ptr[(size_t) g]) ++bad;
+            worst = std::max(worst, std::fabs((double) (int64_t) (base.ptr[(size_t) g] - ref.ptr[(size_t) g])));
+        }
+        verdict("resident_plan entry: ptr[grp] = cache_base + slot_off[slot], BITWISE (host transcription)",
+                bad == 0 && base.counts[0] == G, bad, G, worst, "pointer words differ / |delta| bytes");
+    }
+    {
+        int bad = 0;
+        for (int i = 0; i <= G; ++i) if (base.start[(size_t) i] != ref.start[(size_t) i]) ++bad;
+        for (int i = 0; i < NE; ++i) {
+            if (base.dst[(size_t) i] != ref.dst[(size_t) i]) ++bad;
+            if (base.tok[(size_t) i] != ref.tok[(size_t) i]) ++bad;
+        }
+        verdict("resident_plan entry: start/dst/tok match the group-by (entries ascending, distinct experts in routing order)",
+                bad == 0, bad, (G + 1) + 2 * NE, 0, "plan fields differ");
+    }
+    {
+        int bad = 0;
+        if (base.counts[0] != G) ++bad;
+        if (base.counts[1] != NE) ++bad;
+        if (base.counts[2] != 0) ++bad;
+        if (base.start[(size_t) G] != NE) ++bad;
+        if (base.start2 != NE) ++bad;
+        verdict("resident_plan entry: counts = {groups, n, 0} and start[groups] = start2[0] = n",
+                bad == 0, bad, 5, 0, "counts/terminators wrong");
+    }
+
+    // ---------------- (B) rivals that MOVE the reference ----------------
+    {
+        const uint64_t DELTA = 0x12345;
+        std::vector<uint64_t> so2 = slot_off;
+        for (auto& x : so2) x += DELTA;
+        write_so(so2);
+        run(cache);
+        const RefPlan r2 = ref_resident_plan(ids, K, res, NEXP, CB, so2, CAPX);
+        const RefPlan g2 = fetch(read_plan());
+        int bad = 0, moved = 0;
+        for (int g = 0; g < G; ++g) {
+            if (g2.ptr[(size_t) g] != r2.ptr[(size_t) g]) ++bad;
+            if ((int64_t) (g2.ptr[(size_t) g] - base.ptr[(size_t) g]) == (int64_t) DELTA) ++moved;
+        }
+        verdict("resident_plan entry: a changed slot_off MOVES every pointer by exactly the delta (rival)",
+                bad == 0 && moved == G, bad, G, moved, "pointer did not move by the delta");
+        write_so(slot_off);
+    }
+    {
+        const uint64_t CB2 = (uint64_t) (uintptr_t) cache2;
+        run(cache2);
+        const RefPlan r3 = ref_resident_plan(ids, K, res, NEXP, CB2, slot_off, CAPX);
+        const RefPlan g3 = fetch(read_plan());
+        int bad = 0, shift = 0;
+        for (int g = 0; g < G; ++g) {
+            if (g3.ptr[(size_t) g] != r3.ptr[(size_t) g]) ++bad;
+            if ((int64_t) (g3.ptr[(size_t) g] - base.ptr[(size_t) g]) == (int64_t) (CB2 - CB)) ++shift;
+        }
+        verdict("resident_plan entry: a different cache_base MOVES every pointer by the base delta (rival)",
+                bad == 0 && shift == G && CB2 != CB, bad, G, shift, "pointer did not shift by the base delta");
+    }
+    {
+        std::vector<int32_t> ids4(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) ids4[i] = ids[(i + 3) % ids.size()];   // rotate the id order
+        write_ids(ids4);
+        run(cache);
+        const RefPlan r4 = ref_resident_plan(ids4, K, res, NEXP, CB, slot_off, CAPX);
+        const RefPlan g4 = fetch(read_plan());
+        int bad = 0, moved = 0;
+        for (int g = 0; g < r4.counts[0]; ++g) if (g4.ptr[(size_t) g] != r4.ptr[(size_t) g]) ++bad;
+        for (int i = 0; i < NE; ++i) {
+            if (g4.dst[(size_t) i] != r4.dst[(size_t) i]) ++bad;
+            if (g4.dst[(size_t) i] != base.dst[(size_t) i]) ++moved;
+        }
+        verdict("resident_plan entry: a permuted id order MOVES dst and still matches the rule (rival)",
+                bad == 0 && moved > 0, bad, r4.counts[0] + NE, moved, "dst did not move / rule not matched");
+        write_ids(ids);
+    }
+    {
+        // a duplicated expert ACROSS tokens is ONE group with BOTH entries
+        std::vector<int32_t> ids5(NE);
+        for (int i = 0; i < NE; ++i) ids5[(size_t) i] = i % K;
+        ids5[0] = 5; ids5[K] = 5;                       // expert 5 now hits 4 times (positions 0,5,K,K+5)
+        write_ids(ids5);
+        run(cache);
+        const RefPlan r5 = ref_resident_plan(ids5, K, res, NEXP, CB, slot_off, CAPX);
+        const RefPlan g5 = fetch(read_plan());
+        int bad = 0;
+        for (int g = 0; g < r5.counts[0]; ++g) if (g5.ptr[(size_t) g] != r5.ptr[(size_t) g]) ++bad;
+        int gidx = -1;
+        for (int g = 0; g < r5.counts[0]; ++g) if (r5.ptr[(size_t) g] == CB + slot_off[(size_t) res[5]]) gidx = g;
+        const bool dup_ok = (gidx >= 0) && (r5.counts[0] == 9) && (g5.counts[0] == 9) &&
+                            ((r5.start[(size_t) gidx + 1] - r5.start[(size_t) gidx]) == 4) &&
+                            (g5.ptr[(size_t) gidx] == CB + slot_off[(size_t) res[5]]);
+        verdict("resident_plan entry: an expert duplicated across tokens is ONE group (4 entries, 9 groups total)",
+                bad == 0 && dup_ok, bad, 9, gidx, "the duplicated expert was not one group with 4 entries");
+        write_ids(ids);
+    }
+
+    // ---------------- (C) VACUITY, and the arm that forbids it ----------------
+    {
+        std::vector<int32_t> bad_ids = ids;
+        bad_ids[4] = NEXP + 5;                          // outside [0, n_expert): the CUDA's s_bad arm
+        write_ids(bad_ids);
+        sentinel_plan();
+        run(cache);
+        const std::vector<int32_t> vbad = read_plan();
+        int wrote = 0;
+        for (size_t i = 0; i < vbad.size(); ++i) if (vbad[i] != SEN) ++wrote;
+        verdict("resident_plan entry: a NON-RESIDENT routed expert writes NOTHING (the CUDA's s_bad arm)",
+                wrote == 0, wrote, (int) vbad.size(), 0, "plan words written by a bad plan");
+
+        write_ids(ids);
+        sentinel_plan();
+        run(cache);
+        const std::vector<int32_t> vok = read_plan();
+        const RefPlan rok = ref_resident_plan(ids, K, res, NEXP, CB, slot_off, CAPX);
+        int unwritten = 0;
+        for (int i = 0; i < 3; ++i) if (vok[(size_t) i] == SEN) ++unwritten;
+        for (int i = 0; i <= rok.counts[0]; ++i) if (vok[(size_t) (4 + i)] == SEN) ++unwritten;
+        for (int i = 0; i < NE; ++i) {
+            if (vok[(size_t) (DST_OFF + i)] == SEN) ++unwritten;
+            if (vok[(size_t) (TOK_OFF + i)] == SEN) ++unwritten;
+        }
+        for (int g = 0; g < rok.counts[0]; ++g)
+            if (vok[(size_t) (PTR_OFF + 2 * g)] == SEN && vok[(size_t) (PTR_OFF + 2 * g + 1)] == SEN) ++unwritten;
+        if (vok[(size_t) (PTR_OFF + 4 * (int64_t) CAPX)] == SEN) ++unwritten;
+        verdict("resident_plan entry: the SAME call with a valid fixture writes EVERY group and entry (anti-vacuity)",
+                unwritten == 0, unwritten, 3 + rok.counts[0] + 1 + 2 * NE + rok.counts[0] + 1, 0,
+                "plan words the valid call left unwritten");
+    }
+
+    // ---------------- (D) the skip word (the device-plan arm's own word; nullptr in this form) ----------------
+    {
+        const uint32_t RING = 7;
+        uint32_t v = 12345;
+        strata::vulkan::stream_write(st, d_skip, &v, 4);
+        strata::kernels::resident_plan(d_ids, NE, K, d_res, NEXP, cache, (const unsigned long long*) d_so, 0,
+                                       d_plan, CAPX, d_skip, RING, (void*) cs);
+        strata::vulkan::stream_read(st, d_skip, &v, 4);
+        std::vector<int32_t> bad = ids; bad[2] = -1;
+        write_ids(bad);
+        uint32_t v2 = 12345;
+        strata::vulkan::stream_write(st, d_skip, &v2, 4);
+        strata::kernels::resident_plan(d_ids, NE, K, d_res, NEXP, cache, (const unsigned long long*) d_so, 0,
+                                       d_plan, CAPX, d_skip, RING, (void*) cs);
+        strata::vulkan::stream_read(st, d_skip, &v2, 4);
+        verdict("resident_plan entry: *skip = ring on a good plan and 0 on a bad one (the device-plan word)",
+                v == RING && v2 == 0, (v == RING ? 0 : 1) + (v2 == 0 ? 0 : 1), 2, 0, "the skip word is wrong");
+        write_ids(ids);
+    }
+
+    // ---------------- (E) THE CAPTURE ARM: the call RECORDS, and replay == direct BITWISE ----------------
+    {
+        write_ids(ids);
+        write_so(slot_off);
+        sentinel_plan();
+        run(cache);                                     // DIRECT
+        const std::vector<int32_t> direct = read_plan();
+        sentinel_plan();                                // the inputs stay live; the plan is sentinelled
+        cudaGraph_t g = nullptr;
+        cudaGraphExec_t ex = nullptr;
+        bool captured = false;
+        if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+            run(cache);                                 // RECORDS - it must not run here
+            captured = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != nullptr;
+        }
+        const std::vector<int32_t> cap = read_plan();
+        int not_run = 0;
+        for (int32_t w : cap) if (w != SEN) ++not_run;
+        verdict("resident_plan entry: the call RECORDS under capture (the plan is untouched after EndCapture)",
+                captured && not_run == 0, not_run, (int) cap.size(), 0, "a recording wrote the plan");
+        if (captured) { cudaGraphInstantiate(&ex, g, 0); cudaGraphDestroy(g); }
+        int bad_rep = (int) direct.size();
+        if (ex != nullptr && cudaGraphLaunch(ex, cs) == cudaSuccess) {
+            const std::vector<int32_t> rep = read_plan();
+            bad_rep = 0;
+            for (size_t i = 0; i < direct.size(); ++i) if (rep[i] != direct[i]) ++bad_rep;
+        }
+        verdict("resident_plan entry: the recorded replay == direct execution, BITWISE",
+                bad_rep == 0, bad_rep, (int) direct.size(), 0, "words differ");
+        if (ex != nullptr) cudaGraphExecDestroy(ex);
+    }
+
+    // ---------------- (F) THE POINTERS FLOW: ptr_to_off turns them into the launcher's byte offsets ----------
+    // The engine's own layout has the ptr region at `plan + PTR_OFF*4` bytes - 8-byte aligned, and therefore
+    // BINDABLE only where `minStorageBufferOffsetAlignment` divides 8 (the Arc: 4).  On a device whose limit is
+    // 16 (llvmpipe) that view cannot be bound, so this arm SKIPS with the reason rather than letting the device
+    // layer exit on the unaligned descriptor the ENGINE's own layout produces.
+    {
+        write_ids(ids);
+        write_so(slot_off);
+        run(cache);
+        const RefPlan r = ref_resident_plan(ids, K, res, NEXP, CB, slot_off, CAPX);
+        const uint64_t WB = 4096;
+        const uint64_t BASE = strata::vulkan::Stream::kArenaBase;
+        const uint64_t ptr_bytes = (uint64_t) (PTR_OFF * 4);
+        if (ALIGN != 0 && (ptr_bytes % ALIGN) != 0) {
+            skip("resident_plan ptr_to_off window", "the engine's ptr-region offset is not a multiple of this device's descriptor-offset alignment");
+        } else {
+            strata::vulkan::Buf b_ptr{};
+            auto* o_n = strata::vulkan::arena_alloc<int32_t>(st, 1);
+            auto* o_off = strata::vulkan::arena_alloc<uint32_t>(st, (uint64_t) r.counts[0]);
+            auto* o_win = strata::vulkan::arena_alloc<uint32_t>(st, (uint64_t) r.counts[0]);
+            const int32_t nv = r.counts[0];
+            strata::vulkan::stream_write(st, o_n, &nv, 4);
+            strata::vulkan::Buf b_n{}, b_off{}, b_win{};
+            const bool okbind = strata::vulkan::arena_resolve(st, (const void*) ((uintptr_t) d_plan + ptr_bytes),
+                                                              (uint64_t) r.counts[0] * 8, b_ptr) &&
+                                strata::vulkan::arena_resolve(st, o_n, 4, b_n) &&
+                                strata::vulkan::arena_resolve(st, o_off, (uint64_t) r.counts[0] * 4, b_off) &&
+                                strata::vulkan::arena_resolve(st, o_win, (uint64_t) r.counts[0] * 4, b_win);
+            auto push_off = [&](uint64_t base) {
+                struct { uint32_t base_lo, base_hi, win_bytes; } pc{
+                    (uint32_t) (base & 0xFFFFFFFFu), (uint32_t) (base >> 32), (uint32_t) WB};
+                VkPipeline pipe = st.ctx->pipeline(dir + "/ptr_to_off.spv", 4, sizeof(pc));
+                st.ctx->dispatch(pipe, {&b_ptr, &b_n, &b_off, &b_win}, &pc, sizeof(pc), 1u);
+            };
+            int bad_off = 0, bad_win = 0, moved = 0;
+            if (okbind) {
+                push_off(BASE);
+                std::vector<uint32_t> goff((size_t) r.counts[0]), gwin((size_t) r.counts[0]);
+                strata::vulkan::stream_read(st, o_off, goff.data(), goff.size() * 4);
+                strata::vulkan::stream_read(st, o_win, gwin.data(), gwin.size() * 4);
+                for (int g = 0; g < r.counts[0]; ++g) {
+                    const uint64_t f = r.ptr[(size_t) g] - BASE;
+                    if (goff[(size_t) g] != (uint32_t) (f % WB)) ++bad_off;
+                    if (gwin[(size_t) g] != (uint32_t) (f / WB)) ++bad_win;
+                }
+                // the RIVAL base: every offset moves by the base delta mod the window
+                const uint64_t B2 = BASE + 4;
+                push_off(B2);
+                std::vector<uint32_t> g2((size_t) r.counts[0]);
+                strata::vulkan::stream_read(st, o_off, g2.data(), g2.size() * 4);
+                for (int g = 0; g < r.counts[0]; ++g) if (g2[(size_t) g] != goff[(size_t) g]) ++moved;
+            }
+            verdict("resident_plan entry: ptr_to_off reads the plan's pointers as the RIGHT byte offset+window",
+                    okbind && bad_off == 0 && bad_win == 0, bad_off + bad_win, 2 * r.counts[0], 0,
+                    "the launcher would bind the wrong bytes");
+            verdict("resident_plan entry: a different arena base MOVES the derived offset (rival)",
+                    moved == r.counts[0], 0, r.counts[0], moved, "offsets did not move with the base");
+        }
+    }
+
+    strata::vulkan::cuda_compat_set_stream(nullptr);
+    strata::vulkan::stream_close(s);
+}
+
 void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     for (const char* spv : {"bcast_streams.spv", "gdn_conv_tail.spv", "gdn_step_norm_multi.spv"})
         if (!have(dir, spv)) return;
@@ -24662,6 +25061,7 @@ int main(int argc, char** argv) {
     // already-gated single-token kernel it is a loop over.
     case_verify_seam_entry(ctx, dir);                // the P6 handshake seam (host boundary) + copy_indexed + copy_rows_from_mapped
     case_blob_stage_entry(ctx, dir);                 // fetch_blobs / rebase_ptrs (the P6 PCIe staging) + the window split
+    case_resident_plan_entry(ctx, dir);              // THE LAST UNPORTED SYMBOL: resident_plan (the all-resident per-group plan)
     case_verify_window_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders

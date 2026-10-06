@@ -1,6 +1,136 @@
 # Start here next session
 
+## THE LAST SYMBOL LANDS AND THE ENGINE PRODUCES ITS FIRST REAL-CONTENT TOKEN: `resident_plan` PORTED, the P6 verify window CAPTURES AND LAUNCHES, token id 20 from `coder-iq1_m` on the Intel Arc Pro B70 (2026-10-06, `vega`)
+
+**A TOKEN CAME OUT OF THE REAL MODEL.**  `strata_vulkan` on the pack `coder-iq1_m` ran the whole 48-layer
+all-resident verify window, the token graph CAPTURED (`strata verify: captured the 1-token window`), the graph
+LAUNCHED, and the engine decoded **token id 20** (`output  : 20`) in 143.0 ms / 6.99 tok/s, exit 0.  The engine prints
+token IDS, not decoded text; decoded with the PACK'S OWN tokenizer (`tokenizer/vocab.json`), id 20 is the character
+**`5`**.  Bounds are stated in the same breath, below - **a token id is NOT a correct token.**
+
+### WHAT LANDED - `resident_plan` (`verify.cpp:938`, the ALL-RESIDENT arm)
+
+The CUDA `resident_plan_kernel` (`src/kernels/cuda/verify_kernels.cu:507-594`) is a **device-side group-by over the
+routed expert ids**: per group (a DISTINCT expert id, in routing order) it writes a POINTER and a COUNT, plus the
+per-entry (thread, token) map, into the host pool's plan layout (`counts | start | dst | tok | pad | ptr | ptr2 |
+start2`, `capx = max_t_*K` entries).  Ported as `ports/vulkan/shaders/resident_plan.comp` + the wrapper
+`strata::kernels::resident_plan` in `vulkan/src/kernels/verify_vk.cpp` (the definition that was a refusal in
+`refusals_vk.cpp`).
+
+* **THE ONE DANGEROUS LINE IS `ptr[grp] = cache_base + slot_off[slot]`.**  64-bit base+offset arithmetic - the class
+  that has produced a defect in EVERY batch of this port.  glslang 15.1 has no 64-bit buffer index, so the shader
+  reads `cache_base` and `slot_off` as lo/hi uint32 PAIRS (the `ptr_to_off.spv` technique), does the ADD in
+  `GL_EXT_shader_explicit_arithmetic_types_int64`, and stores the result as a lo/hi pair - byte-for-byte the
+  little-endian `unsigned long long` the CUDA stores.  **The plan is bound WHOLE (offset 0) and indexed as a uint
+  array**, so the ptr region's own byte offset (8-byte aligned for the engine's `capx`) is never a DESCRIPTOR
+  offset and cannot trip `minStorageBufferOffsetAlignment`.
+* **`skip = nullptr, ring = 0` in this form.**  The `else if (device_plan_)` arm (`verify.cpp:943`) passes
+  `skip + grp` and a ring; the SAME definition carries that (a skip word is bound and written when given, a dummy
+  when not) - it is trivial, so it is carried rather than refused blind.
+* **The WORKGROUP SIZE was reconciled at the cause.**  The CUDA block is `kResidentPlanMax == 128` (one thread per
+  window entry) and the shader was FIRST written `local_size_x = 128` - which the gate FAILED
+  (`FAIL resident_plan (OpExecutionMode %main LocalSize 128 1 1 does not match the host's kLocalSize=256)`,
+  `/tmp/gate_b14.log`): the harness (`vk_gate.cpp:151`) sizes EVERY kernel it drives to `kLocalSize == 256` and
+  `run_gate.sh` enforces the agreement.  The dispatch takes its local size FROM THE SHADER
+  (`vkCmdDispatch(cb, groups, ...)`, `vk_compute.cpp:1043`) and the wrapper dispatches ONE group, so the run's
+  workgroup was 128 = the CUDA's own shape and the extra lanes never existed at runtime; but the instrument was RED,
+  so the shader now declares **256 with the shared arrays sized 256**, and every `tid`-guarded loop keeps threads
+  `>= n_entries` (<= 128) inert.  **The token is UNCHANGED after the fix (below), so the mismatch was benign - with
+  the evidence rather than the assertion.**  The corrected refusal text the 2026-10-06 batch shipped is now
+  UNREACHABLE: the symbol is DEFINED, so the engine prints NO `resident_plan` line at all (grepped, 0 hits).
+
+### THE RUN - exact command, environment, raw output
+
+    STRATA_VK_SPV_DIR=/home/bob/strata-vulkan-wt/ports/vulkan/shaders \
+    VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json \
+    STRATA_VK_ARENA_MIB=28560 STRATA_VK_DESKTOP_RESERVE_MIB=256 \
+    /tmp/memguard_swap.sh 45G 16G ~/vkbuild-vulkan/vulkan/strata_vulkan \
+      --pack /media/bob/3d651e2c-e9a4-4758-ba77-863725fe3731/public/strata-gguf/strata-packs/coder-iq1_m \
+      --native /home/bob/strata-models/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf \
+      --spec 4 --prefill 1 --tokens "1,2" --max-new 1 --max-context 8 \
+      --expert-profile /tmp/expert-profile-coder-built.bin --expert-cache 12288 --mmap-experts
+
+**`STRATA_VK_DESKTOP_RESERVE_MIB=256` is LOAD-BEARING and must not be dropped.**  Without it the reserve defaults to
+1.00 GiB, usable falls to 28,081 MiB and the port REFUSES the 28,560 MiB arena (`/tmp/tok_run3.log`) - a correct
+refusal, not a defect.  The arena fits only at the reserve floor: 28,560 needs `usable >= 28560`, i.e. a reserve at
+or below ~0.53 GiB; 256 MiB (the 0.50 GiB floor) gives 28,593 MiB, which is where the ceiling figure comes from.
+
+| run | binary | `output :` | decode |
+|---|---|---|---|
+| `/tmp/tok_run4.log` | pre-fix (LocalSize 128) | **20** | 1 token, 149.4 ms, 6.69 tok/s, exit 0 |
+| (parent's own run, `/tmp/parent_tok.log`) | pre-fix | **20** | 1 token, 141.7 ms, 7.06 tok/s |
+| `/tmp/tok_run6.log` (my 2nd run) | pre-fix | **20** | 1 token, 143.9 ms, 6.95 tok/s |
+| `/tmp/tok_run7.log` | **post-fix (LocalSize 256)** | **20** | 1 token, 143.0 ms, 6.99 tok/s, exit 0 |
+
+Raw (run7, verbatim):
+
+```
+strata generate: pre-filled 12288 of 12288 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: sampling greedy
+strata generate: token graph hit path: 12288 resident experts, decided on the device
+strata generate: prefill 1 tokens in 1 chunks, 925.4 ms (1.1 tok/s); experts streamed 0 (0 by DMA, host 0.0 ms), resident 480; PLE 6.8 ms
+strata verify: window up to 6 tokens, 74.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata verify: captured the 1-token window (upload no error, sync no error)
+speculation              1 rounds of 6, drafts accepted 0 of 0 (0.000), 1.00 tokens per round
+prompt  : 1 2
+output  : 20
+decode                   1 tokens in 143.0 ms  ->  6.99 tok/s
+prefill                  1 tokens in 925.4 ms  ->  1.08 tok/s  (time to first token 1310.7 ms)
+```
+
+**THE SAMPLER PATH is GREEDY** (`strata generate: sampling greedy`; `sample_tokens` -> the argmax).  **THE CAPTURE
+LINE is `strata verify: captured the 1-token window (upload no error, sync no error)`; the WINDOW line is
+`strata verify: window up to 6 tokens, 74.0 MiB of device buffers (100% VRAM resident: zero-doorbell graph)`; the
+graph's own line is `strata generate: token graph hit path: 12288 resident experts, decided on the device`.**  There
+is no separate "launch" line - the launch is observable as the decode itself: `speculation 1 rounds of 6, drafts
+accepted 0 of 0` then `1 tokens in 143.0 ms`.
+
+### THE BOUNDS, in the same breath
+
+Real weights (`coder-iq1_m`, the native IQ pack + GGUF shard1), but a **2-token prompt** (`--tokens "1,2"`, ids 1 and
+2); PLE **file-backed** (never in VRAM); **`--spec 4`** (so the window is 6 tokens wide and 1 round ran);
+**`pcie_frac 0.05`** (measured; and at that fraction a PARTIAL-residency run would still send ~95% of missed experts
+to the CPU path this port forbids - which is why all-resident is the only CPU-free route here); **12288/12288 slots
+resident** (`--expert-cache 12288` = every expert of all 48 layers); **`--mmap-experts`** so the host side is
+file-backed; **arena 28,560 MiB against a 28,593 MiB ceiling** (the floor reserve).  **Per-kernel numerics are the
+GATE's job, not this run's**, and this run is evidence that **THE CHAIN EXECUTES**, not that it computes the right
+thing: a token id is not a correct token.  Content correctness needs the gate's numerics plus prompt conditioning.
+
+### GATE, MAP, ENGINE BAR, REFUSALS
+
+Gate (vega, `/tmp/gate_b15.log`, BACKGROUND): **intel_icd == 883 passed, 0 failed, 0 skipped** (the port's green;
+was 869 - +14 verdicts, all `resident_plan`), lvp_icd `865/0/6`, **radeon_icd `871/3/2`** - the three FAILs are the
+documented platform intermittent family (`bf16_gemv entry` 511/512, `fused_gr_read entry` 12713/13128,
+`bf16_gemv_fp32_mmvf_cols entry` 2494/2496; NONE is `resident_plan`), and `run_gate.sh` exits 1 BECAUSE of the
+radeon arm - the Arc read is the port's green.  The shader census now prints `OK resident_plan LocalSize 256 1 1`.
+**MAP: `168 = 97 kernel + 0 shader + 47 host + 0 todo + 24 refused`** (146 shaders built) - the ONE row that moved
+is `resident_plan` (`refused -> kernel`); refusal count **25 -> 24**.  `check_port_map.py` passes and
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically.  **ENGINE BAR: 0 undefined - 0 BY CONSTRUCTION**,
+not a porting gain.  **`z820b` untouched** (no XTX/K620 number claimed).
+
+### THE CASES AND THE INJECTIONS
+
+`case_resident_plan_entry` (`ports/vulkan/harness/vk_gate.cpp`) - 14 verdicts - compares the device plan against an
+**INDEPENDENT host transcription** of the CUDA group-by (`ref_resident_plan`), **BITWISE on the pointer VALUES**:
+the rule itself; start/dst/tok; counts/terminators; **rivals that MOVE** (changed `slot_off` by exactly the delta,
+changed `cache_base` by exactly the base delta, permuted ids moving dst, an expert duplicated across tokens as ONE
+group with 4 entries); a **VACUITY arm** (a non-resident routed expert writes NOTHING) with its complementary
+**anti-vacuity** arm (the same call with a valid fixture writes EVERY group and entry - so a do-nothing
+implementation fails one of the two); the **skip word** (ring on a good plan, 0 on a bad one); a **CAPTURE arm**
+(the call RECORDS - the plan is untouched after `EndCapture` - and the recorded replay == direct execution,
+BITWISE); and a **`ptr_to_off` arm** proving the NEXT stage (the grouped-expert launcher) reads the plan's pointers
+as the RIGHT byte offset+window, with a rival base that MOVES the derived offset.  **The first failing arm was the
+ORACLE, not the kernel** (the host transcription summed each group's count for every entry instead of the CUDA's
+`s_cnt = is_first ? count : 0`) - the ninth wrong oracle in this port; the kernel was right.  Four registered
+injections, **all BITE**: `resident-plan-drop-slot-offset` (worst delta 3.28e+04), `resident-plan-all-first`
+(1.23e+14), `resident-plan-entry-order`, `resident-plan-base-off-by-8` (**worst delta exactly 8**).
+**THE INFORMATIVE PART:** post-fix, with the gate GREEN, the model run in `/tmp/tok_run7.log` reproduces the SAME
+token id 20 as the three pre-fix runs, so the size mismatch was benign at runtime - and if it had changed, that
+would be stated here instead.
+
 ## THE HOST-ALLOCATION TYPE IS FIXED AND THE ALL-RESIDENT FIT NOW CLOSES: the window reaches its ALL-RESIDENT ARM and stops at ONE unported symbol, `resident_plan` (2026-10-06, `vega`)
+
 
 **THE STOP MOVED OFF `native_quant_act` AND IS NOW ONE SYMBOL FROM THE LAUNCH.**  With the fit closed the missed
 experts are GONE, so `kd = 0` for every entry, `any_cpu` is false, and the engine never asks for the CPU verb.  The

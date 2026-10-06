@@ -12,6 +12,21 @@
 # set at the end of this file ("THE RE-DEFINED MILESTONE M-A").  The numbers quoted immediately below are the state
 # at `7c317c4`, kept as the record the triage was written against.
 
+# THE ALL-RESIDENT BATCH: `resident_plan` PORTED, THE VERIFY WINDOW LAUNCHES, FIRST REAL-CONTENT TOKEN (2026-10-06, `vega`)
+#
+# **MAP, CURRENT:** `168 = 97 kernel + 0 shader + 47 host + 0 todo + 24 refused` (146 shaders built).  The one row
+# that moved is `resident_plan`: `refused -> kernel`.  The `:938` arm it implements is the P6 verify window's
+# ALL-RESIDENT per-group plan (a DEVICE-side group-by over the routed ids producing `ptr[grp] = cache_base +
+# slot_off[slot]` and the per-entry (thread,token) map).  With `--expert-cache 12288` every expert of all 48
+# layers is resident, so the window takes that arm and BYPASSES the handshake seam / doorbell / `device_plan_`
+# arms; `skip = nullptr, ring = 0` there (the `:943` arm's skip word is carried by the same definition).  The
+# window then CAPTURES, LAUNCHES, and the engine decodes a real-content token on the Intel Arc Pro B70 - the
+# bounds are in `STATUS.md`; per-kernel numerics remain the GATE's job.
+#
+# The class-D counts in the table above are the `7c317c4` record and are NOT rewritten; the row that changed is
+# marked inline.
+
+
 Written 2026-10-05 on `vega`, branch `vulkan-arc-port`, HEAD `7c317c4`.  Companion to `PORT-MAP.tsv` and
 `tools/port_map_lib.py`; it **explains** the map's `todo` column and does not rewrite it.  The map still reads
 
@@ -543,7 +558,7 @@ answer can be re-checked when a default changes.
 | 27 | `native_router_top10_multi` | todo (D) | **no** | `verify.cpp:920` |
 | 28 | `ple_block_projected` | todo (D) | **no** | `verify.cpp:668` |
 | 29 | `rebase_ptrs` | todo (D) | **no** | `verify.cpp:1054` |
-| 30 | `resident_plan` | todo (D) | **no** | `verify.cpp:938`/`:943` |
+| 30 | `resident_plan` | todo (D) → **kernel** | **YES — the ALL-RESIDENT window** | `verify.cpp:938` (`if (all_resident_)`), MEASURED reached with `--expert-cache 12288` (every expert of all 48 layers). **PORTED** this batch (`vulkan/src/kernels/verify_vk.cpp`, `resident_plan.spv`); the `:943` device-plan arm passes a skip word, also carried. |
 | 31 | `wait_flag_ge` | todo (D) | **no** | `verify.cpp:638`/`:1042`/`:1049`/`:1066` |
 | 32 | `wait_flag_ge_or` | todo (D) | **no** | `verify.cpp:1039`/`:1048`/`:1062` |
 
@@ -917,10 +932,15 @@ whether the shipped configuration reaches it.
   (a device source the port should bind as an arena view, or a mapped region never registered).
 
 **NOT reached, with the deciding condition (still loud refusals, still holes):**
-* `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`, `resident_plan`
-  (`verify.cpp:1039-1063`) - all four are inside `if (device_plan_)`, which needs `STRATA_VERIFY_DEVICE_PLAN`
-  (`verify.cpp:512-515`); `all_resident_`, the other way into `resident_plan`, needs EVERY expert of ALL 48
-  layers resident against a few-thousand-slot `--expert-cache`.
+* `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`
+  (`verify.cpp:1039-1063`) - all three are inside `if (device_plan_)`, which needs `STRATA_VERIFY_DEVICE_PLAN`
+  (`verify.cpp:512-515`).
+* `resident_plan` **LEFT THIS LIST (2026-10-06, the all-resident batch).**  Its `:938` arm IS reached - with
+  `--expert-cache 12288` (every expert of all 48 layers = 12288 slots) the window prints `100% VRAM resident:
+  zero-doorbell graph` and takes `if (all_resident_)`.  The earlier reading here ("needs EVERY expert resident
+  against a few-thousand-slot `--expert-cache`") was true of every config anyone had run and FALSE of the code:
+  the FIT, not the arm, was what stopped it (`STRATA_VK_ARENA_MIB=28560`).  It is now DEFINED over
+  `resident_plan.spv`; the `:943` device-plan arm's `skip` word is carried too.
 * `fetch_blobs`, `rebase_ptrs` (`verify.cpp:1053/:1054`) - inside `if (sink_.pcie_mode == 2)`; the PCIe probe on
   this box reads 0.1 GB/s -> `pcie_frac 0.00`.
 * `gpu_stamp` (`verify.cpp:564/:565`) - `STRATA_VERIFY_PROFILE` / `STRATA_VERIFY_TRACE`, both unset.

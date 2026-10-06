@@ -1,0 +1,167 @@
+// ports/vulkan/shaders/resident_plan.comp - the P6 verify window's ALL-RESIDENT per-group plan.
+//
+// THE REFERENCE IS `resident_plan_kernel` (src/kernels/cuda/verify_kernels.cu:507-594), one 128-thread block:
+// a DEVICE-SIDE GROUP-BY over the window's routed expert ids producing, per group (a DISTINCT expert id, in
+// routing order), a POINTER and a COUNT, plus the entry->(thread,token) map:
+//
+//   for tid < n: eid = ids[tid]; slot = (0 <= eid < n_expert) ? res[eid] : -1;
+//                if (slot < 0) bad = 1; else s_ptr[tid] = cache_base + slot_off[slot];
+//   (bad -> write nothing and *skip = 0 when a skip word is given)
+//   for tid < n: first_j = min{ j : s_ids[j] == eid }; rank = |{ j < tid : s_ids[j] == eid }|;
+//                count = |{ j : s_ids[j] == eid }|; s_first[tid] = (first_j==tid); s_cnt[tid] = is_first?count:0
+//   for tid<n first-of-group: grp = |{ j<tid : s_first[j] }|; ent = sum_{j<tid} s_cnt[j]
+//                             ptr[grp] = s_ptr[tid]; start[grp] = ent
+//   for tid < n: out = s_gstart[first_j] + rank; dst[out] = tid; tok[out] = tid / k
+//   tid 0: groups = sum s_first; start[groups] = n; start2[0] = n; counts = {groups, n, 0}; *skip = ring if given
+//
+// THE PLAN LAYOUT (verify.cpp:385-397), in i32 units, `capx = max_t_ * K`:
+//     counts(4) | start(capx+1) | dst(capx) | tok(capx) | pad | ptr(capx u64) | ptr2(capx u64) | start2(capx+1)
+// with ptr_off = (4 + (capx+1) + 2*capx + 1) & ~1.  THIS SHADER BINDS THE WHOLE PLAN BUFFER AT OFFSET 0 and
+// indexes it as a uint array: the ptr region's byte offset (ptr_off*4, which for the engine's own capx is only
+// 8-byte aligned) is then never a DESCRIPTOR OFFSET, so it cannot trip `minStorageBufferOffsetAlignment` (the
+// Arc's 4 B, llvmpipe's 16 B).
+//
+// THE POINTER, AND WHY IT IS THE DANGEROUS LINE.  `ptr[grp] = cache_base + slot_off[slot]` is 64-bit address
+// arithmetic.  glslang 15.1 has NO 64-bit buffer index (measured; `w_b.b[u64]` does not compile), so the two
+// 64-bit operands are read as lo/hi uint32 PAIRS (the `ptr_to_off.spv` technique) and the ADD runs in
+// `GL_EXT_shader_explicit_arithmetic_types_int64`; the RESULT is stored as a lo/hi uint32 pair, which is
+// byte-for-byte the little-endian `unsigned long long` the CUDA stores.  `native_expert_grouped` then reads
+// exactly this table as 2 uints per pointer.
+//
+// `has_slot_off == 0` is the CUDA's `slot_off == nullptr` fallback (`slot * blob`); `has_skip == 0` is
+// `skip == nullptr` (the all-resident form this window takes - a dummy 4-byte buffer is bound so no descriptor
+// is null).  Both general forms are carried, never a host-side shortcut, because the count and the pointers are
+// DEVICE data the capture re-reads at every replay.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// THE WORKGROUP SIZE, AND WHY IT IS 256 EVEN THOUGH THE CUDA BLOCK IS 128.  The reference launches
+// `<<<1, kResidentPlanMax>>>` with kResidentPlanMax == 128 (one thread per window entry; verify_kernels.cu:504),
+// and this shader's shared arrays and every `tid`-guarded loop follow that 128-entry shape.  The HARNESS
+// (ports/vulkan/harness/vk_gate.cpp:151) sizes EVERY kernel it drives to `kLocalSize == 256`, and
+// `run_gate.sh` FAILS a shader whose compiled `OpExecutionMode LocalSize` disagrees with it - so declaring 128
+// here fails the gate (measured 2026-10-06: `FAIL resident_plan (OpExecutionMode %main LocalSize 128 1 1 does
+// not match the host's kLocalSize=256)`).  The dispatch is `vkCmdDispatch(cb, groups, ...)` with the local size
+// taken from THIS shader, so the only way to satisfy both is to declare 256 threads and size the shared arrays
+// for 256: threads 128..255 take the `tid < n` guards (n_entries is <= kResidentPlanMax == 128) and therefore
+// read no entry and write NO plan field - the plan is computed by exactly the CUDA's 128-thread shape, with the
+// surplus 128 lanes inert at every barrier.
+layout(local_size_x = 256) in;                 // the CUDA's kResidentPlanMax (128) fits inside the host's shape
+
+layout(set = 0, binding = 0, std430) readonly buffer Ids { int v[]; } ids_b;
+layout(set = 0, binding = 1, std430) readonly buffer Res { int v[]; } res_b;
+layout(set = 0, binding = 2, std430) readonly buffer SlotOff { uint v[]; } so_b;   // 2 uint per u64 slot offset
+layout(set = 0, binding = 3, std430) buffer Plan { uint v[]; } plan_b;             // counts|start|dst|tok|ptr|start2
+layout(set = 0, binding = 4, std430) buffer Skip { uint v[]; } skip_b;             // *skip (dummy when none)
+
+layout(push_constant, std430) uniform PC {
+    uint base_lo; uint base_hi;       // cache_base, lo/hi
+    uint blob_lo; uint blob_hi;       // the per-expert stride (only used when has_slot_off == 0)
+    int n;                            // n_entries = n_tok * K
+    int k;                            // K (the top-k width)
+    int n_expert;
+    int capx;                         // max_t_ * K
+    int has_slot_off;
+    int has_skip;
+    uint ring;
+} pc;
+
+// Sized for the 256-thread shape; only entries [0, n) are ever written or read (n <= 128).
+shared int  s_ids[256];
+shared uint s_ptr_lo[256];
+shared uint s_ptr_hi[256];
+shared int  s_first[256];
+shared int  s_cnt[256];
+shared int  s_gstart[256];
+shared int  s_badf[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint un = uint(pc.n);
+
+    // (1) eid -> slot -> pointer.  A slot < 0 is a NON-RESIDENT expert: the CUDA flags it and ABORTS the plan
+    //     (nothing is written, and *skip = 0 when a skip word was given).  A per-thread flag avoids an atomic.
+    int eid = -1;
+    int bad = 0;
+    if (tid < un) {
+        eid = ids_b.v[tid];
+        s_ids[tid] = eid;
+        int slot = -1;
+        if (eid >= 0 && eid < pc.n_expert) slot = res_b.v[uint(eid)];
+        if (slot < 0) {
+            bad = 1;
+        } else {
+            uint64_t off;
+            if (pc.has_slot_off != 0)
+                off = (uint64_t(so_b.v[2u * uint(slot) + 1u]) << 32) | uint64_t(so_b.v[2u * uint(slot)]);
+            else
+                off = uint64_t(uint(slot)) * ((uint64_t(pc.blob_hi) << 32) | uint64_t(pc.blob_lo));
+            const uint64_t base = (uint64_t(pc.base_hi) << 32) | uint64_t(pc.base_lo);
+            const uint64_t p = base + off;
+            s_ptr_lo[tid] = uint(p & 0xFFFFFFFFu);
+            s_ptr_hi[tid] = uint(p >> 32);
+        }
+    }
+    s_badf[tid] = bad;
+    barrier();
+
+    int any_bad = 0;
+    for (int j = 0; j < pc.n; ++j) any_bad |= s_badf[j];
+    if (any_bad != 0) {
+        if (tid == 0u && pc.has_skip != 0) skip_b.v[0] = 0u;
+        return;                                  // uniform: every thread took the same s_badf sum
+    }
+
+    // (2) the group-by's per-entry bookkeeping: first index, rank within the group, group count.
+    int first_j = int(tid);
+    int rank_in_group = 0;
+    int count_same = 0;
+    if (tid < un) {
+        for (int j = 0; j < pc.n; ++j) {
+            if (s_ids[j] == eid) {
+                if (j < first_j) first_j = j;
+                if (j < int(tid)) ++rank_in_group;
+                ++count_same;
+            }
+        }
+        const bool is_first = (first_j == int(tid));
+        s_first[tid] = is_first ? 1 : 0;
+        s_cnt[tid] = is_first ? count_same : 0;
+    }
+    barrier();
+
+    // THE PLAN'S FIELD OFFSETS (i32 units), verify.cpp's own arithmetic.
+    const int cap = pc.capx;
+    const uint o_counts = 0u;
+    const uint o_start  = 4u;
+    const uint o_dst    = o_start + uint(cap) + 1u;
+    const uint o_tok    = o_dst + uint(cap);
+    const int  ptr_off  = int((uint(4 + (cap + 1) + 2 * cap) + 1u) & ~1u);
+    const uint o_ptr    = uint(ptr_off);
+    const uint o_start2 = o_ptr + 4u * uint(cap);
+
+    if (tid < un && first_j == int(tid)) {
+        int grp_idx = 0, ent_start = 0;
+        for (int j = 0; j < int(tid); ++j) { grp_idx += s_first[j]; ent_start += s_cnt[j]; }
+        plan_b.v[o_ptr + 2u * uint(grp_idx)]      = s_ptr_lo[tid];
+        plan_b.v[o_ptr + 2u * uint(grp_idx) + 1u] = s_ptr_hi[tid];
+        plan_b.v[o_start + uint(grp_idx)] = uint(ent_start);
+        s_gstart[tid] = ent_start;
+    }
+    barrier();
+
+    if (tid < un) {
+        const int out_idx = s_gstart[first_j] + rank_in_group;
+        plan_b.v[o_dst + uint(out_idx)] = tid;
+        plan_b.v[o_tok + uint(out_idx)] = tid / uint(pc.k);
+    }
+    if (tid == 0u) {
+        int groups = 0;
+        for (int j = 0; j < pc.n; ++j) groups += s_first[j];
+        plan_b.v[o_start + uint(groups)] = un;      // start[groups] = n
+        plan_b.v[o_start2] = un;                    // start2[0] = n
+        plan_b.v[o_counts + 0u] = uint(groups);
+        plan_b.v[o_counts + 1u] = un;
+        plan_b.v[o_counts + 2u] = 0u;
+        if (pc.has_skip != 0) skip_b.v[0] = pc.ring;
+    }
+}

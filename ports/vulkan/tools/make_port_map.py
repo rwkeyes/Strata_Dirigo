@@ -257,7 +257,11 @@ TABLE = {
     'qsa_decode_attn_batch':          ('kernel', 'qsa_decode_attn'),
     'qsa_index_step':                 ('todo', 'no shader in this tree yet'),
     'rebase_ptrs':                    ('kernel', 'rebase_ptrs'),
-    'resident_plan':                  ('todo', 'no shader in this tree yet'),
+    # THE ALL-RESIDENT PER-GROUP PLAN (`verify.cpp:938`).  NOW A KERNEL: `verify_vk.cpp` defines it over
+    # `resident_plan.spv`, the device-side group-by that builds `ptr[grp] = cache_base + slot_off[slot]` and the
+    # per-entry (thread,token) map.  It was the LAST symbol between the all-resident window and the launch; the
+    # row moves `refused -> kernel`.
+    'resident_plan':                  ('kernel', 'resident_plan'),
     'row_top_prob':                   ('todo', 'class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)'),
     'topk_512_step':                  ('todo', 'no shader in this tree yet; ANSWERED BY A LOUD REFUSAL (refusals_vk.cpp): --no-fast-select reaches it'),
     'wait_flag_ge':                   ('host', 'the handshake seam - a HOST boundary, no shader (vulkan/src/kernels/verify_vk.cpp)'),
@@ -296,12 +300,13 @@ REFUSED = {
     # REVERTED `copy_indexed`, `copy_rows_from_mapped` and `wait_flag_ge`, which the seam batch had already
     # defined, so `make_port_map.py` did NOT regenerate byte-identically): `copy_indexed` and
     # `copy_rows_from_mapped` (shaders, seam batch), `wait_flag_ge` (the host boundary, seam batch),
-    # `fetch_blobs` and `rebase_ptrs` (shaders, THIS batch) are all DEFINED.  What is left is the window's
-    # genuinely-unreached tail.
+    # `fetch_blobs` and `rebase_ptrs` (shaders, THIS batch) are all DEFINED, and **`resident_plan` LEFT THIS SET
+    # in the all-resident batch**: it is DEFINED over `resident_plan.spv` (the last symbol the window needed).
+    # What is left is the window's genuinely-unreached tail.
     'copy_i32_from_mapped_unless', 'copy_or_zero_from_mapped',
     'gpu_stamp',
     'ple_block_projected',
-    'resident_plan', 'wait_flag_ge_or',
+    'wait_flag_ge_or',
 }
 _stale_refusals = sorted(REFUSED - set(syms))
 assert not _stale_refusals, f"REFUSED names symbols src/core/ does not reach: {_stale_refusals}"

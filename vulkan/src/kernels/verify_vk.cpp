@@ -559,6 +559,81 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     }
 }
 
+// ---- `resident_plan` - the P6 verify window's ALL-RESIDENT per-group plan (verify.cpp:938) ------------------
+//
+// verify_kernels.hpp: `void resident_plan(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
+//     plan, capx, skip, ring, stream);`  Contract: "One group's plan, built on the device when every routed
+//     expert of its n*k entries is resident: the host pool's layout (counts | start | dst | tok | pad | ptr |
+//     ptr2 | start2, `capx` entries) and order (distinct experts in routing order, their entries ascending),
+//     no PCIe groups.  *skip = ring when it did, else 0."
+//
+// THE ONE DANGEROUS LINE in this whole port is `ptr[grp] = cache_base + slot_off[slot]` (verify_kernels.cu:529):
+// a 64-bit ADDRESS built by adding a base to a per-slot OFFSET.  Every base+offset defect this port has shipped
+// was of exactly this shape (a `view` that SET the offset instead of adding the base; an element-size mismatch;
+// a wrong window), so this wrapper treats it as an address-arithmetic seam and the gate PROVES THE POINTER
+// VALUES, not just the counts.  The shader reads/writes the 64-bit values as lo/hi uint32 pairs (glslang 15.1
+// has no 64-bit buffer index; the `ptr_to_off.spv` technique) and does the ADD in int64.
+//
+// THE PLAN IS BOUND WHOLE (offset 0) and indexed as a uint array, so the ptr region's own byte offset (which is
+// only 8-byte aligned for the engine's capx) is never a DESCRIPTOR OFFSET - it cannot trip
+// `minStorageBufferOffsetAlignment`.
+//
+// `slot_off_d_` (cudaMalloc'd by Verifier::init, `hits.n_slots * 8` bytes) arrives with NO length argument, so
+// it is resolved against the LIVE tail of the arena: the shader reads `slot_off[slot]` for the slots the engine's
+// `res` table names, all of which lie inside that allocation (the CUDA reads the same, unguarded).
+void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                   const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream) {
+    const int kResidentPlanMax = 128;                       // the CUDA's own block size (verify_kernels.cu:504)
+    if (n_entries < 0 || k <= 0 || n_expert <= 0 || capx <= 0)
+        strata::vulkan::refuse("resident_plan", "a non-positive geometry (k, n_expert or capx)");
+    if (n_entries > kResidentPlanMax)
+        strata::vulkan::refuse("resident_plan",
+                               "n_entries exceeds the CUDA's one-block bound (kResidentPlanMax = 128)");
+    if (ids == nullptr || res_layer == nullptr || plan == nullptr)
+        strata::vulkan::refuse("resident_plan", "a null ids/res/plan pointer");
+    strata::vulkan::Stream& s = strata::vulkan::need_stream("resident_plan", stream);
+    strata::vulkan::Buf b_ids{}, b_res{}, b_so{}, b_plan{}, b_skip{};
+    if (!arena_resolve(s, ids, (uint64_t) n_entries * 4, b_ids) ||
+        !arena_resolve(s, res_layer, (uint64_t) n_expert * 4, b_res))
+        strata::vulkan::refuse("resident_plan", "ids or res_layer is not inside this stream's arena");
+    // the plan region (verify.cpp:385-387): counts(4) | start(capx+1) | dst(capx) | tok(capx) | pad |
+    // ptr(capx u64) | ptr2(capx u64) | start2(capx+1).  This is the engine's own per-group size, recomputed
+    // here so the bound checked is the bound the writer uses.
+    const uint64_t i32 = (uint64_t) (4 + (capx + 1) + 2 * capx);
+    const uint64_t ptr_off = (i32 + 1) & ~(uint64_t) 1;
+    const uint64_t plan_i32 = ptr_off + 4 * (uint64_t) capx + ((uint64_t) capx + 1) + 1;
+    if (!arena_resolve(s, plan, plan_i32 * 4, b_plan))
+        strata::vulkan::refuse("resident_plan", "the plan buffer does not cover the engine's own layout");
+    if (slot_off != nullptr) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(slot_off);
+        if (a < strata::vulkan::Stream::kArenaBase)
+            strata::vulkan::refuse("resident_plan", "slot_off is not inside this stream's arena");
+        const uint64_t off = (uint64_t) (a - strata::vulkan::Stream::kArenaBase);
+        if (off > s.bump || !arena_resolve(s, slot_off, s.bump - off, b_so))
+            strata::vulkan::refuse("resident_plan", "slot_off is not inside this stream's arena");
+    } else {
+        b_so = strata::vulkan::dummy_buf(s);
+    }
+    if (skip != nullptr) {
+        if (!arena_resolve(s, skip, 4, b_skip))
+            strata::vulkan::refuse("resident_plan", "the skip word is not inside this stream's arena");
+    } else {
+        b_skip = strata::vulkan::dummy_buf(s);
+    }
+    const uint64_t base = (uint64_t) (uintptr_t) cache_base;
+    const uint64_t bb = (uint64_t) blob;
+    struct {
+        uint32_t base_lo, base_hi, blob_lo, blob_hi;
+        int32_t n, k, n_expert, capx, has_slot_off, has_skip;
+        uint32_t ring;
+    } pc{(uint32_t) (base & 0xFFFFFFFFu), (uint32_t) (base >> 32),
+         (uint32_t) (bb & 0xFFFFFFFFu), (uint32_t) (bb >> 32),
+         n_entries, k, n_expert, (int32_t) capx, slot_off ? 1 : 0, skip ? 1 : 0, ring};
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/resident_plan.spv", 5, sizeof(pc));
+    s.ctx->dispatch(p, {&b_ids, &b_res, &b_so, &b_plan, &b_skip}, &pc, sizeof(pc), 1u);
+}
+
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
     if (blob_bytes <= 0) return;
     strata::vulkan::Stream& s = strata::vulkan::need_stream("rebase_ptrs", stream);

@@ -1,5 +1,56 @@
 # Status — what is done, what is verified, what is not
 
+## `resident_plan` PORTED, THE P6 VERIFY WINDOW CAPTURES AND LAUNCHES, AND THE ENGINE PRODUCES ITS FIRST REAL-CONTENT TOKEN (`coder-iq1_m`, Intel Arc Pro B70) (2026-10-06, `vega`)
+
+**WHAT IS DONE.**  The LAST unported symbol between the all-resident verify window and the launch is wired:
+`strata::kernels::resident_plan` (`verify.cpp:938`, the `if (all_resident_)` arm of the window's per-group plan) is
+DEFINED in `vulkan/src/kernels/verify_vk.cpp` over the new shader `ports/vulkan/shaders/resident_plan.comp` - the
+CUDA `resident_plan_kernel`'s device-side group-by over the routed ids (`ptr[grp] = cache_base + slot_off[slot]`,
+the per-entry (thread,token) map, and the counts/terminators), read and written as lo/hi uint32 word PAIRS because
+glslang has no 64-bit buffer index; the plan buffer is bound WHOLE so the ptr region's 8-byte-aligned offset is never
+a descriptor offset.  The refusal (`refusals_vk.cpp`), the `REFUSED` set and the `todo` row in `make_port_map.py`,
+and the run_gate.sh census all moved with it.  **THE WORKGROUP SIZE was reconciled at the cause:** the CUDA block is
+`kResidentPlanMax == 128`; the shader originally declared 128 and the gate FAILED it
+(`LocalSize 128 1 1 does not match the host's kLocalSize=256`) - the harness sizes every kernel to 256 - so the
+shader now declares 256 with shared arrays sized 256 and every `tid`-guarded loop inert past `n_entries`.
+
+**WHAT IS VERIFIED.**  (1) **THE RUN.**  On `coder-iq1_m`, with
+`STRATA_VK_ARENA_MIB=28560 STRATA_VK_DESKTOP_RESERVE_MIB=256` and `--expert-cache 12288 --mmap-experts`, the window
+prints `100% VRAM resident: zero-doorbell graph`, `captured the 1-token window`, the graph LAUNCHES and the engine
+decodes **token id 20** (`output  : 20`, greedy) in 143.0 ms / 6.99 tok/s, exit 0 (`/tmp/tok_run7.log`, post-fix);
+the SAME id 20 in a SECOND run (`/tmp/tok_run6.log`) and in a third (`/tmp/tok_run4.log`, pre-fix).  Decoded with the
+PACK'S OWN tokenizer, id 20 is `5`.  **BOUNDS, same breath:** real weights but a 2-token prompt; PLE file-backed;
+`--spec 4`; `pcie_frac 0.05` (at which partial residency still sends ~95% of misses to the CPU path this port
+forbids, so all-resident is the only CPU-free route); 12288/12288 resident; `--mmap-experts`; arena 28,560 MiB
+against a 28,593 ceiling (the reserve FLOOR - `STRATA_VK_DESKTOP_RESERVE_MIB=256` is load-bearing; without it the
+port correctly REFUSES the arena, `/tmp/tok_run3.log`).  **Per-kernel numerics are the GATE's job, not this run's: a
+token id is not a correct token - this is evidence the CHAIN EXECUTES.**  (2) **THE CASE**
+`case_resident_plan_entry` (14 verdicts, green on the Arc, llvmpipe and Ryzen iGPU): the plan vs an INDEPENDENT host
+transcription of the CUDA group-by, **bitwise on the pointer VALUES**; rivals that MOVE (changed `slot_off`,
+changed `cache_base`, permuted ids, a duplicated expert); a VACUITY arm (a non-resident expert writes NOTHING) plus
+the anti-vacuity arm that forbids a do-nothing implementation; the skip word; a CAPTURE arm (records, does not run;
+replay == direct BITWISE); and a `ptr_to_off` arm proving the pointers reach the launcher as the right byte
+offset+window.  **The first failing arm was the ninth WRONG ORACLE** (the transcription summed a group's count for
+every entry instead of `s_cnt = is_first ? count : 0`); the kernel was right.  Four registered injections, ALL BITE
+(`...-drop-slot-offset` worst 3.28e+04, `...-all-first` 1.23e+14, `...-entry-order`, `...-base-off-by-8` worst
+exactly 8).  (3) **GATE** (vega, `/tmp/gate_b15.log`, background): **intel_icd 883 passed / 0 failed / 0 skipped**
+(was 869; +14), lvp `865/0/6`, radeon `871/3/2` (the three are the documented intermittent family - `bf16_gemv`,
+`fused_gr_read entry`, `bf16_gemv_fp32_mmvf_cols` - NONE is `resident_plan`; `run_gate.sh` exits 1 because of
+radeon, the Arc read being the port's green).  The census prints `OK resident_plan LocalSize 256 1 1`.  **MAP: `168
+= 97 kernel + 0 shader + 47 host + 0 todo + 24 refused`** (146 shaders built) - ONE row moved
+(`resident_plan: refused -> kernel`); refusal count **25 -> 24**.  `check_port_map.py` passes; `make_port_map.py`
+regenerates byte-identically.  **ENGINE BAR: 0 undefined - 0 BY CONSTRUCTION**, not a porting gain.  (4) The
+corrected `resident_plan` refusal text is now UNREACHABLE (the symbol is DEFINED); the engine prints NO
+`resident_plan` line (grepped 0 hits in the runs).
+
+**WHAT IS NOT.**  **A CORRECT TOKEN.**  The run proves the chain executes, not that it computes the right thing:
+per-kernel numerics are the gate's, prompt conditioning is untested, and the single greedy token from a 2-token
+prompt is not a correctness signal.  The `verify.cpp:943` device-plan arm (`STRATA_VERIFY_DEVICE_PLAN`) is carried
+by the same definition but NOT executed.  The descriptor-pool growth (`pools 2..61`, the 2048-slot config) stays
+OPEN as recorded; `z820b` untouched (no XTX/K620 number).
+
+# Status — what is done, what is verified, what is not
+
 ## THE TYPE FIX IS SHIPPED AND THE ALL-RESIDENT FIT CLOSES; the window reaches its ALL-RESIDENT ARM and stops at `resident_plan` (2026-10-06, `vega`)
 
 **WHAT IS DONE.**  (1) `cudaHostAlloc` no longer hands out DEVICE_LOCAL (BAR VRAM) memory: a new `Ctx::alloc_host`

@@ -160,7 +160,7 @@ quantize_q8_0_scaled	kernel	quantize_q8_0_scaled
 quantize_q8_1_rows	kernel	quantize_q8_1
 quantize_q8_K	kernel	quantize_q8_K
 rebase_ptrs	kernel	rebase_ptrs
-resident_plan	refused	no shader in this tree yet
+resident_plan	kernel	resident_plan
 rms_norm_weighted	kernel	rms_norm
 rope_neox_apply	kernel	rope_neox
 rope_scaling	host	a table parameter

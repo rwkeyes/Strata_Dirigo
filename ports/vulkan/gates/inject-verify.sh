@@ -182,6 +182,16 @@
 #                                       capture where the wait must submit nothing (a waiting kernel in a
 #                                       captured block) -> must FAIL  "doorbell_wait: records NOTHING under capture"
 #
+#   (THE ALL-RESIDENT PLAN - `resident_plan`)
+#   inject-verify.sh resident-plan-drop-slot-offset  resident_plan.comp  drop slot_off from `cache_base +
+#                                       slot_off[slot]` -> must FAIL  "resident_plan entry: ptr[grp]"
+#   inject-verify.sh resident-plan-all-first         resident_plan.comp  claim every entry is a group first
+#                                       -> must FAIL  "resident_plan entry: ptr[grp]"
+#   inject-verify.sh resident-plan-entry-order       resident_plan.comp  write dst at the entry's own index
+#                                       -> must FAIL  "resident_plan entry: start/dst/tok"
+#   inject-verify.sh resident-plan-base-off-by-8     vulkan/src/kernels/verify_vk.cpp  hand the shader a base 8
+#                                       bytes high -> must FAIL  "resident_plan entry: ptr[grp]"
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -982,6 +992,38 @@ case "$name" in
     old=$'    const bool ook = resolve_operand(out, (uint64_t) n_tokens * 4, ov);'
     new=$'    const bool ook = resolve_operand(out, (uint64_t) n_tokens * 4, ov);\n    if (ook) ov = lv;   // INJECTION: the mapped out binds the logits view'
     want="FAIL  sample_tokens entry (mapped out): the id lands" ;;
+  resident-plan-drop-slot-offset)
+    # THE ONE DANGEROUS LINE: `ptr[grp] = cache_base + slot_off[slot]`.  Dropping the slot offset makes every
+    # group point at the CACHE BASE, so the pointer arm's bitwise comparison against the host transcription
+    # fails - and it is the base+offset class that has produced a defect in every batch of this port.
+    file="$SH/resident_plan.comp"; spv="resident_plan"
+    old=$'            const uint64_t p = base + off;'
+    new=$'            const uint64_t p = base;   // INJECTION: the slot offset is dropped from the pointer'
+    want="FAIL  resident_plan entry: ptr[grp]" ;;
+  resident-plan-all-first)
+    # `s_first[tid] = is_first ? 1 : 0` is what makes ONE group per DISTINCT expert.  Claiming every entry is a
+    # group first makes the group count n and every group's ptr/start wrong, so the pointer AND the
+    # start/dst/tok arms must both move.
+    file="$SH/resident_plan.comp"; spv="resident_plan"
+    old=$'        s_first[tid] = is_first ? 1 : 0;'
+    new=$'        s_first[tid] = 1;   // INJECTION: every entry is treated as a group first'
+    want="FAIL  resident_plan entry: ptr[grp]" ;;
+  resident-plan-entry-order)
+    # `dst[out_idx] = tid` with `out_idx = s_gstart[first_j] + rank` is what puts each entry at ITS OWN group's
+    # offset, in index order.  Writing at `dst[tid]` instead is the plausible "identity" wrong rule the fetch
+    # case's rival also names.
+    file="$SH/resident_plan.comp"; spv="resident_plan"
+    old=$'        plan_b.v[o_dst + uint(out_idx)] = tid;'
+    new=$'        plan_b.v[o_dst + uint(tid)] = tid;   // INJECTION: the entry lands at its own index, not its group offset'
+    want="FAIL  resident_plan entry: start/dst/tok" ;;
+  resident-plan-base-off-by-8)
+    # THE ENGINE-SIDE base+offset seam: the wrapper hands the shader `cache_base`.  Off by 8 bytes, every group
+    # pointer is wrong by 8 while the STRUCTURE (groups/counts/order) is untouched - exactly the silent wrong
+    # expert a successful-looking plan would produce.
+    file="$TREE/vulkan/src/kernels/verify_vk.cpp"; spv=""
+    old=$'    const uint64_t base = (uint64_t) (uintptr_t) cache_base;'
+    new=$'    const uint64_t base = (uint64_t) (uintptr_t) cache_base + 8;   // INJECTION: the base is off by 8 bytes'
+    want="FAIL  resident_plan entry: ptr[grp]" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target
