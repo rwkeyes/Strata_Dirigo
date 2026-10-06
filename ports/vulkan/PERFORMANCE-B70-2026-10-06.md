@@ -1,5 +1,104 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE 3-12x PER-DISPATCH "GAP" IS CLOSED: it was a comparison error — the engine's MIXTURE AVERAGE against the bench's LIGHT-kernel marginals — and the like-for-like measurement says the window costs what its own kernels cost, to within 11% (2026-10-06, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH.** The queued brief called "replay 64.0 µs, live 152.5 µs against the bench's in-stream marginal 5-20 µs" **the largest unexplained number in the record**, and asked for the per-dispatch overhead that must cause it. There is no such overhead, and the comparison is the defect: **64.0 µs is an average over the verify window's whole kernel mixture, and that mixture contains ~2,300 weight-reading MoE GEMVs per round — a kernel family this bench had never measured.** Adding the missing row (`iq1m_mmvq`, the window's own IQ1_M format) prices that family at **99.5 / 111.0 / 119.2 µs** per dispatch at the engine's shapes in **device-local** memory — 5-24x the "5-20 µs" the average was held against, and squarely around the 64 µs average. A mixture model built only from measured bench rows prices **77% of the window's dispatches at 38.6 µs each**, leaving **112.7 µs** for the 23% it cannot price (2,304 of which are the `fused_gr_*` hyper-connection read group) — i.e. the window's 64 µs is exactly what a mixture of ~110 µs weight-reading GEMVs and ~3-9 µs elementwise kernels should cost. **The four candidate overheads were also tested one at a time, in ONE process, and all four are falsified**: a different pipeline every dispatch (identical work, identical grid, identical buffer), a device-local buffer, 128 descriptor targets spread over 1 GiB, and all three at once each move the per-dispatch marginal by **<20%** (3.7-4.4 µs against a 3.8 µs uniform baseline). The harness's own fixed cost is **F = 67 µs per submit and c = 3.3 µs marginal per dispatch**, measured by a 1→1,408 sweep — and the engine pays the *same* fixed cost: a single-dispatch live flush in the real run costs **70 µs** (`flush site 11`, n=2,364), which is the F = 67 µs the bench measures, in a different process, on a different instrument. **This is the same class of error as the pooled 1.20/0.30 barriers-per-dispatch: two phases merged into one ratio.** What the window's 64 µs is NOT is host submit time — the decode issues **42** submits for 59,111 dispatches, and the engine's own live-batch `vkQueueSubmit` is **4.6 µs**. A separate, real finding came out of the same counters and is reported as its own thing: the **expert-load** path spends ~12-14 s of host time in 16,114 small upload submits, and that one is **bandwidth-bound, not submit-bound** — a 2 GiB staged-upload probe is **flat at 1.75-2.02 GB/s across 1/4/16/64 MiB chunks** with a ~37 µs per-call overhead, so batching the submits cannot move it; the lever there is the 2.4x between the staged path (1.9 GB/s) and the mapped path (4.65 GB/s).
+
+### 1. THE HARNESS ARM: one structural property at a time, in ONE process
+
+New arm `dispatch_gap` (`ports/vulkan/bench/vk_bench.cpp`), Arc `intel_icd`, `reps 9 warmups 3`, every row the same instrument as the rest of the file (wall clock around a recorded-batch fence, median/batch). `scale` and `add` do the **same work at the same grid** (one f32 element per thread, n = 16384) and differ only in their shader binary and binding count, so "alt-shader" changes the pipeline and nothing else:
+
+| row | what it moves | med µs/dispatch | batch |
+|---|---|---:|---:|
+| `gap_uniform` | K copies of `scale`, ONE mapped buffer (cold: first arm in the process) | 17.2 | 128 |
+| `gap_altshader` | `scale` <-> `add`: a DIFFERENT PIPELINE every dispatch | 4.4 | 256 |
+| `gap_devlocal` | K copies of `scale`, a DEVICE_LOCAL buffer (the arena type) | 3.8 | 128 |
+| `gap_altbuffer` | `scale` on 128 views of ONE 1 GiB device-local buffer, 8 MiB apart | 3.9 | 128 |
+| `gap_engineshape` | alt-shader + device-local + 128 rotating 1 GiB views, all three | 3.7 | 256 |
+
+**FOUR HYPOTHESES, FALSIFIED.** Pipeline diversity, the arena's memory type, and descriptor-target address spread each move the per-dispatch marginal by **<20%**, and together by nothing (3.7 vs a 3.8 µs settled uniform). The one large number in the table is `gap_uniform`, which is **not** a hypothesis result: it is the **first arm in the process**, and the same configuration re-measured later (`gap_batch K=128`) reads **3.8 µs** against its 17.2 µs median (min 4.8). That 4.5x order effect is the harness's own cold regime — the same confound `gdn_step_probe` documented — and it is why the first row of any process here must not be quoted.
+
+**THE FIXED/MARGINAL SPLIT, from the same process** (`gap_batch`, one command buffer, K dispatches of `scale`):
+
+| K | 1 | 2 | 8 | 32 | 128 | 512 | 1,408 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| µs/dispatch | 70.3 | 36.9 | 11.7 | 5.4 | 3.8 | 3.4 | 3.3 |
+
+`per-dispatch = F/K + c` fits every row: **F = 67 µs per submit, c = 3.3 µs marginal per dispatch.** The engine's recorded segments carry ~1,400 dispatches each, so F is worth 0.05 µs/dispatch there — **the fixed cost is not the replay's 64 µs, and no submission-granularity change can be.** And the engine pays the SAME F: `hist199`'s flush-site table has a site with **n=2,364 flushes of exactly ONE dispatch each, wait 165 ms = 70 µs per single-dispatch submit** — the bench's F, measured inside the engine, in a different process.
+
+### 2. THE MISSING ROW: the window's own kernel family, priced
+
+The bench had rows for elementwise kernels and for IQ2_S, and **no row for the format the window's dominant kernels read**. New arm `iq1m_mmvq` (IQ1_M, `n_in=2560`, one workgroup per row, the engine's gate/up `n_out=1280` and down `n_out=2560` shapes), batch 8, `reps 9`:
+
+| row | wbytes | med µs/dispatch | GMAC/s |
+|---|---:|---:|---:|
+| `iq1m_mmvq/dev` n_out=2560 ncols=1 | 1,433,600 | **119.2** | 55.0 |
+| `iq1m_mmvq/mapped` n_out=2560 ncols=1 | 1,433,600 | 136.0 | 48.2 |
+| `iq1m_mmvq/mapped` n_out=1280 ncols=1 | 716,800 | **111.0** | 29.5 |
+| `iq1m_mmvq/mapped` n_out=512 ncols=1 | 286,720 | 99.5 | 13.2 |
+| `iq1m_mmvq/dev` n_out=1280 **ncols=3** | 716,800 | **51.8** | **189.7** |
+| `iq2s_mmvq` n_out=2048 (the previously smallest published row) | – | 46.4 | 112.3 |
+
+**99.5-136 µs, not 5-20 µs.** Device-local (the engine's arena type) is *faster* than the mapped type here, 119.2 vs 136.0 — the opposite of what "the arena is the difference" would predict, and consistent with §1's `gap_devlocal`.
+
+### 3. THE MIXTURE MODEL: what the window SHOULD cost, from measured rows only
+
+`tools`-side arithmetic (`/tmp/gap/mixture_model.py`, printed to `/tmp/gap/mixture_model.out`) takes the engine's `vk disp stat RECORDED arm` histogram — the replay's own composition — and prices each entry against a named bench row (measured / proxy / UNPRICED, no guessing):
+
+* the window's **weight-reading GEMVs alone** (`native_gu_any` 1,152 + `native_down_any` 1,152 + `native_k_mmvq` 633 + `iq4nl_mmvq` 141 + `iq4xs_mmvq` 126 = **3,204 dispatches, 30% of the count**) price at **365.1 ms of the 687.6 ms** the window's 10,743 named dispatches take — **53% of the time from 30% of the dispatches**, all in the 99.5-136 µs band judged above;
+* the harness can price **77%** of the named mixture; those alone average **38.6 µs/dispatch**;
+* the residual 2,424 UNPRICED dispatches (2,304 of them the four `fused_gr_*` hyper-connection kernels, which have no bench row) must carry **112.7 µs each** to reach the engine's measured 64.0 µs average — i.e. they are the same class of kernel as the ones already priced.
+
+**So the 64.0 µs average is what this mixture costs, to within ~11%.** There is no residue for a per-dispatch overhead to occupy. The 152.5 µs live-prefill average is the same statement over a different mixture (the prefill's own histogram is `iq_dequant_f32` 10,767 + `gemm_prefill_fma_small` 7,166 + `gemm_prefill_f16_m8` 3,840 + … , and this file already carries GEMM rows of **0.10-9.0 ms** at the engine's shapes).
+
+### 4. THE MATCHED SUBMIT COMPARISON (a defined operation, three paths, one process)
+
+The brief asked whether the per-dispatch overhead is host-side submit. It is not, and the engine's own counters separate the three submit paths cleanly:
+
+| path | submits | host time in `vkQueueSubmit` | per submit | source |
+|---|---:|---:|---:|---|
+| live batch (the prefill's flushes) | 3,021 | **14 ms** | **4.6 µs** | `gap2_base199` `vk flush stat` |
+| recorded segment (the decode window) | 42 | **1 ms** | **24 µs** | `gap2_base199` `vk disp stat by arm` |
+| transfer (the expert load, one-shot) | 16,114 | ~14.4 s | **~0.89 ms** | `gap2_base199` `vk disp stat ms` |
+
+The decode issues **42** submits for 59,111 dispatches of GPU execution — **3,783 ms of fence wait at 64.0 µs per dispatch**. Host submit time in the decode is **1 ms for the entire run**. The bench's own recorded submit is bounded by its K=1 replay total (70.3 µs, submit + wait), i.e. **no larger than the engine's**. **The 3-12x is not a submit-path problem.**
+
+### 5. THE ONE REAL FINDING ON THAT PATH — AND IT IS NOT FIXABLE BY BATCHING
+
+The 0.75-0.89 ms per submit lives **entirely in the `transfer` arm — the expert load**, 16,114 one-shot staged uploads of ~4.16 MB each (~53.6 GiB), which are ~12-14 s of host submit + ~18.5 s of wait of a ~30 s cold start. **It is a cold-load cost with a different cause from the decode's, and it is not merged with it here.** The obvious fix is to submit fewer, larger copies, so it was measured rather than assumed (new `ports/vulkan/tools/probe_submit.cpp`, Arc `intel_icd`, 2 GiB staged into a device-local buffer):
+
+| chunk | submits | total | per call | achieved |
+|---:|---:|---:|---:|---:|
+| 1 MiB | 2,048 | 1,224.6 ms | 597.9 µs | **1.75 GB/s** |
+| 4 MiB | 512 | 1,062.4 ms | 2,074.9 µs | **2.02 GB/s** |
+| 16 MiB | 128 | 1,176.1 ms | 9,188.7 µs | **1.83 GB/s** |
+| 64 MiB | 32 | 1,149.9 ms | 35,934.2 µs | **1.87 GB/s** |
+| (mapped host memcpy, 16 MiB) | – | 461.4 ms | – | **4.65 GB/s** |
+
+**The total is FLAT across a 64x change in chunk size: the cost is bytes, not calls.** Fitting `per-call = F + bytes/B` gives **F ≈ 37 µs** and B ≈ 1.87 GB/s — so the per-call overhead in a clean process is 37 µs, not 750. **Batching the uploads into larger submits cannot move the load.** The engine's own transfer arithmetic agrees: 4.16 MB per call at (0.89 ms submit + 1.15 ms wait) = **2.0 GB/s**, against this probe's 2.02 GB/s for the same 4 MiB call — the same path at the same rate. **The lever on the load is therefore the 2.4x between the STAGED path (1.9 GB/s) and the MAPPED path (4.65 GB/s), not the submission count.** And the follow-up was attempted rather than left as a suggestion: `alloc_staging` was pointed at the host-visible **device-local** type for one arm (`gap5_bar199`, 199-token, same binary, same token list) and **the port's own account rule refuses it before the first byte** —
+
+```
+vk_compute: REFUSING a 256.00 MiB staging buffer - 28560.00 MiB in the VRAM account, 28589.00 MiB usable
+RUN_RC=3, ARM_VERDICT decoded=0   (/tmp/gap/gap5_bar199.log)
+```
+
+`alloc_staging` charges by HEAP, the arena already holds 28,560 of 28,589 MiB usable, and a staging buffer in VRAM is model-resident memory by that rule. **That is the contract working, not a bug, and it is reported as a CONFLICT rather than worked around.** The change a next batch would need is a *policy* one — exempt transient staging from the VRAM account, or leave arena headroom — and it is deliberately not made here. (The arm's `decoded=0` is exactly the failure mode the new `ARM_VERDICT` line exists to catch: a run that dies at startup still exits 0 for a while.) The upload path is unchanged; what is measured and quotable is the **4.65 vs 1.9 GB/s** difference itself, and the probe that separates it.
+
+### 6. THE NAMED LEVER: FEWER DEPENDENT PAIRS — MEASURED, AND SMALLER THAN IT LOOKS
+
+The brief's lever was the replay's long chain of small dispatches. The fusion it names — `quantize_q8_1` (1,875) -> `swiglu_f32` (1,296) — is priced here at **17.1 + 11.8 ms of the window's 687.6 ms = 4.2%**, so fusing that pair correctly is worth **at most ~4%** of the window. **The measured large version of "fewer dependent pairs" is not fusion but BATCHING TOKENS PER WEIGHT-READING DISPATCH**, and the new row prices it: **`iq1m_mmvq` n_out=1280 at `ncols=3` is 51.8 µs against 111.0 µs at `ncols=1`** — 3x the work for **half** the per-dispatch cost, **6.4x** the throughput per dispatch (189.7 vs 29.5 GMAC/s). Applied to the 2,304 `native_gu_any`/`native_down_any` dispatches, that is the difference between **265 ms and ~124 ms** of the window. It is a kernel change to the grouped expert GEMV (the engine's own grouping, not the barrier), it is NOT attempted here, and it is the honest successor to this batch.
+
+### GATE, IDS, LOGS
+
+Arc `intel_icd` **895 passed / 0 failed / 0 skipped** — the count did NOT fall and nothing was skipped (`/tmp/gap/gate_final.log`). Ids: **`56a0b28d2de6`** (199-token, `gap2_base199`, decoded 32 tokens) and **`3aed108cceee`** (8-token). The bench-only changes in this batch touch no engine source, so both are guards rather than expectations.
+
+Logs, exact: `/tmp/gap/bench_gap_intel.log` (the `dispatch_gap` arm: uniform / alt-shader / device-local / alt-buffer / engine-shape / the 1→1,408 batch sweep — ONE process), `/tmp/gap/bench_iq1m_intel.log` (the `iq1m_mmvq` rows + `iq2s_mmvq` re-run, one config per invocation), `/tmp/gap/mixture_model.py` + `/tmp/gap/mixture_model.out` (the model, per-entry price and source), `/tmp/gap/probe_submit.log` (the chunk sweep), `/tmp/gap/gap2_base199.log` (199-token ids + the flush/dispatch counters), `/tmp/gap/gap3_base8.log` (8-token id), `/tmp/gap/gap_base199.log` (**a FAILED arm, kept on purpose**: the token list was a single id, it decoded **0** tokens and still exited 0 — which is why the driver now writes `ARM_VERDICT … decoded=N` and an arm with 0 is a failure, not a result), `/tmp/gap/gate_final.log` (the gate), `/tmp/gap/gap5_base199.log` (the staging A/B baseline, same binary), `/tmp/gap/gap5_bar199.log` (the BAR-staging arm: **REFUSED by the VRAM account**, 0 dispatches).
+
+### NOT DONE / DELIBERATELY LEFT
+
+(i) **The `fused_gr_*` group is UNPRICED** — 2,304 dispatches, 21% of the window's count, carrying 112.7 µs each in the model's residual. A bench row for those four kernels would close the last 23% of the model; it is not attempted. (ii) **`swiglu_f32` has no bench row** and is priced at the `quantize_q8_1` elementwise row as a proxy. (iii) **The token-batching lever in §6 is measured in the harness, NOT in the engine** — whether `native_gu_any`/`native_down_any` can carry `ncols>1` for the entries the window actually routes is unverified, and no engine change was made. (iv) **The engine's ~0.89 ms `vkQueueSubmit` inside the transfer path is measured, not attributed**: this probe's per-call overhead is 37 µs in a clean process, so the 0.89 ms is a property of the engine's live submission state (the 27 GiB arena's live BO set) that no measurement here separates from the copy itself. (v) The load-time `submit` figure varies across runs (**9.1 / 10.3 / 14.4 s**) and is reported as a range, not a constant. (vi) The `gap_uniform` 17.2 µs is an ORDER effect, not a structural result, and is reported as such.
+
+
 ## THE VERIFY WINDOW'S WAIT STRUCTURE, MEASURED: the 42 segment submits are worth **1 ms for the whole run**, collapsing them to ONE command buffer per window is worth **0.05%**, and the replay's cost is a **faulted dispatch count** — with the chain barrier priced (upper bound) at **~35% of the per-dispatch time** by an arm whose answer is WRONG (2026-10-06, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH.** The queued brief asked for the verify window's waits to be collapsed, from "~57 segments, each ending in `vkSubmit` -> `vkWaitForFences`", against a baseline of `sync 240.623 ms/round`. Measured first, on this card with the same `coder-iq1_m` pack: the whole run has **42 segment submits** (14 rounds x 3 — the window is cut in **two** by its single host boundary, plus **one** for the commit graph), they cost **1 ms of submit in total**, and the `sync` the brief wants to remove is **260.2 ms/round of fence wait that the GPU is executing**, not a round trip: 59,111 recorded dispatches execute for **3,783 ms** of wait. **The change was built anyway** (`STRATA_VK_WINDOW_ONE_CB=1`: the driver publishes the PLE rows before the window's launch, so the recorded window needs no host boundary and is ONE command buffer) and it is **neutral**: segments 42 -> **28**, submit 1 -> 0 ms, segment wait **3,783 ms unchanged**, window `launch+sync` 265.44 -> **265.41 ms/round (0.05%)**, decode 8.36 -> 8.31, ids `56a0b28d2de6` **unmoved**. It ships **opt-in** because a default is a claim and this is not a win. What the counters then say, and it is the same conclusion the port reached in the previous batch by a different route: **the replay's cost is ~64.0 µs per recorded dispatch** (3,783 ms / 59,111) against an in-stream marginal cost of 5-20 µs in the port's own bench, the **submits are 1 ms**, and **the chain barrier is the one thing in that path that removal does improve — by ~35% per dispatch, in an arm that produces the WRONG answer** (`5c30ca20`), which is why it is a bound and not a candidate. The structure is exhausted; the residue is the shaders' own execution.

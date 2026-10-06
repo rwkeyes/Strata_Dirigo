@@ -754,6 +754,19 @@ Ctx::Ctx(int want_device, bool need_16bit) {
     // STAGING: host-visible and coherent first, and preferring a heap that is NOT device-local - a transfer
     // buffer is not model memory, so on a card with a system heap it must not come out of VRAM.  Where the only
     // heap is device-local (llvmpipe) there is no choice, and the account rule says so out loud.
+    //
+    // THE BAR-HEAP VARIANT WAS TRIED AND THE PORT'S OWN ACCOUNT RULE REFUSES IT (2026-10-06).  On a ReBAR card
+    // the host-visible type this port picks for `mem_type_` is ALSO device-local, and `tools/probe_submit.cpp`
+    // measures a host write into it at **4.65 GB/s** against **1.75-2.02 GB/s** for the staged path - a 2.5x
+    // that would take the ~30 s expert load toward ~12 s.  Selecting that type for `alloc_staging` does not
+    // reach the first byte: `alloc_staging` charges by HEAP, the arena already holds 28,560 of the 28,589 MiB
+    // usable, and the run dies at the first upload with
+    //   `vk_compute: REFUSING a 256.00 MiB staging buffer - 28560.00 MiB in the VRAM account, 28589.00 MiB usable`
+    // (RUN_RC=3, 0 dispatches, `/tmp/gap/gap5_bar199.log`).  That refusal is the contract working, not a bug: a
+    // staging buffer in VRAM is model-resident memory by that rule.  The change a next batch would have to make
+    // is therefore a POLICY one - exempt transient staging from the VRAM account, or leave the arena headroom -
+    // and it is deliberately NOT made here.  What is measured and safe to quote is the 4.65 vs 1.9 GB/s
+    // difference itself; the upload path is unchanged.
     for (int pass = 0; pass < 2 && staging_type_ == UINT32_MAX; ++pass) {
         for (const MemTypeInfo& t : mem_types_) {
             if (!t.host_visible || !t.host_coherent) continue;

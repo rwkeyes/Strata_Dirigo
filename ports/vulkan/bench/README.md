@@ -182,6 +182,23 @@ port's own discrepancy (`gdn_step_pair`'s native row read 0.1072 where the batch
 | `gdn_step_unroll` — the KU=1 (rolled), KU=8 and SHIPPED builds of `native_gdn_step.comp` (all from the SAME source via `run_bench.sh`), compared **BITWISE** on state and `o` and then timed hot + through the 36-state footprint | S=128 h_k=16 h_v=48 (3 MiB state) | ms/dispatch + `BITEXACT n/N differ` |
 | `gemm_prefill` — the four prefill GEMM schedules: `gemm_prefill_f16_m8` (matrix units, operands loaded straight from GLOBAL memory), `gemm_prefill_f16_m8_staged` (same tile, operands staged in SHARED memory as `mul_mm.comp` does), `gemm_prefill_fma` (tiled FMA) and `gemm_prefill_fma_small` (untiled FMA) | `T=8/16/64/199 x { gate/up N=1280 K=2560, down N=2560 K=640 }` — the engine's own expert shapes, one arm per schedule per shape | GMAC/s (T·N·K) |
 
+| `iq1m_mmvq` — the IQ1_M weight row against q8_1 activations (one workgroup per row), at the engine's gate/up (`n_out=1280`) and down (`n_out=2560`) shapes, `ncols=1` and `ncols=3`, in mapped and DEVICE_LOCAL memory | `n_in=2560`, `n_out=512/1280/2560` | ms/dispatch (GMAC/s) |
+| `dispatch_gap` — the per-dispatch GAP, ATTRIBUTED. Holds the work per dispatch constant and moves ONE structural property at a time: `gap_uniform` (K copies of `scale`, one mapped buffer), `gap_altshader` (`scale` <-> `add`: a DIFFERENT pipeline every dispatch, same grid, same buffer), `gap_devlocal` (DEVICE_LOCAL buffer), `gap_altbuffer` (128 views of ONE 1 GiB buffer, 8 MiB apart), `gap_engineshape` (all three at once), and `gap_batch` (`scale` at K = 1..1408 in ONE command buffer, which yields the fixed/marginal split F and c) | `scale`/`add` n=16384, grid 64x256 | ms/dispatch |
+
+**WHY `dispatch_gap` EXISTS.** The engine's recorded replay costs **64.0 µs per dispatch** and its live
+prefill **152.5 µs**, against this file's **5-20 µs** "in-stream marginal" — the comparison that produced
+the port's "largest unexplained number". `dispatch_gap` tests the four overhead hypotheses one at a time, in
+one process, and **falsifies all four**: a different pipeline every dispatch, a device-local buffer, 128
+descriptor targets spread over 1 GiB, and all three at once each land within 20% of a settled uniform
+baseline (3.7-4.4 µs against 3.8 µs). What the arm does establish is the split: **F = 67 µs per submit and
+c = 3.3 µs marginal per dispatch** for a trivial kernel, and the engine pays the same F (a single-dispatch
+live flush measures 70 µs in the real run). **The 64 µs is a mixture average, and the row this file was
+missing is `iq1m_mmvq`:** the window's own weight-reading expert GEMV family measures **99.5-136 µs** per
+dispatch at the engine's shapes, not 5-20. Two further traps the arm documents: the FIRST row measured in a
+process reads ~4.5x its settled value (`gap_uniform` 17.2 µs vs the same configuration's 3.8 µs later), and
+`iq1m_mmvq` at `ncols=3` costs **51.8 µs against 111.0 µs at `ncols=1`** — 3x the work for half the
+per-dispatch cost, which is the measured size of the "fewer dependent pairs" lever.
+
 The **sampler is measured last on purpose**: its one-block top-k is a single workgroup sweeping the whole
 vocabulary `k` times, the port's heaviest single dispatch, and on one device (see below) it is heavy enough
 to trip a driver timeout.  Running it last means a reset there costs only that row.  The split row (the

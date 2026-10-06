@@ -427,6 +427,41 @@ void bench_iq_dequant(Ctx& ctx, const std::string& dir, int ty, const char* fmt,
 // work-bound, not dispatch-bound.
 // =========================================================================================================
 
+// =========================================================================================================
+// IQ1_M MMVQ - THE WINDOW'S DOMINANT KERNEL, AND THE ONE ROW THIS HARNESS WAS MISSING.
+// The RECORDED-arm histogram says the verify window's replay is `quantize_q8_1` 1,875 + `swiglu_f32` 1,296
+// + `native_gu_any`/`native_down_any` 1,152 EACH + the four `fused_gr_*` at 576 each, i.e. ~2,300
+// WEIGHT-READING GEMV dispatches per round against the pack's IQ1_M/IQ2_S/IQ3_*/IQ4_XS expert blobs.
+// Every row this harness published before now was either elementwise or IQ2_S: `iq2s_mmvq` measures
+// 22-46 us, NOT the "5-20 us" the engine's 64 us per dispatch was compared against.  This arm measures the
+// format the resident model's gate/up rows actually use, at the engine's own shapes, in BOTH the harness's
+// mapped memory and the engine's DEVICE_LOCAL arena type - so the engine's per-dispatch average can be read
+// against a row for the kernel that actually fills it.
+// =========================================================================================================
+void bench_iq1m(Ctx& ctx, const std::string& dir, int n_out, int ncols, bool dev, int reps, int warmups) {
+    const int n_in = 2560, nb = n_in / 256, row_bytes = nb * 56;   // IQ1_M: 56 bytes per 256-value block
+    std::vector<uint8_t> w((size_t) n_out * row_bytes);
+    for (size_t i = 0; i < w.size(); ++i) w[i] = (uint8_t) (i * 29 + 7);
+    std::vector<uint8_t> act((size_t) ncols * (n_in / 32) * 36);
+    for (size_t i = 0; i < act.size(); ++i) act[i] = (uint8_t) (i * 11 + 3);
+    Buf b_w = dev ? ctx.alloc_device(w.size()) : alloc(ctx, w.size());
+    Buf b_a = alloc(ctx, act.size()), b_g = alloc(ctx, sizeof(strata::vkport::kIq1sGrid)),
+        b_y = alloc(ctx, (size_t) n_out * 4 + 64);
+    ctx.write(b_w, w.data(), w.size());
+    ctx.write(b_a, act.data(), act.size());
+    ctx.write(b_g, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    VkPipeline p = ctx.pipeline(dir + "/iq1m_mmvq.spv", 4, 16);
+    struct { int n_in; int n_out; int row_bytes; int ncols; } pc{n_in, n_out, row_bytes, ncols};
+    Timing t = time_kernel(ctx, p, {&b_w, &b_a, &b_g, &b_y}, &pc, sizeof(pc), (uint32_t) n_out, 1,
+                           n_out <= 8 ? 32 : 8, reps, warmups);
+    char name[40], shape[96];
+    std::snprintf(name, sizeof name, "iq1m_mmvq/%s", dev ? "dev" : "mapped");
+    std::snprintf(shape, sizeof shape, "n_in=2560 n_out=%d ncols=%d row_bytes=%d wbytes=%zu", n_out, ncols,
+                  row_bytes, w.size());
+    report(name, shape, t, (double) n_out * ncols, (double) n_in * n_out * ncols);
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_g); ctx.free(b_y);
+}
+
 void bench_iq2s(Ctx& ctx, const std::string& dir, int n_out, int reps, int warmups) {
     const int n_in = 2560, ncols = 1;
     const int nb = n_in / 256, row_bytes = nb * 82;
@@ -1579,6 +1614,124 @@ void bench_bf16_gemv_pair(Ctx& ctx, const std::string& dir, int reps, int warmup
     }
 }
 
+// =========================================================================================================
+// THE PER-DISPATCH GAP, ATTRIBUTED: the engine's recorded replay (64.0 us per executed dispatch) and its
+// live prefill (152.5 us) against this harness's in-stream marginal (5-20 us) - the largest single
+// unexplained number in the port's record (PERFORMANCE-B70-2026-10-06.md, section 3).
+//
+// EVERY existing row in this file is K copies of ONE kernel, on the SAME few buffers, warm.  The engine's
+// verify window is a LONG chain (~1,400 dispatches per segment, 4,222 per round at the 199-token arm) of
+// SMALL, DIFFERENT, dependent dispatches over a 27 GiB arena, replayed from a recorded command buffer.
+// This arm holds the WORK per dispatch constant and moves ONE structural property at a time, so the gap
+// can be ATTRIBUTED rather than asserted:
+//
+//   gap_uniform      K copies of `scale`, ONE mapped buffer        (this harness's normal shape)
+//   gap_altshader    `scale` <-> `add`, same grid, same buffer     (a DIFFERENT pipeline EVERY dispatch)
+//   gap_devlocal     K copies of `scale`, a DEVICE_LOCAL buffer    (the engine's arena memory type)
+//   gap_altbuffer    `scale` on K spread views of ONE 1 GiB buffer (the descriptor's target moves)
+//   gap_engineshape  alt-shader + device-local + rotating views    (all three at once)
+//   gap_batch        `scale` at K = 1 .. 1408 in ONE buffer        (the fixed/marginal split: F and c)
+//
+// `scale` and `add` are chosen because they do the SAME work at the SAME grid (one f32 element per thread,
+// `n` of them) and differ ONLY in their shader binary and binding count - so alt-shader changes the
+// pipeline and nothing else about the work.  Every row is the SAME instrument as the rest of the file
+// (wall clock around a recorded-batch fence, median/batch) and carries the same documented limit: a
+// per-dispatch cost, NOT a bandwidth figure.
+// =========================================================================================================
+template <class RecordIter>
+Timing time_iters(Ctx& ctx, int iters, int disp_per_iter, int reps, int warmups, RecordIter rec) {
+    ctx.record_begin();
+    for (int i = 0; i < iters; ++i) rec(i);
+    ctx.record_end_and_submit();
+    const int total = iters * disp_per_iter;
+    for (int w = 0; w < warmups; ++w) ctx.replay_recorded();
+    std::vector<double> ms;
+    ms.reserve((size_t) reps);
+    for (int r = 0; r < reps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ctx.replay_recorded();
+        const auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / (double) total);
+    }
+    std::sort(ms.begin(), ms.end());
+    Timing t;
+    t.reps = reps;
+    t.batch = total;
+    t.med = ms[ms.size() / 2];
+    t.lo = ms.front();
+    t.hi = ms.back();
+    return t;
+}
+
+void bench_dispatch_gap(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const uint32_t n = 16384;                                // 64 workgroups x 256 lanes, a per-token activation
+    const uint32_t gx = (n + 255) / 256;
+    struct { int32_t n; float s; } pcs{n, 1.0009765625f};    // `scale`: x[i] *= s (s != 1, so it is real work)
+    struct { int32_t n; } pca{n};                            // `add`:   dst[i] += src[i]
+    std::vector<float> x = floats(n), y = floats(n);
+    const std::string shape = "scale/add n=16384, grid 64x256";
+
+    VkPipeline ps = ctx.pipeline(dir + "/scale.spv", 1, (int) sizeof(pcs));
+    VkPipeline pa = ctx.pipeline(dir + "/add.spv", 2, (int) sizeof(pca));
+
+    Buf ms_ = alloc(ctx, (size_t) n * 4), md_ = alloc(ctx, (size_t) n * 4);            // mapped (the bench type)
+    Buf ds_ = ctx.alloc_device((size_t) n * 4), dd_ = ctx.alloc_device((size_t) n * 4); // VRAM (the arena type)
+    ctx.write(ms_, x.data(), (size_t) n * 4);
+    ctx.write(md_, y.data(), (size_t) n * 4);
+    ctx.write(ds_, x.data(), (size_t) n * 4);
+    ctx.write(dd_, y.data(), (size_t) n * 4);
+
+    // the harness's normal shape: K copies of ONE kernel, ONE warm buffer
+    report("gap_uniform", shape, time_iters(ctx, 128, 1, reps, warmups, [&](int) {
+        ctx.record_dispatch(ps, {&ms_}, &pcs, sizeof(pcs), gx, 1);
+    }), (double) n, 0.0);
+    // a DIFFERENT pipeline every dispatch (identical work, identical grid, identical buffer)
+    report("gap_altshader", shape, time_iters(ctx, 128, 2, reps, warmups, [&](int) {
+        ctx.record_dispatch(ps, {&ms_}, &pcs, sizeof(pcs), gx, 1);
+        ctx.record_dispatch(pa, {&md_, &ms_}, &pca, sizeof(pca), gx, 1);
+    }), (double) n, 0.0);
+    // the engine's arena memory type, one buffer, no rotation
+    report("gap_devlocal", shape, time_iters(ctx, 128, 1, reps, warmups, [&](int) {
+        ctx.record_dispatch(ps, {&ds_}, &pcs, sizeof(pcs), gx, 1);
+    }), (double) n, 0.0);
+
+    // THE DESCRIPTOR'S TARGET MOVES: K spread views of ONE device-local buffer, 8 MiB apart, so the 128
+    // views cover 1 GiB - the address spread the engine's 27 GiB arena has and a 4-buffer bench does not.
+    const int nview = 128;
+    const uint64_t stride = 8ull << 20;
+    Buf big = ctx.alloc_device(stride * (uint64_t) nview);
+    for (int i = 0; i < nview; ++i) {
+        Buf v = view(big, stride * (uint64_t) i);
+        ctx.write(v, x.data(), (size_t) n * 4);
+    }
+    report("gap_altbuffer", "scale on 128 views, 8 MiB stride over 1 GiB, device-local",
+           time_iters(ctx, 128, 1, reps, warmups, [&](int i) {
+               Buf v = view(big, stride * (uint64_t) (i % nview));
+               ctx.record_dispatch(ps, {&v}, &pcs, sizeof(pcs), gx, 1);
+           }), (double) n, 0.0);
+
+    // ALL THREE AT ONCE: a different pipeline, a moving descriptor target, and device-local memory
+    report("gap_engineshape", "scale<->add on 128 rotating 1 GiB views, device-local",
+           time_iters(ctx, 128, 2, reps, warmups, [&](int i) {
+               Buf v = view(big, stride * (uint64_t) (i % nview));
+               ctx.record_dispatch(ps, {&v}, &pcs, sizeof(pcs), gx, 1);
+               ctx.record_dispatch(pa, {&v, &v}, &pca, sizeof(pca), gx, 1);
+           }), (double) n, 0.0);
+
+    // THE FIXED/MARGINAL SPLIT.  per-dispatch = F/K + c for ONE command buffer of K dispatches, so two
+    // rows give F and c - and the engine's ~1,400-dispatch segments can be read against BOTH.
+    const int bs[] = {1, 2, 8, 32, 128, 512, 1408};
+    for (int K : bs) {
+        char sh[80];
+        std::snprintf(sh, sizeof sh, "scale n=16384 K=%d (ONE command buffer)", K);
+        report("gap_batch", sh, time_iters(ctx, K, 1, reps, warmups, [&](int) {
+            ctx.record_dispatch(ps, {&ms_}, &pcs, sizeof(pcs), gx, 1);
+        }), (double) n, 0.0);
+    }
+
+    ctx.free(ms_); ctx.free(md_); ctx.free(ds_); ctx.free(dd_); ctx.free(big);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1699,6 +1852,13 @@ int main(int argc, char** argv) {
     arm("iq2s_mmvq_512", true, [&] { bench_iq2s(ctx, dir, 512, reps, warmups); });
     // the SIZE-SCALING arm (4x)
     arm("iq2s_mmvq_2048", true, [&] { bench_iq2s(ctx, dir, 2048, reps, warmups); });
+    // THE WINDOW'S OWN KERNEL FAMILY: IQ1_M MMVQ at the engine's gate/up (1280) and down (2560) shapes,
+    // one column (one token) and three, mapped vs the arena's DEVICE_LOCAL type.
+    arm("iq1m_mmvq_512", false, [&] { bench_iq1m(ctx, dir, 512, 1, false, reps, warmups); });
+    arm("iq1m_mmvq_1280", false, [&] { bench_iq1m(ctx, dir, 1280, 1, false, reps, warmups); });
+    arm("iq1m_mmvq_2560", false, [&] { bench_iq1m(ctx, dir, 2560, 1, false, reps, warmups); });
+    arm("iq1m_mmvq_2560_dev", false, [&] { bench_iq1m(ctx, dir, 2560, 1, true, reps, warmups); });
+    arm("iq1m_mmvq_1280_n3_dev", false, [&] { bench_iq1m(ctx, dir, 1280, 3, true, reps, warmups); });
 
     arm("quantize_q8_0", false, [&] { bench_quantize_q8_0(ctx, dir, reps, warmups); });
     arm("quantize_q8_1", true, [&] { bench_quantize_q8_1(ctx, dir, reps, warmups); });
@@ -1741,6 +1901,10 @@ int main(int argc, char** argv) {
     // THE PREFILL GEMM: the prompt path's own deep kernel, both cooperative-matrix schedules and both FMA
     // paths, at the engine's shapes.
     arm("gemm_prefill", false, [&] { bench_gemm_prefill(ctx, dir, reps, warmups); });
+    // THE PER-DISPATCH GAP: the engine's replay (64.0 us) / live prefill (152.5 us) against this harness's
+    // in-stream marginal (5-20 us).  Holds the work per dispatch fixed and moves ONE structural property at
+    // a time (pipeline diversity, memory type, descriptor-target spread, command-buffer length).
+    arm("dispatch_gap", false, [&] { bench_dispatch_gap(ctx, dir, reps, warmups); });
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a
@@ -1759,7 +1923,7 @@ int main(int argc, char** argv) {
                              "router_pair moe_combine_pair rms_norm_pair qsa_gate_pair qsa_decode_attn "
                              "gdn_conv_silu_pair gdn_l2_norm_pair gdn_beta_gate_pair gdn_gate_pair "
                              "gdn_out_norm_pair gdn_step_pair fused_gdn_conv_l2_pair fused_gdn_ab_pair "
-                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill sampler\n");
+                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill dispatch_gap sampler\n");
         return 2;
     }
 

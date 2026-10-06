@@ -39,7 +39,15 @@ the port's single correct barrier experiment (`STRATA_VK_BARRIER_HAZARD=1`) left
 and moved `sync` **1.2%**, i.e. the hazards are real and conditional barriers are a wash. (ii) The **taller coopmat
 row block and the opt-in tiled FMA GEMM are still not attempted**. (iii) The **3-12x between the engine's
 per-dispatch cost and the bench's in-stream marginal** (replay 64.0 µs, live 152.5 µs, bench 5-20 µs) is
-**unexplained** and is the largest number in the record. (iv) The MTP draft path is **not enabled**: the port
+**CLOSED, and it was a comparison error, not an anomaly**: the bench had no row for the window's own
+weight-reading expert-GEMV family, and the new `iq1m_mmvq` row prices that family at **99.5-136 µs** per
+dispatch at the engine's shapes, so the 64 µs mixture average is what its own kernels cost (a mixture model
+built from measured rows accounts for it to within ~11%), while the four candidate per-dispatch overheads —
+pipeline diversity, device-local memory, descriptor-target spread, and all three at once — are each falsified
+at **<20%** in ONE process. The engine's fixed per-submit cost is the bench's own **F = 67 µs** (a
+single-dispatch live flush measures **70 µs** in the real run), and the decode's host submit is **1 ms for the
+whole run**. See PERFORMANCE-B70-2026-10-06.md §1-4; the residual is the UNPRICED `fused_gr_*` group.
+(iv) The MTP draft path is **not enabled**: the port
 refuses the config by name (`refusals_vk.cpp:169-206`, nine-plus `refuse_not_ported` seams) and its rationale is
 `layer_verify_compatible()`'s conjunction; it is a multi-kernel port for ~1.2x. (v) The **PCIe probe disagreement**
 (2.0 GB/s here vs 6.6-7.0 GB/s measured by the SYCL port on the same card) is noted, not chased.
