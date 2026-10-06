@@ -11,6 +11,7 @@
 // ready: the runtime seam under the layer, on the device the port ships for.
 #include "cuda_runtime.h"          // THE SHIM - the CUDA names, over the device layer
 #include "vk_arena.hpp"            // Stream, stream_open (the device layer)
+#include "vk_compute.hpp"          // Ctx: the live batch's own view (`live_pending`) for the visibility arm
 
 #include <cstdint>
 #include <cstdio>
@@ -172,6 +173,51 @@ int main(int argc, char** argv) {
         const cudaError_t cleared = cudaGetLastError();
         check("cudaGetLastError returns it and clears it",
               cleared == cudaErrorInvalidValue && cudaPeekAtLastError() == cudaSuccess);
+    }
+
+    // ---- THE LIVE-BATCH VISIBILITY CONTRACT: does `cudaStreamQuery` report a PENDING batch as complete? ------
+    // `Ctx::dispatch` ENCODES into the live batch and returns; the batch is submitted and fenced only at a flush.
+    // CUDA's cudaStreamQuery contract is "cudaSuccess means all preceding work in the stream has completed", so
+    // answering cudaSuccess while a batch is still queued is a WRONG ANSWER that a caller reading a device buffer
+    // would act on.  This arm ISSUES a live dispatch, queries immediately, and checks the query's answer against
+    // the device layer's own view of what is outstanding (`Ctx::live_pending`).  `STRATA_VK_QUERY_NOFIX=1` keeps
+    // the pre-fix answer, so the SAME binary shows both sides.
+    {
+        void* dsrc = nullptr;
+        void* ddst = nullptr;
+        const size_t bytes = 64u * sizeof(float);
+        cudaMalloc(&dsrc, bytes);
+        cudaMalloc(&ddst, bytes);
+        std::vector<float> h(64, 0.0f);
+        for (size_t i = 0; i < h.size(); ++i) h[i] = 0.5f + (float) i;
+        cudaMemset(ddst, 0, bytes);
+        cudaMemcpy(dsrc, h.data(), bytes, cudaMemcpyHostToDevice);   // ends in a flush: nothing pending after it
+        strata::vulkan::Buf sd{}, dd{};
+        const bool resolved = strata::vulkan::arena_resolve(*s, dsrc, bytes, sd) &&
+                              strata::vulkan::arena_resolve(*s, ddst, bytes, dd);
+        check("live-batch probe: both probe buffers resolve into the arena", resolved);
+        if (resolved) {
+            // copy.spv: 2 storage buffers, push {int n} - the same primitive the handshake copies use.
+            VkPipeline p = s->ctx->pipeline(spv + "/copy.spv", 2, (uint32_t) sizeof(int32_t));
+            int32_t n = (int32_t) h.size();
+            s->ctx->dispatch(p, {&sd, &dd}, &n, (uint32_t) sizeof(n), /*groups=*/1, /*groups_y=*/1);
+            const bool pending_before = s->ctx->live_pending();
+            check("live-batch probe: the dispatch left work QUEUED (nothing submitted yet)", pending_before);
+            const cudaError_t q = cudaStreamQuery(cs);
+            const bool pending_after = s->ctx->live_pending();
+            std::printf("  live-batch probe: cudaStreamQuery -> %s; outstanding before/after = %d/%d\n",
+                        cudaGetErrorString(q), (int) pending_before, (int) pending_after);
+            // THE ASSERTION: a "complete" answer with work still outstanding is the defect.
+            check("live-batch probe: cudaStreamQuery does not say 'complete' while work is queued",
+                  !(pending_after && q == cudaSuccess));
+            std::vector<float> got(64, 0.0f);
+            cudaMemcpy(got.data(), ddst, bytes, cudaMemcpyDeviceToHost);
+            bool same = true;
+            for (size_t i = 0; i < got.size(); ++i) same = same && (got[i] == h[i]);
+            check("live-batch probe: the queued copy's bytes are readable afterwards", same);
+        }
+        cudaFree(dsrc);
+        cudaFree(ddst);
     }
 
     strata::vulkan::stream_close(s);

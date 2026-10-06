@@ -381,6 +381,11 @@ public:
     // decremented when one is destroyed.  The instrument a leak test needs - a leaked instantiation shows up
     // here even though it never touches the arena.
     uint32_t owned_recordings() const { return owned_recordings_; }
+    // IS WORK ISSUED AND NOT YET COMPLETE?  `dispatch` ENCODES into the live batch and returns; the batch is
+    // submitted and fenced only at a flush.  So between a dispatch and the next flush the stream holds work that
+    // has not run, and `cudaStreamQuery` MUST NOT answer "complete" - that is the answer this accessor lets the
+    // shim refuse.  Only the live arm can be pending this way; a recording is not in the stream until submitted.
+    bool live_pending() const { return live_open_; }
 
 private:
     // One pipeline and everything that must be created and destroyed with it.  A key list parallel to a value

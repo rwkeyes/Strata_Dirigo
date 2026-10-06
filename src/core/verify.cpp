@@ -1418,6 +1418,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    const Clock::time_point t_launch = Clock::now();   // DECODE MARK: launch .. the window's sync
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
@@ -1529,9 +1530,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
     // beside the expert workers).
     trace_ev("SYNC", -1, -1, 0);
+    ms_launch += ms_since(t_launch);                   // DECODE MARK: launch + the segment submits
+    const Clock::time_point t_sync = Clock::now();
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    ms_sync += ms_since(t_sync);                       // DECODE MARK: waiting out the window's GPU work
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {

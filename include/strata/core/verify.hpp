@@ -207,6 +207,11 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    // DECODE-SIDE marks, the same discipline as the prompt path's phase table: the window's own split, so a
+    // decode token's cost is attributed rather than inferred.  `ms_launch` is the recording's launch + the
+    // segment submissions that had to complete before the flags could be raised; `ms_sync` is the blocking
+    // `cudaStreamSynchronize` that waits out the rest of the window's GPU work.
+    double ms_launch = 0, ms_sync = 0;
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.

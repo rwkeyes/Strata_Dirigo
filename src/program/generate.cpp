@@ -8127,10 +8127,11 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");
         if (rounds > 0)
-            std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
+            std::printf("%-24s wait for rings %.3f  pool %.3f  host(stage) %.3f  launch %.3f  sync %.3f  commit %.3f "
+                        "ms/round; CPU experts %.2f "
                         "distinct / %.2f routed per layer\n",
                         "verify window", ver.ms_wait / rounds, ver.ms_pool / rounds, ver.ms_host / rounds,
-                        ver.ms_commit / rounds,
+                        ver.ms_launch / rounds, ver.ms_sync / rounds, ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0)

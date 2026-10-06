@@ -38,6 +38,35 @@ Stream*& g_current = strata::vulkan::default_stream_ref();
 thread_local cudaError_t g_last = cudaSuccess;
 cudaError_t fail(cudaError_t e) { g_last = e; return e; }
 
+// ---- STRATA_VK_QUERY_STAT: does `cudaStreamQuery` report a pending LIVE BATCH as complete? -------------------
+// `Ctx::dispatch` ENCODES into the live batch and returns; the batch is submitted and fenced only at a flush.  So
+// between a dispatch and the next flush the stream holds work that has NOT run, and CUDA's cudaStreamQuery
+// contract ("cudaSuccess means all preceding work in the stream has completed") is violated if it answers
+// cudaSuccess then.  This counts exactly that: calls that arrived with a live batch pending, and how many of them
+// the answer said "complete".  Measurement-only (off unless the env var is set) and it changes no answer.
+//   STRATA_VK_QUERY_NOFIX=1 keeps the OLD (pre-fix) answer, so one binary measures both sides.
+struct QueryStat {
+    bool on = std::getenv("STRATA_VK_QUERY_STAT") != nullptr;
+    bool nofix = std::getenv("STRATA_VK_QUERY_NOFIX") != nullptr;   // keep the wrong answer, to measure it
+    uint64_t calls = 0, pending_at_call = 0, pending_said_complete = 0, pending_said_notready = 0;
+    bool printed = false;
+};
+QueryStat& qstat() {
+    static QueryStat q;
+    return q;
+}
+void query_stat_dump() {
+    QueryStat& q = qstat();
+    if (!q.on || q.printed) return;
+    q.printed = true;
+    std::fprintf(stderr,
+                 "vk query stat: %llu cudaStreamQuery calls | live batch pending at %llu | "
+                 "pending+succeeded %llu | pending+notready %llu (nofix=%d)\n",
+                 (unsigned long long) q.calls, (unsigned long long) q.pending_at_call,
+                 (unsigned long long) q.pending_said_complete, (unsigned long long) q.pending_said_notready,
+                 (int) q.nofix);
+}
+
 // ---- host regions: what cudaHostAlloc handed out -----------------------------------------------------------
 struct HostRegion {
     void* host = nullptr;          // the mapped host address returned to the caller
@@ -690,11 +719,29 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream) {
 }
 
 cudaError_t cudaStreamQuery(cudaStream_t stream) {
-    if (stream != nullptr) {
-        Stream* s = strata::vulkan::stream_of(reinterpret_cast<void*>(stream));
-        if (s == nullptr) return fail(cudaErrorInvalidValue);
-        g_current = s;
+    Stream* s = (stream != nullptr) ? strata::vulkan::stream_of(reinterpret_cast<void*>(stream)) : nullptr;
+    if (stream != nullptr && s == nullptr) return fail(cudaErrorInvalidValue);
+    if (s != nullptr) g_current = s;
+
+    QueryStat& q = qstat();
+    if (q.on) {
+        static bool reg = false;
+        if (!reg) { reg = true; std::atexit(query_stat_dump); }
+        ++q.calls;
     }
+    // A PENDING LIVE BATCH IS OUTSTANDING WORK.  `dispatch` ENCODES into the batch and returns; it is submitted
+    // and fenced only at a flush.  So between a dispatch and the next flush the stream holds work that has NOT
+    // run, and CUDA's contract - "cudaSuccess means all preceding work in the stream has completed" - is only
+    // true if the batch is flushed first.  The pre-fix body answered cudaSuccess unconditionally here, which is a
+    // wrong answer the moment anything reads a device buffer expecting it to be written (the class the last
+    // worker flagged as reasoned-but-unmeasured).  FLUSH (not NotReady) is the fix: a caller that spins on this
+    // answer alone (peer_experts.cpp:257) would never make progress against a NotReady that nothing advances, and
+    // a flush is what every other observer of the device already does (cudaStreamSynchronize, cudaDeviceSynchronize).
+    const bool pending = (s != nullptr && s->ctx != nullptr && s->ctx->live_pending());
+    if (q.on && pending) ++q.pending_at_call;
+    if (pending && !q.nofix) s->ctx->flush();   // `q.nofix` keeps the OLD answer so one binary measures both sides
+    const bool still_pending = (s != nullptr && s->ctx != nullptr && s->ctx->live_pending());
+
     // A segmented verify-window launch in flight is ADVANCED here, on the host thread: every segment whose leading
     // handshake boundary is satisfied is submitted (and its fence waited).  `cudaErrorNotReady` while boundaries
     // remain unsatisfied or segments remain pending; `cudaSuccess` once the whole recording has run - exactly what
@@ -705,12 +752,15 @@ cudaError_t cudaStreamQuery(cudaStream_t stream) {
             inflight().active = false;
             inflight().exec = nullptr;
             inflight().next = 0;
+            if (q.on && still_pending) ++q.pending_said_complete;
             g_last = cudaSuccess;
             return cudaSuccess;
         }
+        if (q.on && still_pending) ++q.pending_said_notready;
         g_last = cudaErrorNotReady;
         return cudaErrorNotReady;
     }
+    if (q.on && still_pending) ++q.pending_said_complete;
     g_last = cudaSuccess;      // every submit already fenced and waited: work is complete
     return cudaSuccess;
 }

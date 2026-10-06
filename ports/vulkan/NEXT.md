@@ -1,6 +1,155 @@
 # Start here next session
 
-## THE DISPATCH LAYER WAS THE GAP — 5.14 → 16.17 tok/s prefill; DECODE IS UNMOVED AT 7.25 AND IS THE NEXT TARGET (2026-10-06, `vega`)
+## THE DECODE IS THE VERIFY WINDOW'S GPU EXECUTION — 150 ms/token ATTRIBUTED, A MEASURED 1.22x FROM `--spec 2`, AND THE TRANSFER HYPOTHESIS KILLED BY ITS OWN INSTRUMENT (2026-10-06, `vega`, Arc Pro B70)
+
+**A RETRACTION FIRST, BECAUSE IT WAS MINE AND THE INSTRUMENT CAUGHT IT.** The note that opened this file said the
+decode arm *was* the transfer path — "~430 `begin_oneshot` transfers per decode token", 13,774 transfers ÷ 32
+tokens. A new instrument prices every staging transfer by call site with a decode-phase split
+(`STRATA_VK_XFER_STAT=1`, `vulkan/src/device/vk_compute.cpp`):
+
+```
+vk xfer stat: uploads 13725 (53613.30 MiB) | downloads 49 (62.54 MiB) | call sites 36
+vk xfer stat decode-phase (after the first capture_begin): up 0 (0.00 MiB) | down 0 (0.00 MiB)
+```
+
+Site 0 alone is **12,288 calls / 23.42 GiB** — `ExpertCache::fill_slot_blocking`, the initial expert fill — and sites
+1–3 are the dense/native/queued load (`WeightTable::load` 784, `NativeDense::load` 300, `fill_slot_queued` 124),
+taking the load to ~28.5 GiB of the 52.36 GiB total. **The 13,774 "transfers" are the LOAD, not a per-token rate, and
+the decode issues ZERO transfers** (measured twice, two different windows). The decode fixed earlier tonight
+(prefill 5.14 → 16.17 tok/s) is untouched by this: the transfer path was never the decode.
+
+**THE DECODE PHASE TABLE — the deliverable that was missing, and where the 150 ms went.** The prompt path's marks
+(`kPf*`/`PfTimer`, `src/prefill/prefill.cpp`) had no decode twin, so the decode got its own, at the decode-side
+sites: `ms_launch` (the recording's launch + the segment submits) and `ms_sync` (the blocking window sync) in
+`Verifier::run` (`src/core/verify.cpp`, `include/strata/core/verify.hpp`), printed by the CLI's window line
+(`src/program/generate.cpp`). 8-token arm, the shipped `--spec 4`:
+
+```
+verify window  wait for rings 0.000  pool 0.000  host(stage) 0.986  launch 4.903  sync 240.623  commit 4.122 ms/round
+19 rounds of 6, 1.68 tokens/round -> 250.6 ms/round x 19 = 4,762 ms = 99.1% of the 4,803 ms decode
+```
+
+`sync` alone is **4,572 ms = 95.2%** of decode ≈ 143 ms of the 150.1 ms/token. `launch` 4.9, `commit` 4.1,
+`host(stage)` 1.0, `wait for rings` 0, `pool` 0 ms/round.
+
+**WHY THE DECODE COUNTERS READ ZERO — AND THEY WERE RIGHT.** A third number had to be added, because the dispatch
+and transfer counters are blind exactly where the decode lives: a recorded block is not a `dispatch` and not a
+transfer, so `submit_segment` now times itself and counts the recorded dispatches it executes
+(`STRATA_VK_DISP_STAT`):
+
+```
+vk disp stat by arm: live-batch 4293 | transfer 13774 | recorded-submit 0 (replays 0) |
+                     segment 57 (91060 recorded dispatches, submit 1 ms, wait 4742 ms)
+```
+
+**57 segment submits, 91,060 recorded dispatches, 4,742 ms of fence wait.** The decode is 3 segment submits per round
+of a captured window, and the wait is the GPU executing ~4,792 dispatches per round at the port's own measured
+small-dispatch cost (~46–54 µs; `iq2s_mmvq` benches at **0.0464 ms** on this card, `bench/README.md`). **The seam is
+not the cost**: `advance_inflight` (`vulkan/src/compat/cuda_runtime.cpp`) polls the mapped boundary word with a plain
+volatile read and submits the next segment once it is served; the submit side is **1 ms for the whole run**. There is
+no full-drain-per-boundary waste to remove — the 4.7 s is kernels, and a "cheaper seam" would change nothing.
+
+**THE MEASURED WIN AVAILABLE NOW: `--spec 2`.** Same binary, same prompt, ids IDENTICAL at every setting:
+
+| `--spec` | drafts/round | verify `sync` ms/round | decode tok/s | ids md5 |
+|--:|--:|--:|--:|---|
+| 2 | 4 | 197.166 | **8.12** | `3aed108cceee` |
+| 4 | 6 | 240.623 | 6.66 | `3aed108cceee` |
+| 6 | 8 | 285.399 | 5.63 | `3aed108cceee` |
+
+Tokens accepted per round is **flat at 1.68** across all three (accepted 0:6 1:13 every time), so the window pays
+**~110 ms fixed + ~21.7 ms PER DRAFT** and every draft past the second buys no accepted token on this prompt. `--spec 2`
+is **1.22x** the engine's default with bit-identical output. `--spec 1` is REFUSED by the engine for a native pack
+("`is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK`", `generate.cpp:2167`), so
+**there is no non-speculative decode path for a native pack: the verify window IS the decode** and the seam must be
+made cheap, not designed away. `run_vk_perf.sh` now uses `--spec 2` and states why; the engine's own default was NOT
+changed silently.
+
+**THE NAMED NEXT LEVER (~2x, NOT ATTEMPTED).** The per-draft term is ~261 recorded dispatches per draft ≈ **5 per
+layer per draft**, and it is the port's own `_multi` shaping. These are LOOPS that dispatch the per-token kernel once
+per token (`vulkan/src/kernels/verify_vk.cpp`): `gdn_conv_l2_multi` (:234/:267), `gdn_ab_multi` (:277/:285),
+`native_router_top10_multi` (:345/:352), `native_moe_combine_multi` (:424/:432), `shared_expert_multi` (:451/:471) —
+the file's own header chose the loop so bit-exactness holds "by construction" rather than by a shared-weight kernel
+that must reproduce the single-token summation order. Batching those five per round is the same play `Gemm::native`
+got (: the shaders already walked `ncols`; 4.1x fewer dispatches → 2.5x the rate). **Target: the fixed term — sync
+240.6 → ~110 ms at T=4, decode ~6.66 → ~14.0 tok/s.** Falsifiable: the per-draft term (>20 ms/draft) must move.
+
+**THE PREFILL FLUSH LEVER, RE-LABELLED (not the decode).** `STRATA_VK_FLUSH_STAT=1` (new) attributes every live-batch
+flush to its triggering call site and times its submit/wait:
+
+```
+vk flush stat: 4293 live-batch flushes, 14742 dispatches, submit 17 ms, wait 1081 ms
+vk flush stat decode-phase (after the first capture_begin): 0 flushes, 0 dispatches, wait 0 ms
+```
+
+**4,293 flushes for 14,742 dispatches ≈ 3.4 dispatches per flush (~613 per prompt token), the fill-128 batch never
+reached, and NONE of them in the decode.** The triggers, named by address: the prefill's dequant staging
+(`iq_dequant_gu_f16` 1,328 flushes / 6,480 dispatches / 433 ms wait; `iq_dequant_f16` 1,328 / 2,656 / 150 ms; a third
+1,328 flushes / 1,328 dispatches / 111 ms) and the rope/embed/indexer family — i.e. dispatches whose bound buffers are
+HOST-VISIBLE, so the host-visible rule fires after about one dispatch. The rule itself stays (it cost 17.38 → 16.17
+tok/s to get right); what is worth narrowing is *which* mapped buffers count as "the host will read this". That is a
+prefill lever.
+
+**`submit_recorded == 0` IS EXPECTED, NOT A DEAD PATH.** For a native (IQ) pack the CLI's token loop breaks to the
+verify path (`generate.cpp:7579`), so the decode IS the captured verify window re-submitted per round through
+`submit_segment`. `submit_recorded` is the UNSEGMENTED recorded-submit and is reachable only from
+`record_end_and_submit()`/`replay_recorded()`, which **nothing in the tree calls** (checked); the per-token
+`TokenGraph` (`session_run_token`, `src/core/session.cpp`) is the NON-native path and is not entered here. So there is
+no recorded token graph waiting to be replayed: `token graph hit path: 12288 resident experts` describes the
+RESIDENCY decision, not a captured per-token graph.
+
+**`cudaStreamQuery` — THE LAST WORKER'S REASONED-BUT-UNMEASURED RISK, NOW MEASURED AND FIXED.** The risk was real. A
+new arm in `vulkan/tests/cudart_smoke.cpp` issues a live dispatch, queries immediately, and checks the answer against
+the device layer's own view (`Ctx::live_pending()`, added to `vulkan/src/device/vk_compute.hpp`):
+
+```
+NOFIX (STRATA_VK_QUERY_NOFIX=1): outstanding before/after = 1/1, cudaStreamQuery -> "no error"  -> FAIL
+                                (answered "complete" with work still queued - the wrong answer)
+FIX:                            outstanding before/after = 1/0, cudaStreamQuery -> "no error"  -> PASS
+```
+
+The fix: `cudaStreamQuery` FLUSHES a pending live batch before answering, so `cudaSuccess` again means "all work in
+this stream has completed" (`vulkan/src/compat/cuda_runtime.cpp`). Flush, not `cudaErrorNotReady`, because a caller
+that spins on this answer alone (`peer_experts.cpp:257`) must be able to make progress. In the shipped decode the case
+is LATENT: 38 `cudaStreamQuery` calls in a run, **0 with a live batch pending** (the window records, so nothing is
+open) — and `STRATA_VK_QUERY_NOFIX` keeps both sides measurable in one binary.
+
+**`STRATA_VERIFY_PROFILE` / `STRATA_VERIFY_TRACE` ARE CLOSED BY DESIGN — DO NOT CHASE THEM.** Both reach
+`gpu_stamp`, an unported DIAGNOSTIC that REFUSES loudly (`verify.cpp:564/:565`, the P6 stage profiler; refusal text in
+`vulkan/src/kernels/refusals_vk.cpp:296`). The refusal text did its job: it named the path and said the shipped
+configuration does not reach it. A completeness item, not a performance one — the decode attribution comes from the
+engine's own marks instead.
+
+**GATE + IDS (unchanged by all of the above).** Arc **886 passed / 0 failed / 0 skipped** — the SAME case count,
+nothing skipped, no bound widened; lvp 868/0/6; radeon 876/1/2 (the documented `bf16_gemv_fp32_mmvf` family). Ids:
+8-token `3aed108cceee`, 199-token `56a0b28d2de6`, identical across `--spec 2/4/6` and before/after the
+`cudaStreamQuery` fix. The capture/ring contract and the host-visible mapped-region rule are untouched (no code on
+either path changed).
+
+**BEFORE / AFTER, against the same-card reference (`pp512 913.36`, `tg128 36.52`, `/tmp/ref_llamacpp_vulkan.log`):**
+
+| arm | configuration | decode tok/s | vs 36.52 | prefill tok/s | vs 913.36 |
+|---|---|---:|---:|---:|---:|
+| 8-token | before, `--spec 4` (the engine's default) | 6.66 | 18.2% | 5.19 | 0.57% |
+| 8-token | after, `--spec 2` | **8.12** | **22.2%** | — | — |
+| 199-token | before, `--spec 4` (documented) | 7.25 | 19.9% | 16.17 | 1.77% |
+| 199-token | after, `--spec 2` (same session) | **8.27** | **22.6%** | 16.05 | 1.76% |
+
+**INSTRUMENTS ADDED — all measurement-only and environment-gated.** `STRATA_VK_XFER_STAT` (every staging transfer by
+call site, decode-phase split), `STRATA_VK_FLUSH_STAT` (every live-batch flush by trigger, with its submit/wait ms),
+`STRATA_VK_QUERY_STAT` + `STRATA_VK_QUERY_NOFIX` (the `cudaStreamQuery` measurement and its pre-fix switch), segment
+accounting inside `STRATA_VK_DISP_STAT`, and the decode-side `ms_launch`/`ms_sync` marks. One self-inflicted defect,
+fixed: the flush stat's first outing aborted teardown with `std::bad_alloc` because its container was a
+function-local static — built after the `atexit` registration, so destroyed BEFORE the dump touched it. It is
+namespace-scope now (built first, destroyed last).
+
+**NOT DONE / LEFT, STATED.** The ~2x `_multi` batching is named and priced but NOT attempted. The prefill flush
+narrowing is not attempted (the rule stays). The 199-token `--spec 4` "after" figure is the DOCUMENTED 7.25 from the
+earlier batch, not a second same-session run — only the `--spec 2` 199-token run is new. `--spec 2`'s 1.22x is
+measured on ONE prompt (the 199-token `1`-run shows 1.14x); acceptance is prompt-dependent and the general claim is
+"the window cost is per-draft while tokens/round was flat here", not a constant factor.
+
+## [SUPERSEDED BY THE SECTION ABOVE — its decode numbers are attributed in full there] THE DISPATCH LAYER WAS THE GAP — 5.14 → 16.17 tok/s prefill; DECODE IS UNMOVED AT 7.25 AND IS THE NEXT TARGET (2026-10-06, `vega`)
 
 **WHAT WAS MEASURED, IN ORDER.** `STRATA_PREFILL_TIMING=1` (199-token arm): the largest single phase was
 `router+shared` at 24.3% and the expert path 28.4%, but the 8-token arm showed `router+shared`/`gdn`/`qsa proj`/

@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <fstream>
 #include <string>
 #include <sys/wait.h>
@@ -59,6 +61,8 @@ struct DispStat {
     // BY ARM: a live batch flush (the prompt path), a transfer (begin_oneshot), a recorded-step submit (a replay,
     // i.e. the decode/verify arm) and a segment submit (that replay cut at a handshake boundary).
     uint64_t sub_live = 0, sub_transfer = 0, sub_rec = 0, sub_seg = 0, replays = 0;
+    uint64_t seg_disp = 0;                        // recorded dispatches EXECUTED by segment submits
+    double t_seg_wait = 0, t_seg_submit = 0;      // the segment path's own submit + fence wait (ms)
     double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
     std::vector<std::pair<std::string, uint64_t>> by_pipe;   // per-spv dispatch counts
 };
@@ -99,10 +103,183 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
     }
     std::fprintf(stderr, "vk disp stat by shader (top):%s\n", line.c_str());
     std::fprintf(stderr, "vk disp stat by arm: live-batch %llu | transfer %llu | recorded-submit %llu (replays %llu) | "
-                         "segment %llu\n",
+                         "segment %llu (%llu recorded dispatches, submit %.0f ms, wait %.0f ms)\n",
                  (unsigned long long) g_ds.sub_live, (unsigned long long) g_ds.sub_transfer,
                  (unsigned long long) g_ds.sub_rec, (unsigned long long) g_ds.replays,
-                 (unsigned long long) g_ds.sub_seg);
+                 (unsigned long long) g_ds.sub_seg, (unsigned long long) g_ds.seg_disp, g_ds.t_seg_submit,
+                 g_ds.t_seg_wait);
+}
+}  // namespace
+
+// ---- STRATA_VK_XFER_STAT: WHICH CALL SITE issues each staging transfer ---------------------------------------
+// A "transfer" is `stage_upload`/`stage_download`: its own command buffer, its own fence, its own submit and its
+// own wait.  The decode arm issues ~430 of them per token, so this instrument names each one's CALL SITE (a
+// backtrace, symbolized by module-relative offset) and its direction and size, so the per-token count can be
+// attributed to code instead of guessed.  Measurement-only: off unless the env var is set, and no transfer's
+// bytes or ordering change.  Offsets are relative to the module base (or to a resolved symbol), so they resolve
+// with `addr2line -f -C -e <binary> <off>` against the same build.
+namespace {
+struct XferSite {
+    std::string key;
+    uint64_t n = 0;
+    uint64_t bytes = 0;
+    uint64_t n_dec = 0;       // calls after the first capture_begin (the decode phase begins)
+    uint64_t bytes_dec = 0;
+};
+struct XferStat {
+    bool on = std::getenv("STRATA_VK_XFER_STAT") != nullptr;
+    bool decode = false;      // set at the run's first capture_begin: the verify/decode arm starts there
+    uint64_t up = 0, down = 0, up_bytes = 0, down_bytes = 0;
+    uint64_t up_dec = 0, down_dec = 0, up_bytes_dec = 0, down_bytes_dec = 0;
+    std::vector<XferSite> sites;
+    void note(bool is_up, uint64_t bytes) {
+        if (is_up) { ++up; up_bytes += bytes; if (decode) { ++up_dec; up_bytes_dec += bytes; } }
+        else { ++down; down_bytes += bytes; if (decode) { ++down_dec; down_bytes_dec += bytes; } }
+        void* fr[10];
+        const int n = backtrace(fr, 10);
+        std::string key = is_up ? "UP" : "DOWN";
+        // frame 0 is `note`, frame 1 is `stage_*`; the call site is frame 2 and outward.
+        for (int i = 1; i < n && i < 7; ++i) {
+            Dl_info inf{};
+            char b[320];
+            if (dladdr(fr[i], &inf) && inf.dli_fbase) {
+                unsigned long long off =
+                    (unsigned long long) ((uintptr_t) fr[i] - (uintptr_t) inf.dli_fbase);
+                const char* mod = inf.dli_fname ? inf.dli_fname : "?";
+                if (inf.dli_sname != nullptr && inf.dli_saddr != nullptr) {
+                    std::snprintf(b, sizeof b, "%s %s+0x%llx", mod, inf.dli_sname,
+                                  (unsigned long long) ((uintptr_t) fr[i] - (uintptr_t) inf.dli_saddr));
+                } else {
+                    std::snprintf(b, sizeof b, "%s +0x%llx", mod, off);
+                }
+            } else {
+                std::snprintf(b, sizeof b, "?%p", fr[i]);
+            }
+            if (i > 1) key += " <- ";
+            key += b;
+        }
+        for (XferSite& s : sites) {
+            if (s.key == key) {
+                ++s.n; s.bytes += bytes;
+                if (decode) { ++s.n_dec; s.bytes_dec += bytes; }
+                return;
+            }
+        }
+        XferSite ns{key, 1, bytes, 0, 0};
+        if (decode) { ns.n_dec = 1; ns.bytes_dec = bytes; }
+        sites.push_back(ns);
+    }
+};
+XferStat g_xs;
+bool g_xs_printed = false;
+void xfer_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx still reports
+    if (!g_xs.on || g_xs_printed) return;
+    g_xs_printed = true;
+    std::fprintf(stderr,
+                 "vk xfer stat: uploads %llu (%.2f MiB) | downloads %llu (%.2f MiB) | call sites %zu\n",
+                 (unsigned long long) g_xs.up, g_xs.up_bytes / 1048576.0, (unsigned long long) g_xs.down,
+                 g_xs.down_bytes / 1048576.0, g_xs.sites.size());
+    std::fprintf(stderr, "vk xfer stat decode-phase (after the first capture_begin): up %llu (%.2f MiB) | down %llu (%.2f MiB)\n",
+                 (unsigned long long) g_xs.up_dec, g_xs.up_bytes_dec / 1048576.0,
+                 (unsigned long long) g_xs.down_dec, g_xs.down_bytes_dec / 1048576.0);
+    std::sort(g_xs.sites.begin(), g_xs.sites.end(),
+              [](const XferSite& a, const XferSite& b) { return a.n > b.n; });
+    for (size_t i = 0; i < g_xs.sites.size(); ++i) {
+        std::fprintf(stderr, "vk xfer site %2zu: n=%-7llu bytes=%-11llu dec_n=%-7llu dec_bytes=%-11llu %s\n", i,
+                     (unsigned long long) g_xs.sites[i].n, (unsigned long long) g_xs.sites[i].bytes,
+                     (unsigned long long) g_xs.sites[i].n_dec, (unsigned long long) g_xs.sites[i].bytes_dec,
+                     g_xs.sites[i].key.c_str());
+    }
+}
+}  // namespace
+
+// ---- STRATA_VK_FLUSH_STAT: what TRIGGERS each live-batch flush, and what it costs ---------------------------
+// The live dispatch path BATCHES.  A batch is flushed (one submit + one wait) when it fills, or when something
+// must OBSERVE the device.  This records the flush's CALL SITE (a backtrace) with its count and the time spent
+// in submit+wait, so "where does the decode's wait sit" is attributed to the dispatch that forced it.  Same
+// measurement-only rule as the two instruments above.
+namespace {
+struct FlushSite {
+    std::string key;
+    uint64_t n = 0;
+    uint64_t disp = 0;
+    double wait_ms = 0;
+    double submit_ms = 0;
+    uint64_t n_dec = 0;
+    uint64_t disp_dec = 0;
+    double wait_ms_dec = 0;
+};
+bool g_fs_on_env = false;
+// NAMESPACE-SCOPE, NOT A FUNCTION-LOCAL STATIC.  A function-local static's destructor is registered when it is
+// first built, i.e. AFTER the atexit handler registered in `Ctx::Ctx`; at exit the handlers run in REVERSE order,
+// so the vector would be destroyed BEFORE the dump touched it - which is exactly the `std::bad_alloc` this
+// produced on its first outing.  A namespace-scope object is built at static-init (registered first, destroyed
+// LAST), so the dump always runs against a live container.
+std::vector<FlushSite> g_flush_sites;
+uint64_t g_fs_n = 0, g_fs_disp = 0, g_fs_n_dec = 0, g_fs_disp_dec = 0;
+double g_fs_wait = 0, g_fs_submit = 0, g_fs_wait_dec = 0;
+std::string bt_key(int skip, int maxframes) {
+    void* fr[12];
+    const int n = backtrace(fr, 12);
+    std::string key;
+    for (int i = skip; i < n && i < skip + maxframes; ++i) {
+        Dl_info inf{};
+        char b[320];
+        if (dladdr(fr[i], &inf) && inf.dli_fbase) {
+            const char* mod = inf.dli_fname ? inf.dli_fname : "?";
+            if (inf.dli_sname != nullptr && inf.dli_saddr != nullptr) {
+                std::snprintf(b, sizeof b, "%s %s+0x%llx", mod, inf.dli_sname,
+                              (unsigned long long) ((uintptr_t) fr[i] - (uintptr_t) inf.dli_saddr));
+            } else {
+                std::snprintf(b, sizeof b, "%s +0x%llx", mod,
+                              (unsigned long long) ((uintptr_t) fr[i] - (uintptr_t) inf.dli_fbase));
+            }
+        } else {
+            std::snprintf(b, sizeof b, "?%p", fr[i]);
+        }
+        if (!key.empty()) key += " <- ";
+        key += b;
+    }
+    return key;
+}
+// one flush, charged to the call site that triggered it (and to the decode phase when it is one)
+void flush_note(const std::string& key, uint64_t ndisp, double submit_ms, double wait_ms, bool decode) {
+    bool found = false;
+    for (FlushSite& f : g_flush_sites) {
+        if (f.key == key) {
+            ++f.n; f.disp += ndisp; f.submit_ms += submit_ms; f.wait_ms += wait_ms;
+            if (decode) { ++f.n_dec; f.disp_dec += ndisp; f.wait_ms_dec += wait_ms; }
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        FlushSite ns{key, 1, ndisp, wait_ms, submit_ms, 0, 0, 0.0};
+        if (decode) { ns.n_dec = 1; ns.disp_dec = ndisp; ns.wait_ms_dec = wait_ms; }
+        g_flush_sites.push_back(ns);
+    }
+    ++g_fs_n; g_fs_disp += ndisp; g_fs_submit += submit_ms; g_fs_wait += wait_ms;
+    if (decode) { ++g_fs_n_dec; g_fs_disp_dec += ndisp; g_fs_wait_dec += wait_ms; }
+}
+bool g_flush_printed = false;
+void flush_stat_dump() {
+    if (!g_fs_on_env || g_flush_printed) return;
+    g_flush_printed = true;
+    std::fprintf(stderr, "vk flush stat: %llu live-batch flushes, %llu dispatches, submit %.0f ms, wait %.0f ms\n",
+                 (unsigned long long) g_fs_n, (unsigned long long) g_fs_disp, g_fs_submit, g_fs_wait);
+    std::fprintf(stderr,
+                 "vk flush stat decode-phase (after the first capture_begin): %llu flushes, %llu dispatches, "
+                 "wait %.0f ms\n",
+                 (unsigned long long) g_fs_n_dec, (unsigned long long) g_fs_disp_dec, g_fs_wait_dec);
+    std::vector<FlushSite> v = g_flush_sites;
+    std::sort(v.begin(), v.end(), [](const FlushSite& a, const FlushSite& b) { return a.wait_ms > b.wait_ms; });
+    for (size_t i = 0; i < v.size() && i < 20; ++i)
+        std::fprintf(stderr,
+                     "vk flush site %2zu: n=%-6llu disp=%-8llu submit=%.0fms wait=%.0fms | dec_n=%-6llu "
+                     "dec_disp=%-7llu dec_wait=%.0fms  %s\n",
+                     i, (unsigned long long) v[i].n, (unsigned long long) v[i].disp, v[i].submit_ms, v[i].wait_ms,
+                     (unsigned long long) v[i].n_dec, (unsigned long long) v[i].disp_dec, v[i].wait_ms_dec,
+                     v[i].key.c_str());
 }
 }  // namespace
 
@@ -308,6 +485,9 @@ std::vector<DeviceInfo> Ctx::list_devices() {
 Ctx::Ctx(int want_device, bool need_16bit) {
     g_ds.on = std::getenv("STRATA_VK_DISP_STAT") != nullptr;
     if (g_ds.on) std::atexit(disp_stat_dump);
+    if (g_xs.on) std::atexit(xfer_stat_dump);
+    g_fs_on_env = std::getenv("STRATA_VK_FLUSH_STAT") != nullptr;
+    if (g_fs_on_env) std::atexit(flush_stat_dump);
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "strata-vulkan-port-gate";
@@ -559,6 +739,8 @@ Ctx::Ctx(int want_device, bool need_16bit) {
 
 Ctx::~Ctx() {
     disp_stat_dump();
+    xfer_stat_dump();
+    flush_stat_dump();
     flush_live();   // the last batch must reach the device before the device goes away
     if (live_fence_ && dev_) vkDestroyFence(dev_, live_fence_, nullptr);
     if (live_cb_ && cmd_pool_) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &live_cb_);
@@ -954,6 +1136,10 @@ void Ctx::flush_live() {
         g_ds.t_wait += _td - _tw;
         ++g_ds.submits; ++g_ds.waits; ++g_ds.batches; ++g_ds.sub_live;
     }
+    if (g_fs_on_env) {
+        const std::string key = bt_key(2, 5);   // 0 = bt_key, 1 = flush_live, 2 = the caller
+        flush_note(key, (uint64_t) live_n_, _tw - _ts, _td - _tw, g_xs.decode);
+    }
 }
 
 VkCommandBuffer Ctx::begin_oneshot() {
@@ -1009,6 +1195,7 @@ void Ctx::end_oneshot_and_wait(VkCommandBuffer cb) {
 // for.  Getting one wrong does not fail a build, and on a coherent host it does not even fail on the machine it
 // was written on - which is why each direction states its own reasoning and the gate round-trips through it.
 void Ctx::stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offset) {
+    g_xs.note(/*is_up=*/true, bytes);
     Buf st = alloc_staging(bytes ? bytes : 4);
     std::memcpy(st.mapped, src, (size_t) bytes);   // HOST_COHERENT: no flush, and the submit below needs none
     VkCommandBuffer cb = begin_oneshot();
@@ -1031,6 +1218,7 @@ void Ctx::stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offse
 }
 
 void Ctx::stage_download(const Buf& src, void* dst, uint64_t bytes, uint64_t offset) {
+    g_xs.note(/*is_up=*/false, bytes);
     Buf st = alloc_staging(bytes ? bytes : 4);
     VkCommandBuffer cb = begin_oneshot();
     // The source was written by a shader or by an earlier copy, in an earlier submission the caller fenced and
@@ -1344,6 +1532,7 @@ void Ctx::record_end_and_submit() {
 
 // ---- stream capture: the CUDA-graph API's recording, over the recorded step above --------------------------
 void Ctx::capture_begin() {
+    g_xs.decode = true;             // STRATA_VK_XFER_STAT: the first capture is where the decode arm starts
     discard_recording();            // a fresh capture: free any stale segment handles (normally none remain)
     record_begin();                 // SEGMENT 0's command buffer + fence
     capture_ = true;
@@ -1444,9 +1633,23 @@ void Ctx::submit_segment(const CaptureSeg& seg) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &seg.cb;
     VK_CHECK(vkResetFences(dev_, 1, &seg.fence));   // the fence was signalled by the previous submission
+    const double _ts = vk_ms();
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, seg.fence));
+    const double _tw = vk_ms();
+    // THE DECODE'S OWN PATH IS TIMED HERE.  A segment is a recorded block of dispatches (the verify window's
+    // per-round replay), submitted and WAITED.  It is NOT a `dispatch`, so it never reached `g_ds.t_wait` /
+    // `t_submit` and the counters read zero dispatches across the whole decode - which is exactly why the decode
+    // arm had no attribution.  Charged here, per segment, with its dispatch count.
     VK_CHECK(vkWaitForFences(dev_, 1, &seg.fence, VK_TRUE, UINT64_MAX));
-    if (g_ds.on) { ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_seg; }
+    const double _td = vk_ms();
+    if (g_ds.on) {
+        ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_seg;
+        g_ds.t_submit += _tw - _ts;
+        g_ds.t_wait += _td - _tw;
+        g_ds.seg_disp += seg.dispatches;
+        g_ds.t_seg_wait += _td - _tw;
+        g_ds.t_seg_submit += _tw - _ts;
+    }
 }
 
 void Ctx::destroy_owned(const CaptureSeg& seg) {

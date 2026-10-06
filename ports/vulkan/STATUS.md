@@ -1,5 +1,40 @@
 # Status — what is done, what is verified, what is not
 
+## THE DECODE: 150 ms/token ATTRIBUTED TO THE VERIFY WINDOW'S GPU EXECUTION; `--spec 2` IS A MEASURED 1.22x (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** The decode got the phase table it never had. Two decode-side marks in `Verifier::run` (`ms_launch`,
+`ms_sync`; `src/core/verify.cpp` + `include/strata/core/verify.hpp`) and three new instruments
+(`STRATA_VK_XFER_STAT` transfer-by-call-site with a decode split, `STRATA_VK_FLUSH_STAT` flush-by-trigger,
+`STRATA_VK_QUERY_STAT`/`_NOFIX`, plus segment accounting inside `STRATA_VK_DISP_STAT`) priced it. The 8-token arm
+(`--spec 4`): `verify window ... host(stage) 0.986  launch 4.903  sync 240.623  commit 4.122 ms/round` over 19
+rounds = **4,762 ms, 99.1% of the 4,803 ms decode; `sync` alone 4,572 ms (95.2%)** — and the segment counter says
+what that sync is waiting on: **57 segment submits, 91,060 recorded dispatches, submit 1 ms, wait 4,742 ms**, i.e.
+the GPU executing ~4,792 recorded dispatches per round at the port's own measured small-dispatch cost (~46–54 µs).
+
+**VERIFIED.** Gate on the Arc **886 passed / 0 failed / 0 skipped** — the SAME case count, nothing skipped, no bound
+widened; lvp 868/0/6; radeon 876/1/2 (the documented `bf16_gemv_fp32_mmvf` family). Ids `3aed108cceee` (8-token) and
+`56a0b28d2de6` (199-token), identical across `--spec 2/4/6` and before/after the `cudaStreamQuery` fix. **The measured
+win: `--spec 2` → 8.12 tok/s decode vs `--spec 4`'s 6.66 (ids identical; tokens/round flat at 1.68; the window pays
+~110 ms fixed + ~21.7 ms PER DRAFT).** 199-token arm same session: 8.27 vs the documented 7.25.
+
+**A RETRACTION, RECORDED.** The previous section called the decode "the transfer path" (~430 transfers/token).
+**Wrong, and the instrument said so**: `STRATA_VK_XFER_STAT` shows the 13,774 transfers are the LOAD (site 0 =
+`fill_slot_blocking`, 12,288 calls / 23.42 GiB), and the **decode-phase transfer count is 0**. The division by 32
+decode tokens divided a one-off model load by a token count.
+
+**THE LAST WORKER'S OPEN RISK, MEASURED AND FIXED.** `cudaStreamQuery` DID report a pending live batch as complete:
+a new arm in `vulkan/tests/cudart_smoke.cpp` measures outstanding-before/after = **1/1 with `"no error"`** under
+`STRATA_VK_QUERY_NOFIX=1` (a wrong "complete") and **1/0** with the fix. `cudaStreamQuery` now flushes the pending live
+batch before answering. Latent in the shipped decode (38 calls, 0 with a batch pending).
+
+**NOT DONE.** The ~2x lever is named and priced but NOT attempted: the per-draft cost is ~261 recorded dispatches
+(≈5 per layer), from five per-token LOOPS in `vulkan/src/kernels/verify_vk.cpp`
+(`gdn_conv_l2_multi`, `gdn_ab_multi`, `native_router_top10_multi`, `native_moe_combine_multi`, `shared_expert_multi`);
+batching them per round targets sync 240.6 → ~110 ms at T=4 (decode ~14.0 tok/s). The prefill's 4,293 flushes
+(~3.4 dispatches/flush, the fill-128 never reached, decode: 0) are a PREFILL lever, re-labelled as such and not
+narrowed. `STRATA_VERIFY_PROFILE`/`_TRACE` are closed by design (`gpu_stamp` is an unported diagnostic that refuses
+loudly) and were not chased.
+
 ## THE DISPATCH LAYER: PREFILL 5.14 → 16.17 tok/s, AND DECODE UNMOVED AT 7.25 (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** A new instrument (`STRATA_VK_DISP_STAT=1`) priced the submission layer: every dispatch was its own
