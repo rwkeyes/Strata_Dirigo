@@ -1,5 +1,82 @@
 # Start here next session
 
+## THE HANDSHAKE SEAM IS CLOSED: the P6 verify window's RECORDING now passes `wait_flag_ge` and stops at `fetch_blobs`, which is ON PATH and was mis-classified OFF it (2026-10-05, `vega`)
+
+**`wait_flag_ge` IS NO LONGER THE STOP.**  The engine's device spin is carried HOST-SIDE: the captured window is CUT
+at every `wait_flag_ge` into SEGMENTS, and the segment that follows a boundary is submitted only once the host has
+raised the flag - no kernel waits, and the device is never inside a waiting queue item.  On `coder-iq1_m` (the
+corrected launch, NO `--no-pool`, `--expert-profile /tmp/expert-profile-coder-built.bin`, `--expert-cache 2048`),
+`/tmp/run_real_pool6.log` now records PAST all THREE waits (verify.cpp:1042/:1049/:1066) and past
+`copy_rows_from_mapped` (:1071, PORTED this batch), stopping at the NEXT unported symbol:
+
+```
+strata verify: window up to 6 tokens, 74.0 MiB of device buffers
+  (descriptor pool 2 created: the previous one was full)
+  (descriptor pool 3 created: the previous one was full)
+strata::kernels::fetch_blobs: NOT PORTED on the Vulkan backend - REFUSING.
+  Reached by: NOT reached - the P6 verifier's PCIe staging (verify.cpp:1053, `if (sink_.pcie_mode == 2)`)...
+RUN_RC=2
+```
+
+**THIS MEASURES THE RECORDING, NOT THE WINDOW'S GPU EXECUTION, AND THE DIFFERENCE MATTERS.**  On this backend a
+capture RECORDS (`Ctx::dispatch` diverts to `record_dispatch`), and the refusal fires INSIDE `Verifier::capture`'s
+`record_window` - so the window's GRAPH is built further; the body has not been LAUNCHED yet.  **The seam's RUNTIME
+behaviour (the cut, the host-driven advance, replay) is what `case_verify_seam_entry` proves on intel/lvp/radeon.**
+
+**THE PREVIOUS BATCH'S `fetch_blobs`/`rebase_ptrs` "OFF-PATH" CLASSIFICATION WAS WRONG, AND THE RUN IS THE
+EVIDENCE.**  They are ON PATH: `sink_.pcie_mode` is `2` for the DEFAULT `--pcie-mode auto` (`generate.cpp:471`
+default `"auto"`; `:5168`/`:7848` `set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2)`) -
+**NOT a function of `pcie_frac`**.  So `verify.cpp:1050` takes the `if` and `:1053`/`:1054` ARE reached.  With
+`pcie_frac 0.00` the CUDA pair is an EMPTY no-op (counts[2] = 0 blobs; the kernel launches with
+`total = *n * per = 0`), but the port refuses unconditionally - it cannot carry the NON-empty form, which gathers
+from DEVICE-HELD POINTERS (`P.ptr2[q] = device_alias(...)`, `expert_source.cpp:2083`) that a shader cannot
+dereference.  **The next increment is to carry the EMPTY case faithfully and refuse the non-empty one, or to state
+the config that avoids it** (`--pcie-mode dma`/`direct` skip the staging pair; `o.pcie_mode` is a FLAG, not a
+probe).
+
+**DELIVERABLE A - WHAT THE FLAG IS, AND HOW THE WAIT IS CARRIED.**  `wait_flag_ge_kernel` is
+`while (*flag < value) strata_spin_pause(); __threadfence_system();` (`verify_kernels.cu:496`) - a 1-thread SPIN
+on HOST-MAPPED memory.  The flag is one of three u32 handshake words (`m_flagA_`/:1042, `m_flagB_`/:1049,
+`m_flag_`/:1066 - the mapped twins of `h_flagA_`/`h_flagB_`/`h_flag_`); the HOST raises them from
+`Verifier::run`'s loop (`*h_flagA_ = want` :1506, `raise_flag(h_flagB_, want)` :1507, `*flag = want` :1520, `want =
+(l-lb_)*G+grp+1`), and the pool publishes the plan through `sink_`/`publish_plan` (:1637).  A Vulkan kernel cannot
+spin AND the engine's host loop runs AFTER the launch, so:
+* `Ctx` captures into SEGMENTS (`Ctx::capture_boundary`, `vk_compute.{hpp,cpp}`): `wait_flag_ge` under capture
+  CLOSES the current segment and starts a new one, recording `(host flag address, value)`.
+* the shim (`cuda_runtime.cpp`) launches SEGMENT 0 and returns (asynchronous ONLY for a boundary graph; a
+  boundary-less step is unchanged).  `cudaStreamQuery`/`cudaStreamSynchronize` - the engine's OWN calls inside its
+  `while (*seq < want)` loop - submit each next segment once the mapped flag has reached its value, read on the
+  HOST THREAD between split submissions.  A boundary that is never satisfied is a LOUD REFUSAL (exit 2) in the
+  drain, never a hang.  Outside capture `wait_flag_ge` is the boundary check (as `doorbell_wait` is).
+
+**DELIVERABLE B - THE TWO SYMBOLS PORTED THIS BATCH** (in the call order the seam's advance reaches them):
+`copy_rows_from_mapped` (:1071, shader `copy_rows_from_mapped.spv`, one workgroup per row - the CUDA's
+`blockIdx.x` - hit rows -> 0, the rest from the mapped region; NOT in the batch's listed queue but ON PATH) and
+`copy_indexed` (:1311, shader `copy_indexed.spv`, the DEVICE index selects the source row).
+`native_moe_combine_multi` (1083), `fused_gr_read_multi` (693/1142) and `gdn_conv_commit` (1293) were ALREADY
+ported/gate-proven; they sit in the recording's path behind the new stop.
+
+**THE `--pcie-mode dma` PROBE (`/tmp/run_real_dma1.log`) SKIPS THE STAGING PAIR AND STOPS AT A DIFFERENT HOLE:**
+`copy_from_mapped` (`verify.cpp:678`, the PLE-history snapshot, n = HS = 92160) - the SOURCE (`ss.ple.hist`, or
+`slot_ss(t).ple_hist` in the batch-record mode) is not a live MAPPED region in the port's registry.  UNDIAGNOSED:
+either a DEVICE source the port should bind as an arena view (a one-line `arena_resolve` fallback in
+`strata::vulkan::copy_from_mapped`) or a mapped region the shim never registered.  **This is the NEXT increment
+after `fetch_blobs`; `:678` is reached only once `post(0)` records clean, i.e. behind `fetch_blobs` on the DEFAULT
+path and first on the DMA probe.**
+
+**MAP:** `168 = 94 kernel + 0 shader + 47 host + 0 todo + 27 refused` (was `92/0/46/0/30`; `copy_indexed` and
+`copy_rows_from_mapped` moved `refused -> kernel`, `wait_flag_ge` `refused -> host` - it is a host boundary, no
+shader).  `check_port_map.py` passes; `make_port_map.py` regenerates byte-identically.
+
+**GATE (vega, `/tmp/gate_seam.log`): `intel_icd == 853 passed, 0 failed, 0 skipped`** (was 842); `lvp_icd == 837
+passed, 0 failed, 5 skipped` (3 pre-existing + the 2 alignment skips); `radeon_icd == 842 passed, 2 failed, 2
+skipped` where both failures are the DOCUMENTED intermittent `bf16_gemv_fp32_mmvf` family (`entry (n_in=2560
+n_out=64)` 252/256, `_cols entry (n_in=2560 n_out=48 ncols=13)` 2493/2496) - recorded, not chased.  **All eleven
+new arms (`case_verify_seam_entry`) PASS on all three ICDs.**  THREE registered injections
+(`copy-indexed-ignore-index`, `copy-rows-never-zero`, `verify-seam-no-boundary`).
+
+# Start here next session
+
 ## THE P6 VERIFY WINDOW RUNS ELEVEN SYMBOLS DEEP; THE NEXT STOP IS `wait_flag_ge`, A 1-THREAD SPIN THE PORT CANNOT CARRY (2026-10-05, `vega`)
 
 **THE WINDOW'S BODY NOW RUNS PAST EVERY SYMBOL THIS BATCH PORTED AND STOPS AT A REAL, NAMED HOLE.**  On

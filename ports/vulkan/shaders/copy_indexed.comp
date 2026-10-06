@@ -1,0 +1,24 @@
+#version 450
+// ports/vulkan/shaders/copy_indexed.comp - the CUDA `copy_indexed_kernel` (src/kernels/cuda/verify_kernels.cu:263):
+//
+//   const int idx = *index;
+//   if (idx < 0) return;
+//   for (i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) dst[i] = src[idx*stride + i];
+//
+// `index` is DEVICE int32 data (the engine's committed count, `commit_ + 1`), so the row it selects cannot be a
+// descriptor offset resolved on the host: the whole source row table is bound and `idx*stride` is computed IN
+// the shader.  `stride` (and the row it selects) are small here (stride = NG_HIST*NG_HC_DIM = 92160, idx <= 7), so
+// 32-bit arithmetic cannot overflow.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Dst { float v[]; } dst;
+layout(set = 0, binding = 1, std430) readonly buffer Src { float v[]; } src;
+layout(set = 0, binding = 2, std430) readonly buffer Idx { int v[]; } idx;
+layout(push_constant, std430) uniform PC { int n; int stride; } pc;
+
+void main() {
+    const int row = idx.v[0];
+    if (row < 0) return;                                   // the CUDA returns for a negative index
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    dst.v[i] = src.v[row * pc.stride + int(i)];
+}

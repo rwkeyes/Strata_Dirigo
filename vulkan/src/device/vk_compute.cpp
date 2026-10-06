@@ -1075,7 +1075,8 @@ void Ctx::record_end_and_submit() {
 
 // ---- stream capture: the CUDA-graph API's recording, over the recorded step above --------------------------
 void Ctx::capture_begin() {
-    record_begin();                 // allocates a fresh command buffer + fence (the previous one was taken)
+    discard_recording();            // a fresh capture: free any stale segment handles (normally none remain)
+    record_begin();                 // SEGMENT 0's command buffer + fence
     capture_ = true;
     capture_valid_ = true;
 }
@@ -1104,52 +1105,85 @@ void Ctx::capture_copy(const Buf& dst, const Buf& src, uint64_t bytes) {
 bool Ctx::capture_end() {
     if (!capture_) return false;
     capture_ = false;
-    const bool ok = capture_valid_ && (recorded_ + recorded_copies_) > 0;
+    uint32_t total = recorded_ + recorded_copies_;
+    for (const CaptureSeg& sg : cap_segs_) total += sg.dispatches + sg.copies;
+    const bool ok = capture_valid_ && total > 0;
     if (!ok) {
         // Abandon: end the (unfinished) command buffer so it can be freed; the caller discards it and refuses.
         if (recording_) { vkEndCommandBuffer(rec_cb_); recording_ = false; }
         return false;
     }
-    record_end();
-    return true;
-}
-
-void Ctx::take_recording(VkCommandBuffer& cb, VkFence& fence, uint32_t& dispatches, uint32_t& copies) {
-    cb = rec_cb_;
-    fence = rec_fence_;
-    dispatches = recorded_;
-    copies = recorded_copies_;
+    record_end();                   // close the LAST segment
+    cap_segs_.push_back(CaptureSeg{rec_cb_, rec_fence_, recorded_, recorded_copies_});
     rec_cb_ = VK_NULL_HANDLE;
     rec_fence_ = VK_NULL_HANDLE;
     recorded_ = 0;
     recorded_copies_ = 0;
-    recording_ = false;
     have_recording_ = false;
+    return true;
+}
+
+// THE HAND SHAKE SEAM.  A `wait_flag_ge` inside the capture is not a kernel here - it is a CUT.  The segment so
+// far is closed and stashed, the boundary (the HOST word and the value it must reach) is recorded, and a fresh
+// segment begins.  The driver (the shim's graph launch/query/synchronize) submits the segments in order and
+// POLLS the flag on the host thread between them: no kernel spins, and the device is never inside a waiting
+// queue item across the engine's host loop.
+void Ctx::capture_boundary(const void* flag, uint32_t value) {
+    if (!capture_ || !recording_) {
+        std::fprintf(stderr, "capture_boundary: no capture is active - refusing\n");
+        std::exit(2);
+    }
+    record_end();                   // close this segment (the closing host-read barrier); NO submit
+    cap_segs_.push_back(CaptureSeg{rec_cb_, rec_fence_, recorded_, recorded_copies_});
+    cap_bounds_.push_back(CaptureBoundary{flag, value});
+    rec_cb_ = VK_NULL_HANDLE;        // force the NEXT segment to allocate its own command buffer + fence
+    rec_fence_ = VK_NULL_HANDLE;
+    recorded_ = 0;
+    recorded_copies_ = 0;
+    have_recording_ = false;
+    record_begin();
+}
+
+void Ctx::take_recording(std::vector<CaptureSeg>& segs, std::vector<CaptureBoundary>& bounds) {
+    segs = std::move(cap_segs_);
+    bounds = std::move(cap_bounds_);
+    cap_segs_.clear();
+    cap_bounds_.clear();
     ++owned_recordings_;
 }
 
 void Ctx::discard_recording() {
     if (rec_cb_ != VK_NULL_HANDLE) { vkFreeCommandBuffers(dev_, cmd_pool_, 1, &rec_cb_); rec_cb_ = VK_NULL_HANDLE; }
     if (rec_fence_ != VK_NULL_HANDLE) { vkDestroyFence(dev_, rec_fence_, nullptr); rec_fence_ = VK_NULL_HANDLE; }
+    for (CaptureSeg& sg : cap_segs_) {
+        if (sg.cb != VK_NULL_HANDLE) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &sg.cb);
+        if (sg.fence != VK_NULL_HANDLE) vkDestroyFence(dev_, sg.fence, nullptr);
+    }
+    cap_segs_.clear();
+    cap_bounds_.clear();
     recording_ = false;
     have_recording_ = false;
     recorded_ = 0;
     recorded_copies_ = 0;
 }
 
-void Ctx::submit_owned(VkCommandBuffer cb, VkFence fence) {
+void Ctx::submit_segment(const CaptureSeg& seg) {
+    if (seg.cb == VK_NULL_HANDLE) return;
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
-    VK_CHECK(vkResetFences(dev_, 1, &fence));   // the fence was signalled by the previous submission
-    VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence));
-    VK_CHECK(vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX));
+    si.pCommandBuffers = &seg.cb;
+    VK_CHECK(vkResetFences(dev_, 1, &seg.fence));   // the fence was signalled by the previous submission
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, seg.fence));
+    VK_CHECK(vkWaitForFences(dev_, 1, &seg.fence, VK_TRUE, UINT64_MAX));
 }
 
-void Ctx::destroy_owned(VkCommandBuffer cb, VkFence fence) {
-    if (cb != VK_NULL_HANDLE) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &cb);
-    if (fence != VK_NULL_HANDLE) vkDestroyFence(dev_, fence, nullptr);
+void Ctx::destroy_owned(const CaptureSeg& seg) {
+    if (seg.cb != VK_NULL_HANDLE) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &seg.cb);
+    if (seg.fence != VK_NULL_HANDLE) vkDestroyFence(dev_, seg.fence, nullptr);
+}
+
+void Ctx::release_recording() {
     if (owned_recordings_ > 0) --owned_recordings_;
 }
 

@@ -897,12 +897,24 @@ whether the shipped configuration reaches it.
 ## THE GENUINELY-UNREACHED SET, AND WHY (it is now load-bearing)
 
 **REACHED by the shipped configuration, and therefore HOLES:**
-* `wait_flag_ge` (`verify.cpp:1042`, the post of layer 0) - **THE WINDOW'S NEXT STOP.** A translating spin is
-  forbidden by this port's no-waiting-kernel rule, so the device/host handshake seam (the host-driven split
-  submission `sync.hpp` already carries) is what closes it.  This is the stopping point the run reports.
-* `copy_rows_from_mapped` (`verify.cpp:1071`) - the `dec_batch` CPU-share copy (`STRATA_DEC_BATCH` true by default).
-* `copy_indexed` (`verify.cpp:1311`) - the commit graph's PLE-history copy (a native pack's PLE key is native, so
-  the PLE stage is ready).
+* `wait_flag_ge` (`verify.cpp:1042`, the post of layer 0) - **CLOSED (2026-10-05): CARRIED HOST-SIDE.**  The
+  captured window is CUT into SEGMENTS at each wait (`Ctx::capture_boundary`) and the shim submits the next segment
+  only once the mapped handshake word is raised, polled on the HOST THREAD between split submissions (the shape
+  `sync.hpp` designed); no kernel waits, and an unsatisfied boundary is a loud refusal, never a hang.  Proven by
+  `case_verify_seam_entry` (cut / host-driven advance / replay) on intel, lvp and radeon.
+* **`fetch_blobs` (`verify.cpp:1053`) and `rebase_ptrs` (`:1054`) are ON PATH - the previous "off-path" class was
+  WRONG.**  `sink_.pcie_mode` is `2` under the DEFAULT `--pcie-mode auto` (`generate.cpp:471` default `"auto"`;
+  `:5168`/`:7848` `set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2)`), NOT a function of
+  `pcie_frac` - so `verify.cpp:1050` takes the `if` and the pair is called.  With `pcie_frac 0.00` the CUDA form is
+  an EMPTY no-op (`fetch_blobs(p_ptr2, p_counts+2, ...)` with `*n == 0`).  They are still HOLES: the non-empty form
+  gathers from DEVICE-HELD POINTERS (`expert_source.cpp:2083`), which a shader cannot dereference.
+* `copy_rows_from_mapped` (`verify.cpp:1071`) - **PORTED 2026-10-05** (`elementwise_vk.cpp`, shader
+  `copy_rows_from_mapped.spv`): the `dec_batch` CPU-share copy.  The row moved `refused -> kernel`.
+* `copy_indexed` (`verify.cpp:1311`) - **PORTED 2026-10-05** (`verify_vk.cpp`, shader `copy_indexed.spv`).  Same row
+  move.
+* `copy_from_mapped` (`verify.cpp:678`, the PLE-history snapshot) - the port's wrapper refuses because the SOURCE
+  is not a live MAPPED region; reached on the `--pcie-mode dma` probe once `post(0)` records clean.  UNDIAGNOSED
+  (a device source the port should bind as an arena view, or a mapped region never registered).
 
 **NOT reached, with the deciding condition (still loud refusals, still holes):**
 * `copy_i32_from_mapped_unless`, `copy_or_zero_from_mapped`, `wait_flag_ge_or`, `resident_plan`

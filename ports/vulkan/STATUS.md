@@ -1,5 +1,35 @@
 # Status — what is done, what is verified, what is not
 
+## THE P6 HANDSHAKE SEAM IS CARRIED HOST-SIDE AND GATE-PROVEN; the window's RECORDING passes `wait_flag_ge` and now stops at `fetch_blobs` (2026-10-05, `vega`)
+
+**WHAT IS DONE.**  `wait_flag_ge` (`verify_kernels.cu:496`, a 1-thread SPIN on host-mapped memory) is carried
+HOST-SIDE, not translated: `Ctx::capture_boundary` CUTS the captured window into SEGMENTS at each wait, and the
+shim submits each next segment only once the mapped handshake word has been raised - polled on the HOST THREAD
+between split submissions, driven by the engine's own `cudaStreamQuery`/`cudaStreamSynchronize`.  No kernel waits;
+a boundary that is never satisfied is a LOUD REFUSAL, never a hang.  Two reachable symbols were ported:
+`copy_rows_from_mapped` (`verify.cpp:1071`, shader `copy_rows_from_mapped.spv`) and `copy_indexed` (`:1311`,
+shader `copy_indexed.spv`).
+
+**WHAT IS VERIFIED.**  Gate (vega): `intel_icd == 853 passed, 0 failed, 0 skipped` (was 842); lvp `837/0/5`;
+radeon `842/2/2` (both failures the documented intermittent `bf16_gemv_fp32_mmvf` family).  The new case
+`case_verify_seam_entry` proves, on ALL THREE ICDs: `copy_indexed` == the engine rule (device index selects the
+row; a rival index MOVES; a negative index writes nothing); `copy_rows_from_mapped` == the engine rule (hit rows
+-> 0, the rest from mapped memory; the hit rows MOVE; count 0 copies every row); and THE SEAM - after a launch the
+ops BEFORE a boundary have run and the ops AFTER it have NOT (a sentinel read, so a vacuous arm fails), raising the
+flag + synchronizing runs the rest, and a REPLAY cuts and advances again.  Three registered injections, all
+BITING (results in the commit).
+
+**WHAT IS NOT.**  A TOKEN.  The run's RECORDING now passes the three waits and `copy_rows_from_mapped` but stops at
+`fetch_blobs` (`verify.cpp:1053`) - **ON PATH** under the default `--pcie-mode auto` -> `set_pcie_mode(2)`
+(`generate.cpp:5168/:7848`), which the previous batch mis-classified off-path from `pcie_frac`.  `fetch_blobs`/
+`rebase_ptrs` gather from DEVICE-HELD POINTERS a shader cannot dereference; with `pcie_frac 0.00` the CUDA pair is
+an empty no-op, and carrying that empty case faithfully is the next increment.  On a `--pcie-mode dma` probe the
+stop moves to `copy_from_mapped` (`verify.cpp:678`, the PLE-history snapshot) whose source is not a live mapped
+region - undiagnosed.  **The engine capture is a RECORD here, so the window's GPU body has still not been
+launched; no token.**
+
+# Status — what is done, what is verified, what is not
+
 ## THE P6 VERIFY WINDOW RUNS ELEVEN SYMBOLS DEEP; `wait_flag_ge` IS THE NEXT STOP AND IT IS A HOLE (2026-10-05, `vega`)
 
 **WHAT IS DONE.**  Nine symbols of the window's body were ported in `verify.cpp` call order, as DECODE-equivalent

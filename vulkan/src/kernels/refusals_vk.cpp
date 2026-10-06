@@ -267,17 +267,12 @@ void copy_or_zero_from_mapped(float*, const float*, long long, const uint32_t*, 
                       "NOT reached - the P6 verifier's DEVICE-PLAN arm (verify.cpp:1063, `if (device_plan_)`) OR "
                       "the remote-expert opt (remote_expert_opt.cu:124)");
 }
-void copy_rows_from_mapped(float*, const float*, int64_t, int64_t, const int32_t*, const int32_t*, void*) {
-    refuse_not_ported("copy_rows_from_mapped",
-                      "REACHED BY THE SHIPPED CONFIGURATION - the P6 verifier's `dec_batch` CPU-share copy "
-                      "(verify.cpp:1071; STRATA_DEC_BATCH is true by default) and the device-plan expert source "
-                      "(expert_source.cpp:2131)");
-}
-void copy_indexed(float*, const float*, int64_t, const int32_t*, int64_t, void*) {
-    refuse_not_ported("copy_indexed",
-                      "REACHED BY THE SHIPPED CONFIGURATION - the P6 verifier's COMMIT graph when the PLE stage "
-                      "is ready (verify.cpp:1311), which a native pack's PLE key makes true");
-}
+// `copy_rows_from_mapped` is NOW DEFINED (not refused) in `vulkan/src/kernels/elementwise_vk.cpp`
+// (shader `copy_rows_from_mapped.spv`): the P6 verify window's `dec_batch` CPU-share copy (verify.cpp:1071),
+// reached after the three handshake waits.  Its row was previously `refused`; the body is a real one, so the row
+// moves `refused -> kernel` in PORT-MAP.tsv.
+// `copy_indexed` is NOW DEFINED in `vulkan/src/kernels/verify_vk.cpp` (shader `copy_indexed.spv`): the commit
+// graph's PLE-history copy (verify.cpp:1311/:1867), reached whenever the PLE stage is ready.  Same row move.
 void fetch_blobs(const unsigned long long*, const int32_t*, uint8_t*, int64_t, int, void*) {
     refuse_not_ported("fetch_blobs",
                       "NOT reached - the P6 verifier's PCIe staging (verify.cpp:1053, `if (sink_.pcie_mode == 2)`); "
@@ -342,13 +337,11 @@ void resident_plan(const int32_t*, int, int, const int32_t*, int, const uint8_t*
                       "`all_resident_` needs EVERY expert of ALL 48 layers resident against a few-thousand-slot "
                       "`--expert-cache`, and `device_plan_` needs STRATA_VERIFY_DEVICE_PLAN");
 }
-void wait_flag_ge(const uint32_t*, uint32_t, void*) {
-    refuse_not_ported("wait_flag_ge",
-                      "REACHED BY THE SHIPPED CONFIGURATION - the P6 verify window's post of LAYER 0 "
-                      "(verify.cpp:1042, the `else` of `if (all_resident_)`), i.e. the window's NEXT STOP.  A "
-                      "translating spin is forbidden by this port's no-waiting-kernel rule, so this is a HOLE "
-                      "and the handshake seam (host-driven split submission) is what closes it");
-}
+// `wait_flag_ge` is NOW DEFINED (the handshake seam) in `vulkan/src/kernels/verify_vk.cpp`: under capture it
+// records a HOST BOUNDARY that CUTS the window into segments, and the segment that follows is submitted only once
+// the engine's host loop has raised the flag - polled on the HOST thread between the split submissions, never a
+// spinning kernel.  The refusal that used to sit here was correct while the seam was missing; it is now false of
+// the code (the symbol is a real body), so the row moves `refused -> kernel` in PORT-MAP.tsv.
 void wait_flag_ge_or(const uint32_t*, uint32_t, const uint32_t*, void*) {
     refuse_not_ported("wait_flag_ge_or",
                       "NOT reached - the P6 verifier's DEVICE-PLAN arms (verify.cpp:1039/:1048/:1062, "

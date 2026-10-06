@@ -28,9 +28,9 @@ build_rope_table	host	the engine builds the table; rope_neox is the kernel that 
 copy_from_mapped	kernel	copy
 copy_i32_from_mapped	host	a mapped-buffer copy
 copy_i32_from_mapped_unless	refused	a mapped-buffer copy
-copy_indexed	refused	a device-indexed copy
+copy_indexed	kernel	copy_indexed
 copy_or_zero_from_mapped	refused	a mapped-buffer copy
-copy_rows_from_mapped	refused	a mapped-buffer copy
+copy_rows_from_mapped	kernel	copy_rows_from_mapped
 coupled_draft_sample	refused	coupled_penalize coupled_sample
 coupled_draft_scratch_bytes	refused	a size
 coupled_draft_stage	refused	the coupled round's mapped staging (a copy; the coupled kernels read it)
@@ -181,6 +181,6 @@ shared_expert_native_bf16_enabled	host	a capability check
 shared_expert_scratch_bytes	host	a size
 silu_inplace	kernel	silu_f32
 topk_512_step	refused	no shader in this tree yet; ANSWERED BY A LOUD REFUSAL (refusals_vk.cpp): --no-fast-select reaches it
-wait_flag_ge	refused	no shader in this tree yet
+wait_flag_ge	host	the handshake seam - a HOST boundary, no shader (vulkan/src/kernels/verify_vk.cpp)
 wait_flag_ge_or	refused	no shader in this tree yet
 window_ids	refused	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)

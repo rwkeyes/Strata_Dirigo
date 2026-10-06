@@ -23090,6 +23090,204 @@ void case_fused_gr_check_entry(Ctx& ctx, const std::string& dir) {
 // as properties, not as outputs: `gdn_conv_l2_multi` must NOT write the caller's history, and
 // `gdn_step_norm_multi`'s verify half must leave the state untouched.
 // ============================================================================================================
+// ================================================================================================================
+// THE P6 VERIFY HANDSHAKE SEAM + the two symbols the seam's advance reaches (2026-10-05).
+// ================================================================================================================
+// `wait_flag_ge` (verify_kernels.cu:496) is a 1-thread SPIN on host-mapped memory on CUDA; this backend forbids a
+// spinning kernel, so the wrapper records a HOST BOUNDARY that CUTS the recording into segments, and the segment
+// after a boundary is submitted only once the host has raised the flag.  This case proves the three properties
+// that carry the seam, each with a rival that must MOVE and a sentinel that makes a vacuous arm fail:
+//   (1) THE CUT: after the launch returns, the ops BEFORE the boundary have run and the ops AFTER it have NOT.
+//   (2) THE ADVANCE: raising the flag and calling cudaStreamSynchronize runs the remaining segments.
+//   (3) REPLAY: the same exec re-runs (record once, replay many) and cuts again.
+// And the two new symbols the advance reaches: `copy_indexed` (a DEVICE-selected row copy, verify.cpp:1311) and
+// `copy_rows_from_mapped` (the dec_batch CPU-share copy, verify.cpp:1071), each against the engine's own rule.
+void case_verify_seam_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "copy.spv")) return;
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(16ull << 20, dir); }
+    if (s == nullptr) { verdict("verify seam: engine stream", false, 1, 1, 0, "no stream"); return; }
+    strata::vulkan::cuda_compat_set_stream(s);
+    const cudaStream_t cs = reinterpret_cast<cudaStream_t>(s);
+    const float DEAD = 1.0e30f;
+
+    // ---------------- (A) copy_indexed: a DEVICE index selects the row ----------------
+    if (have(dir, "copy_indexed.spv")) {
+        const int STRIDE = 64, ROWS = 8;               // ROWS = kVerifyMaxT (the wrapper's declared view bound)
+        float* src = strata::vulkan::arena_alloc<float>(*s, (size_t) STRIDE * ROWS);
+        float* dst = strata::vulkan::arena_alloc<float>(*s, (size_t) STRIDE);
+        int32_t* idx = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        std::vector<float> sv((size_t) STRIDE * ROWS);
+        for (int r = 0; r < ROWS; ++r)
+            for (int i = 0; i < STRIDE; ++i) sv[(size_t) r * STRIDE + i] = (float) (r + 1) * 0.25f + rndf(0.1f);
+        std::vector<float> dead((size_t) STRIDE, DEAD);
+        strata::vulkan::stream_write(*s, src, sv.data(), sv.size() * 4);
+        const int32_t r3 = 3, r5 = 5, rneg = -1;
+        strata::vulkan::stream_write(*s, idx, &r3, 4);
+        strata::vulkan::stream_write(*s, dst, dead.data(), dead.size() * 4);
+        strata::kernels::copy_indexed(dst, src, STRIDE, idx, STRIDE, (void*) cs);
+        std::vector<float> got((size_t) STRIDE, DEAD);
+        strata::vulkan::stream_read(*s, dst, got.data(), got.size() * 4);
+        int bad = 0;
+        for (int i = 0; i < STRIDE; ++i) if (got[i] != sv[(size_t) 3 * STRIDE + i]) ++bad;
+        verdict("copy_indexed entry: device index 3 selects row 3 (engine rule)", bad == 0, bad, STRIDE, 0, "elements differ");
+        strata::vulkan::stream_write(*s, idx, &r5, 4);
+        strata::vulkan::stream_write(*s, dst, dead.data(), dead.size() * 4);
+        strata::kernels::copy_indexed(dst, src, STRIDE, idx, STRIDE, (void*) cs);
+        std::vector<float> got5((size_t) STRIDE, DEAD);
+        strata::vulkan::stream_read(*s, dst, got5.data(), got5.size() * 4);
+        int moved = 0, bad5 = 0;
+        for (int i = 0; i < STRIDE; ++i) {
+            if (got5[i] != sv[(size_t) 5 * STRIDE + i]) ++bad5;
+            if (got5[i] != got[i]) ++moved;
+        }
+        verdict("copy_indexed entry: index 5 selects row 5 (a different row MOVES the result)",
+                bad5 == 0 && moved == STRIDE, bad5, STRIDE, moved, "index not honoured");
+        strata::vulkan::stream_write(*s, idx, &rneg, 4);
+        strata::vulkan::stream_write(*s, dst, dead.data(), dead.size() * 4);
+        strata::kernels::copy_indexed(dst, src, STRIDE, idx, STRIDE, (void*) cs);
+        std::vector<float> gotn((size_t) STRIDE, DEAD);
+        strata::vulkan::stream_read(*s, dst, gotn.data(), gotn.size() * 4);
+        int wrote = 0;
+        for (int i = 0; i < STRIDE; ++i) if (gotn[i] != DEAD) ++wrote;
+        verdict("copy_indexed entry: a negative index writes NOTHING (the CUDA's early return)", wrote == 0, wrote,
+                STRIDE, 0, "elements written");
+    }
+
+    // ---------------- (B) copy_rows_from_mapped: hit rows zeroed, the rest from MAPPED memory ----------------
+    if (have(dir, "copy_rows_from_mapped.spv")) {
+        const int W = 64, R = 8;
+        float* mdst = strata::vulkan::arena_alloc<float>(*s, (size_t) W * R);
+        int32_t* hits = strata::vulkan::arena_alloc<int32_t>(*s, R);
+        int32_t* cnt = strata::vulkan::arena_alloc<int32_t>(*s, 1);
+        float* hsrc = nullptr;
+        if (cudaHostAlloc((void**) &hsrc, (size_t) W * R * 4, cudaHostAllocMapped) != cudaSuccess) {
+            skip("copy_rows_from_mapped entry: the mapped source", "cudaHostAlloc failed");
+        } else {
+            float* dsrc = nullptr;
+            if (cudaHostGetDevicePointer((void**) &dsrc, hsrc, 0) != cudaSuccess) dsrc = hsrc;
+            std::vector<float> sv((size_t) W * R);
+            for (int r = 0; r < R; ++r)
+                for (int i = 0; i < W; ++i) sv[(size_t) r * W + i] = (float) (r + 1) * 0.5f + rndf(0.1f);
+            std::memcpy(hsrc, sv.data(), sv.size() * 4);      // the publish
+            const int32_t h2[2] = {1, 4}, n2 = 2, n0 = 0;
+            strata::vulkan::stream_write(*s, hits, h2, sizeof h2);
+            strata::vulkan::stream_write(*s, cnt, &n2, 4);
+            std::vector<float> dead((size_t) W * R, DEAD);
+            strata::vulkan::stream_write(*s, mdst, dead.data(), dead.size() * 4);
+            strata::kernels::copy_rows_from_mapped(mdst, dsrc, R, W, hits, cnt, (void*) cs);
+            std::vector<float> got((size_t) W * R, DEAD);
+            strata::vulkan::stream_read(*s, mdst, got.data(), got.size() * 4);
+            int bad = 0, moved = 0;
+            for (int r = 0; r < R; ++r)
+                for (int i = 0; i < W; ++i) {
+                    const size_t o = (size_t) r * W + i;
+                    const bool hit = (r == 1 || r == 4);
+                    if (got[o] != (hit ? 0.0f : sv[o])) ++bad;
+                    if (got[o] != sv[o]) ++moved;              // the hit rows DIFFER from the source
+                }
+            verdict("copy_rows_from_mapped entry: hit rows -> 0, the rest from the mapped source (engine rule)",
+                    bad == 0, bad, W * R, 0, "elements differ");
+            verdict("copy_rows_from_mapped entry: the hit rows MOVE (a rival that zeroes nothing would fail)",
+                    moved == 2 * W, 2 * W - moved, W * R, moved, "hit rows did not move");
+            strata::vulkan::stream_write(*s, cnt, &n0, 4);
+            strata::vulkan::stream_write(*s, mdst, dead.data(), dead.size() * 4);
+            strata::kernels::copy_rows_from_mapped(mdst, dsrc, R, W, hits, cnt, (void*) cs);
+            std::vector<float> got0((size_t) W * R, DEAD);
+            strata::vulkan::stream_read(*s, mdst, got0.data(), got0.size() * 4);
+            int bad0 = 0;
+            for (size_t i = 0; i < got0.size(); ++i) if (got0[i] != sv[i]) ++bad0;
+            verdict("copy_rows_from_mapped entry: count 0 copies EVERY row (the device count is honoured)",
+                    bad0 == 0, bad0, W * R, 0, "elements differ");
+        }
+    }
+
+    // ---------------- (C) THE SEAM: the recording is CUT, then ADVANCED by the flag ----------------
+    {
+        const int N = 4096;
+        float* a = strata::vulkan::arena_alloc<float>(*s, (size_t) N);
+        float* b = strata::vulkan::arena_alloc<float>(*s, (size_t) N);
+        float* hflag = nullptr;
+        float* hsrc = nullptr;
+        if (cudaHostAlloc((void**) &hflag, 4, cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &hsrc, (size_t) N * 4, cudaHostAllocMapped) != cudaSuccess) {
+            skip("verify seam: the handshake flag / payload", "cudaHostAlloc failed");
+        } else {
+            uint32_t* dflag = nullptr;
+            if (cudaHostGetDevicePointer((void**) &dflag, hflag, 0) != cudaSuccess) dflag = (uint32_t*) hflag;
+            float* dsrc = nullptr;
+            if (cudaHostGetDevicePointer((void**) &dsrc, hsrc, 0) != cudaSuccess) dsrc = hsrc;
+            std::vector<float> M((size_t) N), dead((size_t) N, DEAD);
+            for (int i = 0; i < N; ++i) M[(size_t) i] = rndf(2.0f) + 3.0f;
+            std::memcpy(hsrc, M.data(), (size_t) N * 4);
+            auto readD = [&](float* d, std::vector<float>& v) {
+                v.assign((size_t) N, DEAD);
+                strata::vulkan::stream_read(*s, d, v.data(), v.size() * 4);
+            };
+            auto mism = [&](const std::vector<float>& v, const std::vector<float>& w) {
+                int d = 0;
+                for (int i = 0; i < N; ++i) if (v[i] != w[i]) ++d;
+                return d;
+            };
+            auto deadN = [&](const std::vector<float>& v) {
+                int c = 0;
+                for (int i = 0; i < N; ++i) if (v[i] == DEAD) ++c;
+                return c;
+            };
+
+            cudaGraph_t g = nullptr; cudaGraphExec_t ex = nullptr; bool cap = false;
+            *hflag = 0;
+            strata::vulkan::stream_write(*s, a, dead.data(), dead.size() * 4);
+            strata::vulkan::stream_write(*s, b, dead.data(), dead.size() * 4);
+            if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                strata::kernels::copy_from_mapped(a, dsrc, N, (void*) cs);     // SEGMENT 0
+                strata::kernels::wait_flag_ge(dflag, 1, (void*) cs);           // THE BOUNDARY (a cut, not a kernel)
+                strata::kernels::copy_from_mapped(b, dsrc, N, (void*) cs);     // SEGMENT 1
+                cap = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != nullptr;
+            }
+            if (!cap) {
+                verdict("verify seam: the window records with a host boundary", false, 1, 1, 0, "capture refused");
+            } else {
+                cudaGraphInstantiate(&ex, g, 0);
+                cudaGraphDestroy(g);
+                cudaGraphLaunch(ex, cs);
+                std::vector<float> va, vb;
+                readD(a, va); readD(b, vb);
+                verdict("verify seam: the ops BEFORE the boundary ran at launch (segment 0)", mism(va, M) == 0,
+                        mism(va, M), N, 0, "elements differ");
+                verdict("verify seam: the ops AFTER the boundary did NOT run (the recording is CUT)",
+                        deadN(vb) == N, N - deadN(vb), N, deadN(vb), "segment 1 ran before the host raised the flag");
+                *hflag = 1;
+                cudaStreamSynchronize(cs);
+                std::vector<float> vb2;
+                readD(b, vb2);
+                verdict("verify seam: raising the flag and synchronizing runs the REST (the host-side advance)",
+                        mism(vb2, M) == 0, mism(vb2, M), N, 0, "segment 1 did not run after the flag");
+                // (C3) REPLAY: reset, re-launch the same exec, the cut happens again
+                *hflag = 0;
+                strata::vulkan::stream_write(*s, a, dead.data(), dead.size() * 4);
+                strata::vulkan::stream_write(*s, b, dead.data(), dead.size() * 4);
+                cudaGraphLaunch(ex, cs);
+                std::vector<float> ra, rb;
+                readD(a, ra); readD(b, rb);
+                const bool cut_ok = (mism(ra, M) == 0) && (deadN(rb) == N);
+                verdict("verify seam: a REPLAY re-runs and cuts again (record once, replay many)", cut_ok,
+                        cut_ok ? 0 : 1, 1, 0, "replay did not cut");
+                *hflag = 1;
+                cudaStreamSynchronize(cs);
+                std::vector<float> rb2;
+                readD(b, rb2);
+                verdict("verify seam: the replay advances too", mism(rb2, M) == 0, mism(rb2, M), N, 0,
+                        "replay did not advance");
+                cudaGraphExecDestroy(ex);
+            }
+        }
+    }
+
+    strata::vulkan::cuda_compat_set_stream(nullptr);
+    strata::vulkan::stream_close(s);
+}
+
 void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     for (const char* spv : {"bcast_streams.spv", "gdn_conv_tail.spv", "gdn_step_norm_multi.spv"})
         if (!have(dir, spv)) return;
@@ -24181,6 +24379,7 @@ int main(int argc, char** argv) {
     // THIS BATCH: THE P6 VERIFY WINDOW'S KERNELS - the nine symbols the window reaches after the fused
     // read (`broadcast_streams` is the FIRST, at verify.cpp:592).  Every multi is held BITWISE to the
     // already-gated single-token kernel it is a loop over.
+    case_verify_seam_entry(ctx, dir);                // the P6 handshake seam (host boundary) + copy_indexed + copy_rows_from_mapped
     case_verify_window_entry(ctx, dir);
     std::printf("== %d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     // FAIL CLOSED.  A suite that skipped everything (missing SPIR-V, a device without the features the shaders

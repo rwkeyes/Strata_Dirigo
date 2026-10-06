@@ -353,6 +353,69 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
         native_router_top10(logits + (size_t) t * 512, ids + (size_t) t * 10, weights + (size_t) t * 10, stream);
 }
 
+// ---- `wait_flag_ge` -> THE HANDSHAKE SEAM (deliverable A): a HOST boundary, never a spin ---------------------
+// verify_kernels.hpp / verify_kernels.cu:496: the CUDA is `while (*flag < value) strata_spin_pause();` - a
+// ONE-THREAD SPIN on host-mapped memory that the engine's `post` issues between the pool's plan/answer writes and
+// the GPU ops that consume them (verify.cpp:1042/:1049/:1066).  This backend forbids a spinning kernel (a Vulkan
+// spin cannot be preempted inside the 640 ms Battlemage GuC budget), and the flag is HOST memory the engine's own
+// host loop (`Verifier::run`) raises AFTER the graph launch, so the wait is carried HOST-SIDE:
+//
+//   * WHAT THE FLAG IS: a u32 handshake word (`m_flagA_`/:1042, `m_flagB_`/:1049, `m_flag_`/:1066 - the mapped
+//     twins of `h_flagA_`/`h_flagB_`/`h_flag_`), read by the GPU and written by the HOST at `verify.cpp:1506`
+//     (`*h_flagA_ = want`), `raise_flag(h_flagB_, want)` and `*flag = want`, where `want = (l-lb_)*G+grp+1`.  The
+//     host's writes do not happen until well after the launch: the device cannot wait for them.
+//   * THE CARRY: under capture (the only way the window is recorded) this records a HOST BOUNDARY - the recording
+//     is CUT here, and the driver submits the next segment only once `*flag >= value`, polling on the HOST thread
+//     between SPLIT SUBMISSIONS.  The engine's own `cudaStreamQuery(cs_)` inside its `while (*seq < want)` spin
+//     loop, and its closing `cudaStreamSynchronize(cs_)`, are what drive the segments out (the shim's launch is
+//     asynchronous for a graph that recorded a boundary; a boundary-less step is unchanged).
+//   * OUTSIDE capture it is the boundary's enforcement (as `doorbell_wait` is): the host must have answered
+//     BEFORE the consumer is submitted.  An un-answered handoff is a LOUD REFUSAL, never a hang.
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    if (flag == nullptr) return;
+    strata::vulkan::Stream& s = strata::vulkan::need_stream("wait_flag_ge", stream);
+    if (s.ctx != nullptr && s.ctx->capturing()) {
+        s.ctx->capture_boundary(flag, value);
+        return;
+    }
+    const uint32_t cur = *(const volatile uint32_t*) flag;   // mapped, coherent host memory: a plain read
+    if (cur < value) {
+        std::fprintf(stderr,
+                     "strata::kernels::wait_flag_ge: the host has not answered (flag %u < %u).  This backend never "
+                     "asks the device to wait: the host writes the answer, THEN the consumer is submitted.  "
+                     "Refusing rather than submitting a waiting kernel\n",
+                     cur, value);
+        std::exit(2);
+    }
+}
+
+// ---- `copy_indexed` -> copy_indexed.comp (verify_kernels.cu:263) ------------------------------------------
+// verify_kernels.hpp: `void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index,
+//     int64_t n, void* stream);`  (verify.cpp:1311, the commit graph's PLE-history copy; also :1867).
+//     The CUDA: `const int idx = *index; if (idx < 0) return; dst[i] = src[idx*stride + i]` for i in [0, n).
+// `index` is DEVICE int32 (the engine's committed count, `commit_ + 1`), so the row it selects cannot be a
+// descriptor offset resolved on the host: the whole source row table is bound and `idx*stride` is computed IN
+// the shader.  The source is ARENA memory (`hist_snap_`), and the view covers the engine's own window maximum
+// (`kVerifyMaxT` rows), so the shader can never index past a bound that was declared.
+void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if (dst == nullptr || src == nullptr || index == nullptr || stride <= 0) {
+        std::fprintf(stderr, "strata::vulkan::copy_indexed: a null argument or a non-positive stride - refusing\n");
+        std::exit(2);
+    }
+    strata::vulkan::Stream& s = strata::vulkan::need_stream("copy_indexed", stream);
+    strata::vulkan::Buf dv{}, sv{}, iv{};
+    if (!arena_resolve(s, dst, (uint64_t) n * 4, dv) ||
+        !arena_resolve(s, src, (uint64_t) stride * (uint64_t) kVerifyMaxT * 4, sv) ||
+        !arena_resolve(s, index, 4, iv))
+        strata::vulkan::refuse("copy_indexed",
+                               "a pointer is not inside this stream's arena, or the source row table does not "
+                               "cover the window maximum (kVerifyMaxT rows)");
+    struct { int32_t n, stride; } pc{(int32_t) n, (int32_t) stride};
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/copy_indexed.spv", 3, sizeof(pc));
+    s.ctx->dispatch(p, {&dv, &sv, &iv}, &pc, sizeof(pc), strata::vulkan::groups_for((uint64_t) n));
+}
+
 // ---- `native_moe_combine_multi` -> a LOOP over the gated `native_moe_combine` ------------------------------
 // native_moe.hpp: `void native_moe_combine_multi(const float* parts, const float* weights, const float* shared,
 //     float* output, int64_t n_embd, int64_t k, int n_tok, void* stream);`  (verify.cpp:1083 - the window's

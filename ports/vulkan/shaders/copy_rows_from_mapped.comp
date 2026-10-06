@@ -1,0 +1,38 @@
+#version 450
+// ports/vulkan/shaders/copy_rows_from_mapped.comp - the CUDA `copy_rows_from_mapped_kernel`
+// (src/kernels/cuda/elementwise.cu:235):
+//
+//   const int row = blockIdx.x;
+//   hit = any(hit_rows[i] == row for i < *count);           // the GPU's OWN rows: already in hit_out
+//   dst_row = hit ? make_float4(0,0,0,0) : src_row;         // the rest come from MAPPED host memory
+//
+// One workgroup per row (`gl_WorkGroupID.x`), the row copy in float4-sized steps - a plain 4-float load/store, so
+// the bytes are identical to the CUDA's float4 copies.  `src` is the MAPPED region's device-visible buffer (a
+// shader cannot dereference host memory); the engine's host loop writes it before the segment that reads it is
+// submitted (the handshake).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Dst { float v[]; } dst;
+layout(set = 0, binding = 1, std430) readonly buffer Src { float v[]; } src;
+layout(set = 0, binding = 2, std430) readonly buffer Hits { int v[]; } hits;
+layout(set = 0, binding = 3, std430) readonly buffer Cnt { int v[]; } cnt;
+layout(push_constant, std430) uniform PC { int rows; int width; int row4; } pc;
+
+void main() {
+    const int row = int(gl_WorkGroupID.x);
+    if (row >= pc.rows) return;
+    const int c = cnt.v[0];
+    bool hit = false;
+    for (int i = 0; i < c; ++i)
+        if (hits.v[i] == row) { hit = true; break; }
+    const int base = row * pc.width;
+    for (uint i = gl_LocalInvocationID.x; i < uint(pc.row4); i += gl_WorkGroupSize.x) {
+        const int o = base + int(i) * 4;
+        if (hit) { dst.v[o] = 0.0; dst.v[o + 1] = 0.0; dst.v[o + 2] = 0.0; dst.v[o + 3] = 0.0; }
+        else {
+            dst.v[o] = src.v[o];
+            dst.v[o + 1] = src.v[o + 1];
+            dst.v[o + 2] = src.v[o + 2];
+            dst.v[o + 3] = src.v[o + 3];
+        }
+    }
+}

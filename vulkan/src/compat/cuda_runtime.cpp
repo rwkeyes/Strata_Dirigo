@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -163,8 +164,8 @@ struct cudaGraphNode_st {
 };
 
 struct cudaGraph_st {
-    VkCommandBuffer cb = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
+    std::vector<strata::vulkan::CaptureSeg> segs;
+    std::vector<strata::vulkan::CaptureBoundary> bounds;
     strata::vulkan::Ctx* owner = nullptr;
     uint32_t dispatches = 0;
     uint32_t copies = 0;
@@ -173,8 +174,8 @@ struct cudaGraph_st {
 };
 
 struct cudaGraphExec_st {
-    VkCommandBuffer cb = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
+    std::vector<strata::vulkan::CaptureSeg> segs;
+    std::vector<strata::vulkan::CaptureBoundary> bounds;
     strata::vulkan::Ctx* owner = nullptr;
     uint32_t dispatches = 0;
     uint32_t copies = 0;
@@ -182,20 +183,74 @@ struct cudaGraphExec_st {
 
 namespace {
 
+// ---- THE SEGMENTED-LAUNCH DRIVER (the P6 verify handshake seam) --------------------------------------------
+// One queue, so at most one segmented launch is in flight at a time.  `next` is the index of the next segment to
+// submit; bounds[j] is the host boundary BETWEEN segs[j] and segs[j+1], so submitting segs[next] (next >= 1)
+// requires `*(volatile uint32_t*)bounds[next-1].flag >= bounds[next-1].value`.  The poll is a plain HOST read of
+// a mapped, coherent word - the engine writes it from its own host loop (Verifier::run) - and it happens on the
+// host thread between the split submissions, driven by the engine's cudaStreamQuery/cudaStreamSynchronize calls.
+// NO KERNEL WAITS: the device is never inside a queue item across a boundary.
+struct Inflight {
+    cudaGraphExec_st* exec = nullptr;
+    size_t next = 0;
+    bool active = false;
+};
+Inflight& inflight() {
+    static Inflight f;
+    return f;
+}
+
+void advance_inflight() {
+    Inflight& f = inflight();
+    if (!f.active || f.exec == nullptr) return;
+    while (f.next < f.exec->segs.size()) {
+        const strata::vulkan::CaptureBoundary& b = f.exec->bounds[f.next - 1];
+        const uint32_t cur = (b.flag != nullptr) ? *(const volatile uint32_t*) b.flag : UINT32_MAX;
+        if (cur < b.value) return;                       // the host has not served: leave the rest pending
+        f.exec->owner->submit_segment(f.exec->segs[f.next]);
+        ++f.next;
+    }
+}
+
+// Drain an in-flight launch, bounded.  `where` names the caller for the refusal.  The engine raises every flag
+// before it synchronizes, so a boundary that is STILL unsatisfied here means the host loop never served it: that
+// is a LOUD REFUSAL (exit 2), never a hang - a hung compute kernel on the display card is the exact failure this
+// design exists to remove (PORT-PLAN 2.3).
+void drain_inflight(const char* where) {
+    Inflight& f = inflight();
+    if (!f.active) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        advance_inflight();
+        if (f.next >= f.exec->segs.size()) { f.active = false; f.exec = nullptr; f.next = 0; return; }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+                            .count();
+        if (ms > 10000) {
+            const strata::vulkan::CaptureBoundary& b = f.exec->bounds[f.next - 1];
+            std::fprintf(stderr,
+                         "%s: a verify-window handshake boundary was never satisfied (want flag at %p >= %u) - "
+                         "REFUSING rather than leaving a submitted step waiting on the host\n",
+                         where, b.flag, b.value);
+            std::exit(2);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 // The portable `cudaGraphInstantiate` body, shared by the two signatures.
 cudaError_t instantiate_impl(cudaGraphExec_t* exec, cudaGraph_t graph) {
     if (exec == nullptr) return fail(cudaErrorInvalidValue);
     *exec = nullptr;
-    if (graph == nullptr || graph->cb == VK_NULL_HANDLE || graph->taken)
+    if (graph == nullptr || graph->segs.empty() || graph->taken)
         return fail(cudaErrorInvalidValue);
     cudaGraphExec_st* e = new cudaGraphExec_st();
-    e->cb = graph->cb;
-    e->fence = graph->fence;
+    e->segs = std::move(graph->segs);
+    e->bounds = std::move(graph->bounds);
     e->owner = graph->owner;
     e->dispatches = graph->dispatches;
     e->copies = graph->copies;
-    graph->cb = VK_NULL_HANDLE;
-    graph->fence = VK_NULL_HANDLE;
+    graph->segs.clear();
+    graph->bounds.clear();
     graph->taken = true;
     *exec = e;
     g_last = cudaSuccess;
@@ -352,13 +407,19 @@ cudaError_t cudaMemsetAsync(void* devPtr, int value, size_t count, cudaStream_t 
 // ---- the fence ---------------------------------------------------------------------------------------------
 cudaError_t cudaDeviceSynchronize(void) {
     // Every Ctx::dispatch submits with a fence and WAITS it, so nothing is in flight here: a real barrier,
-    // vacuously satisfied (see the header).  It is NOT a wait for asynchronous work, because there is none.
+    // vacuously satisfied (see the header).  It is NOT a wait for asynchronous work, because there is none -
+    // EXCEPT a segmented verify-window launch, whose remaining segments must be driven out first.
+    if (inflight().active) drain_inflight("cudaDeviceSynchronize");
     g_last = cudaSuccess;
     return cudaSuccess;
 }
 
 cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     if (stream != nullptr) g_current = reinterpret_cast<Stream*>(stream);
+    // A segmented verify-window launch in flight is drained here: the engine calls this AFTER its host loop has
+    // raised every handshake flag, so the remaining boundaries are satisfied and the segments submit back to back.
+    // A boundary that is nevertheless unsatisfied is a LOUD REFUSAL inside `drain_inflight` - never a hang.
+    if (inflight().active) drain_inflight("cudaStreamSynchronize");
     g_last = cudaSuccess;
     return cudaSuccess;
 }
@@ -599,6 +660,22 @@ cudaError_t cudaStreamQuery(cudaStream_t stream) {
         if (s == nullptr) return fail(cudaErrorInvalidValue);
         g_current = s;
     }
+    // A segmented verify-window launch in flight is ADVANCED here, on the host thread: every segment whose leading
+    // handshake boundary is satisfied is submitted (and its fence waited).  `cudaErrorNotReady` while boundaries
+    // remain unsatisfied or segments remain pending; `cudaSuccess` once the whole recording has run - exactly what
+    // the engine's own `while (*seq < want) { ...; cudaStreamQuery(cs_); ... }` loop needs.
+    if (inflight().active) {
+        advance_inflight();
+        if (inflight().next >= inflight().exec->segs.size()) {
+            inflight().active = false;
+            inflight().exec = nullptr;
+            inflight().next = 0;
+            g_last = cudaSuccess;
+            return cudaSuccess;
+        }
+        g_last = cudaErrorNotReady;
+        return cudaErrorNotReady;
+    }
     g_last = cudaSuccess;      // every submit already fenced and waited: work is complete
     return cudaSuccess;
 }
@@ -627,8 +704,16 @@ cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* graph) {
         return fail(cudaErrorStreamCaptureUnsupported);
     }
     cudaGraph_st* g = new cudaGraph_st();
-    s->ctx->take_recording(g->cb, g->fence, g->dispatches, g->copies);
+    s->ctx->take_recording(g->segs, g->bounds);
+    if (g->segs.empty()) {
+        delete g;
+        return fail(cudaErrorStreamCaptureUnsupported);
+    }
     g->owner = s->ctx;
+    for (const strata::vulkan::CaptureSeg& sg : g->segs) {
+        g->dispatches += sg.dispatches;
+        g->copies += sg.copies;
+    }
     *graph = g;
     g_last = cudaSuccess;
     return cudaSuccess;
@@ -642,15 +727,36 @@ cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
     g_current = s;
     if (exec->owner == nullptr) return fail(cudaErrorInvalidValue);
     if (exec->owner->capturing()) return fail(cudaErrorStreamCaptureUnsupported);   // a launch inside a capture
-    exec->owner->submit_owned(exec->cb, exec->fence);   // the port's own submit + fence, the same path a replay uses
+    // ONE segmented launch at a time (one queue): drain any earlier one before starting this.
+    if (inflight().active) {
+        if (inflight().exec == exec) return fail(cudaErrorInvalidValue);   // re-launch while in flight
+        drain_inflight("cudaGraphLaunch");
+    }
+    if (exec->bounds.empty()) {
+        // THE PLAIN STEP: submit every segment back to back (normally exactly one) and wait.  A boundary-less
+        // capture is the engine's per-layer decode step, whose split the ENGINE already provides.
+        for (const strata::vulkan::CaptureSeg& sg : exec->segs) exec->owner->submit_segment(sg);
+        g_last = cudaSuccess;
+        return cudaSuccess;
+    }
+    // THE VERIFY WINDOW: submit the FIRST segment (so the window starts and rings its sequence word) and leave the
+    // rest to the host-driven poll.  A call that returns here has NOT run the whole window - the engine's own host
+    // loop raises the flags, and its cudaStreamQuery/cudaStreamSynchronize calls advance the segments between them.
+    exec->owner->submit_segment(exec->segs[0]);
+    Inflight& f = inflight();
+    f.exec = exec;
+    f.next = 1;
+    f.active = true;
     g_last = cudaSuccess;
     return cudaSuccess;
 }
 
 cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
     if (graph == nullptr) return fail(cudaErrorInvalidValue);
-    if (!graph->taken && graph->cb != VK_NULL_HANDLE && graph->owner != nullptr)
-        graph->owner->destroy_owned(graph->cb, graph->fence);
+    if (!graph->taken && !graph->segs.empty() && graph->owner != nullptr) {
+        for (const strata::vulkan::CaptureSeg& sg : graph->segs) graph->owner->destroy_owned(sg);
+        graph->owner->release_recording();
+    }
     delete graph;
     g_last = cudaSuccess;
     return cudaSuccess;
@@ -658,8 +764,13 @@ cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
 
 cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
     if (exec == nullptr) return fail(cudaErrorInvalidValue);
-    if (exec->cb != VK_NULL_HANDLE && exec->owner != nullptr)
-        exec->owner->destroy_owned(exec->cb, exec->fence);
+    if (exec->owner != nullptr) {
+        // Never leave a destroyed launch in flight: this is the destructor path, and a still-advancing graph would
+        // otherwise name freed command buffers.
+        if (inflight().active && inflight().exec == exec) { inflight().active = false; inflight().exec = nullptr; inflight().next = 0; }
+        for (const strata::vulkan::CaptureSeg& sg : exec->segs) exec->owner->destroy_owned(sg);
+        exec->owner->release_recording();
+    }
     delete exec;
     g_last = cudaSuccess;
     return cudaSuccess;

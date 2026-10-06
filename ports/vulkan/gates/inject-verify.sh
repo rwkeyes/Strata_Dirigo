@@ -697,6 +697,28 @@ case "$name" in
     old=$'    g_hc_variant[0].store(kHcPlain);'
     new=$'    g_hc_variant[0].store(kHcStaged);   // INJECTION: record a fused variant the backend does not run'
     want="FAIL  fused_gr_check: the check records the plain read" ;;
+  copy-indexed-ignore-index)
+    # `copy_indexed` selects the source ROW from DEVICE memory (`idx = *index`, then `src[idx*stride + i]`).
+    # Reading the row at the POSITION (src[i]) is the rival the case's two-index arm pins.
+    file="$SH/copy_indexed.comp"; spv="copy_indexed"
+    old=$'    dst.v[i] = src.v[row * pc.stride + int(i)];'
+    new=$'    dst.v[i] = src.v[int(i)];   // INJECTION: the device index ignored'
+    want="FAIL  copy_indexed entry: device index 3 selects row 3" ;;
+  copy-rows-never-zero)
+    # `copy_rows_from_mapped` must ZERO the GPU's own rows and copy the rest from the mapped source.  Never
+    # zeroing leaves the GPU's rows to be added twice by the later `moe_hit_add` - the `moved` arm pins it.
+    file="$SH/copy_rows_from_mapped.comp"; spv="copy_rows_from_mapped"
+    old=$'        if (hit) { dst.v[o] = 0.0; dst.v[o + 1] = 0.0; dst.v[o + 2] = 0.0; dst.v[o + 3] = 0.0; }'
+    new=$'        if (false) { dst.v[o] = 0.0; dst.v[o + 1] = 0.0; dst.v[o + 2] = 0.0; dst.v[o + 3] = 0.0; }   // INJECTION: the hit rows are never zeroed'
+    want="FAIL  copy_rows_from_mapped entry: hit rows -> 0" ;;
+  verify-seam-no-boundary)
+    # `wait_flag_ge` under capture records a HOST BOUNDARY; WITHOUT it the window is ONE submission and the ops
+    # after the wait run at launch - the exact wrong-token shape the seam exists to prevent.  The case's CUT arm
+    # (the sentinel read before the host raises the flag) must catch it.
+    file="$TREE/vulkan/src/kernels/verify_vk.cpp"
+    old=$'        s.ctx->capture_boundary(flag, value);'
+    new=$'        (void) 0;   // INJECTION: the boundary dropped - the recording is not cut'
+    want="FAIL  verify seam: the ops AFTER the boundary did NOT run" ;;
   graph-drop-last-node)
     # THE CUDA GRAPH API (this batch).  A capture RECORDS the dispatches a body issues; dropping the LAST one is
     # the plausible "off by one node" a hand-rolled recorder ships with.  The recorded step then replays 5 of 6

@@ -418,6 +418,53 @@ void copy_i32_from_mapped(Stream& s, int32_t* dst, const int32_t* src, int64_t n
     stream_write(s, dst, src, (uint64_t) n * 4);
 }
 
+// `copy_rows_from_mapped` (elementwise.hpp:109) - the P6 verify window's `dec_batch` CPU-share copy
+// (verify.cpp:1071), which the run reaches once the three handshake waits pass.  The CUDA
+// (`elementwise.cu:235` `copy_rows_from_mapped_kernel`) copies the CPU's rows from MAPPED pinned host memory and
+// writes +0.0 over the GPU's OWN rows (already in `hit_out`, so the later `moe_hit_add` does not double count).
+// `hit_rows` and `count` are DEVICE int32 (`p_dst`, `p_counts + 1`), so the hit test is a device predicate and
+// the shader scans them; `src` is the MAPPED region's device-visible buffer (a shader cannot dereference host
+// memory), published by the engine's host loop BEFORE the segment that reads it is submitted - the handshake.
+void copy_rows_from_mapped(Stream& s, float* dst, const float* src, int64_t rows, int64_t width,
+                           const int32_t* hit_rows, const int32_t* count) {
+    if (rows <= 0 || width <= 0) return;
+    if (dst == nullptr || src == nullptr || hit_rows == nullptr || count == nullptr) {
+        std::fprintf(stderr, "strata::vulkan::copy_rows_from_mapped: a null argument - refusing\n");
+        std::exit(2);
+    }
+    if (width % 4 != 0) {
+        std::fprintf(stderr, "strata::vulkan::copy_rows_from_mapped: width %lld is not a multiple of 4 (the "
+                             "CUDA's own predicate) - refusing\n",
+                     (long long) width);
+        std::exit(2);
+    }
+    Buf dv{}, sv{}, hv{}, cv{};
+    if (!arena_resolve(s, dst, (uint64_t) rows * (uint64_t) width * 4, dv)) {
+        std::fprintf(stderr, "strata::vulkan::copy_rows_from_mapped: dst is not inside this stream's arena - "
+                             "refusing rather than binding a wrong view\n");
+        std::exit(2);
+    }
+    if (!mapped_resolve(src, (uint64_t) rows * (uint64_t) width * 4, sv)) {
+        std::fprintf(stderr, "strata::vulkan::copy_rows_from_mapped: the source %p is not a live MAPPED region "
+                             "covering %lld row(s) of %lld floats - refusing rather than reading bytes the host "
+                             "never published (verify.cpp:1071, the CPU-share copy)\n",
+                     (const void*) src, (long long) rows, (long long) width);
+        std::exit(2);
+    }
+    // hit_rows holds one entry per possible plan row (cap = rows) and count <= rows, so `rows` int32 is a safe
+    // bound; `count` is one int32.
+    if (!arena_resolve(s, hit_rows, (uint64_t) rows * 4, hv) || !arena_resolve(s, count, 4, cv)) {
+        std::fprintf(stderr, "strata::vulkan::copy_rows_from_mapped: the hit list or the count is not inside this "
+                             "stream's arena - refusing\n");
+        std::exit(2);
+    }
+    struct { int32_t rows, width, row4; } pc{(int32_t) rows, (int32_t) width, (int32_t) (width / 4)};
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/copy_rows_from_mapped.spv", 4, sizeof(pc));
+    // ONE WORKGROUP PER ROW: the CUDA's blockIdx.x IS the row, and a row of `width` floats is copied by the
+    // workgroup's 256 threads in float4 steps.
+    s.ctx->dispatch(p, {&dv, &sv, &hv, &cv}, &pc, sizeof(pc), (uint32_t) rows);
+}
+
 // `y[i] = f16(x[i])` (shader f32_to_f16.spv: X float[] read, Y uint16_t[] write, push {int n}) - the F16
 // sibling of f32_to_bf16_bulk below, a SEPARATE entry point (5 vs 8 exponent bits; a wrong pick is a plausible
 // tensor at the wrong precision).
@@ -699,6 +746,19 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
         std::exit(2);
     }
     strata::vulkan::copy_from_mapped(*s, dst, src, n);
+}
+
+// elementwise.hpp: `void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width,
+//     const int32_t* hit_rows, const int32_t* count, void* stream);`   (verify.cpp:1071, the dec_batch CPU-share
+//     copy of the P6 verify window; ALSO expert_source.cpp:2131).  See the backend note above.
+void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
+                           const int32_t* count, void* stream) {
+    strata::vulkan::Stream* s = strata::vulkan::stream_of(stream);
+    if (s == nullptr) {
+        std::fprintf(stderr, "copy_rows_from_mapped: the stream handle is not a live Vulkan stream; refusing\n");
+        std::exit(2);
+    }
+    strata::vulkan::copy_rows_from_mapped(*s, dst, src, rows, width, hit_rows, count);
 }
 
 // elementwise.hpp: `void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);`

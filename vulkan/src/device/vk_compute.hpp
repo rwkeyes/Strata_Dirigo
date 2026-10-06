@@ -191,6 +191,25 @@ struct DeviceInfo {
     uint64_t heap_device_local_bytes = 0;
 };
 
+// ---- A CAPTURED STEP'S SEGMENTS AND BOUNDARIES (the P6 verify handshake seam) ------------------------------
+// A CUDA capture records the WHOLE verify window as one graph; the engine's host loop (Verifier::run) raises the
+// handshake flags AFTER the launch, and the window's `wait_flag_ge` spins on them on the device.  This backend
+// forbids a spinning kernel, so the recording is CUT at every `wait_flag_ge` into SEGMENTS, and the segment that
+// follows boundary j is submitted only once `*(volatile uint32_t*)boundary[j].flag >= boundary[j].value` - the
+// poll is on the HOST thread (the engine's own cudaStreamQuery/cudaStreamSynchronize calls drive it) BETWEEN the
+// split submissions, exactly the shape `sync.hpp` designed for the doorbell.  A boundary-less capture is one
+// segment and one thread of the driver's advance loop, so nothing else changes.
+struct CaptureSeg {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    uint32_t dispatches = 0;
+    uint32_t copies = 0;
+};
+struct CaptureBoundary {
+    const void* flag = nullptr;    // HOST address of the uint32 handshake word (mapped, coherent)
+    uint32_t value = 0;            // submit the NEXT segment once *flag >= value
+};
+
 class Ctx {
 public:
     // `want_device` < 0 picks the first device with a compute queue and the required features; otherwise it is
@@ -324,16 +343,26 @@ public:
     // Record a device->device byte copy into the active capture: one vkCmdCopyBuffer region + a transfer->compute
     // barrier, so the next dispatch reads what it wrote.
     void capture_copy(const Buf& dst, const Buf& src, uint64_t bytes);
+    // A HOST BOUNDARY inside the capture (deliverable A of the P6 verify seam).  The engine's verify window is a
+    // captured step whose `wait_flag_ge` waits for a HOST-raised handshake word; this backend forbids a spinning
+    // kernel, so the recording is CUT here and the driver submits the SEGMENT that follows only once
+    // `*(volatile uint32_t*)flag_host >= value`.  `flag_host` is a mapped host address (the shim's
+    // cudaHostGetDevicePointer returns the host pointer), so the poll is a plain host read on the host thread
+    // BETWEEN SPLIT SUBMISSIONS - no kernel ever waits.
+    void capture_boundary(const void* flag_host, uint32_t value);
     // Close the capture WITHOUT submitting.  False when the capture was invalidated or recorded nothing.
     bool capture_end();
-    // Hand the closed recording to the caller (the shim's cudaGraph_t): nulls this Ctx's recording handles so a
-    // later capture allocates fresh ones.  Only valid after capture_end() returned true.
-    void take_recording(VkCommandBuffer& cb, VkFence& fence, uint32_t& dispatches, uint32_t& copies);
-    // Abandon an in-progress/closed recording (an invalidated capture).  Frees its command buffer and fence.
+    // Hand the closed recording's SEGMENTS (one per boundary, so a boundary-less capture is a one-element list)
+    // and its BOUNDARIES to the caller (the shim's cudaGraph_t).
+    void take_recording(std::vector<CaptureSeg>& segs, std::vector<CaptureBoundary>& bounds);
+    // Abandon an in-progress/closed recording (an invalidated capture).  Frees its command buffers and fences.
     void discard_recording();
-    // Submit + wait an owned recording (the SAME submission path `submit_recorded` uses), and destroy one.
-    void submit_owned(VkCommandBuffer cb, VkFence fence);
-    void destroy_owned(VkCommandBuffer cb, VkFence fence);
+    // Submit + wait ONE owned segment (the SAME submission path `submit_recorded` uses), and destroy one.
+    void submit_segment(const CaptureSeg& seg);
+    void destroy_owned(const CaptureSeg& seg);
+    // One destroyed recording: decrements the leak-test counter (there is one recording per graph, however many
+    // segments it holds).
+    void release_recording();
     // How many recordings the caller (the shim's graphs) currently owns: incremented when a recording is taken,
     // decremented when one is destroyed.  The instrument a leak test needs - a leaked instantiation shows up
     // here even though it never touches the arena.
@@ -428,6 +457,9 @@ private:
     bool have_recording_ = false;   // a finished recording exists and may be replayed
     bool capture_ = false;          // a stream capture is active: dispatch() records instead of submitting
     bool capture_valid_ = false;    // ...and nothing has invalidated it (see capture_invalidate)
+    // The capture's FINISHED segments and the host boundaries between them (see CaptureSeg/CaptureBoundary).
+    std::vector<CaptureSeg> cap_segs_;
+    std::vector<CaptureBoundary> cap_bounds_;
     uint32_t owned_recordings_ = 0; // recordings handed to the caller that have not been destroyed
 
     void query_budget();   // called after device creation, so the extension can be enabled
