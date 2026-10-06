@@ -31,14 +31,18 @@ layout(set = 0, binding = 1, std430) readonly buffer W { float v[]; } weights;
 layout(set = 0, binding = 2, std430) readonly buffer S { float v[]; } sh;
 layout(set = 0, binding = 3, std430) buffer Y { float v[]; } y;
 
-layout(push_constant, std430) uniform PC { int n_embd; int k; int has_shared; } pc;
+layout(push_constant, std430) uniform PC { int n_embd; int k; int has_shared; int n_tok; } pc;
 
 void main() {
-    const uint col = gl_GlobalInvocationID.x;
-    if (col >= uint(pc.n_embd)) return;
-    const uint n = uint(pc.n_embd), k = uint(pc.k);
-    float sum = parts.v[col] * weights.v[0];             // the source's first term: a product, not 0 + product
-    for (uint e = 1u; e < k; ++e) sum += parts.v[e * n + col] * weights.v[e];
-    if (pc.has_shared != 0) sum += sh.v[col];        // added PLAIN, exactly as the source adds it
-    y.v[col] = sum;
+    const uint n = uint(pc.n_embd), k = uint(pc.k), ntok = uint(pc.n_tok);
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= n * ntok) return;                            // one flat grid over n_embd * n_tok
+    const uint t = i / n;                                 // THE TOKEN
+    const uint col = i - t * n;
+    const uint pb = t * k * n;                            // this token's block of the parts/weights rows
+    const uint yb = t * n;                                // this token's shared/output row
+    float sum = parts.v[pb + col] * weights.v[t * k];     // the source's first term: a product, not 0 + product
+    for (uint e = 1u; e < k; ++e) sum += parts.v[pb + e * n + col] * weights.v[t * k + e];
+    if (pc.has_shared != 0) sum += sh.v[yb + col];        // added PLAIN, exactly as the source adds it
+    y.v[yb + col] = sum;
 }

@@ -89,6 +89,7 @@
                                                       //   native_gdn_beta_gate / native_gdn_gate / native_gdn_out_norm
 #include "strata/vulkan/vk_backend.hpp"               // the backend's seam: Stream, stream_of
 #include "vk_arena.hpp"                               // the arena + pointer->buffer resolution
+#include "vk_multi.hpp"                               // the verify window's one-dispatch-per-round forms
 
 #include <cmath>
 #include <cstdint>
@@ -115,25 +116,46 @@ static uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocalSize - 1)
 //        assumes a 256-lane group covers two 128-channel heads).
 void fused_gdn_conv_l2(Stream& s, float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps) {
-    if (channels <= 0) return;
+    // ONE token, the caller's history SLID in place (write_hist = 1), the token index 0 - the single-token
+    // contract, unchanged.  It goes through the token-invariant form with n_tok = 1.
+    fused_gdn_conv_l2_n(s, history, qkv, conv_w, h, channels, qk_heads, eps, /*t_begin=*/0, /*n_tok=*/1,
+                        /*write_hist=*/1);
+}
+
+// THE MULTI (verify_kernels.hpp: "history is NOT written.  Bitwise `fused_gdn_conv_l2` per token.").  One
+// dispatch covers all n_tok tokens: the token is the grid's Y dimension, and the running window is read from
+// `history`/`qkv` directly as stream[t_begin+t .. t_begin+t+3] (see the shader's comment) rather than from a
+// slid working copy, so no token depends on another.  The caller's `history` is NOT written.
+void fused_gdn_conv_l2_n(Stream& s, const float* history, const float* qkv, const float* conv_w, float* h,
+                         int64_t channels, int64_t qk_heads, float eps, int64_t t_begin, int64_t n_tok,
+                         int write_hist) {
+    if (channels <= 0 || n_tok < 1 || t_begin < 0) return;
     if (channels % 128 != 0 || qk_heads < 0 || qk_heads > channels / 128)
         refuse("fused_gdn_conv_l2", "channels is not a multiple of 128 or qk_heads is out of range");
+    const uint64_t rows = (uint64_t) (t_begin + n_tok);
     Buf hv{}, qv{}, wv{}, ov{};
     if (!arena_resolve(s, history, (uint64_t) channels * 3 * 4, hv) ||
-        !arena_resolve(s, qkv, (uint64_t) channels * 4, qv) ||
+        !arena_resolve(s, qkv, rows * (uint64_t) channels * 4, qv) ||
         !arena_resolve(s, conv_w, (uint64_t) channels * 4 * 4, wv) ||
-        !arena_resolve(s, h, (uint64_t) channels * 4, ov))
+        !arena_resolve(s, h, rows * (uint64_t) channels * 4, ov))
         refuse("fused_gdn_conv_l2", "a pointer is not inside this stream's arena");
-    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/fused_gdn_conv_l2.spv", 4, 12);
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/fused_gdn_conv_l2.spv", 4, 24);
     struct Push {
         int32_t channels;
         int32_t qk_heads;
         float eps;
+        int32_t n_tok;
+        int32_t t_begin;
+        int32_t write_hist;
     } pc{};
-    pc.channels = channels;
-    pc.qk_heads = qk_heads;
+    pc.channels = (int32_t) channels;
+    pc.qk_heads = (int32_t) qk_heads;
     pc.eps = eps;
-    s.ctx->dispatch(pipe, {&hv, &qv, &wv, &ov}, &pc, sizeof(pc), groups_for((uint64_t) channels));
+    pc.n_tok = (int32_t) n_tok;
+    pc.t_begin = (int32_t) t_begin;
+    pc.write_hist = write_hist;
+    s.ctx->dispatch(pipe, {&hv, &qv, &wv, &ov}, &pc, sizeof(pc), groups_for((uint64_t) channels),
+                    (uint32_t) n_tok);
 }
 
 // ---- 2. `native_gdn_conv_silu` -> native_gdn_conv_silu.spv (HIST rw, XI ro, W ro, RAW rw, SILU rw; push
@@ -233,26 +255,38 @@ void gdn_l2_norm(Stream& s, float* x, int64_t rows, int64_t cols, float eps) {
 //        `n_embd % 8 == 0` (the shader strides the activation in 8-element chunks); kept here.
 void fused_gdn_ab(Stream& s, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
                   const float* ssm_a, float* gate, float* beta, int n_embd, int h_v) {
-    if (n_embd <= 0 || h_v <= 0) return;
+    // ONE token, the column base 0 - the single-token contract, unchanged (n_tok = 1).
+    fused_gdn_ab_n(s, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, /*n_tok=*/1);
+}
+
+// THE MULTI (verify_kernels.hpp: "Bitwise `fused_gdn_ab` per column").  One dispatch covers all n_tok tokens:
+// the token is the grid's Y dimension, and the activation column (`x + t*n_embd`) plus the `gate`/`beta`
+// columns (`+ t*h_v`) are indexed by it.  The BF16 weights, `dt` and `ssm_a` are token-invariant.
+void fused_gdn_ab_n(Stream& s, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+                    const float* ssm_a, float* gate, float* beta, int64_t n_embd, int64_t h_v, int64_t n_tok) {
+    if (n_embd <= 0 || h_v <= 0 || n_tok < 1) return;
     if (n_embd % 8 != 0) refuse("fused_gdn_ab", "n_embd is not a multiple of 8 (the shader's activation chunk)");
     unsigned bad = 0;
     Buf xv{}, av{}, bv{}, dv{}, sv{}, gv{}, ov{};
-    bad += !arena_resolve(s, x, (uint64_t) n_embd * 4, xv);
+    bad += !arena_resolve(s, x, (uint64_t) n_embd * (uint64_t) n_tok * 4, xv);
     bad += !arena_resolve(s, w_alpha, (uint64_t) n_embd * (uint64_t) h_v * 2, av);
     bad += !arena_resolve(s, w_beta, (uint64_t) n_embd * (uint64_t) h_v * 2, bv);
     bad += !arena_resolve(s, dt, (uint64_t) h_v * 4, dv);
     bad += !arena_resolve(s, ssm_a, (uint64_t) h_v * 4, sv);
-    bad += !arena_resolve(s, gate, (uint64_t) h_v * 4, gv);
-    bad += !arena_resolve(s, beta, (uint64_t) h_v * 4, ov);
+    bad += !arena_resolve(s, gate, (uint64_t) h_v * (uint64_t) n_tok * 4, gv);
+    bad += !arena_resolve(s, beta, (uint64_t) h_v * (uint64_t) n_tok * 4, ov);
     if (bad != 0) refuse("fused_gdn_ab", "a pointer is not inside this stream's arena");
-    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/fused_gdn_ab.spv", 7, 8);
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/fused_gdn_ab.spv", 7, 12);
     struct Push {
         int32_t n;
         int32_t h_v;
+        int32_t n_tok;
     } pc{};
-    pc.n = n_embd;
-    pc.h_v = h_v;
-    s.ctx->dispatch(pipe, {&xv, &av, &bv, &dv, &sv, &gv, &ov}, &pc, sizeof(pc), (uint32_t) (2 * h_v));
+    pc.n = (int32_t) n_embd;
+    pc.h_v = (int32_t) h_v;
+    pc.n_tok = (int32_t) n_tok;
+    s.ctx->dispatch(pipe, {&xv, &av, &bv, &dv, &sv, &gv, &ov}, &pc, sizeof(pc), (uint32_t) (2 * h_v),
+                    (uint32_t) n_tok);
 }
 
 // ============================================================================================================

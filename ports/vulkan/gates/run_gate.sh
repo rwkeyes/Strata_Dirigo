@@ -236,6 +236,7 @@ printf '%s\n' "$out"
 summary="$(grep -E '^== [0-9]+ passed, [0-9]+ failed, [0-9]+ skipped$' <<<"$out" | tail -1)"
 [ -n "$summary" ] || { echo "== no summary line from the gate - refusing to report success"; exit 1; }
 passed="$(sed -n 's/^== \([0-9]*\) passed.*/\1/p' <<<"$summary")"
+failed="$(sed -n 's/^== [0-9]* passed, \([0-9]*\) failed.*/\1/p' <<<"$summary")"
 skipped="$(sed -n 's/.* \([0-9]*\) skipped$/\1/p' <<<"$summary")"
 if [ "${passed:-0}" -eq 0 ]; then echo "== zero cases passed"; exit 1; fi
 if [ "${skipped:-0}" -ne 0 ]; then echo "== $skipped case(s) SKIPPED - a skipped case is not a passing one"; rc=1; fi
@@ -269,6 +270,64 @@ done
 if [ "$impls" -lt 2 ]; then
   echo "  note: only $impls implementation(s) exercised - a width-dependent defect can hide in a single one"
 fi
+
+# -----------------------------------------------------------------------------------------------------------
+# THE CUDA-RUNTIME SMOKE - `strata_vk_cudart_smoke` (`vulkan/CMakeLists.txt:120`).
+#
+# WHY IT IS HERE.  The target existed and NOTHING ran it, so the SHIPPED `cudaStreamQuery` fix - a pending live
+# batch must NOT be answered `cudaSuccess`, a wrong "complete" that a caller reading a device buffer would act on
+# - was UNGUARDED.  The gate now BUILDS it and RUNS it on every ICD that reports a device, and its CASES ARE
+# FOLDED INTO THE TOTALS BELOW: the count RISES by them, and must never fall.  The other direction is
+# `inject-verify.sh cudart-stream-query-nofix` (the unfixed answer must make the case FAIL).  A build failure, or
+# a run that reports no device, is a FAILURE here - never a silent skip.
+echo "== the CUDA-runtime smoke (strata_vk_cudart_smoke; the cudaStreamQuery fix's own guard)"
+source "$ROOT/gates/smoke_sources.sh"
+smoke_passed=0; smoke_failed=0; smoke_skipped=0; smoke_arms=0
+if ! smoke_build "$TREE"; then
+  echo "  FAIL the smoke target did not BUILD - the cudaStreamQuery fix is unguarded in this run"
+  rc=1
+else
+  for icd in /usr/share/vulkan/icd.d/*.json; do
+    [ -e "$icd" ] || continue
+    sname="$(basename "$icd" .json)"
+    slog="$BUILD/smoke-$sname.log"
+    VK_ICD_FILENAMES="$icd" "$(smoke_bin)" "$SH" >"$slog" 2>&1
+    ssum="$(grep -E '^== [0-9]+ passed, [0-9]+ failed, [0-9]+ skipped$' "$slog" | tail -1)"
+    if [ -z "$ssum" ]; then
+      printf '  --   %-16s no device on this machine\n' "$sname"
+      continue
+    fi
+    smoke_arms=$((smoke_arms+1))
+    sverdict="$(grep -E '^strata_vk_cudart_smoke: (PASS|FAIL)$' "$slog" | tail -1)"
+    if [ "${sverdict##*: }" = PASS ]; then
+      printf '  OK   %-16s %s\n' "$sname" "$ssum"
+    else
+      printf '  FAIL %-16s %s\n' "$sname" "$ssum"
+      grep -F ' FAIL' "$slog" | head -5
+      rc=1
+    fi
+    smoke_passed=$((smoke_passed + $(sed -n 's/^== \([0-9]*\) passed.*/\1/p' <<<"$ssum")))
+    smoke_failed=$((smoke_failed + $(sed -n 's/^== [0-9]* passed, \([0-9]*\) failed.*/\1/p' <<<"$ssum")))
+    smoke_skipped=$((smoke_skipped + $(sed -n 's/.* \([0-9]*\) skipped$/\1/p' <<<"$ssum")))
+  done
+  if [ "$smoke_arms" -lt 1 ]; then
+    echo "  FAIL the smoke reported no device on any ICD - its cases did not run, so the fix is unguarded"
+    rc=1
+  fi
+fi
+printf '  smoke subtotal: %d passed, %d failed, %d skipped over %d implementation(s)\n' \
+  "$smoke_passed" "$smoke_failed" "$smoke_skipped" "$smoke_arms"
+
+# THE TOTALS: the numeric gate's own summary PLUS the smoke's cases.  A skipped case is never a passing one, the
+# Arc arm's count must never fall, and this line is the number the port quotes.
+total_passed=$((passed + smoke_passed))
+total_failed=$((${failed:-0} + smoke_failed))
+total_skipped=$((skipped + smoke_skipped))
+if [ "$total_skipped" -ne 0 ]; then
+  echo "== $total_skipped case(s) SKIPPED - a skipped case is not a passing one"
+  rc=1
+fi
+
 [ $rc -eq 0 ] || { echo "== this run does NOT report success - see the FAIL/SKIP lines above (a skipped case is not a passing one)"; exit 1; }
 
-echo "== shader checks + numeric gate: $summary ($impls implementation(s))"
+echo "== shader checks + numeric gate + CUDA-runtime smoke: $total_passed passed, $total_failed failed, $total_skipped skipped (numeric gate $summary; smoke: $smoke_passed over $smoke_arms implementation(s); $impls gate implementation(s))"

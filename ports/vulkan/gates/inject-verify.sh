@@ -192,6 +192,16 @@
 #   inject-verify.sh resident-plan-base-off-by-8     vulkan/src/kernels/verify_vk.cpp  hand the shader a base 8
 #                                       bytes high -> must FAIL  "resident_plan entry: ptr[grp]"
 #
+#   (THE CUDA-RUNTIME SMOKE'S OWN GUARD - `strata_vk_cudart_smoke`.  This target existed in
+#    `vulkan/CMakeLists.txt` and NOTHING ran it, so the shipped `cudaStreamQuery` fix was unguarded.  The
+#    injection edits NO file: the unfixed answer is reachable in the SHIPPED binary through the environment the
+#    fix left in place, and the case must FAIL under it.  The passing direction is the gate's own run of the
+#    smoke, whose cases are folded into `run_gate.sh`'s totals.)
+#   inject-verify.sh cudart-stream-query-nofix   (env) STRATA_VK_QUERY_NOFIX=1  the unfixed `cudaStreamQuery`
+#                                       answers "complete" with a live batch still queued -> must FAIL
+#                                       "live-batch probe: cudaStreamQuery does not say 'complete' while work
+#                                       is queued" (outstanding before/after 1/1)
+#
 # Usage: inject-verify.sh <name> [icd.json]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # ports/vulkan
@@ -1025,8 +1035,38 @@ case "$name" in
     old=$'    const uint64_t base = (uint64_t) (uintptr_t) cache_base;'
     new=$'    const uint64_t base = (uint64_t) (uintptr_t) cache_base + 8;   // INJECTION: the base is off by 8 bytes'
     want="FAIL  resident_plan entry: ptr[grp]" ;;
+  cudart-stream-query-nofix)
+    # THE CUDA-RUNTIME SMOKE'S OWN GUARD, IN THE FAILING DIRECTION.  `strata_vk_cudart_smoke` was a CMake target
+    # that NOTHING ran, so the shipped `cudaStreamQuery` fix was unguarded.  Its UNFIXED answer is reachable in
+    # the SHIPPED binary (`STRATA_VK_QUERY_NOFIX=1`), so there is NO text edit here: the "injection" is that
+    # environment, and the case must FAIL under it (outstanding before/after 1/1 with cudaStreamQuery answering
+    # "no error" - a wrong "complete").  Handled by the `smoke_env` block below, before the anchor/compile steps.
+    file=""; spv=""; smoke_env="STRATA_VK_QUERY_NOFIX=1"
+    want="live-batch probe: cudaStreamQuery does not say 'complete' while work is queued" ;;
   *) echo "unknown injection '$name'"; exit 2 ;;
 esac
+
+# THE SMOKE'S OWN INJECTION - handled BEFORE the anchor/compile block, because nothing is edited: the unfixed
+# answer is reachable in the shipped binary through the environment, and the run is the SAME helper the gate
+# sources.  No restore trap is armed here (no file was touched).
+if [ -n "${smoke_env:-}" ]; then
+  source "$ROOT/gates/smoke_sources.sh"
+  if ! smoke_build "$TREE"; then echo "DID NOT BUILD (smoke): $name"; exit 3; fi
+  sm_icd="${icd:-/usr/share/vulkan/icd.d/intel_icd.json}"
+  out="$(env $smoke_env VK_ICD_FILENAMES="$sm_icd" "$(smoke_bin)" "$SH" 2>&1)"
+  # THE SMOKE'S OWN PER-CASE LINE ENDS IN PASS/FAIL (the harness's `check()` format), unlike the gate's
+  # `FAIL  <case>` lines - so the anchor is "contains the case text AND ends in FAIL".
+  line="$(grep -F -- "$want" <<<"$out" | grep -E 'FAIL$' | head -1)"
+  if [ -n "$line" ]; then
+    echo "FALSIFIED ($name): $line"
+    grep -F 'outstanding before/after' <<<"$out" | head -1
+    exit 0
+  fi
+  echo "NOT FALSIFIED ($name): expected a line starting '$want' and did not get one"
+  grep -E '^  .*(PASS|FAIL)$' <<<"$out" | tail -6
+  exit 1
+fi
+
 COMPILE_TARGET="${comp:-$file}"   # an include cannot be compiled alone; its including shader is the target
 
 # 1. the anchor must be there, or we would be "injecting" into a file that no longer says what we think.

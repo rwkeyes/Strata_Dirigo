@@ -86,6 +86,7 @@
 #include "strata/kernels/native_router.hpp"  // native_router_top10
 #include "strata/vulkan/vk_backend.hpp"      // the backend's seam: Stream, stream_of
 #include "vk_arena.hpp"                      // the arena + pointer->buffer resolution
+#include "vk_multi.hpp"                      // the verify window's one-dispatch-per-round forms
 
 #include <cmath>
 #include <cstdint>
@@ -328,16 +329,26 @@ void qsa_gate_apply_f32(Stream& s, const float* attn, const float* q_full, const
 //        2^-14 lower clamp - all fixed by the shader.  `n_tokens = 1` and one workgroup, exactly as the case's
 //        single-token arm drives it.
 void native_router_top10(Stream& s, const float* logits, int32_t* ids, float* weights) {
+    router_top10_n(s, logits, ids, weights, /*n_tok=*/1);
+}
+
+// THE MULTI.  `native_router_top10.spv` ALREADY carries a token dimension - `gl_WorkGroupID.x` is the token
+// and the push constant is `n_tokens` - so the window's whole group is ONE dispatch of n_tok workgroups
+// instead of n_tok dispatches of one.  Each workgroup's arithmetic (including its shared `nr_*` arrays and
+// every barrier) is per-token and untouched, so this is bitwise the single call per token.
+void router_top10_n(Stream& s, const float* logits, int32_t* ids, float* weights, int64_t n_tok) {
+    if (n_tok < 1) return;
     Buf lv{}, iv{}, wv{};
-    if (!arena_resolve(s, logits, 512ull * 4, lv) || !arena_resolve(s, ids, 10ull * 4, iv) ||
-        !arena_resolve(s, weights, 10ull * 4, wv))
+    if (!arena_resolve(s, logits, (uint64_t) n_tok * 512ull * 4, lv) ||
+        !arena_resolve(s, ids, (uint64_t) n_tok * 10ull * 4, iv) ||
+        !arena_resolve(s, weights, (uint64_t) n_tok * 10ull * 4, wv))
         refuse("native_router_top10", "a pointer is not inside this stream's arena");
     VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_router_top10.spv", 3, 4);
     struct Push {
         int32_t n_tokens;
     } pc{};
-    pc.n_tokens = 1;
-    s.ctx->dispatch(pipe, {&lv, &iv, &wv}, &pc, sizeof(pc), 1);
+    pc.n_tokens = (int32_t) n_tok;
+    s.ctx->dispatch(pipe, {&lv, &iv, &wv}, &pc, sizeof(pc), (uint32_t) n_tok);
 }
 
 // ---- 9. `qsa_decode_attn_step` -> qsa_decode_attn.spv.  THE DEFAULT QSA DECODE ATTENTION (layer.cpp:980): the

@@ -81,6 +81,7 @@
 #include "strata/kernels/elementwise.hpp"    // f32_to_bf16_bulk (the value projection's activation copy)
 #include "strata/vulkan/vk_backend.hpp"      // the backend's seam: Stream, stream_of
 #include "vk_arena.hpp"                      // the arena + pointer->buffer resolution
+#include "vk_multi.hpp"                      // the verify window's one-dispatch-per-round forms
 
 #include <atomic>
 #include <cmath>
@@ -367,24 +368,35 @@ static void router_top10_impl(Stream& s, const float* logits, int n_tokens, int 
 // `native_moe_combine` -> native_moe_combine.spv (PARTS ro, W ro, S ro, Y rw; push {n_embd, k, has_shared}).
 // The NATIVE pure-f32 expression: the first term is a PRODUCT, later terms a separate multiply and add, the
 // shared row added PLAIN.  `shared == nullptr` binds the sentinel with has_shared=0.
-static void native_moe_combine_impl(Stream& s, const float* parts, const float* weights, const float* shared,
-                                    float* output, int64_t n_embd, int64_t k) {
-    if (n_embd <= 0 || k <= 0) return;
+void native_moe_combine_n(Stream& s, const float* parts, const float* weights, const float* shared, float* output,
+                          int64_t n_embd, int64_t k, int64_t n_tok) {
+    if (n_embd <= 0 || k <= 0 || n_tok < 1) return;
     if (!parts || !weights || !output) refuse("native_moe_combine", "a required pointer is null");
     if (k > 15) refuse("native_moe_combine", "the pinned contract is k in [1, 15]");
     Buf pv{}, wv{}, sv{}, ov{};
-    if (!arena_resolve(s, parts, (uint64_t) k * (uint64_t) n_embd * 4, pv) ||
-        !arena_resolve(s, weights, (uint64_t) k * 4, wv) || !arena_resolve(s, output, (uint64_t) n_embd * 4, ov))
+    if (!arena_resolve(s, parts, (uint64_t) k * (uint64_t) n_embd * (uint64_t) n_tok * 4, pv) ||
+        !arena_resolve(s, weights, (uint64_t) k * (uint64_t) n_tok * 4, wv) ||
+        !arena_resolve(s, output, (uint64_t) n_embd * (uint64_t) n_tok * 4, ov))
         refuse("native_moe_combine", "a pointer is not inside this stream's arena");
     if (shared != nullptr) {
-        if (!arena_resolve(s, shared, (uint64_t) n_embd * 4, sv))
+        if (!arena_resolve(s, shared, (uint64_t) n_embd * (uint64_t) n_tok * 4, sv))
             refuse("native_moe_combine", "the shared pointer is not inside this stream's arena");
     } else {
         sv = dummy_buf(s);
     }
-    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/native_moe_combine.spv", 4, 12);
-    struct { int32_t n_embd, k, has_shared; } pc{(int32_t) n_embd, (int32_t) k, shared ? 1 : 0};
-    s.ctx->dispatch(p, {&pv, &wv, &sv, &ov}, &pc, sizeof(pc), groups_for((uint64_t) n_embd));
+    // THE MULTI ("n_tok rows (parts [n,k,N], weights [n,k], shared/output [n,N]) in one launch, each as the
+    // single call") is ONE dispatch: the token rides the flat grid's high digits, and the per-token
+    // arithmetic is the identical expression the single call uses.
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/native_moe_combine.spv", 4, 16);
+    struct { int32_t n_embd, k, has_shared, n_tok; } pc{(int32_t) n_embd, (int32_t) k, shared ? 1 : 0,
+                                                        (int32_t) n_tok};
+    s.ctx->dispatch(p, {&pv, &wv, &sv, &ov}, &pc, sizeof(pc), groups_for((uint64_t) n_embd * (uint64_t) n_tok));
+}
+
+// THE SINGLE-TOKEN FORM: one row (n_tok = 1), the contract the gate's `case_native_moe_combine` drives.
+static void native_moe_combine_impl(Stream& s, const float* parts, const float* weights, const float* shared,
+                                    float* output, int64_t n_embd, int64_t k) {
+    native_moe_combine_n(s, parts, weights, shared, output, n_embd, k, /*n_tok=*/1);
 }
 
 // `moe_combine` -> moe_combine_f32.spv (PARTS ro, W ro, S ro, Y rw; push {n_embd, k, has_shared}).  THE

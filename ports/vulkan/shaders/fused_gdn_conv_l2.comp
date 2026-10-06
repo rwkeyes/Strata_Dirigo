@@ -42,7 +42,7 @@ layout(set = 0, binding = 0, std430) buffer HIST { float v[]; } hist;          /
 layout(set = 0, binding = 1, std430) readonly buffer QKV { float v[]; } qkv;   // (channels,)
 layout(set = 0, binding = 2, std430) readonly buffer W { float v[]; } w;       // (channels, 4), tap fastest
 layout(set = 0, binding = 3, std430) buffer H { float v[]; } h;                // (channels,)
-layout(push_constant, std430) uniform PC { int channels; int qk_heads; float eps; } pc;
+layout(push_constant, std430) uniform PC { int channels; int qk_heads; float eps; int n_tok; int t_begin; int write_hist; } pc;
 
 // ONE shared array for the per-head norm; the two 128-lane halves reduce independently in place.  The tree is
 // custom (not common/wg_reduce.glsl's whole-workgroup `wg_sum`) because a workgroup spans TWO heads here.
@@ -54,18 +54,29 @@ void main() {
     const uint lane = lid & 127u;                    // 0..127: this thread's column within its head
     const uint c = gl_WorkGroupID.x * 256u + lid;    // the channel
     const int channels = pc.channels;
+    const uint t = gl_WorkGroupID.y;                 // THE TOKEN: one (channel-block, token) workgroup
+    if (t >= uint(pc.n_tok)) return;                 // workgroup-uniform
+    const uint a = uint(pc.t_begin) + t;             // the ABSOLUTE token index (verify.cpp:730 passes `tb`)
 
     float y = 0.0f;
     if (c < uint(channels)) {
-        const float v0 = hist.v[c * 3u + 0u];
-        const float v1 = hist.v[c * 3u + 1u];
-        const float v2 = hist.v[c * 3u + 2u];
-        const float x = qkv.v[c];
-        // the four-tap dot in the CUDA's own order, tap fastest; NO zero-bias fold (the fused body has none)
-        const float sum = v0 * w.v[c * 4u + 0u] + v1 * w.v[c * 4u + 1u] + v2 * w.v[c * 4u + 2u] + x * w.v[c * 4u + 3u];
-        hist.v[c * 3u + 0u] = v1;                    // slide: drop the oldest, the new column lands LAST
-        hist.v[c * 3u + 1u] = v2;
-        hist.v[c * 3u + 2u] = x;
+        // THE RUNNING WINDOW, TOKEN-INVARIANT.  The single-token kernel SLIDES a history it owns, so token t+1
+        // depends on token t.  But the CUDA multi's own window (verify_kernels.cu:30,
+        // `win[j] = (t+j<3) ? hist[c*3+t+j] : qkv[(t+j-3)*C+c]`) is just stream[a..a+3] of the concatenation
+        // [history(3) | qkv], so the whole window reads `history`/`qkv` DIRECTLY and no token depends on
+        // another - the per-token arithmetic is unchanged, the index base moves.
+        float four[4];
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint p = a + j;
+            four[j] = (p < 3u) ? hist.v[c * 3u + p] : qkv.v[(p - 3u) * uint(channels) + c];
+        }
+        const float sum = four[0] * w.v[c * 4u + 0u] + four[1] * w.v[c * 4u + 1u] +
+                          four[2] * w.v[c * 4u + 2u] + four[3] * w.v[c * 4u + 3u];
+        if (pc.write_hist != 0) {                    // the SINGLE-token contract; the multi must NOT write it
+            hist.v[c * 3u + 0u] = four[1];           // slide: drop the oldest, the new column lands LAST
+            hist.v[c * 3u + 1u] = four[2];
+            hist.v[c * 3u + 2u] = four[3];
+        }
         y = sum / (1.0f + exp(-sum));                // FP32 fast-math SiLU
     }
 
@@ -84,6 +95,6 @@ void main() {
     }
     barrier();
     if (c < uint(channels)) {
-        h.v[c] = norm_this_head ? (y * red[hg * 128u]) : y;
+        h.v[a * uint(channels) + c] = norm_this_head ? (y * red[hg * 128u]) : y;
     }
 }

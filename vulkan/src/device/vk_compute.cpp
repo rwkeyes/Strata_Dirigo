@@ -62,11 +62,32 @@ struct DispStat {
     // i.e. the decode/verify arm) and a segment submit (that replay cut at a handshake boundary).
     uint64_t sub_live = 0, sub_transfer = 0, sub_rec = 0, sub_seg = 0, replays = 0;
     uint64_t seg_disp = 0;                        // recorded dispatches EXECUTED by segment submits
+    uint64_t barriers = 0;                        // COMPUTE->COMPUTE chain barriers emitted (one per chained dispatch)
     double t_seg_wait = 0, t_seg_submit = 0;      // the segment path's own submit + fence wait (ms)
     double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
     std::vector<std::pair<std::string, uint64_t>> by_pipe;   // per-spv dispatch counts
 };
 DispStat g_ds;
+// ---- STRATA_VK_NOBARRIER: MEASUREMENT-ONLY, UNSAFE.  Every dispatch carries a full COMPUTE -> COMPUTE pipeline
+// barrier (`encode_dispatch`'s `chain_barrier`), which is what ORDERS one kernel's write against the next
+// kernel's read inside a recorded step.  This switch ELIDES it so the barrier can be PRICED - the answers are
+// then WRONG wherever a real hazard exists.  Off unless the env var is set; never a shipping mode.
+bool g_nobarrier = false;
+// ---- STRATA_VK_BARRIER_HAZARD: MEASUREMENT-ONLY hazard narrowing, so the chain barrier can be PRICED.
+// The unconditional rule is one full COMPUTE -> COMPUTE pipeline barrier after EVERY chained dispatch.  The
+// device layer has no read/write information - a binding is just a buffer - so "a real data hazard exists" is
+// approximated CONSERVATIVELY: every bound region counts as both read and written, and a barrier is emitted only
+// when the dispatch about to run touches a (buffer, byte-range) REGION that a dispatch since the last barrier
+// also touched.  Otherwise the region is only remembered.  This can miss a hazard, which is why it prices the
+// barrier rather than shipping; the ids are the guard.  Off unless the env var is set.
+bool g_hazard_only = false;
+struct HazardRange {
+    VkBuffer buf;
+    uint64_t off, end;
+};
+std::vector<HazardRange> g_haz;
+constexpr size_t kHazardCap = 8192;   // force a barrier rather than grow without bound
+uint64_t g_haz_barriers = 0;          // barriers actually EMITTED in the hazard mode
 inline double vk_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -103,11 +124,17 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
     }
     std::fprintf(stderr, "vk disp stat by shader (top):%s\n", line.c_str());
     std::fprintf(stderr, "vk disp stat by arm: live-batch %llu | transfer %llu | recorded-submit %llu (replays %llu) | "
-                         "segment %llu (%llu recorded dispatches, submit %.0f ms, wait %.0f ms)\n",
+                         "segment %llu (%llu recorded dispatches, %llu chain barriers, submit %.0f ms, wait %.0f ms)\n",
                  (unsigned long long) g_ds.sub_live, (unsigned long long) g_ds.sub_transfer,
                  (unsigned long long) g_ds.sub_rec, (unsigned long long) g_ds.replays,
-                 (unsigned long long) g_ds.sub_seg, (unsigned long long) g_ds.seg_disp, g_ds.t_seg_submit,
+                 (unsigned long long) g_ds.sub_seg, (unsigned long long) g_ds.seg_disp,
+                 (unsigned long long) g_ds.barriers, g_ds.t_seg_submit,
                  g_ds.t_seg_wait);
+    if (g_hazard_only)
+        std::fprintf(stderr,
+                     "vk disp stat[HAZARD]: %llu of %llu chain barriers EMITTED (the rest were elided where no "
+                     "bound REGION overlapped a dispatch since the last barrier)\n",
+                     (unsigned long long) g_haz_barriers, (unsigned long long) g_ds.barriers);
 }
 }  // namespace
 
@@ -485,6 +512,16 @@ std::vector<DeviceInfo> Ctx::list_devices() {
 Ctx::Ctx(int want_device, bool need_16bit) {
     g_ds.on = std::getenv("STRATA_VK_DISP_STAT") != nullptr;
     if (g_ds.on) std::atexit(disp_stat_dump);
+    g_nobarrier = std::getenv("STRATA_VK_NOBARRIER") != nullptr;
+    if (g_nobarrier)
+        std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_NOBARRIER=1 - the per-dispatch COMPUTE->COMPUTE "
+                             "pipeline barrier is ELIDED.  The answers may be WRONG wherever a real hazard exists; "
+                             "this PRICES the barrier, it is not a shipping mode.\n");
+    g_hazard_only = std::getenv("STRATA_VK_BARRIER_HAZARD") != nullptr;
+    if (g_hazard_only)
+        std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_BARRIER_HAZARD=1 - the chain barrier is emitted "
+                             "only where a bound buffer REGION overlaps one touched since the last barrier.  A "
+                             "hazard it does not see is a WRONG answer; this PRICES the barrier.\n");
     if (g_xs.on) std::atexit(xfer_stat_dump);
     g_fs_on_env = std::getenv("STRATA_VK_FLUSH_STAT") != nullptr;
     if (g_fs_on_env) std::atexit(flush_stat_dump);
@@ -1395,13 +1432,34 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     vkCmdDispatch(cb, groups, groups_y, 1);
     if (chain_barrier) {
         // One kernel's output is the next one's input inside a recorded step.  Compute -> compute, not to host:
-        // the step has exactly one host-read barrier, at its end.
-        VkMemoryBarrier mb{};
-        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                             &mb, 0, nullptr, 0, nullptr);
+        // the step has exactly one host-read barrier, at its end.  COUNTED whether or not it is emitted (the
+        // `STRATA_VK_NOBARRIER` and `STRATA_VK_BARRIER_HAZARD` measurements).
+        ++g_ds.barriers;
+        bool emit = !g_nobarrier;
+        if (g_hazard_only) {
+            bool need = g_haz.size() >= kHazardCap;
+            std::vector<HazardRange> cur;
+            cur.reserve(bufs.size());
+            for (const Buf* b : bufs) {
+                if (b == nullptr || b->buffer == VK_NULL_HANDLE || b->bytes == 0) continue;
+                const uint64_t s = b->offset, e = b->offset + b->bytes;
+                cur.push_back({b->buffer, s, e});
+                for (const HazardRange& p : g_haz) {
+                    if (p.buf == b->buffer && s < p.end && p.off < e) { need = true; break; }
+                }
+            }
+            emit = need;
+            if (need) { g_haz = cur; ++g_haz_barriers; }
+            else for (const HazardRange& r : cur) g_haz.push_back(r);
+        }
+        if (emit) {
+            VkMemoryBarrier mb{};
+            mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &mb, 0, nullptr, 0, nullptr);
+        }
     }
 }
 

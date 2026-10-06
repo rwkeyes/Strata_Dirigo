@@ -35,7 +35,7 @@ layout(set = 0, binding = 3, std430) readonly buffer DT { float v[]; } dt;    //
 layout(set = 0, binding = 4, std430) readonly buffer SSMA { float v[]; } ssm_a;   // (h_v,)
 layout(set = 0, binding = 5, std430) buffer GATE { float v[]; } gate;         // (h_v,)
 layout(set = 0, binding = 6, std430) buffer BETA { float v[]; } beta;         // (h_v,)
-layout(push_constant, std430) uniform PC { int n; int h_v; } pc;
+layout(push_constant, std430) uniform PC { int n; int h_v; int n_tok; } pc;
 
 #include "common/wg_reduce.glsl"
 
@@ -56,9 +56,13 @@ void main() {
     const uint row = gl_WorkGroupID.x;
     const int hv = pc.h_v;
     if (row >= uint(2 * hv)) return;                  // workgroup-uniform
+    const uint t = gl_WorkGroupID.y;                  // THE TOKEN: one (row, token) pair per workgroup
+    if (t >= uint(pc.n_tok)) return;                  // workgroup-uniform
     const bool is_beta = row >= uint(hv);
     const uint r = is_beta ? row - uint(hv) : row;
     const uint n = uint(pc.n);
+    const uint xrow = t * n;                          // this token's activation column
+    const uint orow = t * uint(hv);                   // this token's gate/beta column
     const uint base = r * (n >> 1u);                  // the row's uint pair base (n is a multiple of 8)
     const uint lid = gl_LocalInvocationIndex;
     const uint lsize = gl_WorkGroupSize.x;
@@ -70,7 +74,7 @@ void main() {
         const uint w1 = is_beta ? wb.v[ub + 1u] : wa.v[ub + 1u];
         const uint w2 = is_beta ? wb.v[ub + 2u] : wa.v[ub + 2u];
         const uint w3 = is_beta ? wb.v[ub + 3u] : wa.v[ub + 3u];
-        const uint xb = j * 8u;
+        const uint xb = xrow + j * 8u;
         acc = fma(bf16_to_f32(w0 & 0xFFFFu), x.v[xb + 0u], acc);
         acc = fma(bf16_to_f32(w0 >> 16u),    x.v[xb + 1u], acc);
         acc = fma(bf16_to_f32(w1 & 0xFFFFu), x.v[xb + 2u], acc);
@@ -84,11 +88,11 @@ void main() {
     const float total = wg_sum(acc);
     if (lid == 0u) {
         if (is_beta) {
-            beta.v[r] = 1.0f / (1.0f + exp(-total));
+            beta.v[orow + r] = 1.0f / (1.0f + exp(-total));
         } else {
             const float v = total + dt.v[r];
             const float sp = (v > 20.0f) ? v : log1p_s(exp(v));
-            gate.v[r] = sp * ssm_a.v[r];
+            gate.v[orow + r] = sp * ssm_a.v[r];
         }
     }
 }

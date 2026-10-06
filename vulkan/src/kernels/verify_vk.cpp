@@ -20,17 +20,22 @@
 //   capture_commit -> the conv commit: `gdn_conv_commit`             verify.cpp:1293/:1844
 //   (mtp.cpp:497) -> the drafter's embedding: `add_streams_broadcast`
 //
-// THE SHAPING (the brief's standing rule, and the header's own contract): a `_multi` variant is a LOOP over the
-// ALREADY-GATED single-token kernel.  `verify_kernels.hpp` says so in as many words:
+// THE SHAPING (the brief's standing rule, and the header's own contract): a `_multi` variant was a LOOP over
+// the ALREADY-GATED single-token kernel, so each contract below was true BY CONSTRUCTION rather than by a
+// shared-weight kernel that had to reproduce the single-token summation order.  `verify_kernels.hpp` says so
+// in as many words:
 //   * `gdn_conv_l2_multi`   "Bitwise `fused_gdn_conv_l2` per token."
 //   * `gdn_ab_multi`        "Bitwise `fused_gdn_ab` per column."
 //   * `gdn_step_norm_multi` "Bitwise `fused_gdn_step_norm`." (ONE exception - see below)
 //   * `native_router_top10_multi` "each row exactly as the single call" (`native_router.hpp`)
 //   * `native_moe_combine_multi`  "each as the single call" (`native_moe.hpp`)
 //   * `shared_expert_multi`       "every token is bitwise `shared_expert` on that token" (`shared_expert.hpp`)
-// A loop makes each of those true BY CONSTRUCTION rather than by a shared-weight kernel that must reproduce the
-// single-token summation order.  The CUDA's one-weight-read-for-all-tokens (and its multi-column MMVQ) is a COST
-// optimisation, and it is the one property this port does not carry - stated, not hidden.
+// IT IS NOW ONE DISPATCH PER ROUND, NOT A HOST LOOP.  The loop shape cost a recorded dispatch per token per
+// stage, and the window's cost is a dispatch COUNT (~4,792 per round at ~46-54 us).  Each `_multi` issues ONE
+// dispatch whose grid carries the token (a Y dimension, or the module's own column dimension) and whose
+// per-token arithmetic is the single kernel's expression, so every contract above still holds by construction
+// - `ports/vulkan/PERFORMANCE-B70-2026-10-06.md` measures the round.  The CUDA's one-weight-read-for-all-tokens
+// is still a COST optimisation this port does not carry; the column walk inside a workgroup is the workaround.
 //
 // THE ONE EXCEPTION, AND WHY IT IS NOT A LOOP: `gdn_step_norm_multi` reads its loop bound `n = n_keep ? *n_keep
 // : T` FROM DEVICE MEMORY (`verify_kernels.cu:178`), and its commit half is captured ONCE
@@ -63,6 +68,7 @@
 
 #include "strata/vulkan/vk_backend.hpp"        // Stream, stream_of
 #include "vk_arena.hpp"                        // arena_alloc / arena_resolve / Buf
+#include "vk_multi.hpp"                        // the one-dispatch-per-round forms (fused_gdn_conv_l2_n, ...)
 
 #include <cstdint>
 #include <cstdio>
@@ -114,17 +120,15 @@ static Buf& dummy_buf(Stream& s) {
     return s.dummy;
 }
 
-// THE DESCRIPTOR-OFFSET ALIGNMENT, checked where a multi binds a PER-TOKEN VIEW.  The single-token wrappers take
-// raw pointers, so a loop hands them `base + t*stride`, and a storage-buffer descriptor offset must be a
-// multiple of the device's `minStorageBufferOffsetAlignment` (vk_compute.cpp:701-712).  On the Arc that limit is
-// 4 bytes, so every stride binds; on llvmpipe it is 16, and `h_v*4 = 12` (h_v = 3) or `k*4 = 40` (k = 10) do
-// NOT.  This is a HARD property of the loop shape (the CUDA has no such limit - it passes a pointer, not a
-// descriptor offset), so the honest answer is a NAMED refusal here rather than the device layer's offset dump,
-// and the gate case SKIPS an arm whose stride this device cannot bind.
-static bool token_view_bindable(const Stream& s, uint64_t stride_bytes) {
-    const uint32_t al = s.ctx->info().min_storage_offset_align;
-    return al == 0 || stride_bytes % al == 0;
-}
+// THE DESCRIPTOR-OFFSET ALIGNMENT (kept as a note, because it is the reason the old per-token loop shape is
+// gone).  The single-token wrappers take raw pointers, so a loop handed them `base + t*stride`, and a
+// storage-buffer descriptor offset must be a multiple of the device's `minStorageBufferOffsetAlignment`
+// (vk_compute.cpp:701-712).  On the Arc that limit is 4 bytes, so every stride bound; on llvmpipe it is 16,
+// and `h_v*4 = 12` (h_v = 3) or `k*4 = 40` (k = 10) did NOT - which is why the per-token form carried a NAMED
+// refusal and the gate SKIPPED such an arm.  THE ROUND FORM HAS NO PER-TOKEN DESCRIPTOR AT ALL: the token is a
+// grid dimension and a push constant, so the whole class of arm disappears with the loop.
+// (The old `token_view_bindable` helper was removed with the last per-token loop; nothing binds `base+t*stride`
+// any more.)
 
 // ---- the shared expert's three small stages, the SAME .spv the single-token `shared_expert` dispatches --------
 // (`shared_expert_vk.cpp`'s swiglu_f32 / scalar_gate_f32 / scale_rows; the multi repeats them per token because
@@ -236,38 +240,12 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     if (history == nullptr || qkv == nullptr || conv_w == nullptr || h == nullptr) return;
     if (channels <= 0 || n_tok < 1 || t_begin < 0) return;
     strata::vulkan::Stream& s = strata::vulkan::need_stream("gdn_conv_l2_multi", stream);
-    strata::vulkan::Buf hv{}, qv{}, kv{}, dv{};
-    if (!arena_resolve(s, history, (uint64_t) channels * 3 * 4, hv) ||
-        !arena_resolve(s, qkv, (uint64_t) (t_begin + n_tok) * (uint64_t) channels * 4, qv) ||
-        !arena_resolve(s, conv_w, (uint64_t) channels * 4 * 4, kv) ||
-        !arena_resolve(s, h, (uint64_t) (t_begin + n_tok) * (uint64_t) channels * 4, dv))
-        strata::vulkan::refuse("gdn_conv_l2_multi", "a pointer is not inside this stream's arena");
-    // the working history (channels, 3), seeded with the window's own starting history
-    float* work = reinterpret_cast<float*>(strata::vulkan::need_scratch(s, (uint64_t) channels * 3 * 4));
-    strata::vulkan::Buf wv{};
-    if (!arena_resolve(s, work, (uint64_t) channels * 3 * 4, wv))
-        strata::vulkan::refuse("gdn_conv_l2_multi", "the working history is not inside this stream's arena");
-    if (t_begin == 0) {
-        // the seed IS the caller's history: one plain copy (copy.spv, 2 bindings, push {int n})
-        struct { int32_t n; } pc{channels * 3};
-        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/copy.spv", 2, sizeof(pc));
-        s.ctx->dispatch(p, {&hv, &wv}, &pc, sizeof(pc), strata::vulkan::groups_for((uint64_t) channels * 3));
-    } else {
-        // the seed is the last three of [history | qkv_0 .. qkv_{t_begin-1}] - `gdn_conv_tail`'s own rule with
-        // the count as a HOST constant (use_dev = 0)
-        strata::vulkan::Buf dmy = strata::vulkan::dummy_buf(s);
-        struct { int32_t channels, n, use_dev; } pc{channels, t_begin, 0};
-        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/gdn_conv_tail.spv", 4, sizeof(pc));
-        s.ctx->dispatch(p, {&hv, &qv, &dmy, &wv}, &pc, sizeof(pc), strata::vulkan::groups_for((uint64_t) channels));
-    }
-    // THE ABSOLUTE TOKEN INDEX.  The CUDA multi's token `t` is `t_begin + t` (`verify_kernels.cu:30`) and it
-    // reads `qkv[(t_begin+t)*C + c]`, writing `h[(t_begin+t)*C + c]` - BOTH ABSOLUTE rows of the buffers
-    // `verify.cpp:730` hands it (the layer's full qkv/h, with `tb` as `t_begin`).  The working history's running
-    // window already carries the earlier tokens, so only the pointer arithmetic moves.
-    for (int t = 0; t < n_tok; ++t) {
-        const size_t row = (size_t) (t_begin + t) * (size_t) channels;
-        fused_gdn_conv_l2(work, qkv + row, conv_w, h + row, channels, qk_heads, eps, stream);
-    }
+    // ONE DISPATCH FOR THE WHOLE ROUND (the token is the grid's Y dimension).  `history` is NOT written
+    // (`write_hist = 0`) and the running window is read from `history`/`qkv` directly as stream[t_begin+t ..
+    // t_begin+t+3] - the CUDA multi's own window formula - instead of from a slid working copy, so no token
+    // depends on another and no scratch is needed.  The per-token arithmetic is the single kernel's.
+    strata::vulkan::fused_gdn_conv_l2_n(s, history, qkv, conv_w, h, channels, qk_heads, eps, t_begin, n_tok,
+                                        /*write_hist=*/0);
 }
 
 // verify_kernels.hpp: `void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta,
@@ -278,14 +256,8 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
                   const float* ssm_a, float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd <= 0 || h_v <= 0 || n_tok < 1) return;
     strata::vulkan::Stream& s = strata::vulkan::need_stream("gdn_ab_multi", stream);
-    if (!strata::vulkan::token_view_bindable(s, (uint64_t) h_v * 4))
-        strata::vulkan::refuse("gdn_ab_multi",
-                               "the per-token gate/beta view (stride h_v*4) is not a multiple of the device's "
-                               "descriptor-offset alignment - the loop shape cannot bind it here");
-    for (int t = 0; t < n_tok; ++t) {
-        fused_gdn_ab(x + (size_t) t * (size_t) n_embd, w_alpha, w_beta, dt, ssm_a,
-                     gate + (size_t) t * (size_t) h_v, beta + (size_t) t * (size_t) h_v, n_embd, h_v, stream);
-    }
+    // ONE DISPATCH FOR THE WHOLE ROUND (the token is the grid's Y dimension); the weights are token-invariant.
+    strata::vulkan::fused_gdn_ab_n(s, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
 }
 
 // verify_kernels.hpp: `void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate,
@@ -345,12 +317,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
     if (logits == nullptr || ids == nullptr || weights == nullptr || n_tok < 1) return;
     strata::vulkan::Stream& s = strata::vulkan::need_stream("native_router_top10_multi", stream);
-    if (!strata::vulkan::token_view_bindable(s, 10u * 4u))
-        strata::vulkan::refuse("native_router_top10_multi",
-                               "the per-token ids/weights view (stride 10*4 = 40 B) is not a multiple of the "
-                               "device's descriptor-offset alignment - the loop shape cannot bind it here");
-    for (int t = 0; t < n_tok; ++t)
-        native_router_top10(logits + (size_t) t * 512, ids + (size_t) t * 10, weights + (size_t) t * 10, stream);
+    // ONE DISPATCH FOR THE WHOLE ROUND: the shader's own token dimension is the grid x.  (The per-token
+    // 40-byte ids/weights descriptor-offset refusal that used to guard this loop is gone with the loop.)
+    strata::vulkan::router_top10_n(s, logits, ids, weights, n_tok);
 }
 
 // ---- `wait_flag_ge` -> THE HANDSHAKE SEAM (deliverable A): a HOST boundary, never a spin ---------------------
@@ -425,14 +394,9 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
                               int64_t n_embd, int64_t k, int n_tok, void* stream) {
     if (n_embd <= 0 || k <= 0 || n_tok < 1) return;
     strata::vulkan::Stream& s = strata::vulkan::need_stream("native_moe_combine_multi", stream);
-    if (!strata::vulkan::token_view_bindable(s, (uint64_t) k * 4u))
-        strata::vulkan::refuse("native_moe_combine_multi",
-                               "the per-token weights view (stride k*4) is not a multiple of the device's "
-                               "descriptor-offset alignment - the loop shape cannot bind it here");
-    for (int t = 0; t < n_tok; ++t)
-        native_moe_combine(parts + (size_t) t * (size_t) k * (size_t) n_embd, weights + (size_t) t * (size_t) k,
-                           shared != nullptr ? shared + (size_t) t * (size_t) n_embd : nullptr,
-                           output + (size_t) t * (size_t) n_embd, n_embd, k, stream);
+    // ONE DISPATCH FOR THE WHOLE ROUND (the token is the flat grid's high digits).  (The per-token k*4-byte
+    // weights descriptor-offset refusal that used to guard this loop is gone with the loop.)
+    strata::vulkan::native_moe_combine_n(s, parts, weights, shared, output, n_embd, k, n_tok);
 }
 
 // ---- `shared_expert_multi` -> a LOOP over the shared expert's NATIVE path, per token ------------------------
@@ -460,30 +424,23 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     if (!native_mmvq_supported(nw.gate_type) || !native_mmvq_supported(nw.up_type) ||
         !native_mmvq_supported(nw.down_type))
         strata::vulkan::refuse("shared_expert_multi", "a native projection's type has no shader on this backend");
-    // the per-token strides this loop binds (see `token_view_bindable`)
-    if (!strata::vulkan::token_view_bindable(s, (uint64_t) n_embd * 4) ||
-        !strata::vulkan::token_view_bindable(s, (uint64_t) n_embd * 2) ||
-        !strata::vulkan::token_view_bindable(s, (uint64_t) n_ff * 4))
-        strata::vulkan::refuse("shared_expert_multi",
-                               "a per-token view's stride is not a multiple of the device's descriptor-offset "
-                               "alignment - the loop shape cannot bind it here");
-    const int64_t xcol = (int64_t) native_q8_1_bytes((int) n_embd, 1);
-    for (int t = 0; t < n_tok; ++t) {
-        const float* xt = x + (size_t) t * (size_t) n_embd;
-        float* gt = gate + (size_t) t * (size_t) n_ff;
-        float* ut = up + (size_t) t * (size_t) n_ff;
-        // gate/up activation: the caller's pre-quantized image when it provided one, else a fresh quantisation
-        void* act = nw.q8_1;
-        if (nw.x_q8_1 != nullptr)
-            act = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(nw.x_q8_1)) + (size_t) t * (size_t) xcol;
-        else native_quantize_q8_1(xt, nw.q8_1, (int) n_embd, 1, stream);
-        native_mmvq(nw.gate_type, nw.gate_data, act, gt, (int) n_embd, (int) n_ff, 1, stream);
-        native_mmvq(nw.up_type, nw.up_data, act, ut, (int) n_embd, (int) n_ff, 1, stream);
-        strata::vulkan::swiglu_f32(s, gt, ut, gt, n_ff);
-        native_quantize_q8_1(gt, nw.q8_1, (int) n_ff, 1, stream);
-        native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out + (size_t) t * (size_t) n_embd, (int) n_ff,
-                    (int) n_embd, 1, stream);
-    }
+    // ONE DISPATCH PER STAGE FOR THE WHOLE ROUND, not one per token.  The projections and the quantiser
+    // already carry a COLUMN dimension (`native_mmvq`'s `ncols`, `native_quantize_q8_1`'s `ncols`), and that
+    // dimension's layout is the single-column layout replicated - `iq1m_mmvq.comp`: `arow = c*arow_bytes`,
+    // `y.v[c*n_out + row]`; `quantize_q8_1.comp`: `x.v[c*n_in + i]`, block `c*(n_in/32) + i/32` - so token t's
+    // column is BITWISE the single-column call, which is exactly the multi's own contract ("every token is
+    // bitwise `shared_expert` on that token").  The SwiGLU is flat in its element index and `gate`/`up`/`out`
+    // are contiguous per token, so one call covers the window.  No per-token descriptor offset is needed, so
+    // the descriptor-alignment refusal this loop used to carry is gone with the loop.
+    const void* act = (nw.x_q8_1 != nullptr) ? nw.x_q8_1 : static_cast<const void*>(nw.q8_1);
+    if (nw.x_q8_1 == nullptr) native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+    native_mmvq(nw.gate_type, nw.gate_data, act, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+    native_mmvq(nw.up_type, nw.up_data, act, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    strata::vulkan::swiglu_f32(s, gate, up, gate, (int64_t) n_tok * (int64_t) n_ff);
+    // the down activation goes into the SAME scratch after both gate/up projections have read it; the
+    // dispatches are ordered, so the overwrite is defined.
+    native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     // the BF16 scalar gate and the row scale for the WHOLE window, one dispatch each (see the helpers' note)
     strata::vulkan::scalar_gate_f32(s, x_bf16, gate_inp_bf16, g, n_tok, n_embd);
     strata::vulkan::scale_rows(s, out, g, n_tok, n_embd);

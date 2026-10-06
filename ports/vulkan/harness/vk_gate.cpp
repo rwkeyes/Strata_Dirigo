@@ -12983,8 +12983,8 @@ void case_native_moe_combine(Ctx& ctx, const std::string& dir) {
             ctx.write(bp, parts.data(), parts.size() * 4);
             ctx.write(bw, w.data(), (size_t) k * 4);
             ctx.write(bs, sh.data(), (size_t) n_embd * 4);
-            VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, 12);
-            struct { int32_t n_embd, k, has_shared; } pc{n_embd, k, has_shared};
+            VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, 16);
+            struct { int32_t n_embd, k, has_shared, n_tok; } pc{n_embd, k, has_shared, 1};
             ctx.dispatch(p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), groups_for((uint64_t) n_embd));
             std::vector<float> got(n_embd);
             ctx.read(by, got.data(), (size_t) n_embd * 4);
@@ -14039,8 +14039,10 @@ void case_fused_gdn_conv_l2(Ctx& ctx, const std::string& dir) {
         ctx.write(bcs, cs.data(), hist * 4);
         ctx.write(bx, x.data(), (size_t) C * 4);
         ctx.write(bkw, kw.data(), (size_t) C * dc * 4);
-        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_conv_l2.spv", 4, 12);
-        struct { int32_t channels; int32_t qk_heads; float eps; } pc{C, qk, eps};
+        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_conv_l2.spv", 4, 24);
+        // the SINGLE-token shape of the round form: n_tok = 1, t_begin = 0, the history IS written
+        struct { int32_t channels; int32_t qk_heads; float eps; int32_t n_tok; int32_t t_begin; int32_t write_hist; }
+            pc{C, qk, eps, 1, 0, 1};
         ctx.dispatch(p, {&bcs, &bx, &bkw, &bh}, &pc, sizeof(pc), groups_for((uint64_t) C));
         std::vector<float> got_h((size_t) C), got_cs(hist);
         ctx.read(bh, got_h.data(), (size_t) C * 4);
@@ -14165,8 +14167,8 @@ void case_fused_gdn_ab(Ctx& ctx, const std::string& dir) {
         ctx.write(bwb, wb.data(), (size_t) hv * n * 2);
         ctx.write(bdt, dt.data(), (size_t) hv * 4);
         ctx.write(bssm, ssm_a.data(), (size_t) hv * 4);
-        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_ab.spv", 7, 8);
-        struct { int32_t n; int32_t h_v; } pc{n, hv};
+        VkPipeline p = ctx.pipeline(dir + "/fused_gdn_ab.spv", 7, 12);
+        struct { int32_t n; int32_t h_v; int32_t n_tok; } pc{n, hv, 1};
         ctx.dispatch(p, {&bx, &bwa, &bwb, &bdt, &bssm, &bg, &bb2}, &pc, sizeof(pc), (uint32_t) (2 * hv));
         std::vector<float> got_gate((size_t) hv), got_beta((size_t) hv);
         ctx.read(bg, got_gate.data(), (size_t) hv * 4);
@@ -15684,8 +15686,9 @@ void case_fused_gdn_conv_l2_entry(Ctx& ctx, const std::string& dir) {
         ctx.write(bx, x.data(), (size_t) C * 4);
         ctx.write(bkw, kw.data(), (size_t) C * dc * 4);
         {
-            VkPipeline p = ctx.pipeline(dir + "/fused_gdn_conv_l2.spv", 4, 12);
-            struct { int32_t channels; int32_t qk_heads; float eps; } pc{C, qk, eps};
+            VkPipeline p = ctx.pipeline(dir + "/fused_gdn_conv_l2.spv", 4, 24);
+            struct { int32_t channels; int32_t qk_heads; float eps; int32_t n_tok; int32_t t_begin; int32_t write_hist; }
+                pc{C, qk, eps, 1, 0, 1};
             ctx.dispatch(p, {&bcs, &bx, &bkw, &bh}, &pc, sizeof(pc), groups_for((uint64_t) C));
         }
         std::vector<float> ref_h((size_t) C), ref_cs(hist);
@@ -16163,8 +16166,8 @@ void case_fused_gdn_ab_entry(Ctx& ctx, const std::string& dir) {
         ctx.write(bdt, dt.data(), (size_t) hv * 4);
         ctx.write(bssm, ssm_a.data(), (size_t) hv * 4);
         {
-            VkPipeline p = ctx.pipeline(dir + "/fused_gdn_ab.spv", 7, 8);
-            struct { int32_t n; int32_t h_v; } pc{n, hv};
+            VkPipeline p = ctx.pipeline(dir + "/fused_gdn_ab.spv", 7, 12);
+            struct { int32_t n; int32_t h_v; int32_t n_tok; } pc{n, hv, 1};
             ctx.dispatch(p, {&bx, &bwa, &bwb, &bdt, &bssm, &bg, &bb2}, &pc, sizeof(pc), (uint32_t) (2 * hv));
         }
         std::vector<float> ref_gate((size_t) hv), ref_beta((size_t) hv);
@@ -19528,7 +19531,7 @@ void case_native_moe_combine_entry(Ctx& ctx, const std::string& dir) {
         ctx.write(bp, parts.data(), parts.size() * 4);
         ctx.write(bw, w.data(), (size_t) k * 4);
         ctx.write(bs, sh.data(), (size_t) n_embd * 4);
-        { struct { int32_t n_embd, k, has_shared; } pc{n_embd, k, ar.shared}; VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, (int) sizeof(pc)); ctx.dispatch(p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), groups_for((uint64_t) n_embd)); }
+        { struct { int32_t n_embd, k, has_shared, n_tok; } pc{n_embd, k, ar.shared, 1}; VkPipeline p = ctx.pipeline(dir + "/native_moe_combine.spv", 4, (int) sizeof(pc)); ctx.dispatch(p, {&bp, &bw, &bs, &by}, &pc, sizeof(pc), groups_for((uint64_t) n_embd)); }
         std::vector<float> sf(n_embd); ctx.read(by, sf.data(), (size_t) n_embd * 4);
 
         strata::vulkan::Stream* s = nullptr;
@@ -23999,13 +24002,14 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     for (const char* spv : {"bcast_streams.spv", "gdn_conv_tail.spv", "gdn_step_norm_multi.spv"})
         if (!have(dir, spv)) return;
     const float DEAD = 1.0e30f;
-    // THE DESCRIPTOR-OFFSET LIMIT.  A multi is a loop that hands the single-token wrapper `base + t*stride`; the
-    // stride becomes a storage-buffer DESCRIPTOR OFFSET, which must be a multiple of the device's
-    // `minStorageBufferOffsetAlignment` (the Arc: 4 bytes - every stride binds; llvmpipe: 16).  Two of the
-    // engine's strides are NOT multiples of 16 (`native_router_top10_multi`/`native_moe_combine_multi`: 10*4 =
-    // 40 B), so on such a device those arms SKIP with the reason rather than dying mid-dispatch - and the
-    // wrappers refuse loudly for the same reason (`token_view_bindable`, verify_vk.cpp).
+    // THE DESCRIPTOR-OFFSET LIMIT IS NO LONGER CONSUMED BY ANY OF THESE ARMS.  A multi USED TO be a loop that
+    // handed the single-token wrapper `base + t*stride`, which became a storage-buffer DESCRIPTOR OFFSET and had
+    // to be a multiple of the device's `minStorageBufferOffsetAlignment` (the Arc: 4 bytes; llvmpipe: 16) - two
+    // of the engine's strides are 40 B, so on such a device those arms skipped.  The round form carries the
+    // token in the GRID and the buffers WHOLE (`verify_vk.cpp`), so every arm below runs on every device.  The
+    // alignment is still read for the harness's own informational line.
     const uint32_t ALIGN = ctx.info().min_storage_offset_align;
+    (void) ALIGN;
 
     // =====================================================================================
     // (A)/(B) broadcast_streams and add_streams_broadcast - ONE shader, `mode` selects the rule
@@ -24191,10 +24195,8 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     // =====================================================================================
     // (D) gdn_ab_multi == n_tok x fused_gdn_ab, BITWISE
     // =====================================================================================
-    if (ALIGN != 0 && (16u % ALIGN) != 0) {
-        skip("gdn_ab_multi entry", "the device's descriptor-offset alignment cannot bind the per-token 16-byte view");
-    } else {
-        const int N = 64, HV = 4, NT = 3;   // h_v = 4 -> the gate/beta view stride is 16 B, bindable everywhere
+    {
+        const int N = 64, HV = 4, NT = 3;   // h_v = 4 -> the gate/beta column is 16 B; the round form binds whole
         std::vector<float> x((size_t) NT * N);
         for (auto& v : x) v = rndf(1.0f);
         std::vector<uint16_t> wa((size_t) HV * N), wb((size_t) HV * N);
@@ -24249,11 +24251,9 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     // =====================================================================================
     // (E) native_router_top10_multi == n_tok x native_router_top10, BITWISE
     // =====================================================================================
-    if (ALIGN != 0 && (40u % ALIGN) != 0) {
-        skip("native_router_top10_multi entry",
-             "the device's descriptor-offset alignment cannot bind the per-token 40-byte ids/weights view");
-    } else {
+    {
         const int NT = 3;
+        const int OSTRIDE = 16;   // the ORACLE's padded row: 16 ints/floats per token = 64 B, a bindable offset
         std::vector<float> logits((size_t) NT * 512);
         for (auto& v : logits) v = rndf(1.0f);
         strata::vulkan::Stream* s = nullptr;
@@ -24263,27 +24263,34 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
         float* dl = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * 512);
         int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * 10);
         float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * 10);
-        int32_t* di2 = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * 10);
-        float* dw2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * 10);
+        // THE ORACLE'S ROWS ARE PADDED TO A BINDABLE STRIDE.  The per-token oracle calls the single-token
+        // wrapper with `ids + t*10` / `weights + t*10` - a 40-byte DESCRIPTOR OFFSET, which is not a multiple of
+        // llvmpipe's 16-byte minStorageBufferOffsetAlignment (the reason this arm used to SKIP there).  The
+        // ROUND form binds whole buffers and has no such stride, so the FIXTURE is padded (its own memory
+        // layout, not a widened bound) and the arms now run on every device.
+        int32_t* di2 = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * OSTRIDE);
+        float* dw2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * OSTRIDE);
         strata::vulkan::stream_write(*s, dl, logits.data(), logits.size() * 4);
         for (int32_t* p : {di, di2}) {
-            std::vector<int32_t> dead((size_t) NT * 10, -7);
+            std::vector<int32_t> dead((size_t) NT * (p == di ? 10 : OSTRIDE), -7);
             strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
         }
         for (float* p : {dw, dw2}) {
-            std::vector<float> dead((size_t) NT * 10, DEAD);
+            std::vector<float> dead((size_t) NT * (p == dw ? 10 : OSTRIDE), DEAD);
             strata::vulkan::stream_write(*s, p, dead.data(), dead.size() * 4);
         }
         strata::kernels::native_router_top10_multi(dl, di, dw, NT, s);
         for (int t = 0; t < NT; ++t)
-            strata::kernels::native_router_top10(dl + (size_t) t * 512, di2 + (size_t) t * 10,
-                                                 dw2 + (size_t) t * 10, s);
+            strata::kernels::native_router_top10(dl + (size_t) t * 512, di2 + (size_t) t * OSTRIDE,
+                                                 dw2 + (size_t) t * OSTRIDE, s);
         std::vector<int32_t> gi((size_t) NT * 10), gi2((size_t) NT * 10);
         std::vector<float> gw((size_t) NT * 10), gw2((size_t) NT * 10);
         strata::vulkan::stream_read(*s, di, gi.data(), gi.size() * 4);
-        strata::vulkan::stream_read(*s, di2, gi2.data(), gi2.size() * 4);
         strata::vulkan::stream_read(*s, dw, gw.data(), gw.size() * 4);
-        strata::vulkan::stream_read(*s, dw2, gw2.data(), gw2.size() * 4);
+        for (int t = 0; t < NT; ++t) {   // out of the oracle's PADDED rows, into the packed comparison
+            strata::vulkan::stream_read(*s, di2 + (size_t) t * OSTRIDE, gi2.data() + (size_t) t * 10, 10 * 4);
+            strata::vulkan::stream_read(*s, dw2 + (size_t) t * OSTRIDE, gw2.data() + (size_t) t * 10, 10 * 4);
+        }
         int bad = 0, moved = 0;
         for (size_t i = 0; i < gi.size(); ++i) {
             if (gi[i] != gi2[i] || gw[i] != gw2[i]) ++bad;
@@ -24299,11 +24306,9 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     // =====================================================================================
     // (F) native_moe_combine_multi == n_tok x native_moe_combine, BITWISE
     // =====================================================================================
-    if (ALIGN != 0 && ((10u * 4u) % ALIGN) != 0) {
-        skip("native_moe_combine_multi entry",
-             "the device's descriptor-offset alignment cannot bind the per-token 40-byte weights view");
-    } else {
+    {
         const int N = 128, K = 10, NT = 3;
+        const int WSTRIDE = 16;   // the ORACLE's padded weights row: 16 floats per token = 64 B, a bindable offset
         std::vector<float> parts((size_t) NT * K * N), wt((size_t) NT * K), sh((size_t) NT * N);
         for (auto& v : parts) v = rndf(1.0f);
         for (int t = 0; t < NT; ++t) { float s = 0; for (int j = 0; j < K; ++j) { wt[(size_t) t * K + j] = 0.1f; s += 0.1f; } (void) s; }
@@ -24314,11 +24319,18 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
         strata::vulkan::cuda_compat_set_stream(s);
         float* dp = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K * N);
         float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K);
+        // THE ORACLE'S WEIGHTS ROWS ARE PADDED TO A BINDABLE STRIDE: `weights + t*K` is a 40-byte DESCRIPTOR
+        // OFFSET, not a multiple of llvmpipe's 16-byte minStorageBufferOffsetAlignment (the reason this arm used
+        // to SKIP there).  The ROUND form binds the whole weights buffer; the per-token oracle is the fixture's
+        // own layout, so IT is padded - no bound is widened.
+        float* dw2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * WSTRIDE);
         float* dsh = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
         float* dout = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
         float* dout2 = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
         strata::vulkan::stream_write(*s, dp, parts.data(), parts.size() * 4);
         strata::vulkan::stream_write(*s, dw, wt.data(), wt.size() * 4);
+        for (int t = 0; t < NT; ++t)
+            strata::vulkan::stream_write(*s, dw2 + (size_t) t * WSTRIDE, wt.data() + (size_t) t * K, (size_t) K * 4);
         strata::vulkan::stream_write(*s, dsh, sh.data(), sh.size() * 4);
         for (float* p : {dout, dout2}) {
             std::vector<float> dead((size_t) NT * N, DEAD);
@@ -24326,7 +24338,7 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
         }
         strata::kernels::native_moe_combine_multi(dp, dw, dsh, dout, N, K, NT, s);
         for (int t = 0; t < NT; ++t)
-            strata::kernels::native_moe_combine(dp + (size_t) t * K * N, dw + (size_t) t * K,
+            strata::kernels::native_moe_combine(dp + (size_t) t * K * N, dw2 + (size_t) t * WSTRIDE,
                                                 dsh + (size_t) t * N, dout2 + (size_t) t * N, N, K, s);
         std::vector<float> go((size_t) NT * N), go2((size_t) NT * N);
         strata::vulkan::stream_read(*s, dout, go.data(), go.size() * 4);
@@ -24346,9 +24358,7 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
     // =====================================================================================
     // (G) shared_expert_multi == n_tok x shared_expert (all three projections native), BITWISE
     // =====================================================================================
-    if (ALIGN != 0 && (64u % ALIGN) != 0) {
-        skip("shared_expert_multi entry", "the device's descriptor-offset alignment cannot bind the per-token views");
-    } else {
+    {
         const int N = 64, FF = 64, NT = 3;                 // strides 256/128/256 B: multiples of 16
         const int GG = 8;                                  // ggml Q8_0: 34 B per 32 values
         auto q8row = [&](int n, std::vector<uint8_t>& out) {
@@ -24375,9 +24385,14 @@ void case_verify_window_entry(Ctx& ctx, const std::string& dir) {
         uint8_t* dg = strata::vulkan::arena_alloc<uint8_t>(*s, wg.size());
         uint8_t* du = strata::vulkan::arena_alloc<uint8_t>(*s, wu.size());
         uint8_t* dd = strata::vulkan::arena_alloc<uint8_t>(*s, wd.size());
+        // `nw.q8_1` MUST hold n_tok columns of the largest active input (`shared_expert.hpp`): the multi indexes
+        // its columns, the single-token oracle below uses one.  Sized for ONE column this fixture let the
+        // multi's batched quantiser run past its allocation into the next arena region; the ENGINE sizes it for
+        // T columns (`verify.cpp:412`, `native_q8_1_bytes(max_in, T)`), so the fixture now does too.
         const size_t q81 = strata::kernels::native_q8_1_bytes(N > FF ? N : FF, 1);
+        const size_t q81m = strata::kernels::native_q8_1_bytes(N > FF ? N : FF, NT);
         uint8_t* dq81 = strata::vulkan::arena_alloc<uint8_t>(*s, q81);
-        uint8_t* dq81b = strata::vulkan::arena_alloc<uint8_t>(*s, q81);
+        uint8_t* dq81b = strata::vulkan::arena_alloc<uint8_t>(*s, q81m);
         float* dx = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * N);
         uint16_t* dxb = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) NT * N);
         uint16_t* dginp = strata::vulkan::arena_alloc<uint16_t>(*s, (size_t) N);

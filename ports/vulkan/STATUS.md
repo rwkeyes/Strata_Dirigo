@@ -1,5 +1,65 @@
 # Status — what is done, what is verified, what is not
 
+## THE PER-ROUND PREDICTION IS FALSIFIED, AND SO IS THE BARRIER — the delivered decode gap is SPECULATIVE WASTE (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** The verify window's five per-token loops are batched to ONE dispatch per ROUND: `gdn_conv_l2_multi`,
+`gdn_ab_multi`, `native_router_top10_multi`, `shared_expert_multi`, `native_moe_combine_multi`.  The binding is
+`vulkan/src/kernels/vk_multi.hpp`; the round forms (`*_n`) live in `gdn_vk.cpp` / `ple_vk.cpp` / `qsa_vk.cpp`.
+Two are HOST-ONLY (`native_router_top10.spv` already had the token dimension; `shared_expert_multi` uses the
+module's own `ncols` column layout, which is the single-column layout replicated, so token t's column is bitwise
+the single-token call).  Three shaders gained a token dimension: `native_moe_combine` (flat `n_embd*n_tok` grid),
+`fused_gdn_ab` (token = `gl_WorkGroupID.y`), and `fused_gdn_conv_l2`, whose running window is now
+TOKEN-INVARIANT (`stream[a..a+3]` of `[history(3) | qkv]` — the CUDA multi's own `win[j]` rule) with
+`write_hist = 0` for the multi's "history is NOT written" contract.  New measurement-only instruments:
+`STRATA_VK_NOBARRIER`, `STRATA_VK_BARRIER_HAZARD`, and a chain-barrier counter in the disp stat.  The four
+descriptor-offset SKIPs on the `_multi` arms are RETIRED (no per-token descriptor exists any more); the harness's
+six direct dispatches carry the new push-constant sizes, and its case-(G) `nw.q8_1` fixture is sized for `n_tok`
+columns as `shared_expert.hpp` requires.
+
+**VERIFIED.** Gate: Arc `intel_icd` **886 passed / 0 failed / 0 skipped** — the count has NOT moved, nothing
+skipped, no bound widened; **lvp_icd 872/0/4** (868/0/6 before — the four retired `_multi` alignment SKIPs now
+RUN, and the four remaining skips are the documented pre-existing ones) and **radeon_icd 876/1/2** (the
+documented intermittent `bf16_gemv_fp32_mmvf_cols`); smoke 20/0/0 on all three.  The `_multi` arms are bitwise
+against their single-token oracles on all three ICDs.  Ids `3aed108cceee` / `56a0b28d2de6` in all EIGHT
+before/after runs (`/tmp/meas/before2.*.log`, `/tmp/meas/after.*.log`).  `check_port_map.py` passes;
+`make_port_map.py` regenerates `PORT-MAP.tsv` byte-identically
+(`168 — 97 kernel, 0 shader, 47 host, 0 todo, 24 refused`).
+
+**THE PREDICTION IS FALSIFIED.** Recorded dispatches fell **13.0-16.5%** (81,154 -> 73,126 and 91,060 -> 78,952
+on the 8-token arm; 68,999 -> 59,111 and 75,005 -> 62,669 on the 199-token arm) while the verify window's `sync`
+moved **1.2-1.4%** (197.275 -> 194.971 and 240.720 -> 237.764) and decode **+1.0-1.5%** (8.12 -> 8.21,
+6.67 -> 6.74, 8.25 -> 8.36, 7.25 -> 7.36).  Per REMOVED dispatch that is **4.6-5.4 us**, against the port's own
+bench figure of 46-54 us — so the five loops' dispatches are real, were really per-draft (the count DID fall:
+422.5 dispatches/round removed at T=2, 637.2 at T=4 = 105.6/106.2 per window token), and are CHEAP.  The
+`--spec 4` prediction of ~14 tok/s did not happen; the measured value is 6.74.
+
+**THE BARRIER IS FALSIFIED TOO.** 21,826 chain barriers at T=2 / 26,668 at T=4 per run (~1,149 / ~1,404 per
+round — about 30% of recorded dispatches, NOT one per dispatch).  Elision is impossible
+(`STRATA_VK_NOBARRIER=1` breaks the prompt path: `prefill: routed id out of range`), and a conservative
+bound-region hazard rule still required **21,825 of 21,826** barriers with `sync` unchanged (194.882 vs 194.971;
+237.662 vs 237.764).  Ids identical.  A barrier is therefore < ~5 us, bounded by the removal, not the barrier.
+
+**THE DECODE GAP, RE-FRAMED.** The `--spec 4` 8-token window computes 6 draft tokens in 240.6 ms = **40.1 ms per
+computed token (~24.9 tok/s raw compute)**; **1.68 tokens/round are accepted**, so a delivered token costs
+`240.6/1.68 = 143.2 ms` (6.98 tok/s) and **72% of the window's compute is discarded**.  Against llama.cpp's
+36.52 tok/s (27.4 ms/token) the port's RAW compute is **~1.47x** off while the delivered 4.4x is speculative
+WASTE — an engine/MTP property, not Vulkan overhead.  Acceptance is flat at 1.68 across T=2/4/6 (observation,
+not chased).
+
+**THE GATE GAP IS CLOSED.** `strata_vk_cudart_smoke` was a CMake target NOTHING ran, so the `cudaStreamQuery`
+fix was unguarded.  `run_gate.sh` now sources `gates/smoke_sources.sh`, builds the target, runs it per ICD, and
+FOLDS its cases into the totals (the count RISES; a build failure or a no-device run is a FAILURE, not a skip).
+`inject-verify.sh cudart-stream-query-nofix` is the other direction and PROVEN (`outstanding before/after = 1/1`
+-> FAIL; `1/0` -> PASS 20/0/0).  One arm was over-strict and is fixed at the cause: on llvmpipe EVERY arena
+buffer is host-visible+coherent (`STRATA_VK_MEM_TRACE=1`: one heap, `host_visible=1 host_coherent=1`) so
+`vk_compute.cpp:1521`'s rule flushes at every dispatch and nothing is queued — the arm now asserts the RULE
+(queued OR flushed-because-mapped) and prints which condition held, 20/20 on intel, lvp and radeon.
+
+**NOT DONE.** The ~21.7 ms/draft was NOT attributed: the remaining per-token work is the QSA branch's per-token
+loops (`verify.cpp:778-900`) and none of it is measured (`STRATA_VERIFY_PROFILE`/`_TRACE` are closed by design).
+The barrier's absolute cost is bounded, not measured.  On llvmpipe the visibility arm is vacuous.  A batched form
+for the QSA per-token family is the next honest lever.  `submit_recorded` is still ZERO and unexplained.
+
 ## THE DECODE: 150 ms/token ATTRIBUTED TO THE VERIFY WINDOW'S GPU EXECUTION; `--spec 2` IS A MEASURED 1.22x (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** The decode got the phase table it never had. Two decode-side marks in `Verifier::run` (`ms_launch`,

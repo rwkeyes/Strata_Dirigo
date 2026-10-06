@@ -1,5 +1,52 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE PER-ROUND BATCHING: 13-17% FEWER DISPATCHES, 1.2-1.4% OF `sync` — THE PREDICTION IS FALSIFIED, AND THE DELIVERED DECODE GAP IS SPECULATIVE WASTE (later, same day, `vega`)
+
+**THE CHANGE.** The verify window's five per-token loops (`gdn_conv_l2_multi`, `gdn_ab_multi`,
+`native_router_top10_multi`, `shared_expert_multi`, `native_moe_combine_multi`) now issue ONE dispatch per ROUND
+instead of one per draft.  Two are host-only (`native_router_top10.spv` already carried the token dimension;
+`shared_expert_multi` drives the module's own multi-column `ncols` path); three shaders gained a token dimension
+(`native_moe_combine`, `fused_gdn_ab`, and `fused_gdn_conv_l2`, whose running history window is now read as
+`stream[a..a+3]` instead of being slid token by token).  `sync`/`launch`/`commit`/`host` are the port's own
+decode phase table; the dispatches are `STRATA_VK_DISP_STAT`'s segment counter.  Logs: `/tmp/meas/before2.*.log`
+and `/tmp/meas/after.*.log`.
+
+| arm | config | recorded dispatches / run | per round | verify `sync` ms/round | `launch` | `commit` | decode tok/s | ids md5 |
+|---|---|---|---|---|---|---|---|---|
+| 8-token | before `--spec 2` | 81,154 | 4,271.3 | 197.275 | 4.077 | 3.950 | 8.12 | `3aed108cceee` |
+| 8-token | **after** `--spec 2` | 73,126 | 3,849.5 | **194.971** | 3.994 | 4.022 | **8.21** | `3aed108cceee` |
+| 8-token | before `--spec 4` | 91,060 | 4,792.6 | 240.720 | 4.914 | 4.100 | 6.67 | `3aed108cceee` |
+| 8-token | **after** `--spec 4` | 78,952 | 4,155.4 | **237.764** | 4.872 | 4.128 | **6.74** | `3aed108cceee` |
+| 199-token | before `--spec 2` | 68,999 | 4,928.5 | 263.669 | 5.333 | 4.844 | 8.25 | `56a0b28d2de6` |
+| 199-token | **after** `--spec 2` | 59,111 | 4,222.2 | **260.153** | 5.289 | 4.833 | **8.36** | `56a0b28d2de6` |
+| 199-token | before `--spec 4` | 75,005 | 5,357.5 | 300.602 | 6.044 | 4.989 | 7.25 | `56a0b28d2de6` |
+| 199-token | **after** `--spec 4` | 62,669 | 4,476.4 | **296.348** | 5.950 | 4.942 | **7.36** | `56a0b28d2de6` |
+
+**THE PREDICTION WAS `sync 240.6 -> ~110 ms, decode 6.66 -> ~14 tok/s` AT T=4.  It is FALSIFIED**: the dispatch
+count fell 13.0-16.5% and `sync` moved 2.30 ms (T=2) / 2.96 ms (T=4), i.e. **4.6-5.4 us per REMOVED dispatch**
+against this port's own bench figure of 46-54 us.  The five loops' dispatches are real and were really per-draft
+(the count DID fall, 105.6/106.2 fewer dispatches per WINDOW TOKEN on the 8-token arm), they are simply cheap;
+the ~21.7 ms/draft measured at T=2/4/6 is elsewhere in the window.  Ids are identical in all eight runs and the
+gate's `_multi` arms are bitwise, so the change is safe — it is just not the lever.
+
+**THE CHAIN BARRIER IS NOT THE COST EITHER.**  `STRATA_VK_DISP_STAT` now counts them: **21,826 chain barriers at
+T=2 and 26,668 at T=4 per run (~1,149 / ~1,404 per round — ~30% of the recorded dispatches, not one each)**.
+`STRATA_VK_NOBARRIER=1` cannot even be measured: the prompt path breaks in the first stages
+(`prefill: routed id out of range`, the engine's own guard).  A conservative bound-region hazard rule
+(`STRATA_VK_BARRIER_HAZARD=1`) still required **21,825 of 21,826** barriers and left `sync` unchanged
+(194.882 vs 194.971; 237.662 vs 237.764), ids identical — the barriers are at real region overlaps, and a
+barrier is < ~5 us by the removal bound above.
+
+**THE DECODE GAP, IN FOUR NUMBERS.**  The `--spec 4` 8-token window computes **6 draft tokens in 240.6 ms =
+40.1 ms per computed token (~24.9 tok/s of raw compute)**; only **1.68 tokens/round are accepted**, so one
+DELIVERED token costs `240.6/1.68 = 143.2 ms` (6.98 tok/s; the measured 6.67-6.74 adds launch/commit/host);
+**72% of the window's compute is discarded** on unaccepted drafts; and against llama.cpp Vulkan on the same card
+(36.52 tok/s = 27.4 ms/token) the port's **RAW compute is ~1.47x off**, while the delivered 4.4x gap
+(36.52 / 8.27 at `--spec 2` on the 199-token arm) is dominated by speculative waste — an engine/MTP draft-quality
+property, not Vulkan overhead.  `--spec 2` wins for exactly this reason (fewer drafts computed per round for the
+same ~1.68 accepted): **1.14x** from the dispatch batching and **1.22x** from `--spec 2` over the engine's
+`--spec 4` default, both id-verified.
+
 ## THE DECODE, ATTRIBUTED — the sync is the GPU executing the verify window; `--spec 2` is 1.22x (later, same day, `vega`)
 
 **THE TRANSFER HYPOTHESIS IS RETRACTED, AND THE INSTRUMENT THAT KILLED IT IS ITS OWN.** The section below says
