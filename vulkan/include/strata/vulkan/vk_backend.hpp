@@ -45,6 +45,13 @@ Stream* stream_of(void* stream);
 Stream*& default_stream_ref();
 Stream* default_stream();
 
+/// The router wrapper's OWN geometry contract, shared so the gate can compare the wrapper against the shader
+/// its contract NAMES instead of pinning it bitwise to one implementation.  TRUE when the native fused router
+/// shader (`native_router_top10.spv`) is the correct member: `native_router_enabled()` AND the geometry that
+/// shader is built for (`k == 10`, `1 <= n_expert <= 512` - the shared `rs_*`/`nr_*` arrays' cap).  The
+/// engine's `router_top10` wrapper consults this; `STRATA_ROUTER_FORCE_F32=1` is a control that bypasses it.
+bool router_top10_uses_native(int n_expert, int k);
+
 // ---- ENTRY POINTS IMPLEMENTED BY THE BACKEND ----------------------------------------------------------------
 // One function per engine `kernels::` symbol whose body is GPU work.  The first is the skeleton's proof; the
 // rest are the plan's increments in ports/vulkan/plan/BACKEND-INTEGRATION.md.

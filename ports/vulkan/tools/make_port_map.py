@@ -124,7 +124,7 @@ TABLE = {
     'quantize_q8_K':                  ('kernel', 'quantize_q8_K'),
     'rms_norm_weighted':              ('kernel', 'rms_norm'),
     'rope_neox_apply':                ('kernel', 'rope_neox'),
-    'router_top10':                   ('kernel', 'router_top10_f32 router_top10_f64'),
+    'router_top10':                   ('kernel', 'router_top10_f32 router_top10_f64 native_router_top10'),
     's2_gemv_q8':                     ('kernel', 's2_gemv_q8'),
     # ---- THE TWO SPLIT GEMV ROWS THAT WERE MIS-RECORDED, now that the pair is wired ---------------------------
     # `s_gemv_q8_0_split` / `s_gemv_q8k_split` -> the ONE shader `s_gemv_q8_split` (the CUDA's

@@ -140,3 +140,29 @@ void native_gdn_set_enabled(bool) { /* see the header note */ }
 bool native_gdn_enabled() { return true; }         // all nine gated symbols have shaders (six native + three fused)
 
 }  // namespace strata::kernels
+
+// ---- THE ROUTER WRAPPER'S GEOMETRY CONTRACT (vulkan/include/strata/vulkan/vk_backend.hpp) --------------------
+// THE PORTABLE ARITHMETIC IS THE CONTRACT, NOT A TOLERANCE.  The gate's `case_router` shows the port's router is
+// the PORTABLE form - float exp with KAHAN sums - whose ids are BIT-EXACT against the double transcription of the
+// same rule, while its weights carry a tolerance (worst err/tol ~0.24).  The engine's own router
+// (`src/kernels/cuda/router_top10.cu:105,:110-112,:115,:120`) computes exp and its sum in DOUBLE; the portable
+// f32+Kahan member is the port's faithful approximation of that and it is what captured the bit-exact ids
+// `56a0b28d2de6` (199-token) / `3aed108cceee` (8-token).  A plain-float sum is a DIFFERENT arithmetic; it moved
+// the 8-token id (`3aed108cceee` -> `0732bdd71367`) on a near-tie, so it is a deviation regardless of any weight
+// tolerance.  The NATIVE member now REPRODUCES the portable arithmetic exactly (Kahan softmax sum on one lane in
+// ascending order, the Kahan selected-sum, the 2**-14 clamp and a DIVIDE), so it is a drop-in with the SAME
+// bit-exact ids and a far smaller link price.  This predicate is the geometry contract; the wrapper and the
+// gate's `case_router_top10_entry` both consult it, and the gate pins the shipped router to the portable shader
+// BITWISE, so the summation cannot silently change again.
+namespace strata::vulkan {
+// THE GEOMETRY CONTRACT.  The native member's shared arrays cap at 512 experts and its k is fixed at 10.  Its
+// ARITHMETIC now REPRODUCES the portable member EXACTLY - a Kahan softmax sum on one lane in ascending expert
+// order, the Kahan selected-sum, the 2**-14 clamp and a DIVIDE (`router_top10_f32.comp:49-83`) - so it is a
+// drop-in for `router_top10_f32` with the SAME bit-exact ids and a much smaller link price.  The wrapper takes
+// it for this geometry; `STRATA_ROUTER_FORCE_F32` there restores the legacy member (the gate's failure-path
+// control) and the gate's `case_router_top10_entry` pins the shipped router to the portable shader bitwise, so
+// the summation cannot silently change again.
+bool router_top10_uses_native(int n_expert, int k) {
+    return strata::kernels::native_router_enabled() && k == 10 && n_expert >= 1 && n_expert <= 512;
+}
+}  // namespace strata::vulkan

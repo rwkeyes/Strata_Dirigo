@@ -573,8 +573,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
-            else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
+            // GEOMETRY-AWARE (the same choice moe_route makes at layer.cpp:370-373).  The canonical native member
+            // is the 512-expert form; calling it unconditionally here read PAST a 256-logit row on a non-512
+            // model - a silent over-read.  `router_top10` is the geometry-aware entry: it takes the fused native
+            // shader at the model's OWN width (inside its 512 cap, k == 10) or the portable f32 member otherwise.
+            router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);

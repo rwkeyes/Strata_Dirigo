@@ -736,8 +736,8 @@ void bench_router_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) 
     }
     Timing tn;
     {
-        VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 4);
-        struct { int32_t n_tokens; } pc{NT};
+        VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 8);
+        struct { int32_t n_tokens, n_expert; } pc{NT, NE};
         tn = time_kernel(ctx, p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT, 1, 16, reps, warmups);
         report("native_router_top10", shape, tn, (double) NT * NE, 0.0);
     }
@@ -843,6 +843,51 @@ void bench_membw_onchip(Ctx& ctx, const std::string& dir, int reps, int warmups)
                     N, tchain.med, tfused.med, tbase.med, tchain.med / tfused.med, tfused.med - tbase.med);
     }
     ctx.free(bi); ctx.free(bmid); ctx.free(bo);
+}
+
+// THE BARRIER-COUNT SWEEP (Task 1 of the mechanism batch).  Same bytes, same grid, same recorded path and the
+// same per-dispatch chain barrier; the ONLY variable is the number of in-kernel `barrier()`s (0/1/5/35).  Four
+// pre-built bw_bar{N}.spv shaders (one static OpControlBarrier per call - the harness does not run spirv-opt),
+// so the emitted barrier count is verifiable with spirv-dis and any price difference between rows is the
+// barrier count alone.  The four counts are run INTERLEAVED in ROTATED order for `PASSES` passes (the README's
+// "a row's position in the process decides its value" artifact), and each count's row is the median of its
+// pass medians - so a first-touch effect cannot masquerade as a barrier effect.
+void bench_barrier_sweep(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int N = 1 << 16;                          // 65,536 floats = 256 KiB - the router-scale stream volume
+    std::vector<float> in = floats((size_t) N);
+    Buf bi = alloc(ctx, (size_t) N * 4), bo = alloc(ctx, (size_t) N * 4);
+    ctx.write(bi, in.data(), (size_t) N * 4);
+    const uint32_t groups = (uint32_t) (N / 256);
+    struct { int32_t n; } pc{N};
+    char shape[96];
+    std::snprintf(shape, sizeof shape, "n=%d floats (256 KiB), grid=%u groups, batch=8", N, groups);
+    const int counts[4] = {0, 1, 5, 35};
+    const int PASSES = 6;
+    VkPipeline pip[4];
+    for (int k = 0; k < 4; ++k)
+        pip[k] = ctx.pipeline(dir + "/bw_bar" + std::to_string(counts[k]) + ".spv", 2, 4);
+    std::vector<double> samp[4];
+    for (int pass = 0; pass < PASSES; ++pass)
+        for (int j = 0; j < 4; ++j) {
+            const int k = (j + pass) & 3;           // rotate the order every pass
+            Timing t = time_kernel(ctx, pip[k], {&bi, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+            samp[k].push_back(t.med);
+        }
+    double med[4] = {0, 0, 0, 0};
+    for (int k = 0; k < 4; ++k) {
+        std::vector<double>& v = samp[k];
+        std::sort(v.begin(), v.end());
+        med[k] = v[v.size() / 2];
+        Timing t;                                   // the row carries the interleaved median + the spread
+        t.med = med[k]; t.lo = v.front(); t.hi = v.back(); t.reps = reps; t.batch = 8;
+        char name[48];
+        std::snprintf(name, sizeof name, "barrier_sweep nbar=%2d", counts[k]);
+        report(name, shape, t, (double) N, 0.0);
+    }
+    std::printf("XPAIR barriers (median of %d interleaved passes) nbar=0 %.4f | nbar=1 %.4f | nbar=5 %.4f | "
+                "nbar=35 %.4f ms/link | d(35-0)=%+.4f | ratio(35/0)=%.3f\n",
+                PASSES, med[0], med[1], med[2], med[3], med[3] - med[0], med[3] / med[0]);
+    ctx.free(bi); ctx.free(bo);
 }
 
 void bench_moe_combine_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
@@ -2485,6 +2530,8 @@ int main(int argc, char** argv) {
     arm("router_pair", false, [&] { bench_router_pair(ctx, dir, reps, warmups); });
     arm("membw_pattern", false, [&] { bench_membw_pattern(ctx, dir, reps, warmups); });
     arm("membw_onchip", false, [&] { bench_membw_onchip(ctx, dir, reps, warmups); });
+    // THE BARRIER-COUNT SWEEP (Task 1): everything held fixed except the number of in-kernel barrier()s.
+    arm("barrier_sweep", false, [&] { bench_barrier_sweep(ctx, dir, reps, warmups); });
     arm("moe_combine_pair", false, [&] { bench_moe_combine_pair(ctx, dir, reps, warmups); });
     arm("rms_norm_pair", false, [&] { bench_rms_norm_pair(ctx, dir, reps, warmups); });
     // class B: native_qsa_gate_apply <- qsa_gate_apply_f32

@@ -21,7 +21,7 @@ namespace strata::vulkan {
 
 // `native_router_top10.spv` already carries a token dimension (`gl_WorkGroupID.x` is the token, `n_tokens` the
 // count): one workgroup per token.  n_tok workgroups = one dispatch for the window.
-void router_top10_n(Stream& s, const float* logits, int32_t* ids, float* weights, int64_t n_tok);
+void router_top10_n(Stream& s, const float* logits, int32_t* ids, float* weights, int64_t n_tok, int n_expert);
 
 // `native_moe_combine.spv` gains the token as `gl_WorkGroupID.y`; one flat grid over n_embd*n_tok elements.
 void native_moe_combine_n(Stream& s, const float* parts, const float* weights, const float* shared, float* output,

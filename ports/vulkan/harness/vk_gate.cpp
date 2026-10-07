@@ -12938,8 +12938,8 @@ void case_native_router_top10(Ctx& ctx, const std::string& dir) {
         Buf bl = ctx.alloc(logits.size() * 4), b_ids = ctx.alloc((size_t) NT * K * 4),
             b_w = ctx.alloc((size_t) NT * K * 4);
         ctx.write(bl, logits.data(), logits.size() * 4);
-        VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 4);
-        struct { int32_t n_tokens; } pc{NT};
+        VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 8);
+        struct { int32_t n_tokens, n_expert; } pc{NT, NE};
         ctx.dispatch(p, {&bl, &b_ids, &b_w}, &pc, sizeof(pc), (uint32_t) NT);
         std::vector<int32_t> ids((size_t) NT * K);
         std::vector<float> w((size_t) NT * K);
@@ -18674,8 +18674,8 @@ void case_native_router_top10_entry(Ctx& ctx, const std::string& dir) {
         Buf bl = ctx.alloc(logits.size() * 4), bi = ctx.alloc((size_t) NT * K * 4), bw = ctx.alloc((size_t) NT * K * 4);
         ctx.write(bl, logits.data(), logits.size() * 4);
         {
-            VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 4);
-            struct { int32_t n_tokens; } pc{NT};
+            VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, 8);
+            struct { int32_t n_tokens, n_expert; } pc{NT, NE};
             ctx.dispatch(p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT);
         }
         std::vector<int32_t> ref_ids((size_t) NT * K);
@@ -19453,56 +19453,111 @@ void case_gr_read_entry(Ctx& ctx, const std::string& dir) {
     }
 }
 
-// #5 `router_top10` (layer.cpp:373) -> router_top10_f32.spv (the PORTABLE member; the target has no f64).  The
-// engine's own router rule (`router_top10.cu` / `router_host_row`) is the oracle; the shader path drives ONE
-// multi-token launch and the wrapper the SAME call, so the whole group compared is bitwise ids+weights.
+// #5 `router_top10` (layer.cpp:373) -> THE MEMBER ITS GEOMETRY CONTRACT NAMES.  The engine reaches BOTH router
+// members through this one wrapper, so the arm no longer pins it BITWISE to `router_top10_f32.spv`: it drives
+// the shader `strata::vulkan::router_top10_uses_native(n_expert, k)` names (the backend's OWN contract, the same
+// predicate the wrapper consults) and compares the wrapper against THAT, bitwise.  The engine's own router rule
+// (`router_host_row`) stays the oracle, so the correctness verdict is unchanged in strength.
+//
+// THE ARM IS GEOMETRY-LOOPED, because "the wrapper runs a ported router" is not one geometry: (512, k=10)
+// selects the fused NATIVE member, (512, k=8) selects the portable f32 member, and (256, k=10) is THIS model's
+// geometry - it selects the native member AT WIDTH 256, and is the arm that FIRES if a 256-expert model is
+// routed through the 512-hardcoded kernel (the defect Task 3 repairs).  Run with STRATA_ROUTER_FORCE_F32=1 and
+// the wrapper takes the f32 member regardless: the arms the contract says select native then FAIL, which is the
+// failure path of THIS check demonstrated on the shipped binary, not asserted.
 void case_router_top10_entry(Ctx& ctx, const std::string& dir) {
-    if (!have(dir, "router_top10_f32.spv")) return;
-    const int NE = 512, K = 10, NT = 4;
-    std::mt19937 rng(4242);
-    std::normal_distribution<float> gauss(0.0f, 1.0f);
-    std::vector<float> logits((size_t) NT * NE);
-    for (int t = 0; t < NT; ++t)
-        for (int e = 0; e < NE; ++e) logits[(size_t) t * NE + e] = (t == 1) ? 0.5f : (t == 2 ? -1.0f : gauss(rng));
-    std::vector<int> r_ids((size_t) NT * K); std::vector<float> r_w((size_t) NT * K);
-    for (int t = 0; t < NT; ++t)
-        router_host_row(std::vector<float>(logits.begin() + (size_t) t * NE, logits.begin() + (size_t) (t + 1) * NE), NE, K, r_ids, r_w, t);
+    if (!have(dir, "router_top10_f32.spv") || !have(dir, "native_router_top10.spv")) return;
+    struct Arm { int ne, k, nt; };
+    const Arm arms[] = {{512, 10, 4}, {512, 8, 4}, {256, 10, 2}};
+    int gidx = 0;
+    for (const Arm& ar : arms) {
+        const int NE = ar.ne, K = ar.k, NT = ar.nt;
+        ++gidx;
+        std::mt19937 rng(4242u + (unsigned) gidx);
+        std::normal_distribution<float> gauss(0.0f, 1.0f);
+        std::vector<float> logits((size_t) NT * NE);
+        for (int t = 0; t < NT; ++t)
+            for (int e = 0; e < NE; ++e) logits[(size_t) t * NE + e] = (t == 1) ? 0.5f : (t == 2 ? -1.0f : gauss(rng));
+        // t == 0 is a DELIBERATE NEAR-TIE at the top of the row - the band where the SUMMATION ORDER decides the
+        // order. The engine's router (`router_top10.cu:105,:110-112,:115`) sums in DOUBLE; the port's SHIPPED
+        // f32-Kahan member reproduces that order, the plain-float native member does not (this is the 8-token
+        // guard's `3aed108cceee -> 0732bdd71367`).  Driving the WRAPPER here is what pins the ENGINE'S OWN router
+        // to the engine's own arithmetic: a future rewire to the native member makes the 'vs the engine rule'
+        // verdict below FIRE.  gap 1e-7 is inside case_router's calibrated near-tie band (1e-9..1e-5).
+        if (NT >= 1) {
+            for (int e = 0; e < NE; ++e) logits[(size_t) e] = gauss(rng) * 0.5f - 6.0f;
+            logits[3] = 5.0f;
+            logits[7] = 5.0f + 1e-7f;
+        }
+        std::vector<int> r_ids((size_t) NT * K); std::vector<float> r_w((size_t) NT * K);
+        for (int t = 0; t < NT; ++t)
+            router_host_row(std::vector<float>(logits.begin() + (size_t) t * NE, logits.begin() + (size_t) (t + 1) * NE), NE, K, r_ids, r_w, t);
 
-    Buf bl = ctx.alloc(logits.size() * 4), bi = ctx.alloc((size_t) NT * K * 4), bw = ctx.alloc((size_t) NT * K * 4);
-    ctx.write(bl, logits.data(), logits.size() * 4);
-    { struct { int32_t n_tokens, n_expert, k; } pc{NT, NE, K}; VkPipeline p = ctx.pipeline(dir + "/router_top10_f32.spv", 3, (int) sizeof(pc)); ctx.dispatch(p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT); }
-    std::vector<int32_t> sf_ids((size_t) NT * K); std::vector<float> sf_w((size_t) NT * K);
-    ctx.read(bi, sf_ids.data(), sf_ids.size() * 4);
-    ctx.read(bw, sf_w.data(), sf_w.size() * 4);
+        // THE SHADER THE GEOMETRY CONTRACT NAMES, driven directly; the wrapper is compared against it bitwise.
+        const bool native = strata::vulkan::router_top10_uses_native(NE, K);
+        Buf bl = ctx.alloc(logits.size() * 4), bi = ctx.alloc((size_t) NT * K * 4), bw = ctx.alloc((size_t) NT * K * 4);
+        ctx.write(bl, logits.data(), logits.size() * 4);
+        if (native) {
+            struct { int32_t n_tokens, n_expert; } pc{NT, NE};
+            VkPipeline p = ctx.pipeline(dir + "/native_router_top10.spv", 3, (int) sizeof(pc));
+            ctx.dispatch(p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT);
+        } else {
+            struct { int32_t n_tokens, n_expert, k; } pc{NT, NE, K};
+            VkPipeline p = ctx.pipeline(dir + "/router_top10_f32.spv", 3, (int) sizeof(pc));
+            ctx.dispatch(p, {&bl, &bi, &bw}, &pc, sizeof(pc), (uint32_t) NT);
+        }
+        std::vector<int32_t> sf_ids((size_t) NT * K); std::vector<float> sf_w((size_t) NT * K);
+        ctx.read(bi, sf_ids.data(), sf_ids.size() * 4);
+        ctx.read(bw, sf_w.data(), sf_w.size() * 4);
 
-    strata::vulkan::Stream* s = nullptr;
-    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
-    if (s == nullptr) { verdict("router_top10 entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
-    float* dl = strata::vulkan::arena_alloc<float>(*s, logits.size());
-    int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * K);
-    float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K);
-    strata::vulkan::stream_write(*s, dl, logits.data(), logits.size() * 4);
-    strata::kernels::router_top10(dl, NT, NE, K, di, dw, s);   // THE ENGINE WRAPPER
-    std::vector<int32_t> g_ids((size_t) NT * K); std::vector<float> g_w((size_t) NT * K);
-    strata::vulkan::stream_read(*s, di, g_ids.data(), g_ids.size() * 4);
-    strata::vulkan::stream_read(*s, dw, g_w.data(), g_w.size() * 4);
-    strata::vulkan::stream_close(s);
+        // THE SUMMATION PIN - THE PORTABLE MEMBER, driven on the SAME fixtures.  The port's router is
+        // contractually the PORTABLE form (float exp + KAHAN sums): `case_router` shows its ids are bit-exact
+        // against the double rule while its weights only carry a tolerance.  The SHIPPED router must reproduce
+        // that arithmetic BITWISE (ids AND weights, not merely inside a tolerance), so this is the arm that keeps
+        // a different summation (a plain-float sum, e.g. `0732bdd71367`) from silently replacing the ids.
+        Buf bip = ctx.alloc((size_t) NT * K * 4), bwp = ctx.alloc((size_t) NT * K * 4);
+        {
+            struct { int32_t n_tokens, n_expert, k; } pc{NT, NE, K};
+            VkPipeline p = ctx.pipeline(dir + "/router_top10_f32.spv", 3, (int) sizeof(pc));
+            ctx.dispatch(p, {&bl, &bip, &bwp}, &pc, sizeof(pc), (uint32_t) NT);
+        }
+        std::vector<int32_t> pf_ids((size_t) NT * K); std::vector<float> pf_w((size_t) NT * K);
+        ctx.read(bip, pf_ids.data(), pf_ids.size() * 4);
+        ctx.read(bwp, pf_w.data(), pf_w.size() * 4);
 
-    int bad_bw = 0;
-    for (size_t i = 0; i < g_ids.size(); ++i) { if (g_ids[i] != sf_ids[i]) ++bad_bw; uint32_t a, b; std::memcpy(&a, &sf_w[i], 4); std::memcpy(&b, &g_w[i], 4); if (a != b) ++bad_bw; }
-    char tag[160];
-    std::snprintf(tag, sizeof tag, "router_top10 entry (%d tokens): engine wrapper == shader path, bitwise", NT);
-    verdict(tag, bad_bw == 0, bad_bw, (int) (2 * g_ids.size()), 0.0, "ids/weights differ from the ported shader path");
-    int bad = 0; double worst = 0;
-    for (size_t i = 0; i < g_ids.size(); ++i) {
-        if (g_ids[i] != r_ids[i]) ++bad;
-        const double rel = std::fabs((double) g_w[i] - (double) r_w[i]) / (std::fabs((double) r_w[i]) + 1e-30);
-        worst = std::max(worst, rel);
-        if (!(rel <= 1e-5)) ++bad;
+        strata::vulkan::Stream* s = nullptr;
+        { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+        if (s == nullptr) { verdict("router_top10 entry: engine wrapper", false, 1, 1, 0, "no stream"); return; }
+        float* dl = strata::vulkan::arena_alloc<float>(*s, logits.size());
+        int32_t* di = strata::vulkan::arena_alloc<int32_t>(*s, (size_t) NT * K);
+        float* dw = strata::vulkan::arena_alloc<float>(*s, (size_t) NT * K);
+        strata::vulkan::stream_write(*s, dl, logits.data(), logits.size() * 4);
+        strata::kernels::router_top10(dl, NT, NE, K, di, dw, s);   // THE ENGINE WRAPPER
+        std::vector<int32_t> g_ids((size_t) NT * K); std::vector<float> g_w((size_t) NT * K);
+        strata::vulkan::stream_read(*s, di, g_ids.data(), g_ids.size() * 4);
+        strata::vulkan::stream_read(*s, dw, g_w.data(), g_w.size() * 4);
+        strata::vulkan::stream_close(s);
+
+        int bad_bw = 0;
+        for (size_t i = 0; i < g_ids.size(); ++i) { if (g_ids[i] != sf_ids[i]) ++bad_bw; uint32_t a, b; std::memcpy(&a, &sf_w[i], 4); std::memcpy(&b, &g_w[i], 4); if (a != b) ++bad_bw; }
+        char tag[200];
+        std::snprintf(tag, sizeof tag, "router_top10 entry (n_expert=%d k=%d): wrapper == the contract's %s shader, bitwise", NE, K, native ? "native" : "f32");
+        verdict(tag, bad_bw == 0, bad_bw, (int) (2 * g_ids.size()), 0.0, "ids/weights differ from the shader the geometry contract names - the wrapper took the other member");
+        int bad = 0; double worst = 0;
+        for (size_t i = 0; i < g_ids.size(); ++i) {
+            if (g_ids[i] != r_ids[i]) ++bad;
+            const double rel = std::fabs((double) g_w[i] - (double) r_w[i]) / (std::fabs((double) r_w[i]) + 1e-30);
+            worst = std::max(worst, rel);
+            if (!(rel <= 1e-5)) ++bad;
+        }
+        std::snprintf(tag, sizeof tag, "router_top10 entry (n_expert=%d k=%d): wrapper vs the engine rule (double)", NE, K);
+        verdict(tag, bad == 0, bad, (int) (2 * g_ids.size()), worst, "ids exact; weights relative vs router_top10.cu's rule (tol 1e-5)");
+        int bad_port = 0;
+        for (size_t i = 0; i < g_ids.size(); ++i) { if (g_ids[i] != pf_ids[i]) ++bad_port; uint32_t a, b; std::memcpy(&a, &pf_w[i], 4); std::memcpy(&b, &g_w[i], 4); if (a != b) ++bad_port; }
+        std::snprintf(tag, sizeof tag, "router_top10 entry (n_expert=%d k=%d): shipped router == the PORTABLE shader, BITWISE", NE, K);
+        verdict(tag, bad_port == 0, bad_port, (int) (2 * g_ids.size()), 0.0, "the shipped router's summation differs from the portable (Kahan) arithmetic - the id contract");
+        ctx.free(bl); ctx.free(bi); ctx.free(bw); ctx.free(bip); ctx.free(bwp);
     }
-    std::snprintf(tag, sizeof tag, "router_top10 entry (%d tokens): wrapper vs the engine rule (double)", NT);
-    verdict(tag, bad == 0, bad, (int) (2 * g_ids.size()), worst, "ids exact; weights relative vs router_top10.cu's rule (tol 1e-5)");
-    ctx.free(bl); ctx.free(bi); ctx.free(bw);
 }
 
 // #6 `native_moe_combine` (layer.cpp:463, the DEFAULT combine) -> native_moe_combine.spv.  The engine's NATIVE

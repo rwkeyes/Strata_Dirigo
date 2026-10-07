@@ -347,14 +347,30 @@ static void ple_history_advance_impl(Stream& s, float* hist, const float* normal
 // THE MoE ROUTING ROWS
 // ============================================================================================================
 
-// `router_top10` -> router_top10_f32.spv (LOGITS ro, IDS rw, WEIGHTS rw; push {n_tokens, n_expert, k}; one
-// workgroup per token).  THE PORTABLE (f32) variant: the engine's router computes its exponentials and its
-// sum in DOUBLE and the target has no shaderFloat64, so the faithful member cannot run here.  The honest
+// `router_top10` -> the MoE router (LOGITS ro, IDS rw, WEIGHTS rw; one workgroup per token).  THE GEOMETRY-AWARE
+// ENTRY: the engine reaches BOTH router members only through this symbol for a non-512 model, so this is where
+// the width is honoured.  When `router_top10_uses_native(n_expert, k)` holds the call takes the FUSED native
+// member (`native_router_top10.spv`, whose expert width is now a push constant) - that is how a 256-expert model
+// stops falling through to the portable f32 member.  Otherwise (k != 10, or n_expert outside the shader's 512
+// cap) it takes `router_top10_f32.spv`, the portable variant: the engine's router computes its exponentials and
+// its sum in DOUBLE and the target has no shaderFloat64, so the faithful member cannot run here; the honest
 // deviation is MEASURED by the gate's `case_router` (ids vs the double rule on realistic rows and near-ties).
+// `STRATA_ROUTER_FORCE_F32=1` forces the f32 member regardless - the control that restores the pre-rewire router.
 static void router_top10_impl(Stream& s, const float* logits, int n_tokens, int n_expert, int k, int32_t* ids,
                               float* weights) {
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
     if (!logits || !ids || !weights) refuse("router_top10", "a required pointer is null");
+    // THE SHIPPED SELECTION (its one source of truth is `router_top10_uses_native`).  The native member now
+    // REPRODUCES the portable arithmetic bit-for-bit (Kahan sums, same order), so it is a drop-in with the same
+    // bit-exact ids; `STRATA_ROUTER_FORCE_F32` restores the legacy member - the gate's failure-path control.
+    static const bool force_f32 = [] {
+        const char* v = std::getenv("STRATA_ROUTER_FORCE_F32");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!force_f32 && router_top10_uses_native(n_expert, k)) {
+        router_top10_n(s, logits, ids, weights, n_tokens, n_expert);   // the fused native member, at this width
+        return;
+    }
     Buf lv{}, iv{}, wv{};
     if (!arena_resolve(s, logits, (uint64_t) n_tokens * (uint64_t) n_expert * 4, lv) ||
         !arena_resolve(s, ids, (uint64_t) n_tokens * (uint64_t) k * 4, iv) ||

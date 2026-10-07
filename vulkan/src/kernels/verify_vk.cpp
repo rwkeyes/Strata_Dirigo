@@ -319,7 +319,7 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     strata::vulkan::Stream& s = strata::vulkan::need_stream("native_router_top10_multi", stream);
     // ONE DISPATCH FOR THE WHOLE ROUND: the shader's own token dimension is the grid x.  (The per-token
     // 40-byte ids/weights descriptor-offset refusal that used to guard this loop is gone with the loop.)
-    strata::vulkan::router_top10_n(s, logits, ids, weights, n_tok);
+    strata::vulkan::router_top10_n(s, logits, ids, weights, n_tok, /*n_expert=*/512);
 }
 
 // ---- `wait_flag_ge` -> THE HANDSHAKE SEAM (deliverable A): a HOST boundary, never a spin ---------------------

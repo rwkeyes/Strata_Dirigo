@@ -3,9 +3,12 @@
 // adapted from llama.cpp's topk-moe.cu).
 //
 // WHAT THE NATIVE BODY DOES DIFFERENTLY FROM `router_top10.cu` (the legacy router the port already has).
-// Both implement the SAME rule - softmax over all 512 experts, a stable descending top-10 with ties by
-// ascending index, then renormalise the ten by their own sum with ggml's 2**-14 lower clamp.  The difference
-// is the ARITHMETIC, and it is the point of this symbol:
+// Both implement the SAME rule - softmax over all experts, a stable descending top-10 with ties by
+// ascending index, then renormalise the ten by their own sum with ggml's 2**-14 lower clamp.  THE EXPERT WIDTH
+// IS A PUSH CONSTANT (`n_expert`): the CUDA/legacy canonical form is 512, but a narrower model (e.g. 256) runs
+// this SAME shader at its own width, because the arrays below are sized for the 512 CAP and every loop/stride is
+// bounded by `pc.n_expert`.  The difference from the legacy kernel is the ARITHMETIC, and it is the point of this
+// symbol:
 //
 //   * the legacy kernel computes its exponentials AND its sum in DOUBLE (`exp((double)l - (double)mx)`, a
 //     double sum, `inv = (float)(1.0/sum)`); router_top10_f32.comp reproduces that in float with KAHAN
@@ -43,21 +46,22 @@ layout(set = 0, binding = 2, std430) buffer WEIGHTS { float v[]; } weights;
 #include "common/wg_reduce.glsl"
 #include "common/router_select.glsl"
 
-const uint NR_EXPERTS = 512u;
+const uint NR_MAX_EXPERTS = 512u;     // the shared arrays' CAP; the ACTIVE expert width is `pc.n_expert`
 const uint NR_K = 10u;
 
-shared float nr_ex[NR_EXPERTS];      // the float exponentials (the source's `values[]`)
+shared float nr_ex[NR_MAX_EXPERTS];   // the float exponentials (the source's `values[]`)
 shared float nr_selw[NR_K];          // the ten selected probabilities, in rank order
+shared float nr_sum;                 // the lane-0 Kahan softmax sum (the PORTABLE arithmetic's term)
 shared float nr_av[256];             // the argmax tree's per-invocation value ...
 shared int nr_ai[256];               // ... and its expert index
 
-layout(push_constant, std430) uniform PC { int n_tokens; } pc;
+layout(push_constant, std430) uniform PC { int n_tokens; int n_expert; } pc;
 
 // The block-wide argmax, as a PAIRWISE TREE (the port's reduction shape) with the source's tie-break.
-int nr_rank_max(uint lid, uint lsize) {
+int nr_rank_max(uint ne, uint lid, uint lsize) {
     float bv = rs_neg_inf();
-    int bi = int(NR_EXPERTS);                 // loses to every real index
-    for (uint e = lid; e < NR_EXPERTS; e += lsize) {
+    int bi = int(ne);                          // loses to every real index
+    for (uint e = lid; e < ne; e += lsize) {
         if (rs_taken[e] != 0u) continue;
         const float pe = rs_p[e];
         if (pe > bv) { bv = pe; bi = int(e); }   // STRICT: the lowest index wins a tie
@@ -80,33 +84,44 @@ void main() {
     const uint t = gl_WorkGroupID.x;
     if (t >= uint(pc.n_tokens)) return;
     const uint lid = gl_LocalInvocationIndex, lsize = gl_WorkGroupSize.x;
-    const uint lbase = t * NR_EXPERTS;
+    const uint ne = uint(pc.n_expert);        // the ACTIVE expert width (<= the shared arrays' 512 cap)
+    const uint lbase = t * ne;
 
     // ---- the stability maximum (the port's barrier tree; exact, so identical to the CUDA warp_max).
     float mx = rs_neg_inf();
-    for (uint e = lid; e < NR_EXPERTS; e += lsize) mx = max(mx, logits.v[lbase + e]);
+    for (uint e = lid; e < ne; e += lsize) mx = max(mx, logits.v[lbase + e]);
     mx = wg_max(mx);
 
-    // ---- the exponentials, ONCE each, in FLOAT (the native arithmetic: `expf(values[i] - maximum)`), and a
-    // plain-float partial sum per invocation.  This is NOT the Kahan sum of the portable legacy variant.
-    float part = 0.0;
-    for (uint e = lid; e < NR_EXPERTS; e += lsize) {
-        const float ex = exp(logits.v[lbase + e] - mx);
-        nr_ex[e] = ex;
-        part += ex;
+    // ---- the exponentials, ONCE each, in FLOAT, then THE PORTABLE SUMMATION, REPRODUCED EXACTLY.
+    // The PORTABLE member (`router_top10_f32.comp`) - the one whose bit-exact ids are the port's regression bar -
+    // accumulates the softmax sum as a KAHAN-compensated f32 sum on ONE lane in ASCENDING expert order.  That is
+    // the f32 approximation of the engine's DOUBLE sum (`router_top10.cu:110-112`).  A plain-float or pairwise-
+    // tree sum is a DIFFERENT arithmetic that moves an id on a near-tie (the 8-token guard), so the id contract
+    // requires this exact order, not merely a value inside tolerance.
+    for (uint e = lid; e < ne; e += lsize) nr_ex[e] = exp(logits.v[lbase + e] - mx);
+    barrier();                                 // nr_ex visible before the lane-0 sum reads it back
+    if (lid == 0u) {
+        float s = 0.0, c = 0.0;
+        for (uint e = 0u; e < ne; ++e) {
+            const float y = nr_ex[e] - c;
+            const float tt = s + y;
+            c = (tt - s) - y;
+            s = tt;
+        }
+        nr_sum = s;
     }
-    barrier();                                 // nr_ex visible before the probability pass reads it back
-    const float inv = 1.0f / wg_sum(part);      // the source's `reciprocal = 1.0f / warp_sum(sum)`
-    for (uint e = lid; e < NR_EXPERTS; e += lsize) {
+    barrier();
+    const float inv = 1.0f / nr_sum;            // `router_top10_f32.comp:60`
+    for (uint e = lid; e < ne; e += lsize) {
         const float p = nr_ex[e] * inv;         // the source's `values[i] *= reciprocal`
         // `if (__isnanf(values[i])) values[i] = -FLT_MAX` - the bit pattern, since GLSL has no FLT_MAX.
         rs_p[e] = isnan(p) ? uintBitsToFloat(0xFF7FFFFFu) : p;
     }
 
-    rs_clear_taken(NR_EXPERTS, lid, lsize);
+    rs_clear_taken(ne, lid, lsize);
     for (uint i = 0u; i < NR_K; ++i) {
-        const int ix = nr_rank_max(lid, lsize);
-        if (ix < int(NR_EXPERTS) && lid == 0u) {
+        const int ix = nr_rank_max(ne, lid, lsize);
+        if (ix < int(ne) && lid == 0u) {
             ids.v[t * NR_K + i] = ix;
             nr_selw[i] = rs_p[ix];
             rs_taken[ix] = 1u;
@@ -114,10 +129,17 @@ void main() {
         barrier();
     }
     if (lid == 0u) {
-        float s = 0.0;
-        for (uint i = 0u; i < NR_K; ++i) s += nr_selw[i];
-        s = max(s, 6.103515625e-05f);        // 2**-14, ggml's clamp
-        const float invs = 1.0f / s;         // the source's `inverse_selected_sum`
-        for (uint i = 0u; i < NR_K; ++i) weights.v[t * NR_K + i] = nr_selw[i] * invs;
+        // THE PORTABLE ARITHMETIC, reproduced: a Kahan-compensated sum of the ten selected probabilities in RANK
+        // ORDER, the 2**-14 clamp, then a DIVIDE per element - `router_top10_f32.comp:73-83`.  A plain sum or a
+        // multiply-by-reciprocal rounds differently and is a different arithmetic.
+        float s = 0.0, c = 0.0;
+        for (uint i = 0u; i < NR_K; ++i) {
+            const float y = nr_selw[i] - c;
+            const float tt = s + y;
+            c = (tt - s) - y;
+            s = tt;
+        }
+        const float sc = max(s, 6.103515625e-05f);   // 2**-14, ggml's clamp
+        for (uint i = 0u; i < NR_K; ++i) weights.v[t * NR_K + i] = nr_selw[i] / sc;
     }
 }

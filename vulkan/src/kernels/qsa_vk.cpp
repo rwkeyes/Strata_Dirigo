@@ -326,30 +326,37 @@ void qsa_gate_apply_f32(Stream& s, const float* attn, const float* q_full, const
     s.ctx->dispatch(pipe, {&av, &qv, &ov}, &pc, sizeof(pc), groups_for(n) + 1u);
 }
 
-// ---- 8. `native_router_top10` -> native_router_top10.spv (LOGITS ro, IDS rw, WEIGHTS rw; push {int n_tokens}).
-//        ONE token per call (the engine's moe_route calls it per token).  512 experts, top-10, softmax, ggml's
-//        2^-14 lower clamp - all fixed by the shader.  `n_tokens = 1` and one workgroup, exactly as the case's
-//        single-token arm drives it.
+// ---- 8. `native_router_top10` -> native_router_top10.spv (LOGITS ro, IDS rw, WEIGHTS rw; push {n_tokens,
+//        n_expert}).  ONE token per call (the engine's moe_route calls it per token).  Top-10, softmax, ggml's
+//        2^-14 lower clamp - all fixed by the shader; the expert width comes from the push constant (512 here,
+//        the canonical member's own geometry, but the shader is width-general - see `router_top10_n`).
+//        `n_tokens = 1` and one workgroup, exactly as the case's single-token arm drives it.
 void native_router_top10(Stream& s, const float* logits, int32_t* ids, float* weights) {
-    router_top10_n(s, logits, ids, weights, /*n_tok=*/1);
+    router_top10_n(s, logits, ids, weights, /*n_tok=*/1, /*n_expert=*/512);
 }
 
 // THE MULTI.  `native_router_top10.spv` ALREADY carries a token dimension - `gl_WorkGroupID.x` is the token
-// and the push constant is `n_tokens` - so the window's whole group is ONE dispatch of n_tok workgroups
-// instead of n_tok dispatches of one.  Each workgroup's arithmetic (including its shared `nr_*` arrays and
-// every barrier) is per-token and untouched, so this is bitwise the single call per token.
-void router_top10_n(Stream& s, const float* logits, int32_t* ids, float* weights, int64_t n_tok) {
-    if (n_tok < 1) return;
+// and the push constant is `{n_tokens, n_expert}` - so the window's whole group is ONE dispatch of n_tok
+// workgroups instead of n_tok dispatches of one.  Each workgroup's arithmetic (including its shared `nr_*`
+// arrays and every barrier) is per-token and untouched, so this is bitwise the single call per token.
+//
+// `n_expert` is passed in: the shader's ACTIVE expert width is a push constant, so the canonical 512 form and a
+// narrower (e.g. 256-expert) model run the SAME shader at their own width.  The shared `rs_*`/`nr_*` arrays are
+// sized for the 512 CAP, so the caller must keep n_expert <= 512 (the wrapper's `router_top10_uses_native`
+// predicate owns that check).
+void router_top10_n(Stream& s, const float* logits, int32_t* ids, float* weights, int64_t n_tok, int n_expert) {
+    if (n_tok < 1 || n_expert < 1 || n_expert > 512) return;
     Buf lv{}, iv{}, wv{};
-    if (!arena_resolve(s, logits, (uint64_t) n_tok * 512ull * 4, lv) ||
+    if (!arena_resolve(s, logits, (uint64_t) n_tok * (uint64_t) n_expert * 4, lv) ||
         !arena_resolve(s, ids, (uint64_t) n_tok * 10ull * 4, iv) ||
         !arena_resolve(s, weights, (uint64_t) n_tok * 10ull * 4, wv))
         refuse("native_router_top10", "a pointer is not inside this stream's arena");
-    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_router_top10.spv", 3, 4);
+    VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_router_top10.spv", 3, 8);
     struct Push {
-        int32_t n_tokens;
+        int32_t n_tokens, n_expert;
     } pc{};
     pc.n_tokens = (int32_t) n_tok;
+    pc.n_expert = n_expert;
     s.ctx->dispatch(pipe, {&lv, &iv, &wv}, &pc, sizeof(pc), (uint32_t) n_tok);
 }
 

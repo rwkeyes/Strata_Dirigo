@@ -166,7 +166,7 @@ rope_neox_apply	kernel	rope_neox
 rope_scaling	host	a table parameter
 rope_table_release	host	table bookkeeping
 rope_table_set	host	table bookkeeping
-router_top10	kernel	router_top10_f32 router_top10_f64
+router_top10	kernel	router_top10_f32 router_top10_f64 native_router_top10
 row_top_prob	refused	class C - the --spec 4 --mtp DRAFTER config the port does not select (see DECODE-PATH-TRIAGE.md)
 s2_gemv_q8	kernel	s2_gemv_q8
 s_gemv_q8_0_split	kernel	s_gemv_q8_split

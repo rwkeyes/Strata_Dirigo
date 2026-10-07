@@ -366,7 +366,10 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      LEDGER L41 -> L42.
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
-// the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
+// The CANONICAL 512-expert native member is taken directly here; any other width or k falls to the generic
+// `router_top10`, which is GEOMETRY-AWARE: for k == 10 and a width inside the native shader's 512 cap it takes
+// the SAME fused native shader AT THE MODEL'S OWN WIDTH (so a 256-expert model no longer falls through to the
+// portable f32 router), and the portable f32 member otherwise.  See vulkan/src/kernels/ple_vk.cpp:router_top10_impl.
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
     try { native_router_top10(b.logits, b.ids, b.weights, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
