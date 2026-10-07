@@ -493,6 +493,20 @@ bool g_barrier_narrow = std::getenv("STRATA_VK_BARRIER_NARROW") != nullptr;
 // reads.  Opt-in; the shipped path keeps the per-dispatch global barrier.  `g_pair_seen` counts pairs that had
 // something pending, `g_pair_indep` how many of them intersected NOTHING (no barrier), `g_pair_emit` the rest.
 bool g_barrier_pair = std::getenv("STRATA_VK_BARRIER_PAIR") != nullptr;
+// ---- STRATA_VK_DIRECT_UPLOAD: upload STRAIGHT INTO a mappable device buffer instead of staging through host RAM.
+// Two halves, and both are needed for the win:
+//   * `alloc_device()` takes `mem_type_` (HOST_VISIBLE|HOST_COHERENT, device-local heap) instead of `vram_type_`
+//     (the unmappable one).  Same heap, so the VRAM ACCOUNT is unchanged and the account rule is not bent - only
+//     whether the CPU may map it.
+//   * `stage_upload()` then has nothing to stage: the host store IS the transfer, so the copy command, the submit,
+//     the fence and its wait all disappear for that call.
+// MEASURED BASIS (Arc Pro B70, port's own instruments, 2026-10-07): host store into the mapped type 5.64 GB/s
+// against the staged path's 1.92 (probe_mem), and the GPU reads a mappable allocation ~3% slower (probe_gpuread:
+// 499.71 vs 512.49 GB/s).  Applied to the 53.7 GB of cold-start uploads the flag is worth roughly -18 s of a
+// ~163 s startup for ~0.4% of the prefill.  OPT-IN ON PURPOSE: making model memory mappable is the port's parked
+// policy question, not a tuning knob, so the shipped default keeps the staged path and the gate keeps asserting
+// the types it asserts today.
+bool g_direct_upload = std::getenv("STRATA_VK_DIRECT_UPLOAD") != nullptr;
 struct PairRange {
     VkBuffer buf;
     uint64_t off, end;
@@ -1645,7 +1659,25 @@ Buf Ctx::alloc_host(uint64_t bytes) {
 }
 
 Buf Ctx::alloc_device(uint64_t bytes) {
-    return alloc_impl(bytes, vram_type_, /*vram_account=*/true, "device-local buffer");
+    // STRATA_VK_DIRECT_UPLOAD: hand back the MAPPABLE device-local type so an upload can be a host store instead
+    // of a staged copy.  TWO GUARDS, both necessary: the remap only happens (a) when the flag is set and (b) when
+    // that type really is DEVICE_LOCAL - on a device whose only mappable type is system RAM (llvmpipe, and any
+    // card without a ReBAR-style window) `mem_type_` would hand the engine host memory dressed as device memory,
+    // so the flag stays inert there.  Same heap as `vram_type_` on the cards it does apply to, so the VRAM
+    // account is unchanged; the only cost is the measured ~3% GPU read (tools/probe_gpuread.cpp).
+    const bool mappable_vram = g_direct_upload && mem_type_ < mem_types_.size() && mem_types_[mem_type_].device_local;
+    Buf b = alloc_impl(bytes, mappable_vram ? mem_type_ : vram_type_, /*vram_account=*/true, "device-local buffer");
+    // The TYPE is mappable, but the mapping must NOT be persistent - see Buf::map_on_demand for the whole reason
+    // (a persistent mapping makes `dispatch` flush the live batch per dispatch, which cost the prefill 47%).  A
+    // device buffer is written by the host once and read by the GPU; the host never reads it back through the
+    // mapping, and a host READ of this type measures 0.06 GB/s anyway (tools/probe_mem.cpp), so on-demand loses
+    // nothing.  Coherent memory, so an unmap here cannot lose a store.
+    if (mappable_vram && b.mapped != nullptr) {
+        vkUnmapMemory(dev_, b.mem);
+        b.mapped = nullptr;
+        b.map_on_demand = true;
+    }
+    return b;
 }
 
 Buf Ctx::alloc_staging(uint64_t bytes) {
@@ -1860,6 +1892,32 @@ void Ctx::end_oneshot_and_wait(VkCommandBuffer cb) {
 // was written on - which is why each direction states its own reasoning and the gate round-trips through it.
 void Ctx::stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offset) {
     g_xs.note(/*is_up=*/true, bytes);
+    // ---- STRATA_VK_DIRECT_UPLOAD: when the DESTINATION is mappable, the host store IS the transfer -------------
+    // No staging buffer, no copy command, no submit, no fence wait.  Measured on the Arc Pro B70 with the port's
+    // own instruments: a host store into the mapped device-local type runs at 5.64 GB/s against the staged path's
+    // 1.92 GB/s (tools/probe_mem.cpp) - 2.9x on the 53.7 GB of cold-start uploads, i.e. ~29 s -> ~10 s of a
+    // ~163 s startup.  The cost of the trade is measured too: the GPU READS a mappable allocation ~3% slower
+    // (tools/probe_gpuread.cpp, 499.71 vs 512.49 GB/s), which is why this is opt-in and not a default - it is the
+    // port's parked policy question (a staging buffer in VRAM is model memory by the account rule), so the DEFAULT
+    // path below is untouched and the choice stays with the operator.
+    // Host-coherent is a precondition, not an assumption: `mem_type_` was selected for HOST_VISIBLE|HOST_COHERENT,
+    // so per the Vulkan memory model the stores are available to the device without a flush.  The barrier the
+    // staged path emits orders TRANSFER_WRITE before SHADER_READ/HOST_READ; with a direct coherent store there is
+    // no device write to order, and the dispatch path's own chain barrier still orders this layer's writes against
+    // the kernels that read them (the engine relies on that ordering for its mapped grouping tables too).
+    if (g_direct_upload && bytes != 0 && (dst.mapped != nullptr || dst.map_on_demand)) {
+        // Map ON DEMAND when the port holds no persistent mapping (the device-buffer case): the store itself is the
+        // transfer, and leaving no mapping behind is what keeps `dispatch`'s host-visible rule off this buffer.
+        if (dst.mapped == nullptr) {
+            void* m = nullptr;
+            VK_CHECK(vkMapMemory(dev_, dst.mem, 0, VK_WHOLE_SIZE, 0, &m));
+            std::memcpy((uint8_t*) m + offset, src, (size_t) bytes);   // HOST_COHERENT: no flush needed
+            vkUnmapMemory(dev_, dst.mem);
+        } else {
+            std::memcpy((uint8_t*) dst.mapped + offset, src, (size_t) bytes);
+        }
+        return;
+    }
     Buf st = alloc_staging(bytes ? bytes : 4);
     std::memcpy(st.mapped, src, (size_t) bytes);   // HOST_COHERENT: no flush, and the submit below needs none
     VkCommandBuffer cb = begin_oneshot();

@@ -42,6 +42,15 @@ struct Buf {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     void* mapped = nullptr;          // null when the type is not host-visible: write/read then STAGE
+    // MAP-ON-DEMAND (STRATA_VK_DIRECT_UPLOAD): the allocation's TYPE is host-visible, but the port holds no
+    // persistent mapping for it.  `stage_upload` then maps, stores and unmaps per call, so the host still writes at
+    // the mapped type's ~5.64 GB/s while `mapped` stays null - which matters far beyond tidiness: `dispatch`
+    // flushes the live batch whenever a bound buffer carries a persistent mapping (a host-visible region the
+    // engine may legitimately read the instant the call returns - relaxing THAT rule once cost 5 gate failures and
+    // is not on the table).  With every device buffer persistently mapped, that rule fired on every dispatch and
+    // turned the prefill's 563 batches into 45,635, which is where a 47% prefill regression came from.  Null here
+    // keeps the rule aimed at the buffers that actually need it.
+    bool map_on_demand = false;
     uint64_t bytes = 0;
     uint32_t mem_type = UINT32_MAX;
     bool device_local = false;       // DEVICE_LOCAL (real VRAM on a discrete card)
