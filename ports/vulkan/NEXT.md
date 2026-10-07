@@ -7963,3 +7963,35 @@ give each LANE more work in flight: unroll the row walk the way the shipped KU=1
 compiled ROLLED: 5 `OpLoopMerge`) so the 128-load row read issues as a batch instead of a chain. Predict a
 material per-token drop; REFUTE if the phase does not move, which would say the exposed latency is in the `t`
 dependency itself and not in the per-token memory walk.
+
+**THAT PREDICTION WAS TESTED AND REFUTED (second A/B, `KU=16`, same day).** The unrolled variant now mirrors the
+shipped kernel's structure (137 loads / 11 loops against its 135 / 8, `#define KU 16` with the same single
+ascending-`i` accumulator), and the ids stayed `56a0b28d2de6` - as the shipped kernel's own note predicted for
+KU=8/16. Result:
+
+| variant (n=2, interleaved with the chain in the SAME launch) | `gdn recurrence` ms | prefill ms | tok/s |
+|---|---|---|---|
+| chain | 2,704 / 2,691 | 9,286.5 / 9,284.0 | 21.32 / 21.33 |
+| chunk ROLLED | 2,794 / 2,756 | 9,362.3 / 9,655.5 | 21.15 / 20.51 |
+| chunk **KU unrolled** | 2,749 / 2,695 | 9,295.7 / 9,421.2 | 21.30 / 21.02 |
+
+Rolled is +2.3% on the phase, KU +0.9% (inside the chain's own 2,691-2,704 spread), end-to-end a wash in every
+pairing. **So the per-token cost is invariant to BOTH the number of dispatches AND the per-lane work in flight:
+it is the exposed latency of the serial `t` dependency itself.** Also measured at the engine level: the chunk
+path removes exactly 7,092 live dispatches (48,873 -> 41,781) and 7,092 descriptor sets, while only 61 submits
+and 61 live batches disappear - dispatch COUNT is not the lever, confirmed independently of the phase table.
+(The earlier "this box is 29% slower" note was TRANSIENT: the warm arms of this launch read 9,284-9,286 ms =
+21.33 tok/s, i.e. the recorded 21.37 tok/s baseline. Cold first-arm runs were the anomaly.)
+
+**THE DECISION THE NEXT SESSION FACES (a policy call, not a measurement call).** The only remaining way to take
+the latency out of the `t` chain is to stop re-reading the 128-value state column per token by keeping it in
+REGISTERS. Two routes, and they are mutually exclusive under the port's current contract:
+1. **Bit-exact route:** 128 registers per lane. glslc will NOT promote `float st[128]` (it compiled the array into
+   per-invocation memory; the loops stayed rolled: `OpLoopMerge` 5-11), so this needs a GENERATED shader with 128
+   named scalars and fully unrolled constant indices. Risk: the target's per-thread register budget is ~128 GRF,
+   so a 128-float live state is AT the limit and may spill to scratch - which is exactly where it is now.
+2. **The CUDA's own route:** split the row axis into `RG` groups per column (RPG rows each) with the state in a
+   few registers and a shared-memory + barrier reduction for `sk`/readout. That REASSOCIATES both sums (the
+   engine's `gdn_rec_kernel` does this, which is why its chunk arithmetic differs from the decode step for T>1),
+   so the ids WOULD move and the port's bit-exact contract would have to be re-baselined deliberately.
+Do not start either without deciding which. Measure on the 199-token arm with the ids checked in every arm.

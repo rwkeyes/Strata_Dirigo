@@ -19,9 +19,18 @@
 // Arc Pro B70): the same `native_gdn_step` kernel and grid read **0.2921 ms as a LONE dispatch** (the engine's
 // prefill issues one per (layer, token) and waits for it) and **0.0135-0.0222 ms when dispatches are not each
 // isolated**.  The engine's `gdn recurrence` phase is 2,701 ms of a 9,267 ms prefill (29.7%) over 7,128 rows =
-// 379 us per row, i.e. that lone-dispatch latency.  Fusion alone does not help (halving the dispatch count with
-// `STRATA_PF_GDN_REC_FUSED` moved the phase 3.7%): the CHAIN LENGTH is the cost, and the only way to shorten a
-// strictly dependent chain is to carry more tokens per dispatch.
+// 379 us per row, i.e. that lone-dispatch latency.
+//
+// AND WHAT THE FIRST VERSION OF THIS KERNEL MEASURED (2026-10-07, id `56a0b28d2de6` on all four arms): pooling
+// all 198 tokens into ONE dispatch left the per-(layer, token) cost UNCHANGED (chain 381 us vs chunk 389 us), so
+// the phase is NOT lone-dispatch latency and NOT the dispatch chain - it is this kernel's own per-token cost
+// with the dependency EXPOSED.  The bench's best per-row figure (22 us) is its DISPATCH-PIPELINED one (128
+// INDEPENDENT rows in flight hide the per-lane load latency); the recurrence's rows are strictly sequential in
+// `t`, so nothing hides it.  Hence THIS revision: give each LANE more work in flight by unrolling the row walk
+// the way the shipped kernel's KU does - the loads of a KU-wide chunk are issued TOGETHER, before the FMAs that
+// consume them, while the single ascending-`i` accumulator is preserved.  The shipped kernel's own note records
+// that KU=8 and KU=16 are BOTH bit-exact against its rolled baseline (0/786,432 state and 0/6,144 `o` elements
+// differ on intel, lvp AND radeon), which is why this restructure is not expected to move the ids either.
 //
 // GEOMETRY (the host wrapper refuses anything else, as it does for native_gdn_step):
 //   state  (S, h_v, S), j fastest, IN PLACE   - the per-layer state, shared with the decode path
@@ -29,7 +38,10 @@
 //   g/b    (T, h_v)        the pre-exp gate and beta
 //   out    (T, h_v, S)     the readout, one row per token (the closing norm stays a separate per-token launch)
 //   S == 128, enforced by the wrapper; that is what makes the row axis a compile-time constant here and lets
-//   the state stay in the invocation's own registers instead of being re-read from global memory per token.
+//   the state stay in the invocation's own storage instead of being re-read from global memory per token.
+#ifndef KU
+#define KU 16
+#endif
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;      // (S, h_v, S), j fastest, in place
 layout(set = 0, binding = 1, std430) readonly buffer QKV { float v[]; } qkv;  // (T, (2*h_k + h_v)*S)
@@ -61,13 +73,40 @@ void main() {
         const uint vrow = t * row + 2u * hk * SL + h * SL + j;
         const float g = exp(gb.v[t * hv + h]);          // the native body's `g_val = expf(gate[head])`
         const float b = bb.v[t * hv + h];
-        // the contract against the UNDECAYED state, ONE accumulator, terms in ascending `i`
+        // pass 1: the contract against the UNDECAYED state.  ONE accumulator, terms added in ascending `i`
+        // order; the KU loads of a chunk are issued together, before the FMAs consume them (the shipped
+        // kernel's own structure, and the reason both KU=8 and KU=16 are bit-exact against its rolled form).
         float kv = 0.0f;
-        for (uint i = 0u; i < SL; ++i) kv += st[i] * qkv.v[krow + i];
+        uint i = 0u;
+        for (; i + uint(KU) <= SL; i += uint(KU)) {
+            float ss[KU], kk[KU];
+            for (uint u = 0u; u < uint(KU); ++u) {
+                ss[u] = st[i + u];
+                kk[u] = qkv.v[krow + i + u];
+            }
+            for (uint u = 0u; u < uint(KU); ++u) kv += ss[u] * kk[u];
+        }
+        for (; i < SL; ++i) kv += st[i] * qkv.v[krow + i];
         const float delta = (qkv.v[vrow] - g * kv) * b;
-        // the folded decay + rank-1 update, then the readout against the UPDATED state, same single accumulator
+        // pass 2: the folded decay + rank-1 update, then the readout against the UPDATED state.  Same single
+        // `attn` accumulator and the same ascending order; the stores are independent of each other and of the
+        // accumulation (each term is formed from a load, never from the previous row's result).
         float attn = 0.0f;
-        for (uint i = 0u; i < SL; ++i) {
+        i = 0u;
+        for (; i + uint(KU) <= SL; i += uint(KU)) {
+            float ss[KU], kk[KU], qq[KU];
+            for (uint u = 0u; u < uint(KU); ++u) {
+                ss[u] = st[i + u];
+                kk[u] = qkv.v[krow + i + u];
+                qq[u] = qkv.v[qrow + i + u];
+            }
+            for (uint u = 0u; u < uint(KU); ++u) {
+                const float s = g * ss[u] + kk[u] * delta;  // g*s + k*delta, one step
+                st[i + u] = s;
+                attn += s * qq[u];
+            }
+        }
+        for (; i < SL; ++i) {
             const float s = g * st[i] + qkv.v[krow + i] * delta;
             st[i] = s;
             attn += s * qkv.v[qrow + i];
