@@ -23,7 +23,7 @@
 | dispatches | 9,349 encoded (57,690 executed in the grid arm's run) | 56,330 executed | — |
 | **total workgroups** | **10,336,674** | **13,210,151** | 0.78x |
 | **workgroups / dispatch (mean)** | **1,105.6** | **234.5** | **4.71x** |
-| p50 / p90 / p99 | 30 / 2,560 / 248,320 | 40 / 640 / 2,560 | — |
+| p50 / p90 / p99 (workgroups/dispatch) | 256 / 2,560 / 10,240 | 40 / 640 / 2,560 | — |
 | widest | 248,320 (×3, the 248,320-vocab sampler) | 62,080 | 4.0x |
 | **us / dispatch (Step 0, same arms)** | **66.8** | **14.5** | **4.61x** |
 | **us per workgroup per dispatch** | **60.4 ns** | **61.8 ns** | **0.98x** |
