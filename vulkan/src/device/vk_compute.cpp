@@ -65,6 +65,7 @@ struct DispStat {
     uint64_t seg_disp = 0;                        // recorded dispatches EXECUTED by segment submits
     uint64_t barriers = 0;                        // COMPUTE->COMPUTE chain barriers emitted (one per chained dispatch)
     double t_seg_wait = 0, t_seg_submit = 0;      // the segment path's own submit + fence wait (ms)
+    std::vector<std::pair<uint32_t, double>> seg_log;  // per segment submit: {executed dispatches, fence-wait ms}
     double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
     // The RECORDED arm's own encode, charged at record_dispatch (the old t_encode above is the LIVE path's, so the
     // recorded arm read 0 "by construction").  Its own counter so the existing per-dispatch totals do not shift.
@@ -121,6 +122,23 @@ struct KtStat {
     int64_t last_c = -1;
     uint32_t last_i = 0;
     bool have_last = false;
+    // ---- STRATA_VK_WARM_SPLIT: the WARM per-replay split.  The read-once pool above sees the COLD first replay
+    // only, because the monotone `done_upto` cursor never revisits a slot.  A recorded command buffer re-writes
+    // the SAME slots every time it is re-submitted, so the warm state is sitting in the pool unread.  This mode
+    // records a `vkCmdResetQueryPool` at the TOP of every recorded command buffer (reset -> write -> read, per
+    // replay, exactly the shape the spec guarantees) and reads each segment's own slot span after ITS fence wait,
+    // so a segment submitted R times yields R splits, keyed by replay ordinal.  The engine's decode drives a
+    // CAPTURED graph: the segments are recorded once and re-submitted every round, which is what makes this the
+    // measurement the cold pool cannot take.
+    bool warm = std::getenv("STRATA_VK_WARM_SPLIT") != nullptr;
+    std::map<VkCommandBuffer, std::pair<uint32_t, uint32_t>> cb_span;   // cb -> {base slot, timed dispatches}
+    std::map<VkCommandBuffer, uint32_t> cb_exec;                        // cb -> times submitted so far
+    struct WRow { double front = 0, kern = 0, bar = 0, gap = 0; uint64_t n = 0, gaps = 0; };
+    std::map<uint32_t, WRow> wrows;                                     // replay ordinal -> aggregate split
+    struct CbRow { uint32_t n = 0, submits = 0; WRow cold, warm; };      // per command buffer: cold vs warm
+    std::map<VkCommandBuffer, CbRow> cb_rows;
+    uint32_t span_open = 0, span_base = 0, span_n = 0;
+    uint64_t w_reads = 0, w_unavail = 0;
     void add(const std::string& s, double ns_add, uint64_t wg_add) {
         auto bump = [&](std::vector<std::pair<std::string, uint64_t>>& v, uint64_t x) {
             for (auto& kv : v) if (kv.first == s) { kv.second += x; return; }
@@ -237,6 +255,57 @@ void kt_flush(VkDevice dev) {
         ++g_kt.done_upto;
     }
 }
+// ---- STRATA_VK_WARM_SPLIT: read ONE segment's slot span after ITS fence wait, then keep it for the next replay.
+// The reset is in the command buffer (see record_begin), so reset -> write -> read holds per replay and the values
+// belong to exactly one execution.  The span (`cb_span`) is monotonic over the whole recording, so the k-th slot of
+// a segment is `g_kt.slots[base/4 + k]` and carries the shader name the per-family table needs.
+void kt_flush_seg(VkDevice dev, VkCommandBuffer cb) {
+    if (!g_kt.on || !g_kt.warm || g_kt.pool == VK_NULL_HANDLE) return;
+    auto it = g_kt.cb_span.find(cb);
+    if (it == g_kt.cb_span.end() || it->second.second == 0) return;
+    const uint32_t base = it->second.first, n = it->second.second;
+    ++g_kt.w_reads;
+    const size_t nq = (size_t) n * 4u;
+    std::vector<uint64_t> t(nq * 2, 0);
+    const VkResult r = vkGetQueryPoolResults(dev, g_kt.pool, base, (uint32_t) nq, t.size() * 8, t.data(), 16,
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (r != VK_SUCCESS && r != VK_NOT_READY) { g_kt.overflow = true; return; }
+    const uint32_t ord = g_kt.cb_exec[cb]++;
+    KtStat::WRow row;
+    const double tick = (double) g_kt.period_ns;
+    int64_t last_c = -1;
+    uint32_t last_i = 0;
+    bool have = false;
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint32_t i = base + k * 4u;
+        auto val = [&](uint32_t q) -> int64_t {
+            const size_t idx = (size_t) (q - base) * 2;
+            return t[idx + 1] != 0 ? (int64_t) t[idx] : -1;
+        };
+        const int64_t v0 = val(i), v1 = val(i + 1), v2 = val(i + 2), v3 = val(i + 3);
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) { ++g_kt.w_unavail; return; }   // not this replay: count, do not fake
+        double front = (double) (v1 - v0), kern = (double) (v2 - v1), bar = (double) (v3 - v2);
+        if (front < 0) front = 0;
+        if (kern < 0) kern = 0;
+        if (bar < 0) bar = 0;
+        row.front += front * tick;
+        row.kern += kern * tick;
+        row.bar += bar * tick;
+        ++row.n;
+        if (have && i == last_i + 4u && v0 >= last_c) { row.gap += (double) (v0 - last_c) * tick; ++row.gaps; }
+        last_c = v3; last_i = i; have = true;
+        const size_t si = (size_t) (base / 4u) + k;
+        if (si < g_kt.slots.size()) g_kt.add(g_kt.slots[si].spv, kern * tick, g_kt.slots[si].wg);
+    }
+    // merge into the replay-ordinal row and this command buffer's own cold/warm rows
+    auto merge = [](KtStat::WRow& d, const KtStat::WRow& s) {
+        d.front += s.front; d.kern += s.kern; d.bar += s.bar; d.gap += s.gap; d.n += s.n; d.gaps += s.gaps;
+    };
+    merge(g_kt.wrows[ord], row);
+    KtStat::CbRow& cr = g_kt.cb_rows[cb];
+    cr.n = n; cr.submits = ord + 1;
+    merge(ord == 0 ? cr.cold : cr.warm, row);
+}
 void kt_dump() {
     if (!g_kt.on || g_kt.printed) return;
     g_kt.printed = true;
@@ -248,11 +317,63 @@ void kt_dump() {
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     double tot = 0;
     for (const auto& kv : v) tot += kv.second;
+    const uint64_t never = g_kt.warm ? 0 : (g_kt.slots.size() - g_kt.done_upto);
     std::fprintf(stderr, "vk kernel time (RECORDED/decode arm): %zu shader families, %.1f ms GPU over %llu dispatches "
-                         "(%zu recorded slots never executed%s)\n",
+                         "(%llu recorded slots never executed%s)%s\n",
                  v.size(), tot / 1e6, (unsigned long long) g_kt.disp_total(),
-                 g_kt.slots.size() - g_kt.done_upto, g_kt.overflow ? "; READBACK ERRORS SEEN - PARTIAL" : "");
-    {
+                 (unsigned long long) never, g_kt.overflow ? "; READBACK ERRORS SEEN - PARTIAL" : "",
+                 g_kt.warm ? " [WARM: values are summed over every replay]" : "");
+    if (g_kt.warm) {
+        // THE WARM PER-REPLAY SPLIT.  Each row is one replay ORDINAL of the captured graph, summed over every
+        // segment that was submitted for that ordinal: row 0 is the COLD first execution of each segment, rows
+        // >= 1 are the warm steady state the read-once pool never sees.  us/dispatch and us/pair, so the rows are
+        // directly comparable to the cold "119.86 us" and to `t_seg_wait / seg_disp`.
+        std::fprintf(stderr, "vk warm split [WARM=%d]: %zu segment command buffers, %llu per-segment reads, "
+                             "%llu reads hit an unavailable slot\n",
+                     (int) g_kt.warm, g_kt.cb_span.size(), (unsigned long long) g_kt.w_reads,
+                     (unsigned long long) g_kt.w_unavail);
+        for (const auto& kv : g_kt.wrows) {
+            const KtStat::WRow& r = kv.second;
+            const double n = (double) r.n, gn = (double) r.gaps;
+            const double f = n ? r.front / 1e3 / n : 0.0, k = n ? r.kern / 1e3 / n : 0.0;
+            const double b = n ? r.bar / 1e3 / n : 0.0, g = gn ? r.gap / 1e3 / gn : 0.0;
+            std::fprintf(stderr, "vk warm replay %2u%s: n=%-8llu front %.2f + kernel %.2f + barrier %.2f + gap %.2f "
+                                 "= %.2f us/disp ; barrier+gap %.2f ; %llu pairs\n",
+                         kv.first, kv.first == 0 ? " COLD" : "    ", (unsigned long long) r.n, f, k, b, g, f + k + b + g,
+                         b + g, (unsigned long long) r.gaps);
+        }
+        // the warm aggregate over replays >= 1 (the steady state the round actually lives in)
+        double wf = 0, wk = 0, wb = 0, wg = 0;
+        uint64_t wn = 0, wgp = 0;
+        for (const auto& kv : g_kt.wrows) {
+            if (kv.first == 0) continue;
+            wf += kv.second.front; wk += kv.second.kern; wb += kv.second.bar; wg += kv.second.gap;
+            wn += kv.second.n; wgp += kv.second.gaps;
+        }
+        const double n = (double) wn, gn = (double) wgp;
+        const double f = n ? wf / 1e3 / n : 0.0, k = n ? wk / 1e3 / n : 0.0;
+        const double b = n ? wb / 1e3 / n : 0.0, g = gn ? wg / 1e3 / gn : 0.0;
+        std::fprintf(stderr, "vk warm split AGGREGATE (replays >=1, the steady state): n=%llu  front %.2f + kernel %.2f "
+                             "+ barrier %.2f + gap %.2f = %.2f us/dispatch ; barrier+gap %.2f\n",
+                     (unsigned long long) wn, f, k, b, g, f + k + b + g, b + g);
+        // PER COMMAND BUFFER: each segment's own cold (submit 0) against its warm mean (submits >= 1).  This is the
+        // comparison the ordinal table cannot make, because different command buffers appear in different ordinals.
+        for (const auto& kv : g_kt.cb_rows) {
+            const KtStat::CbRow& c = kv.second;
+            auto row = [](const KtStat::WRow& r, double& f, double& k, double& b, double& g, double& tot) {
+                const double n = (double) r.n, gn = (double) r.gaps;
+                f = n ? r.front / 1e3 / n : 0.0; k = n ? r.kern / 1e3 / n : 0.0;
+                b = n ? r.bar / 1e3 / n : 0.0; g = gn ? r.gap / 1e3 / gn : 0.0; tot = f + k + b + g;
+            };
+            double cf, ck, cb2, cg, ct, wf2, wk2, wb2, wg2, wt;
+            row(c.cold, cf, ck, cb2, cg, ct);
+            row(c.warm, wf2, wk2, wb2, wg2, wt);
+            std::fprintf(stderr,
+                         "vk warm cb n=%-6u submits=%-3u | COLD %.2f+%.2f+%.2f+%.2f=%.2f | WARM %.2f+%.2f+%.2f+%.2f=%.2f "
+                         "us/disp (front+kernel+barrier+gap)\n",
+                         c.n, c.submits, cf, ck, cb2, cg, ct, wf2, wk2, wb2, wg2, wt);
+        }
+    } else {
         // THE FOUR-WAY SPLIT, in us per timed dispatch.  `split_n` counts dispatches whose four timestamps were
         // read; the gap is counted only between CONSECUTIVE timed dispatches, so its own denominator is `gaps`.
         const double n = (double) g_kt.split_n, gn = (double) g_kt.gaps;
@@ -417,6 +538,17 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
                  (unsigned long long) g_ds.sub_seg, (unsigned long long) g_ds.seg_disp,
                  (unsigned long long) g_ds.barriers, g_ds.t_seg_submit,
                  g_ds.t_seg_wait);
+    // PER-SEGMENT DRAIN: did the fence wait scale with the SEGMENT'S DISPATCH COUNT (links) or is it fixed?  One
+    // line per segment submit so the relation is visible, not asserted.
+    if (!g_ds.seg_log.empty()) {
+        std::fprintf(stderr, "vk seg drain (per segment submit: executed dispatches, fence-wait ms, us/dispatch):\n");
+        for (size_t i = 0; i < g_ds.seg_log.size(); ++i) {
+            const uint32_t d = g_ds.seg_log[i].first;
+            const double w = g_ds.seg_log[i].second;
+            std::fprintf(stderr, "vk seg drain i=%-3zu disp=%-6u wait_ms=%-9.3f us/disp=%.2f\n", i, d, w,
+                         d ? w * 1e3 / (double) d : 0.0);
+        }
+    }
     std::fprintf(stderr, "vk disp stat RECORDED encode: %.1f ms over %llu encodes (%.4f ms/encode) - charged at "
                          "record_dispatch; the OLD `encode` term read 0 on this arm BY CONSTRUCTION\n",
                  g_ds.t_encode_rec, (unsigned long long) g_ds.rec_encodes,
@@ -2011,6 +2143,17 @@ void Ctx::record_begin() {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     // NOT ONE_TIME_SUBMIT: this buffer is submitted once per replay, which is the entire point of it.
     VK_CHECK(vkBeginCommandBuffer(rec_cb_, &bi));
+    // STRATA_VK_WARM_SPLIT: arm this command buffer's timestamp slots.  The pool is created up front (rather than
+    // lazily at the first recorded dispatch) so the reset command can be recorded here, at the TOP; on EVERY
+    // replay the device then executes reset -> the per-dispatch writes, and the host reads this segment's span
+    // after THIS submit's fence (see kt_flush_seg).  Segments are submitted strictly one at a time - every submit
+    // is followed by a fence wait - so a whole-pool reset here can only wipe values already read.
+    if (g_kt.on && g_kt.warm) {
+        if (!g_kt.ready) kt_create(phys_, dev_, queue_family_);
+        g_kt.span_open = g_kt.next;
+        if (g_kt.ready && g_kt.pool != VK_NULL_HANDLE)
+            vkCmdResetQueryPool(rec_cb_, g_kt.pool, 0, g_kt.cap);
+    }
     recording_ = true;
     recorded_ = 0;
     recorded_copies_ = 0;
@@ -2050,6 +2193,12 @@ void Ctx::record_end() {
     vkCmdPipelineBarrier(rec_cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     VK_CHECK(vkEndCommandBuffer(rec_cb_));
+    // STRATA_VK_WARM_SPLIT: register this command buffer's slot span for the per-replay read.
+    if (g_kt.on && g_kt.warm) {
+        g_kt.span_base = g_kt.span_open;
+        g_kt.span_n = (g_kt.next - g_kt.span_open) / 4u;
+        g_kt.cb_span[rec_cb_] = { g_kt.span_base, g_kt.span_n };
+    }
     recording_ = false;
     have_recording_ = true;
 }
@@ -2171,7 +2320,10 @@ void Ctx::submit_segment(const CaptureSeg& seg) {
     // arm had no attribution.  Charged here, per segment, with its dispatch count.
     VK_CHECK(vkWaitForFences(dev_, 1, &seg.fence, VK_TRUE, UINT64_MAX));
     const double _td = vk_ms();
-    kt_flush(dev_);   // STRATA_VK_KERNEL_TIME: read this replay's per-dispatch timestamps, then reset the pool
+    // STRATA_VK_KERNEL_TIME: read this replay's per-dispatch timestamps.  WARM mode reads THIS segment's span
+    // into its replay-ordinal row; the read-once form reads the un-read prefix once (the COLD first replay).
+    if (g_kt.on && g_kt.warm) kt_flush_seg(dev_, seg.cb);
+    else kt_flush(dev_);
     if (g_ds.on) {
         ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_seg;
         g_ds.t_submit += _tw - _ts;
@@ -2179,6 +2331,7 @@ void Ctx::submit_segment(const CaptureSeg& seg) {
         g_ds.seg_disp += seg.dispatches;
         g_ds.t_seg_wait += _td - _tw;
         g_ds.t_seg_submit += _tw - _ts;
+        g_ds.seg_log.push_back({ seg.dispatches, _td - _tw });
     }
 }
 
@@ -2204,7 +2357,8 @@ void Ctx::submit_recorded() {
     VK_CHECK(vkResetFences(dev_, 1, &rec_fence_));   // the fence was signalled by the previous submission
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, rec_fence_));
     VK_CHECK(vkWaitForFences(dev_, 1, &rec_fence_, VK_TRUE, UINT64_MAX));
-    kt_flush(dev_);   // STRATA_VK_KERNEL_TIME: read this replay's per-dispatch timestamps, then reset the pool
+    if (g_kt.on && g_kt.warm) kt_flush_seg(dev_, rec_cb_);
+    else kt_flush(dev_);   // STRATA_VK_KERNEL_TIME: read this replay's per-dispatch timestamps, then reset the pool
     if (g_ds.on) { ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_rec; }
 }
 
