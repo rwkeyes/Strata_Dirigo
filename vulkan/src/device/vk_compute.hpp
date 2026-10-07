@@ -330,6 +330,21 @@ public:
     // the explicit cases, and it costs nothing when nothing is pending.
     void flush();
 
+    // ---- EVENT TIMESTAMPS: real device time for cudaEventRecord / cudaEventElapsedTime ---------------------
+    // WHY THIS EXISTS.  The engine's phase table (`STRATA_PREFILL_TIMING=1`) is EVENT-based - see
+    // `src/prefill/prefill.cpp:1458`: "Events are recorded on the compute stream in order; the time between two
+    // consecutive marks is charged to the phase of the first".  That is device time ONLY if the marks are, and
+    // this port's `cudaEvent*` was `steady_clock` - so every phase number it reported was HOST time: the time
+    // this (blocking, batching) backend spent inside the phase, which is why its `gdn recurrence` read 225x the
+    // SYCL tree's device-time figure for the same work.  These four calls are the honest form: a timestamp
+    // written INTO THE LIVE BATCH at the point of the mark, read back after the device has executed it.
+    // `ts_read` uses VK_QUERY_RESULT_WITH_AVAILABILITY_BIT and NEVER a WAIT_BIT - a waiting read over this
+    // device's doorbell path is a measured DEVICE LOST (r=-4), not a slow read.
+    uint32_t ts_alloc();                              // a slot in the event pool, or UINT32_MAX on exhaustion
+    void     ts_mark(uint32_t slot);                  // write a timestamp into the live batch AT THIS POINT
+    bool     ts_read(uint32_t slot, uint64_t* ticks); // availability-bit read; false = not executed yet
+    double   ts_period_ns() const;                    // ns per tick for this device (0 = instrument off)
+
     // ---- RECORDED STEPS: the CUDA-graph replacement (see NEXT.md's stage-3 note) ------------------------
     // The engine's decode step is a fixed sequence of dispatches re-issued every token, and the live path's
     // batch above is flushed at every observer, so it cannot re-issue a sequence without re-encoding it.  These

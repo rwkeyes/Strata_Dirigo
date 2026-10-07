@@ -13,6 +13,7 @@
 #include "vk_arena.hpp"            // Stream, stream_open (the device layer)
 #include "vk_compute.hpp"          // Ctx: the live batch's own view (`live_pending`) for the visibility arm
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -134,23 +135,36 @@ int main(int argc, char** argv) {
         cudaFree(ddst);
     }
 
-    // ---- events: HOST-side wall-clock, labelled as such ------------------------------------------------------
+    // ---- events: the TIMED pair measures the DEVICE gap, the sync-only one the HOST fallback ----------------
+    // The port's cudaEvent* now writes the pool's timestamps into the live batch, so a timed pair measures the
+    // device time between the two marks rather than the host time between two host calls.  BOTH arms are checked
+    // and PRINTED: the difference between them IS the port's scheduling cost, which is what the engine's phase
+    // table used to report as if it were device time.
     {
-        cudaEvent_t a = nullptr, b = nullptr;
+        cudaEvent_t a = nullptr, b = nullptr, bs = nullptr;
         cudaError_t e = cudaEventCreate(&a);
-        e = (e == cudaSuccess) ? cudaEventCreateWithFlags(&b, cudaEventDisableTiming) : e;
+        e = (e == cudaSuccess) ? cudaEventCreate(&b) : e;                                   // TIMED (no disable flag)
+        e = (e == cudaSuccess) ? cudaEventCreateWithFlags(&bs, cudaEventDisableTiming) : e;  // SYNC-ONLY
         cudaEventRecord(a, cs);
         void* d = nullptr;
         cudaMalloc(&d, 8u << 20);
         cudaMemsetAsync(d, 0x11, 8u << 20, cs);
         cudaDeviceSynchronize();
         cudaEventRecord(b, cs);
-        float ms = -1.0f;
+        cudaEventRecord(bs, cs);
+        float ms = -1.0f, ms_host = -1.0f;
         e = (e == cudaSuccess) ? cudaEventElapsedTime(&ms, a, b) : e;
-        check("cudaEventElapsedTime returns a finite host-wall figure", e == cudaSuccess && ms >= 0.0f);
-        std::printf("  (host-wall cudaEventElapsedTime over an 8 MiB staged fill: %.3f ms)\n", (double) ms);
+        check("cudaEventElapsedTime (timed pair) returns a finite DEVICE figure",
+              e == cudaSuccess && ms >= 0.0f && std::isfinite(ms));
+        const cudaError_t e2 = cudaEventElapsedTime(&ms_host, a, bs);
+        check("cudaEventElapsedTime (sync-only end event) returns the HOST fallback",
+              e2 == cudaSuccess && ms_host >= 0.0f);
+        std::printf("  (8 MiB staged fill: device %.3f ms against host %.3f ms - the gap is this backend's\n"
+                    "   scheduling cost, and it is why the engine's phase table needs the timed pair)\n",
+                    (double) ms, (double) ms_host);
         cudaEventDestroy(a);
         cudaEventDestroy(b);
+        cudaEventDestroy(bs);
         cudaFree(d);
     }
 

@@ -524,18 +524,25 @@ cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     return cudaSuccess;
 }
 
-// ---- events (HOST-side wall-clock; see the header) ---------------------------------------------------------
+// ---- events: DEVICE time (see vk_compute.hpp's EVENT TIMESTAMPS note) --------------------------------------
+// A mark is a timestamp WRITTEN INTO THE LIVE BATCH at the point of the record, read back once the device has
+// executed it.  The host reading survives ONLY as a named fallback for the cases where the device value cannot
+// be had (no timestamp support, pool exhausted, mark not executed yet) - and it SAYS SO, because a silently
+// host-timed phase table is what made this port's `gdn recurrence` read 225x upstream's device-time figure.
 struct cudaEvent_st {
-    std::chrono::steady_clock::time_point t{};
+    uint32_t slot = UINT32_MAX;                   // the slot the LAST cudaEventRecord wrote
     bool recorded = false;
+    bool disable_timing = false;                  // cudaEventDisableTiming: a sync-only event, never timed
+    bool warned_fallback = false;
+    std::chrono::steady_clock::time_point t{};    // the fallback reading
 };
 
 cudaError_t cudaEventCreate(cudaEvent_t* event) { return cudaEventCreateWithFlags(event, 0); }
 
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t* event, unsigned int flags) {
-    (void) flags;      // no device timing exists to disable
     if (event == nullptr) return fail(cudaErrorInvalidValue);
     *event = new cudaEvent_st();
+    (*event)->disable_timing = (flags & cudaEventDisableTiming) != 0u;   // sync-only and never timed
     g_last = cudaSuccess;
     return cudaSuccess;
 }
@@ -543,7 +550,12 @@ cudaError_t cudaEventCreateWithFlags(cudaEvent_t* event, unsigned int flags) {
 cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
     if (stream != nullptr) g_current = reinterpret_cast<Stream*>(stream);
     if (event == nullptr) return fail(cudaErrorInvalidValue);
-    event->t = std::chrono::steady_clock::now();
+    event->t = std::chrono::steady_clock::now();              // the fallback reading, always taken
+    event->slot = UINT32_MAX;
+    if (!event->disable_timing && g_current != nullptr && g_current->ctx != nullptr) {
+        event->slot = g_current->ctx->ts_alloc();
+        g_current->ctx->ts_mark(event->slot);                 // INTO THE LIVE BATCH, at this point
+    }
     event->recorded = true;
     g_last = cudaSuccess;
     return cudaSuccess;
@@ -551,14 +563,31 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
 
 cudaError_t cudaEventSynchronize(cudaEvent_t event) {
     if (event == nullptr) return fail(cudaErrorInvalidValue);
+    // A real wait now: the mark lives in the device's batch, so it has not "happened" until that ran.
+    if (g_current != nullptr && g_current->ctx != nullptr) g_current->ctx->flush();
     g_last = cudaSuccess;
-    return cudaSuccess;      // the timestamp is already host-side: there is nothing to wait for
+    return cudaSuccess;
 }
 
 cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end) {
     if (ms == nullptr || start == nullptr || end == nullptr) return fail(cudaErrorInvalidValue);
-    const std::chrono::duration<float, std::milli> d = end->t - start->t;
-    *ms = d.count();
+    strata::vulkan::Ctx* c = (g_current != nullptr) ? g_current->ctx : nullptr;
+    // The engine reads elapsed times after the stream is synchronized, so the marks are executed by then; this
+    // flush makes that true even for a caller that reads early.  Correctness over speed - it is a diagnostic.
+    if (c != nullptr) c->flush();
+    uint64_t a = 0, b = 0;
+    if (c != nullptr && !start->disable_timing && !end->disable_timing && c->ts_read(start->slot, &a) &&
+        c->ts_read(end->slot, &b)) {
+        *ms = (float) ((double) (b - a) * c->ts_period_ns() / 1e6);      // TICKS -> ms, device-measured
+    } else {
+        const std::chrono::duration<float, std::milli> d = end->t - start->t;
+        *ms = d.count();
+        if (!start->warned_fallback) {
+            start->warned_fallback = true;
+            std::fprintf(stderr, "cudaEventElapsedTime: device timestamps unavailable - HOST time returned; "
+                                 "these numbers are host scheduling, not device time\n");
+        }
+    }
     g_last = cudaSuccess;
     return cudaSuccess;
 }

@@ -182,16 +182,32 @@ struct KtStat {
     }
 };
 KtStat g_kt;
-void kt_create(VkPhysicalDevice pd, VkDevice dev, uint32_t qfam) {
-    g_kt.ready = true;                       // decided once; a failure leaves `ready` false forever
+// ONE device probe for EVERY timestamp user - the decode's kernel timer below and the EVENT pool further down.
+// The period and the queue family's valid bits come from the same two queries, and two copies of this drifting
+// apart would be a silent instrument difference (one pool reading ticks with the other's period), so it is
+// single-sourced here.  Returns zeros when the family cannot timestamp at all.
+struct TsCaps {
+    double period_ns = 0.0;
+    uint32_t valid_bits = 0;
+};
+TsCaps ts_caps(VkPhysicalDevice pd, uint32_t qfam) {
     VkPhysicalDeviceProperties pr{};
     vkGetPhysicalDeviceProperties(pd, &pr);
-    g_kt.period_ns = pr.limits.timestampPeriod;
     uint32_t n = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, nullptr);
     std::vector<VkQueueFamilyProperties> q(n);
     if (n) vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, q.data());
-    const uint32_t vb = qfam < n ? q[qfam].timestampValidBits : 0;
+    TsCaps c;
+    c.period_ns = (double) pr.limits.timestampPeriod;
+    c.valid_bits = qfam < n ? q[qfam].timestampValidBits : 0;
+    return c;
+}
+
+void kt_create(VkPhysicalDevice pd, VkDevice dev, uint32_t qfam) {
+    g_kt.ready = true;                       // decided once; a failure leaves `ready` false forever
+    const TsCaps caps = ts_caps(pd, qfam);
+    g_kt.period_ns = caps.period_ns;
+    const uint32_t vb = caps.valid_bits;
     if (vb == 0) {
         std::fprintf(stderr, "vk kernel time: queue family %u reports timestampValidBits 0 - instrument OFF\n", qfam);
         g_kt.ready = false;
@@ -2337,6 +2353,100 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
 }
 
 void Ctx::flush() { flush_live(); }
+
+// ============================================================================================================
+// EVENT TIMESTAMPS: the pool behind cudaEventRecord / cudaEventElapsedTime (see the header's note).
+// A SEPARATE pool from `g_kt` on purpose: g_kt numbers slots for the RECORDED decode arm and may only be reset
+// ONCE, at creation, because a per-submit reset wipes the other segments' queries on every replay.  These marks
+// are LIVE-path and must SURVIVE until the engine's own fold() reads them, so they cannot share that discipline.
+// ============================================================================================================
+namespace {
+struct TsPool {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    double period_ns = 0.0;
+    uint32_t cap = 0, next = 0;
+    bool unavailable = false;                     // decided once; the fallback is NAMED, never silent
+    bool warned_exhausted = false;
+};
+TsPool g_ts;
+// One mark per phase per chunk, so this is deliberately generous; a long server run still exhausts it and says so
+// when it does.  There is no recycling on purpose: the engine may hold recorded marks until its own fold().
+constexpr uint32_t kEventTsCap = 8192u;
+}  // namespace
+
+double Ctx::ts_period_ns() const { return g_ts.period_ns; }
+
+static void ts_ensure(VkPhysicalDevice phys, VkDevice dev, uint32_t qfam) {
+    if (g_ts.pool != VK_NULL_HANDLE || g_ts.unavailable) return;
+    const TsCaps caps = ts_caps(phys, qfam);
+    if (caps.valid_bits == 0 || caps.period_ns <= 0.0) {
+        std::fprintf(stderr, "vk event time: queue family %u has timestampValidBits %u / period %.3f - "
+                             "cudaEvent* falls back to HOST time, so the engine's phase numbers are host "
+                             "scheduling, not device time\n",
+                     qfam, caps.valid_bits, caps.period_ns);
+        g_ts.unavailable = true;
+        return;
+    }
+    g_ts.cap = kEventTsCap;
+    VkQueryPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    ci.queryCount = g_ts.cap;
+    if (vkCreateQueryPool(dev, &ci, nullptr, &g_ts.pool) != VK_SUCCESS) {
+        std::fprintf(stderr, "vk event time: vkCreateQueryPool failed - cudaEvent* falls back to HOST time\n");
+        g_ts.unavailable = true;
+        return;
+    }
+    vkResetQueryPool(dev, g_ts.pool, 0, g_ts.cap);
+    g_ts.period_ns = caps.period_ns;
+    std::fprintf(stderr, "vk event time: ON - %u timestamp queries, %.4f ns/tick, valid bits %u "
+                         "(cudaEventRecord/cudaEventElapsedTime now report DEVICE time)\n",
+                 g_ts.cap, g_ts.period_ns, caps.valid_bits);
+}
+
+uint32_t Ctx::ts_alloc() {
+    ts_ensure(phys_, dev_, queue_family_);
+    if (g_ts.pool == VK_NULL_HANDLE) return UINT32_MAX;
+    if (g_ts.next >= g_ts.cap) {
+        if (!g_ts.warned_exhausted) {
+            g_ts.warned_exhausted = true;
+            std::fprintf(stderr, "vk event time: the %u-slot pool (kEventTsCap) is EXHAUSTED - further cudaEvent* "
+                                 "marks fall back to HOST time for the rest of this process\n",
+                         g_ts.cap);
+        }
+        return UINT32_MAX;
+    }
+    return g_ts.next++;
+}
+
+void Ctx::ts_mark(uint32_t slot) {
+    if (g_ts.pool == VK_NULL_HANDLE || slot == UINT32_MAX) return;
+    // A MARK IS A BATCH BOUNDARY, and that is a SEMANTIC requirement rather than a tidy-up.  The engine charges
+    // the gap between two consecutive marks to the phase of the first, i.e. it assumes the marks PARTITION the
+    // stream's work.  Because this backend BATCHES, encoding several dispatches into one command buffer and
+    // submitting them together, a timestamp written into the middle of a live batch would complete after work
+    // that belongs to an EARLIER phase - and when the engine chains marks across passes ("keep the last mark"),
+    // the first mark of a pass can inherit unrelated work from before it, which made the phase deltas sum to
+    // MORE than the run's own wall time (measured: 8,043 ms of phases against a 6,976 ms wall).  Flushing first
+    // makes the timestamp the first command of its own submission, so its predecessor is always the previous
+    // mark and the deltas partition the timeline - which is what the engine's model requires.  The cost is one
+    // submission per phase mark, and this path only runs when something is actually recording events.
+    flush_live();
+    live_ensure();                        // the live batch needs a command buffer for the mark to land in
+    // BOTTOM_OF_PIPE: the timestamp completes after everything encoded BEFORE it - which is the semantic
+    // cudaEventRecord has, and what makes the engine's "gap between consecutive marks" a device-measured gap.
+    vkCmdWriteTimestamp(live_cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts.pool, slot);
+}
+
+bool Ctx::ts_read(uint32_t slot, uint64_t* ticks) {
+    if (g_ts.pool == VK_NULL_HANDLE || slot == UINT32_MAX || ticks == nullptr) return false;
+    uint64_t out[2] = {0, 0};
+    const VkResult r = vkGetQueryPoolResults(dev_, g_ts.pool, slot, 1, sizeof(out), out, sizeof(uint64_t) * 2,
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (r != VK_SUCCESS || out[1] == 0) return false;
+    *ticks = out[0];
+    return true;
+}
 
 // ---- recorded steps: the CUDA-graph replacement (NEXT.md's stage-3 note) -----------------------------------
 // The command buffer and fence live for the life of the Ctx and are re-submitted, never re-recorded by a replay.
