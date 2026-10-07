@@ -619,6 +619,28 @@ Four schedules are measured at every shape, each as ONE dispatch per replay of a
 `cm-staged` = `gemm_prefill_f16_m8_staged.spv` (the SAME tile with the operand tiles staged in shared memory, as
 llama.cpp's `mul_mm.comp`/`mul_mmq.comp` do - both are built by `run_bench.sh` and by the gate).
 
+**THE `fma-untiled` COLUMN HAS SINCE MOVED, BY 1.6-5.6x, AND THE TABLE ABOVE IS THE PRE-UNROLL BASELINE.**
+`gemm_prefill_fma_small.comp` walked its reduction with a RUNTIME bound (`pc.k`), so no compiler could unroll it
+and its two global f16 loads were issued one iteration at a time. It now carries a compile-time K unroll
+(`-DKU=<n>`, 8 shipped). Measured on the Arc Pro B70, same arm, same shapes (median of `reps=9`):
+
+| shape | pre-unroll | KU=4 | **KU=8 (shipped)** | KU=16 |
+|---|---:|---:|---:|---:|
+| gate/up T=8 N=1280 K=2560 | 0.1952 | 0.1008 | **0.1025** | 0.1069 |
+| gate/up T=16 | 0.2822 | 0.1506 | **0.1519** | 0.1477 |
+| gate/up T=64 | 2.8117 | 0.7873 | **0.4994** | 0.6109 |
+| gate/up T=199 | 6.3302 | 2.1875 | **1.4690** | 1.5769 |
+| down T=8 N=2560 K=640 | 0.0688 | 0.0438 | **0.0439** | 0.0436 |
+| down T=64 | 1.1797 | 0.3425 | **0.2245** | 0.2456 |
+| down T=199 | 3.3530 | 1.0226 | **0.6445** | 0.6908 |
+
+KU=8 is the best or tied-best at every shape. **Two consequences worth reading off this table:** (a) the unrolled
+FMA kernel is now FASTER THAN THE SHIPPED COOPERATIVE-MATRIX DEFAULT at every shape here - the T=8 comparison is
+0.1025 against `cm-global`'s 0.4017 and T=199 is 1.4690 against 3.3426 - which the engine's `Gemm::f16` shape
+rule does not yet reflect (it sends T >= 8 to the matrix units); (b) end to end the engine gained 5.3% of the
+prefill, not the per-call multiple, because `gemm gate/up` + `gemm down` also carry the expert dequant, the
+staging and the swiglu. Price a kernel change against the PHASE it lands in.
+
 **THE READING, AND IT HAS THREE PARTS THAT DO NOT AGREE WITH EACH OTHER - WHICH IS THE POINT.**
 
 * **The shared-memory staging is a 2.5-3.2x LOSS at every shape on this card.**  It is not the idea and not the

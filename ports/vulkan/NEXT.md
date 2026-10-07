@@ -8044,3 +8044,66 @@ if it did not exist.)
 intel **965/0/0**, lvp 949/0/4, radeon 951/3/2, smoke 60/0/0, rc=1 by design. Both chunk shaders pass the shader
 pass: `OK gdn_rec_chunk` and `OK gdn_rec_chunk_reg`, each `LocalSize 256 1 1 | census: none`. (radeon's failures
 are the flaky, rotating "engine wrapper == shader path, bitwise" set documented above - never in the intel block.)
+
+---
+
+## 2026-10-07 (later still) — THE GEMM K-UNROLL: A REAL WIN, and it is where the expert path actually is
+
+**WHAT WAS FOUND.** `gemm_prefill_fma_small.comp` is the prefill GEMM the ENGINE lands on for every expert group
+with fewer than 8 rows (`Gemm::f16`'s `t_cma = (T/8)*8` rule leaves `t_cma = 0` for T < 8, so the FMA kernel runs
+alone) - and, on a routed MoE prompt, that is nearly every expert call: `port log` shows ~7,166
+`gemm_prefill_fma_small` dispatches for a 199-token prompt, and the `gemm gate/up` + `gemm down` phases were
+2,183-2,209 ms of a 9,127 ms GPU timeline (24%). Its reduction loop was:
+
+    for (uint i = 0u; i < pc.k; ++i) acc += float(X.x[..]) * float(W.w[..]);
+
+`pc.k` is a RUNTIME value, so no compiler could unroll it, and the two global f16 loads per iteration were issued
+ONE AT A TIME: at T=8 the gate/up shape cost 0.195 ms for T*N*K = 26 MMAC, where the arithmetic bound is ~2 us.
+The kernel was latency-bound on its own K walk, exactly like the GDN recurrence - same disease, different kernel.
+
+**THE FIX.** A compile-time K unroll (`#ifndef KU / #define KU 8`, `-DKU=<n>` for the bench), issuing the KU loads
+of X and W together before the FMAs that consume them, ONE accumulator in the same ascending `k` order and the
+same `k % KU` tail. The arithmetic is unchanged, so the ids must not move - and they did not.
+
+**BENCH (this card, `--only gemm_prefill`, fma-untiled rows; baseline = the recorded table above):**
+
+| shape | baseline | KU=4 | **KU=8 (shipped)** | KU=16 |
+|---|---|---|---|---|
+| gate/up T=8 | 0.1952 | 0.1008 | **0.1025** | 0.1069 |
+| gate/up T=16 | 0.2822 | 0.1506 | **0.1519** | 0.1477 |
+| gate/up T=64 | 2.8117 | 0.7873 | **0.4994** | 0.6109 |
+| gate/up T=199 | 6.3302 | 2.1875 | **1.4690** | 1.5769 |
+| down T=8 | 0.0688 | 0.0438 | **0.0439** | 0.0436 |
+| down T=64 | 1.1797 | 0.3425 | **0.2245** | 0.2456 |
+| down T=199 | 3.3530 | 1.0226 | **0.6445** | 0.6908 |
+
+**1.6-5.6x per call, and KU=8 is the best or tied-best at every shape** (KU=4 loses at T=64/199, KU=16 loses
+everywhere but T=16). Note what that does to the schedule choice: the unrolled FMA kernel now beats the SHIPPED
+cooperative-matrix default at every shape measured (T=8: 0.1025 against 0.4017; T=199: 1.469 against 3.3426) -
+a follow-up worth its own A/B, because `gemm_f16` currently routes T >= 8 to the matrix units.
+
+**ENGINE A/B (199-token arm, interleaved A,B,A,B in ONE launch, one env-less .spv swap, ids checked every arm):**
+
+| arm | variant | id | gemm gate/up | gemm down | prefill | tok/s |
+|---|---|---|---|---|---|---|
+| A_1 | pre-unroll | `56a0b28d2de6` | 1,189 | 994 | 9,420.8 | 21.02 |
+| B_1 | KU=8 | `56a0b28d2de6` | 1,044 | 882 | 9,022.7 | 21.94 |
+| A_2 | pre-unroll | `56a0b28d2de6` | 1,199 | 1,010 | 9,620.5 | 20.58 |
+| B_2 | KU=8 | `56a0b28d2de6` | 1,044 | 878 | 9,014.9 | 21.96 |
+
+* **prefill 9,520.6 -> 9,018.8 ms median (-5.3%), ranges DISJOINT** (B's worst 9,022.7 is under A's best 9,420.8);
+  **tok/s 20.80 -> 21.95 (+5.5%)**; `gemm gate/up` -12.6% and `gemm down` -11.6%, both disjoint.
+* **ids `56a0b28d2de6` on all four arms** - the unroll is a memory schedule, and the engine's own id check is the
+  guard that it stayed one.
+* The per-phase win (12%) is far smaller than the per-call bench win (1.6-5.6x) because those phases also carry
+  the expert dequant, the staging and the swiglu around the GEMM. That is why the port's earlier tiled-vs-untiled
+  A/B read as a WASH: the kernel is a minority of the phase. **The lesson to keep: price a kernel change against
+  the phase it lands in, not against its own microbenchmark.**
+
+**ALSO RECORDED (a self-inflicted false negative, worth the lines).** The first version of this edit DROPPED the
+shader's `#version 450` and its two `#extension` lines (the file was rewritten from a partial read), so glslc
+never produced a new `.spv` - and the bench then returned numbers byte-identical to the recorded baseline, which
+read as "the unroll does not help". The sha check that "passed" compared two copies of the SAME stale file. The
+tell was the identity of the medians (0.1952 twice); the fix is to assert the `.spv` sha CHANGED and to read the
+compiler's own output, not just the exit status. `case_gemm_prefill_fma_small` plus the engine ids are the guards
+now that it is real.

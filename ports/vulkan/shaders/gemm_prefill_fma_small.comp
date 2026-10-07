@@ -32,6 +32,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 
+// THE K UNROLL FACTOR (`-DKU=<n>`): 8 shipped, or the bench's sweep factor.  Compile-time on purpose - see the
+// loop's own note for why a runtime `pc.k` bound was the whole problem.
+#ifndef KU
+#define KU 8
+#endif
+
 layout(local_size_x = 256) in;
 
 // X: [T x K] row-major.  W: [N x K] row-major.  Y: [T x ldy] row-major.
@@ -54,8 +60,26 @@ void main() {
     float acc = 0.0;
     // The reduction runs over the CONTIGUOUS axis of both operands - W's row and X's row - which is the engine's
     // (OP_T, OP_N) layout.  fp16 -> fp32 is exact, so the widening below costs nothing but the load.
-    for (uint i = 0u; i < pc.k; ++i) {
-        acc += float(X.x[row * pc.k + i]) * float(W.w[col * pc.k + i]);
+    //
+    // THE K UNROLL (`KU`, compile-time).  `pc.k` is a RUNTIME value, so the loop above could not be unrolled and
+    // its two global f16 loads were issued one iteration at a time: at small T this kernel is LATENCY-bound, not
+    // ALU- or bandwidth-bound (T=8 gate/up: 0.195 ms for T*N*K = 26 MMAC, where the arithmetic bound is ~2 us).
+    // The KU loads of X and W are now issued TOGETHER, before the FMAs that consume them.  THE ARITHMETIC IS
+    // UNCHANGED - ONE accumulator, terms added in the same ascending `k` order (`(acc + t0) + t1` never becomes
+    // `acc + (t0 + t1)`), the same tail loop for `k % KU` - which is why the ids must not move.
+    const uint xb = row * pc.k;
+    const uint wb = col * pc.k;
+    uint i = 0u;
+    for (; i + uint(KU) <= pc.k; i += uint(KU)) {
+        float xx[KU], ww[KU];
+        for (uint u = 0u; u < uint(KU); ++u) {
+            xx[u] = float(X.x[xb + i + u]);
+            ww[u] = float(W.w[wb + i + u]);
+        }
+        for (uint u = 0u; u < uint(KU); ++u) acc += xx[u] * ww[u];
+    }
+    for (; i < pc.k; ++i) {
+        acc += float(X.x[xb + i]) * float(W.w[wb + i]);
     }
     Y.y[row * pc.ldy + col] = acc;
 }
