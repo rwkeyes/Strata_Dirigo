@@ -1,5 +1,13 @@
 # Start here next session
 
+> **START WITH `PERFORMANCE-FINAL-SURVEY.md` (2026-10-07).** It is the broad check taken before mothballing:
+> the ranked levers, the ten closed negatives with the number that kills each, and the commands to re-check
+> every claim. Two things in this file are superseded: its per-PHASE ratios compare this port's old
+> **host-clock** timings against the SYCL tree's **device** timestamps (the port's `cudaEvent*` was host time
+> until `9934785`), and the phase table is not a reliable way to pick a kernel to optimise — on an asynchronous
+> backend it names a neighbourhood, not a phase, and adjacent phases exchange time between runs. Totals and
+> every counter-based result still stand.
+
 ## THE ALL-ZEROS CAUSE IS **MEASURED**: A CONSTANT ZERO LOGITS ROW, **NOT** NON-FINITE LOGITS (2026-10-07, `vega`, Arc Pro B70, `nan6` = `ddb871abc6fec391`)
 
 **THE CLAIM THIS CORRECTS.** The record said "an all-zeros decode IS non-finite head logits" — read off
