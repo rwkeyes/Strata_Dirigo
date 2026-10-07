@@ -61,6 +61,21 @@ for ku in 1 8; do
   fi
   printf '  OK   %s\n' "native_gdn_step_u$ku (-DKU=$ku)"
 done
+# THE CM_CT OUTPUT-TILE VARIANTS: one source, three builds, the same pattern as the KU loop above - so a variant
+# cannot drift from the body it claims to measure.  `common/gemm_prefill.glsl` sizes a cooperative matrix at
+# compile time, so the number of output tiles a subgroup owns HAS to be a compile-time constant; -DCM_CT is how
+# the arm gets 2 and 4 without a second copy of the file.  Measured 2026-10-07, gate/up T=199: ct1 3.335 -> ct2
+# 2.563 -> ct4 2.174 ms (1.53x for the matrix-unit path, still 2x behind the FMA kernel, hence opt-in).
+for ct in 2 4; do
+  if ! glslc --target-env=vulkan1.3 -fshader-stage=compute -DCM_CT=$ct "$SH/gemm_prefill_f16_m8.comp" \
+        -o "$SPV/gemm_prefill_f16_m8_ct$ct.spv" 2>"$BUILD/gemm_prefill_f16_m8_ct$ct.err"; then
+    echo "  FAIL glslc gemm_prefill_f16_m8 -DCM_CT=$ct"; sed -n '1,8p' "$BUILD/gemm_prefill_f16_m8_ct$ct.err"; rc=1; continue
+  fi
+  if ! spirv-val --target-env vulkan1.3 "$SPV/gemm_prefill_f16_m8_ct$ct.spv" 2>>"$BUILD/gemm_prefill_f16_m8_ct$ct.err"; then
+    echo "  FAIL spirv-val gemm_prefill_f16_m8_ct$ct"; rc=1; continue
+  fi
+  printf '  OK   %s\n' "gemm_prefill_f16_m8_ct$ct (-DCM_CT=$ct)"
+done
 [ $rc -eq 0 ] || { echo "== shader build FAILED"; exit 1; }
 
 # THE BENCH-LOCAL SHADERS.  The scatter-vs-stream arm needs three kernels the GATE never sees (one of them has

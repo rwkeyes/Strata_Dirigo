@@ -257,6 +257,20 @@ void bench_gemm_prefill(Ctx& ctx, const std::string& dir, int reps, int warmups)
             std::snprintf(shape, sizeof shape, "%s T=%u N=%u K=%u", s.proj, s.t, s.n, s.k);
             report("gemm_prefill", std::string("cm-global  ") + shape, tg, (double) s.t * s.n,
                    (double) s.t * s.n * s.k);
+            // THE CM_CT ROWS (2026-10-07): the same body with TWO / FOUR output tiles per subgroup.  They price the
+            // diagnosis in `common/gemm_prefill.glsl`: at CM_CT = 1 a subgroup holds ONE accumulator, so its K loop
+            // is a serial chain of dependent coopMatMulAdds and each loaded A element is reused only TM times.
+            // MEASURED, gate/up T=199: cm-global 3.335 -> ct2 2.563 -> ct4 2.174 ms, so CM_CT buys 1.53x on the
+            // matrix-unit path and closes its gap to the FMA kernel from 3.16x to 2.06x.  IT DOES NOT FLIP A
+            // DEFAULT: the FMA kernel is still 2x ahead of the best CM_CT arm in isolation, so the shape rule is
+            // unchanged and the matrix units stay opt-in.  At T=8/16 CM_CT LOSES (2.5x at ct4) - occupancy, not
+            // reuse, is the limit at small T, which is the shape rule this knob needs if it ever becomes one.
+            const Timing tc2 = bench_gemm_one(ctx, dir, "gemm_prefill_f16_m8_ct2.spv", s.t, s.n, s.k, reps, warmups);
+            report("gemm_prefill", std::string("cm-ct2     ") + shape, tc2, (double) s.t * s.n,
+                   (double) s.t * s.n * s.k);
+            const Timing tc4 = bench_gemm_one(ctx, dir, "gemm_prefill_f16_m8_ct4.spv", s.t, s.n, s.k, reps, warmups);
+            report("gemm_prefill", std::string("cm-ct4     ") + shape, tc4, (double) s.t * s.n,
+                   (double) s.t * s.n * s.k);
             ts = bench_gemm_one(ctx, dir, "gemm_prefill_f16_m8_staged.spv", s.t, s.n, s.k, reps, warmups);
             report("gemm_prefill", std::string("cm-staged  ") + shape, ts, (double) s.t * s.n,
                    (double) s.t * s.n * s.k);
