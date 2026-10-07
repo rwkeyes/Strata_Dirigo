@@ -92,6 +92,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
+#include <vector>
 
 namespace strata::vulkan {
 
@@ -508,6 +510,18 @@ void native_qsa_indexer_append_dev(Stream& s, const float* raw, const int32_t* p
     s.ctx->dispatch(p, {&rawv, &posv, &gv, &tailv, &deadv, &poolv, &bpv}, &pc, sizeof(pc), 1u);
 }
 
+// THE CHUNK'S POSITION ROW, placed once per stream (`arena_alloc` never decreases, so a per-call bump would
+// grow the arena - the `iq_grids`/`vscratch` precedent).  `native_qsa_indexer_append_batch` writes every cell
+// of the chunk into it with ONE `stream_write`, then binds cell t's own 4 bytes as POS for that cell's
+// dispatch.  Grown on demand, never shrunk.
+struct IdxPosScratch { int32_t* p = nullptr; uint64_t n = 0; };
+std::unordered_map<Stream*, IdxPosScratch> g_idx_pos;
+static int32_t* indexer_pos_scratch(Stream& s, uint64_t n) {
+    IdxPosScratch& c = g_idx_pos[&s];
+    if (c.n < n) { c.p = arena_alloc<int32_t>(s, n); c.n = n; }
+    return c.p;
+}
+
 }  // namespace strata::vulkan
 
 // ---- the engine's entry points: the symbols include/strata/kernels/*.hpp declare --------------------------
@@ -653,6 +667,22 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
 // one cell per dispatch, positions written to a device int per token.  The batch is documented HOST-side
 // positions ("not for a captured graph"), so the host-staged position is honest here; the SINGLE append (the
 // decode/verify path) reads the engine's real device `pos_dev` and is capturable.
+//
+// **THE POSITION STAGE IS NOT A PER-CELL STAGE (2026-10-06).**  The loop exists because the shader appends ONE
+// cell per dispatch (`POS_.v[0]`, one workgroup).  What sat INSIDE it as well was the position UPLOAD: one
+// `stream_write` of 4 bytes per cell.  `Ctx::write` flushes the live batch by contract (`vk_compute.cpp:1344`,
+// the host-visible rule), so a 198-cell chunk issued **198 single-dispatch submits**.  The chunk's positions are
+// `p0 .. p0+n-1` - all known before the loop - so the upload does not depend on the loop's reason at all.
+// `prefill::rope` (prefill_vk.cpp:842) and `prefill::kv_append` (:909) already build their whole position array
+// and write it ONCE outside their dispatch loops; this wrapper was the only one that did not.  FIX: one
+// `stream_write` of the n-int row, then cell `t` binds its own 4 bytes (`pos + t`) as POS - the same value the
+// per-cell write left in the same place, so the dispatch's INPUT IS BIT-IDENTICAL BY CONSTRUCTION.  The
+// dispatches then batch (`kLiveBatchMax`) instead of each paying a submit+fence.  The per-cell form is kept and
+// is taken when the device's `minStorageBufferOffsetAlignment` exceeds 4 (a 4-byte step is not bindable there -
+// llvmpipe measures 16) and for `n == 1`; `STRATA_VK_INDEXER_POS_ONCE=0` forces it back for an A/B in one
+// binary (read per call, the `STRATA_PF_GDN_REC_FUSED` precedent).  MEASURED in the engine: flush site
+// `stream_write <- native_qsa_indexer_append_batch` is n=2,364 flushes of exactly ONE dispatch each - the
+// largest flush COUNT of the whole prefill (2,364 of 3,021).
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream) {
@@ -660,6 +690,22 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     strata::vulkan::Stream* st = need_stream("native_qsa_indexer_append_batch", stream);
     if (p0 < 0 || p0 + n > max_cells)
         strata::vulkan::refuse("native_qsa_indexer_append_batch", "the batch [p0, p0+n) does not fit max_cells");
+    // Read PER CALL, not once per process, so one binary can A/B it and the gate can drive both paths.
+    const char* once_env = std::getenv("STRATA_VK_INDEXER_POS_ONCE");
+    const bool pos_once = once_env == nullptr || once_env[0] != '0';
+    // A 4-byte descriptor step binds only where the device's own alignment limit allows it; `arena_alloc`
+    // carves on a 256-byte boundary, so the condition reduces to `align | 4`.  Elsewhere: the per-cell form.
+    const uint32_t align = (st->ctx != nullptr) ? st->ctx->info().min_storage_offset_align : 0;
+    if (pos_once && n > 1 && align != 0 && align <= 4) {
+        int32_t* pos = strata::vulkan::indexer_pos_scratch(*st, (uint64_t) n);
+        std::vector<int32_t> hp((size_t) n);
+        for (int64_t t = 0; t < n; ++t) hp[(size_t) t] = (int32_t) (p0 + t);
+        strata::vulkan::stream_write(*st, pos, hp.data(), (uint64_t) n * 4);     // ONE upload, ONE flush
+        for (int64_t t = 0; t < n; ++t)
+            strata::vulkan::native_qsa_indexer_append_dev(*st, raw + t * s.idx_dim, pos + t, pos_base, gamma,
+                                                          epsilon, b, s, max_cells, scaling);
+        return;
+    }
     int32_t* pos_dev = strata::vulkan::arena_alloc<int32_t>(*st, 1);
     for (int64_t t = 0; t < n; ++t) {
         const int32_t pos = (int32_t) (p0 + t);

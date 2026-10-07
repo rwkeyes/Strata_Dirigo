@@ -1,5 +1,68 @@
 # Start here next session
 
+## THE PATTERN PAYS A THIRD TIME, AND THIS ONE IS **PREFILL**: the QSA indexer's per-cell POSITION UPLOAD sat inside its per-cell dispatch loop (`stream_write` flushes the live batch by contract), so a 198-token chunk issued **198 single-dispatch submits** per QSA layer; hoisting the upload out (one n-int row, cell `t` binds its own 4 bytes) drops the prefill's flushes **3,021 -> 681** with the dispatch count **UNCHANGED at 59,640** and moves the prefill **9,752 -> 9,313 ms (20.30 -> 21.26 tok/s, -4.5%/+4.7%, ranges disjoint)**; the other 7+7 empty `native_expert_grouped` launches are **PRICED (4-5% of the decode round), not built**; Arc gate **898/0/0**, both ids unmoved (2026-10-06, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH, AND WHAT TO DO NEXT.** The win pattern is *a loop that exists for one reason while repeating a stage
+inside it that does not need that reason*, and it has now paid **three** times — twice in `native_expert_grouped`, and this
+batch **once in the PREFILL**, which the earlier two had not touched. **(1) The audit first.** Every dispatch loop in the
+port was named with its *reason* and the stages inside it that do not need that reason; the table is in the section below.
+The two loops that still have a loop-invariant stage are `matvec_vk::bf16_gemv_fp32_mmvf_cols` (loop over **columns**, but the
+**weight read** is column-invariant and `..._multi` reads it once — DECODE-only here) and `fused_gr_vk::fused_gr_read_multi`
+(loop over **tokens**, but the four sub-kernels' weights are **enforced** token-invariant — needs a token dimension in four
+shaders). Neither was built. **(2) THE WIN, and it is `qsa_vk::native_qsa_indexer_append_batch`.** The batch is a LOOP because
+the native indexer shader appends **ONE CELL per dispatch** (`POS_.v[0]`, one workgroup) — but what also sat inside it was the
+**position UPLOAD**: one 4-byte `stream_write` per cell, and `Ctx::write` flushes the live batch **by contract**
+(`vk_compute.cpp:1344`, the host-visible rule), so a 198-cell chunk issued 198 single-dispatch submits. The positions are
+`p0 .. p0+n-1`, all known before the loop, so the upload does not depend on the loop's reason at all — and **the port already
+does this correctly in the two other wrappers of the same shape**: `prefill::rope` (`prefill_vk.cpp:842`) and
+`prefill::kv_append` (`:909`) build the whole position row and write it ONCE, outside their dispatch loops. This wrapper was
+the only one that did not. FIX: one `stream_write` of the n-int row, then cell `t` binds its own 4 bytes (`pos + t`) as POS —
+the same value at the same place, so the dispatch's input is **bit-identical by construction** (checked BITWISE by the gate,
+and by a `p0=1` rival that must move the state). **MEASURED**: flush-site `stream_write <- native_qsa_indexer_append_batch`
+was **n=2,364 flushes of exactly ONE dispatch each — the largest flush COUNT of the whole prefill (2,364 of 3,021)** — and it
+is GONE; live flushes **3,021 -> 681**, staged transfers **16,114 -> 13,750** (the per-cell writes were being charged as
+transfers), submits **19,177 -> 14,473**, cb allocs/fences **16,114 -> 13,750**, flush submit **15-16 -> 5-6 ms**; live
+dispatches **59,640 unchanged**, recorded **9,349 unchanged**, segments **42**, chain barriers **68,989**, descriptor sets
+**69,063**, recorded composition unchanged. Engine A/B, interleaved, one config per invocation, prev `662d2547…` vs new
+`333c2a7c…`: prefill **9,711.3 / 9,752.3 / 9,834.3 ms** (20.39 / 20.30 / 20.13) against **9,520.9 / 9,313.0 / 9,292.7**
+(20.80 / 21.26 / 21.31) — **disjoint**, median **-4.5% / +4.7%**; the CONTROL (the same new binary with
+`STRATA_VK_INDEXER_POS_ONCE=0`) restores the 3,021 flushes and lands in the OLD band (19.62 / 20.41). Ids `56a0b28d2de6` /
+`3aed108cceee` in every valid arm. **(3) Task 2 — the remaining 7+7 EMPTY `native_expert_grouped` launches are PRICED, NOT
+BUILT.** All-resident, a layer's groups live in ONE window, so 7 gu + 7 down of each call's 16 launches are empty; the
+recorded histogram (1,152 gu / 8) gives **144 calls/round = 2,016 empty launches/round = 47.7% of the round's 4,222 recorded
+dispatches**, priced at **9.3-10.9 ms/round = 4.1-4.8% of the decode round (decode 9.62 -> ~10.0-10.1 tok/s)** on the
+dispatch-slot model, floor 1.1 ms (workgroup-proportional) and bound 32.4 ms (the whole gy30->gy1 grid change). **Two of the
+three mechanisms are now TESTED:** the **64-bit buffer index is CLOSED** on this box — `w_b.v[uint64]` is rejected by BOTH
+`glslc`/glslang 14.0 AND the standalone **glslang 15.1.0** with the same `'[]' : scalar integer expression required`; the
+**buffer-device-address route is FEASIBLE** (the Arc has `VK_KHR_buffer_device_address` rev 1 + `VK_EXT_buffer_device_address`
+rev 2 with `shaderInt64`, and `GL_EXT_buffer_reference` **compiles and `spirv-val` validates** on both toolchains,
+`PhysicalStorageBuffer64` present) and it is the only route that removes ALL `nwin` launches with ONE binding; the
+**8-binding weight switch** also compiles (no extension) but costs 8 descriptor targets per dispatch. **NEXT, in this order:**
+(1) **build** the window-count removal — buffer-device-address is the priced route — or, cheaper first, run loop #6
+(`bf16_gemv_fp32_mmvf_cols` -> `..._multi`, a per-call 1-dispatch for <= 8 columns) as a DECODE A/B; (2) `prefill_vk.cpp:753`
+`gdn_recurrence` is the prefill's biggest dispatch pair (14,256 dispatches) but both stages depend on `t` — the fused
+opt-in already exists and the phase is NOT dispatch-count-bound, so nothing is claimed there; (3) the **prefill's own
+per-dispatch cost (152.5 µs live-batch average against the 4.6-5.4 µs marginal)** is still the largest unexplained number in
+the record.
+
+### THE LOOP AUDIT (reason -> the stage inside that does not need it -> what was done)
+
+| # | loop | REASON | stage inside that does not need it | verdict |
+|---|---|---|---|---|
+| 1 | `native_expert_grouped` gu window loop (`native_expert_grouped_vk.cpp:189`) | the 4 GiB **weight window** | SwiGLU + q8_1 — **already hoisted** (prior batch); y-grid already capped (`GYMAX`) | no further stage |
+| 2 | same, **down** window loop (`:223`) | the weight window | one dispatch | nothing to hoist |
+| 3 | `verify_vk::fetch_blobs` (`verify_vk.cpp:508`) | the weight window | one dispatch, grid `cap <= 64` | **non-resident path, NOT exercised here — untested** |
+| 4 | **`qsa_vk::native_qsa_indexer_append_batch` (`qsa_vk.cpp:664`)** | **one CELL per dispatch** | **the position UPLOAD: n x `stream_write`, each flushing the batch** | **HOISTED — this batch** |
+| 5 | `qsa_vk::qsa_decode_attn_batch` (`:683`) | one QUERY per dispatch | none — no host staging; the loop batches at `kLiveBatchMax` | clean |
+| 6 | `matvec_vk::bf16_gemv_fp32_mmvf_cols` (`matvec_vk.cpp:432`) | ncols **COLUMNS** | the **WEIGHT READ** is column-invariant (`..._multi` reads it once for <= 8) | **candidate, decode-only — NOT built** |
+| 7 | `fused_gr_vk::fused_gr_read_multi` (`:211,:223`) | n_tok **TOKENS** | the four sub-kernels' weights are **enforced** token-invariant | **candidate, needs a token dim in 4 shaders — NOT built** |
+| 8 | `prefill_vk::Gemm::native` per-token fallback (`:458`) | the TOKEN | only taken when `beta != 0` or `ldy != N` | not on the engine's path |
+| 9 | `prefill_vk::Gemm::bf16` row-slice loop (`:408`) | the render scratch holds `N` rows | each slice is different weights | nothing |
+| 10 | `prefill_vk::gdn_recurrence` (`:753`) | the **sequential recurrence** | none — both stages depend on `t`; `to_f16` already outside | clean (fused form opt-in) |
+| 11 | `prefill_vk::kv_append` (`:911`) | one CELL per token | none — its position row is **already** written once (`:909`) | clean |
+| 12 | `rope_vk::build_rope_table` (`:100,:123`), `ple_vk::gr_workspace_init` (`:479,:487`) | host tables | no dispatch at all | host-only |
+
+
 ## THE "EMPTY LAUNCH" IS NOT IN THE OTHER LAUNCHERS - IT IS A SECOND TIME IN THE **SAME** ONE: the `native_k_mmvq` "41,580 dispatch, ~50% of the dispatch layer" premise is STALE (the kernel is now ABSENT from the run's top-14, < 1,152), `moe_grouped_s2` is a loud refusal and `peer_experts` only ever calls the launcher that already had the cap - and what the audit DID find is the grouped launcher's TWO WINDOW-INDEPENDENT stages (SwiGLU + q8_1) running `nwin`=8 times per call, now **hoisted** (32 -> 18 dispatches/call, window sync 227.9 -> 225.0 ms/round, decode 9.49 -> 9.62 tok/s), `fused_gr_mix` priced a REDUCTION-BOUND NO, Arc gate 895/0/0, both ids unmoved (2026-10-06, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH, AND WHAT TO DO NEXT.** The brief asked for the proven empty-launch cap (`STRATA_VK_GROUPED_GYMAX`, gy=1: `native_expert_grouped`'s window grid capped, +13.4% decode) to be carried to the port's other grouped launchers - `native_k_mmvq`, `moe_grouped_s2`, `peer_experts`. **The audit says the pattern is not there, and then finds it a second time inside the launcher that already had it.** (1) **`native_k_mmvq` has no window loop and no y-grid at all.** `matvec_vk.cpp` hands it a ONE-DIMENSIONAL grid (`n_out`) and `native_k_mmvq.comp` reads no `gl_WorkGroupID.y`, so there is no window guard and no `gy` to cap. Its headline number is also **stale**: "41,580 dispatches, ~50% of the dispatch layer" is the PER-TOKEN prefill form (210 K-quant dense tensors x 198 tokens) that the batched native GEMM (`prefill_vk.cpp::Gemm::native`, the `beta == 0 && ldy == N` arm) replaced with three dispatches per PROJECTION - so 210, not 41,580 - and the engine's OWN current histogram confirms it: `native_k_mmvq.spv` is **absent from the top-14 of the run's 59,640 live dispatches, whose 14th entry is 1,152**. New arm `native_k_mmvq_engine` (Q6_K, n_in 2560, n_out 1280, device-local): batched **5.9188 ms** per dispatch for 198 tokens (**0.0299 ms/token**, ONE dispatch) against per-token **0.0408 ms** (198 dispatches, 1.36x the per-token cost and 198x the count); a spurious `gy=8` is **0.2006 ms = 4.9x**, i.e. a y-grid multiplies WORKGROUPS, never guarded-and-empty ones. (2) **`moe_grouped_s2` is a LOUD REFUSAL** (`refusals_vk.cpp:187`, "`--spec 4 --mtp` OR `--expert-cache-remote N`/`--peer-device`") reached only on a NON-native pack (`verify.cpp`'s `else` branch); **`peer_experts.cpp:233` and `remote_experts.cpp:310` call `native_expert_grouped` ITSELF** (with the default `grid_groups`), so they do not have their own launcher to sweep - they INHERIT the cap - and the port is all-resident, so neither peer path is dispatched in this run: **no `fetch_blobs.spv`, no S2-tier shader, appears in ANY histogram**. The cap's optimum for a large `ng` therefore stays **UNMEASURED**, as the previous commit already said - said again, not forced. (3) **What the audit found instead is the same waste one layer up, inside the launcher that already had the cap.** The window loop exists ONLY for the weight read; but TWO of the launcher's four stages read NO weights - the **SwiGLU** over the gate/up scratch and the **q8_1 quantise** of its result - and both sat INSIDE the loop, so a call ran **8 SwiGLU launches and 8 q8_1 launches, 7 of each recomputing the byte-identical result** over the identical scratch (the empty-window gu launches write nothing, so the scratch after the loop equals the scratch after the one working launch). Hoisting them out - gu loop -> SwiGLU -> q8_1 -> down loop, because `down` must read the single q8_1 image - is **bit-identical by construction** and takes the call from **32 to 18 dispatches**. Bench `native_grouped_hoist` at the engine's shape: **4.1465 -> 4.0780 ms/call (-1.7%)**, i.e. 14 removed dispatches at the port's own recorded-batch marginal (**~4.9 us**; the record's live-batch figure is 4.6-5.4). **Engine A/B (interleaved, n=3 per arm, one binary saved as the previous):** the ENCODED dispatch composition falls by exactly the predicted **2,016** (`swiglu_f32` 1,296 -> 288, `quantize_q8_1` 1,875 -> 867, gu/down/mix and every other kernel UNCHANGED), segment chain barriers 71,005 -> 68,989, window sync **227.9 -> 225.0 ms/round (-1.3%)**, segment wait 3,322 -> 3,279, decode **9.49 -> 9.62 tok/s (+1.4%)**, id `56a0b28d2de6` UNMOVED in every arm, ranges disjoint; the 8-token arm

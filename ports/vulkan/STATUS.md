@@ -1,5 +1,56 @@
 # Status — what is done, what is verified, what is not
 
+## THE WIN PATTERN PAYS A THIRD TIME — AND THIS ONE IS **PREFILL**: the QSA indexer's per-cell POSITION UPLOAD sat inside its per-cell dispatch loop (`stream_write` flushes the live batch by contract), so a 198-token chunk issued 198 single-dispatch submits per QSA layer; hoisting the upload out (one n-int row, cell `t` binds its own 4 bytes) drops the prefill's live flushes 3,021 → 681 with the dispatch count UNCHANGED at 59,640, prefill 9,752 → 9,313 ms (20.30 → 21.26 tok/s, −4.5%/+4.7%, disjoint), the remaining 7+7 empty `native_expert_grouped` launches PRICED (not built), Arc gate 898/0/0, both ids unmoved (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) **The loop audit — every dispatch loop in the port, its reason, and the stages inside it that do not need
+that reason** (full table in `NEXT.md` and `PERFORMANCE-B70-2026-10-06.md`). The two loops that still hold a
+loop-invariant stage are `matvec_vk::bf16_gemv_fp32_mmvf_cols` (columns; the **weight read** is column-invariant and
+`..._multi` reads it once — **decode-only here**) and `fused_gr_vk::fused_gr_read_multi` (tokens; the four sub-kernels'
+weights are **enforced** token-invariant — needs a token dim in four shaders); **neither was built.** Every other loop is
+clean or already fixed. (2) **THE FIX, host-only, in `vulkan/src/kernels/qsa_vk.cpp::native_qsa_indexer_append_batch`:** the
+batch loops because the shader appends ONE CELL per dispatch, but the **position upload** sat inside it — one 4-byte
+`stream_write` per cell, and `Ctx::write` flushes the live batch by contract (`vk_compute.cpp:1344`; the host-visible rule).
+The chunk's positions are `p0 .. p0+n-1`, known before the loop, so the upload does not depend on the loop's reason. **The
+port already does this right in `prefill::rope` (`prefill_vk.cpp:842`) and `prefill::kv_append` (`:909`)** — both write the
+whole position row ONCE outside their dispatch loops; this wrapper was the only one that did not. Now: one `stream_write` of
+the n-int row, cell `t` binds `pos + t` — the same 4 bytes at the same place, so the input is **bit-identical by
+construction**. The per-cell form is kept and is taken for `n == 1` or a device whose
+`minStorageBufferOffsetAlignment > 4` (llvmpipe measures 16); `STRATA_VK_INDEXER_POS_ONCE=0` forces it back in one binary.
+
+**VERIFIED.** Arc `intel_icd` **898 passed / 0 failed / 0 skipped** — the count **RISES by exactly three (895 → 898)**,
+nothing removed, nothing skipped (`/tmp/pfaudit/gate_final.log`). The three new gate arms are **bitwise, and one is a rival**:
+the batch `== the n single appends` (1153/1153), the one-upload path `==` the per-cell path (1153/1153, with
+`minStorageBufferOffsetAlignment=4` printed so the arm says which path it exercised), and a `p0 = 1` batch that **must MOVE
+the state** — so the two arms cannot pass on a comparison that cannot fail. `lvp_icd` **882/0/4** (the four documented
+skips); `radeon_icd` **884/3/2** with all three failures in the documented RADV moving-failing-set family
+(`bf16_gemv_fp32_mmvf_cols` 2495/2496 and its two `_multi` siblings) — **none is a case this batch touches**. Smoke 60/0/0.
+Engine A/B, interleaved, n=3 per arm, one config per invocation, prev `662d2547…` vs new `333c2a7c…` (shader shas
+**identical**): prefill **9,711.3 / 9,752.3 / 9,834.3 ms** (20.39 / 20.30 / 20.13 tok/s) against **9,520.9 / 9,313.0 /
+9,292.7** (20.80 / 21.26 / 21.31) — **ranges disjoint**, median −4.5% time / +4.7% tok/s. The **control** (the same new
+binary with `STRATA_VK_INDEXER_POS_ONCE=0`, n=2) restores the 3,021 flushes and lands in the OLD band (19.62 / 20.41) — so
+the delta is the change, not the rebuild. **Structural proof:** live dispatches 59,640 → 59,640; recorded 9,349 → 9,349;
+segments 42 → 42; recorded-in-segments 49,703 → 49,703; chain barriers 68,989 → 68,989; descriptor sets 69,063 → 69,063;
+the RECORDED composition unchanged. Fell: live flushes 3,021 → 681; staged transfers 16,114 → 13,750; submits 19,177 →
+14,473; cb allocs / fences 16,114 → 13,750; flush submit 15-16 → 5-6 ms. Flush-site `stream_write <-
+native_qsa_indexer_append_batch` (n=2,364, disp=2,364 — the largest flush COUNT of the prefill) is **gone**. Ids
+`56a0b28d2de6` (199-token) and `3aed108cceee` (8-token) in every valid arm. The tree diff is `vulkan/src/kernels/qsa_vk.cpp`
+and `ports/vulkan/harness/vk_gate.cpp` — **no shader, no binding, no push constant, no new symbol**.
+
+**NOT DONE.** (i) **Task 2 is PRICED, not built**: all-resident, 7 gu + 7 down of each `native_expert_grouped` call's 16
+launches are empty — 144 calls/round → **2,016 empty launches/round = 47.7% of the round's 4,222 recorded dispatches**,
+priced **9.3-10.9 ms/round = 4.1-4.8% of the decode round** (decode 9.62 → ~10.0-10.1 tok/s) on the dispatch-slot model,
+floor 1.1 ms (workgroup-proportional) and bound 32.4 ms (the whole gy30→gy1 grid change). **The 64-bit buffer index is
+CLOSED on this box** — rejected by BOTH `glslc`/glslang 14.0 AND the standalone **glslang 15.1.0**; the
+**buffer-device-address route is FEASIBLE** (the Arc has `VK_KHR_buffer_device_address` rev 1 + shaderInt64, and
+`GL_EXT_buffer_reference` compiles AND validates on both toolchains) and is the only route that removes all `nwin` launches
+with ONE binding; the 8-binding switch also compiles but costs 8 descriptor targets per dispatch. (ii) The 8-token arm does
+**not** resolve the change (flushes 381 → 309, but the rate overlaps) — it is a guard, not a win. (iii) One 8-token control
+arm (`prev8b`) is a **FAILED ARM** (all-zero output, 4,566 dispatches instead of 14,742, id `d01eee6a3948`) and is recorded
+as dead. (iv) **`verify::fetch_blobs`' grid cap of 64 is UNTESTED here** — the port is all-resident, no `fetch_blobs.spv`
+appears in any histogram, and the non-resident tier is not exercised by this run. (v) The prefill's own per-dispatch cost
+(**152.5 µs live-batch average against the 4.6-5.4 µs marginal**) is still the largest unexplained number in the record.
+
+
 ## THE EMPTY LAUNCH IS NOT IN THE OTHER LAUNCHERS, IT IS A SECOND TIME IN THE SAME ONE: `native_k_mmvq` has no window loop or y-grid (and the "41,580 dispatches" premise is STALE), `moe_grouped_s2` is a refusal, `peer_experts` only calls the launcher that already had the cap — and the grouped launcher's WINDOW-INDEPENDENT stages (SwiGLU + q8_1) ran `nwin`=8 times per call, now HOISTED (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** (1) **The audit the brief asked for, launcher by launcher, and the pattern is not in any of them.**

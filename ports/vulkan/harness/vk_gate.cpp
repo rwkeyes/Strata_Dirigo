@@ -23204,6 +23204,74 @@ void case_prefill_prompt_path(Ctx& ctx, const std::string& dir) {
         if (got_bp != ref_bp) ++bad;
         verdict("prefill native_qsa_indexer_append: pooled/dead/tail/block_pos vs the CUDA rule", bad == 0, bad, tot,
                 worst, "worst rel err (f32)");
+
+        // ---- (6b) the BATCH form -> native_qsa_indexer_append_batch (prefill.cpp:2101).  The gate ran the
+        // SINGLE append above and had never run the batch the prefill actually drives.  The header's contract
+        // ("exactly as n single appends, in order") makes it a BITWISE arm; the hoist inside it (one position
+        // upload instead of one per cell) is a reordering, so both of its upload paths must agree BITWISE too,
+        // and a RIVAL must move the state - otherwise the two arms are passing on a comparison that cannot fail.
+        {
+            auto zero_state = [&] {
+                strata::vulkan::stream_write(*s, dpool, zero.data(), zero.size() * 4);
+                strata::vulkan::stream_write(*s, ddead, zero.data(), (size_t) D * 4);
+                strata::vulkan::stream_write(*s, dtail, zero.data(), (size_t) (R - 1) * D * 4);
+                const int32_t z = 0;
+                strata::vulkan::stream_write(*s, dbp, &z, 4);
+            };
+            auto readout = [&](std::vector<float>& po, std::vector<float>& de, std::vector<float>& ta, int32_t& bp) {
+                strata::vulkan::stream_read(*s, dpool, po.data(), po.size() * 4);
+                strata::vulkan::stream_read(*s, ddead, de.data(), de.size() * 4);
+                strata::vulkan::stream_read(*s, dtail, ta.data(), ta.size() * 4);
+                strata::vulkan::stream_read(*s, dbp, &bp, 4);
+            };
+            const size_t pn = (size_t) (MAXC / R + 1) * (size_t) D, dn = (size_t) D, tn = (size_t) (R - 1) * D;
+            const int all = (int) (pn + dn + tn + 1);
+            auto same = [](const std::vector<float>& a, const std::vector<float>& b2) {
+                for (size_t i = 0; i < a.size(); ++i) if (a[i] != b2[i]) return false;
+                return true;
+            };
+            auto eq = [&](const std::vector<float>& p1, const std::vector<float>& d1, const std::vector<float>& t1,
+                          int32_t b1, const std::vector<float>& p2, const std::vector<float>& d2,
+                          const std::vector<float>& t2, int32_t b2) {
+                return same(p1, p2) && same(d1, d2) && same(t1, t2) && b1 == b2;
+            };
+            // (A) the batch's default path vs the n single appends of (6) - the header's own contract.
+            zero_state();
+            strata::kernels::native_qsa_indexer_append_batch(draw, N, 0, 0, dgam, strata::kernels::qsa_rms_eps(), ib,
+                                                             sh, MAXC, rs, s);
+            std::vector<float> a_pool(pn), a_dead(dn), a_tail(tn);
+            int32_t a_bp = -1;
+            readout(a_pool, a_dead, a_tail, a_bp);
+            const bool a_ok = eq(a_pool, a_dead, a_tail, a_bp, got_pool, got_dead, got_tail, got_bp);
+            verdict("prefill indexer_append_batch: == the n single appends, BITWISE", a_ok, a_ok ? 0 : 1, all, 0,
+                    "bitwise");
+            // (B) the hoist: the ONE-position-upload path (default) vs the per-cell-upload path, BITWISE.
+            zero_state();
+            setenv("STRATA_VK_INDEXER_POS_ONCE", "0", 1);
+            strata::kernels::native_qsa_indexer_append_batch(draw, N, 0, 0, dgam, strata::kernels::qsa_rms_eps(), ib,
+                                                             sh, MAXC, rs, s);
+            unsetenv("STRATA_VK_INDEXER_POS_ONCE");
+            std::vector<float> b_pool(pn), b_dead(dn), b_tail(tn);
+            int32_t b_bp = -1;
+            readout(b_pool, b_dead, b_tail, b_bp);
+            const bool b_ok = eq(b_pool, b_dead, b_tail, b_bp, a_pool, a_dead, a_tail, a_bp);
+            std::printf("      indexer_append_batch: minStorageBufferOffsetAlignment=%u -> the one-upload path is %s\n",
+                        s->ctx->info().min_storage_offset_align,
+                        s->ctx->info().min_storage_offset_align <= 4 ? "LIVE (the two paths ARE two paths)"
+                                                                     : "not bindable, both take the per-cell form");
+            verdict("prefill indexer_append_batch: one position upload == per-cell upload, BITWISE", b_ok,
+                    b_ok ? 0 : 1, all, 0, "bitwise");
+            // (C) the RIVAL: a batch at p0 = 1 (one cell later) must MOVE the state - the arms above can fail.
+            zero_state();
+            strata::kernels::native_qsa_indexer_append_batch(draw, N, 1, 0, dgam, strata::kernels::qsa_rms_eps(), ib,
+                                                             sh, MAXC, rs, s);
+            std::vector<float> r_pool(pn), r_dead(dn), r_tail(tn);
+            int32_t r_bp = -1;
+            readout(r_pool, r_dead, r_tail, r_bp);
+            const bool moves = !eq(r_pool, r_dead, r_tail, r_bp, a_pool, a_dead, a_tail, a_bp);
+            verdict("prefill indexer_append_batch: the p0=1 RIVAL moves the state", moves, moves ? 0 : 1, 1, 0,
+                    "rival differs");
+        }
     }
 
     strata::vulkan::stream_close(s);
