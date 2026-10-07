@@ -236,6 +236,10 @@ TABLE = {
     'gdn_step_norm_multi':            ('kernel', 'gdn_step_norm_multi'),
     'gdn_conv_commit':                ('kernel', 'gdn_conv_tail'),
     'native_router_top10_multi':      ('kernel', 'native_router_top10'),
+    # The WIDTH-GENERAL sibling the window's batched router branch now reaches at this model's 256 experts
+    # (verify.cpp: the guard was `NE == 512`): the SAME one-dispatch `native_router_top10.spv`, the shader's
+    # `n_expert` push constant carried in (`verify_vk.cpp`), bitwise the single-token call per token.
+    'native_router_top10_multi_ne':   ('kernel', 'native_router_top10'),
     'native_moe_combine_multi':       ('kernel', 'native_moe_combine'),
     'fetch_blobs':                    ('kernel', 'fetch_blobs'),
     'fused_gdn_ab':                   ('kernel', 'fused_gdn_ab'),          # replaces 2x bf16 mmvf + beta_gate + gate

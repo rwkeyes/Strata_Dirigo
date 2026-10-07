@@ -938,11 +938,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        // THE ROUTER'S GEOMETRY.  The Vulkan port's native router is WIDTH-GENERAL: `native_router_top10_multi_ne`
+        // drives the SAME one-dispatch `router_top10_n` at the model's own width (the shader takes `n_expert` as a
+        // push constant, <= 512 - `router_top10_uses_native`), so the batched branch is reachable at this model's
+        // 256 experts and not only at 512; without the second disjunct every token routed separately (verify.cpp's
+        // per-token `moe_route` loop below = 48 layers x 3 tokens = 144 links/cb, the highest per-token count on
+        // the shipped path).  The CUDA/HIP native member is the canonical 512 form, so their guard keeps NE == 512.
+        // (This is the geometry upstream #1357 reports: a non-512 model on a path whose geometry assumes 512.)
+#if defined(STRATA_ENABLE_VULKAN)
+        const bool router_multi_ok = NE >= 1 && NE <= 512 && K == 10;
+#else
+        const bool router_multi_ok = NE == 512 && K == 10;
+#endif
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && router_multi_ok) {
             try {
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+#if defined(STRATA_ENABLE_VULKAN)
+                native_router_top10_multi_ne(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, (int) NE, cs);
+#else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+#endif
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {

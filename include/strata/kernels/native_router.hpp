@@ -16,4 +16,10 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+/// n_tok rows at once at the MODEL'S OWN expert width (logits [n,n_expert], ids/weights [n,10]); each row
+/// exactly as the single call.  The Vulkan port's width-general member (its shader takes n_expert as a push
+/// constant, n_expert <= 512); the CUDA/HIP tree defines only the canonical 512 form above, so its callers keep
+/// the 512 geometry.  Backend-specific, like the width-general router itself.
+void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert,
+                                  void* stream);
 }

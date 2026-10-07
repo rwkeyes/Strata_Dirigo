@@ -134,6 +134,7 @@ native_rope_enabled	host	a capability check
 native_router_enabled	host	a capability check
 native_router_top10	kernel	native_router_top10
 native_router_top10_multi	kernel	native_router_top10
+native_router_top10_multi_ne	kernel	native_router_top10
 ngram_rows	host	host-side row bookkeeping
 penalty_rows	host	folded into the samplers in this port: see sampler_greedy/sampler_kernel
 ple_block	kernel	ple_bcast ple_conv ple_gate ple_gnorm

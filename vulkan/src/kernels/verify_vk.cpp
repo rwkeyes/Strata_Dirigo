@@ -322,6 +322,24 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     strata::vulkan::router_top10_n(s, logits, ids, weights, n_tok, /*n_expert=*/512);
 }
 
+// ---- `native_router_top10_multi_ne` -> the SAME ONE DISPATCH at the MODEL'S OWN expert width ------------------
+// The canonical form above pins the row stride to 512 experts (`native_router.cu:88`).  This model has 256, so
+// the window's batched router branch (verify.cpp:941) could not take it and every token routed separately
+// (verify.cpp:957): 48 layers x 3 tokens = 144 links/recorded-cb, the HIGHEST per-token count on the shipped
+// path (`off8_ws2.log:283`; 34.647 us/link = 3.33 ms/round = 1.39%).  `native_router_top10.comp` has carried its
+// own token dimension AND the expert width as a push constant since `a905c27` (`router_top10_n`, which
+// `router_top10_uses_native` guards to k == 10 and n_expert <= 512), so this is the SAME one-dispatch shader at
+// the model's own width - not a new kernel.  Contract: bitwise the single-token call per token (the shader's
+// per-workgroup arithmetic, its shared `nr_*` arrays and every barrier, is per-token and untouched; only the
+// index base moves - exactly the guarantee `native_router_top10_multi` already makes at 512).
+void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert,
+                                  void* stream) {
+    if (logits == nullptr || ids == nullptr || weights == nullptr || n_tok < 1) return;
+    if (n_expert < 1 || n_expert > 512) return;   // the shader's shared arrays cap at 512 (router_top10_uses_native)
+    strata::vulkan::Stream& s = strata::vulkan::need_stream("native_router_top10_multi_ne", stream);
+    strata::vulkan::router_top10_n(s, logits, ids, weights, n_tok, n_expert);
+}
+
 // ---- `wait_flag_ge` -> THE HANDSHAKE SEAM (deliverable A): a HOST boundary, never a spin ---------------------
 // verify_kernels.hpp / verify_kernels.cu:496: the CUDA is `while (*flag < value) strata_spin_pause();` - a
 // ONE-THREAD SPIN on host-mapped memory that the engine's `post` issues between the pool's plan/answer writes and
