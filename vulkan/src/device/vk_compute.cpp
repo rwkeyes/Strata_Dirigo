@@ -440,7 +440,7 @@ void kt_dump() {
                      g_kt.front_ns / 1e6, g_kt.kern_ns / 1e6, g_kt.bar_ns / 1e6, g_kt.gap_ns / 1e6,
                      (unsigned long long) g_kt.gaps);
     }
-    for (size_t i = 0; i < v.size() && i < 30; ++i) {
+    for (size_t i = 0; i < v.size() && i < 64; ++i) {
         const std::string& s = v[i].first;
         const size_t slash = s.find_last_of('/');
         const std::string b = s.substr(slash == std::string::npos ? 0 : slash + 1);
@@ -531,6 +531,51 @@ FpStat g_fp;
 // footprint - which is what separates DEVICE TURNAROUND from DEPENDENCY COST without the elision arm's confounds.
 // MEASUREMENT-ONLY: the decode's answers are garbage by construction and the id is expected to move.
 bool g_trivial_rec = std::getenv("STRATA_VK_TRIVIAL_REC") != nullptr;
+// STRATA_VK_TRIVIAL_REC_FAMILY: the PER-FAMILY form of the same trick.  A comma/space-separated list of shader
+// family names (the basename with or without `.spv`, e.g. `native_router_top10` or `native_k_mmvq.spv`).  When
+// set, ONLY the named families' recorded dispatches are replaced by the trivial work and EVERY OTHER dispatch is
+// encoded exactly as it always was - so the round's wall clock under this flag differs from a baseline run by
+// exactly the named family's cost.  That is what turns the trivial-kernel trick into a MARGINAL-price instrument:
+// run F-trivial, subtract the baseline, and the difference IS F's marginal price for the round.  With the list
+// EMPTY and STRATA_VK_TRIVIAL_REC=1 the whole recorded arm is trivialised (the original deliverable-2 form).
+std::string vk_trivial_norm(const std::string& spv) {
+    std::string b = spv;
+    const size_t slash = b.find_last_of('/');
+    if (slash != std::string::npos) b = b.substr(slash + 1);
+    if (b.size() > 4 && b.compare(b.size() - 4, 4, ".spv") == 0) b = b.substr(0, b.size() - 4);
+    return b;
+}
+std::vector<std::string> g_trivial_fam;
+bool g_trivial_fam_set = false;
+std::string g_trivial_fam_str;
+bool vk_trivial_fam_init() {
+    const char* f = std::getenv("STRATA_VK_TRIVIAL_REC_FAMILY");
+    if (f == nullptr || *f == '\0') return false;
+    std::string s(f);
+    for (char& c : s) if (c == ',' || c == '\t' || c == ';') c = ' ';
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(' ', i);
+        if (j == std::string::npos) j = s.size();
+        if (j > i) { const std::string n = vk_trivial_norm(s.substr(i, j - i));
+                     g_trivial_fam.push_back(n);
+                     if (!g_trivial_fam_str.empty()) g_trivial_fam_str += " ";
+                     g_trivial_fam_str += n; }
+        i = j + 1;
+    }
+    g_trivial_fam_set = !g_trivial_fam.empty();
+    return g_trivial_fam_set;
+}
+// Does THIS recorded dispatch's family get substituted?  The family list, when present, is the whole rule; the
+// all-of-arm flag applies only when no list was given.
+bool trivial_rec_hit(const std::string& spv) {
+    if (g_trivial_fam_set) {
+        const std::string n = vk_trivial_norm(spv);
+        for (const std::string& x : g_trivial_fam) if (x == n) return true;
+        return false;
+    }
+    return g_trivial_rec;
+}
 inline double vk_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -597,7 +642,7 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
         uint64_t tot = 0;
         for (const auto& kv : r) tot += kv.second;
         std::string l2;
-        for (size_t i = 0; i < r.size() && i < 24; ++i) {
+        for (size_t i = 0; i < r.size() && i < 64; ++i) {
             const size_t slash = r[i].first.find_last_of('/');
             l2 += " " + r[i].first.substr(slash == std::string::npos ? 0 : slash + 1) + " " +
                   std::to_string(r[i].second);
@@ -1084,6 +1129,12 @@ Ctx::Ctx(int want_device, bool need_16bit) {
         std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_TRIVIAL_REC=1 - recorded dispatches are replaced "
                              "by ONE workgroup of `scale` (same count, same chain barrier, same submit path).  The "
                              "decode's answers are WRONG by construction; deliverable 2 only.\\n");
+    if (vk_trivial_fam_init())
+        std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_TRIVIAL_REC_FAMILY=%s - ONLY these recorded "
+                             "families' dispatches are replaced by ONE workgroup of `scale` (same count, same chain "
+                             "barrier, same submit path); the REST OF THE ROUND IS UNTOUCHED, so the round's "
+                             "wall-clock delta IS that family's MARGINAL price.  The decode's answers are WRONG by "
+                             "construction; this is a PRICE, not a candidate.\n", g_trivial_fam_str.c_str());
     g_fs_on_env = std::getenv("STRATA_VK_FLUSH_STAT") != nullptr;
     if (g_fs_on_env) std::atexit(flush_stat_dump);
     VkApplicationInfo app{};
@@ -2276,21 +2327,32 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
     // descriptor set and the SAME submit path - but ONE workgroup of the trivial `scale` kernel (x[i] *= s) over a
     // 4 KiB scratch, so the work and the write footprint are both negligible.  What remains in the drain is device
     // TURNAROUND + the barrier; the decode's answers are garbage by construction and the id is expected to move.
-    if (g_trivial_rec) {
-        static const float pcs[2] = {1.0f, 1.0f};
-        if (trivial_pipe_ == VK_NULL_HANDLE) {
-            const char* d = std::getenv("STRATA_VK_SPV_DIR");
-            const std::string dir = (d != nullptr && *d != '\0') ? d : "ports/vulkan/shaders";
-            trivial_buf_ = alloc(4096);
-            trivial_pipe_ = pipeline(dir + "/scale.spv", 1, 8);
-            std::fprintf(stderr, "vk TRIVIAL_REC: recording `scale` (1 workgroup, 4 KiB scratch, same chain barrier) "
-                                 "instead of the engine kernel - the decode's answers are GARBAGE by construction\n");
+    if (g_trivial_rec || g_trivial_fam_set) {
+        std::string spv_here;
+        for (const Pipe& p : pipes_) if (p.pipe == pipe) { spv_here = p.spv_path; break; }
+        if (trivial_rec_hit(spv_here)) {
+            static const float pcs[2] = {1.0f, 1.0f};
+            if (trivial_pipe_ == VK_NULL_HANDLE) {
+                const char* d = std::getenv("STRATA_VK_SPV_DIR");
+                const std::string dir = (d != nullptr && *d != '\0') ? d : "ports/vulkan/shaders";
+                trivial_buf_ = alloc(4096);
+                trivial_pipe_ = pipeline(dir + "/scale.spv", 1, 8);
+                if (g_trivial_fam_set)
+                    std::fprintf(stderr, "vk TRIVIAL_REC_FAMILY: recording `scale` (1 workgroup, 4 KiB scratch, "
+                                         "same chain barrier) ONLY for family [%s] - the REST of the round is "
+                                         "untouched, so the wall-clock delta IS that family's MARGINAL price; the "
+                                         "decode's answers are GARBAGE by construction\n", g_trivial_fam_str.c_str());
+                else
+                    std::fprintf(stderr, "vk TRIVIAL_REC: recording `scale` (1 workgroup, 4 KiB scratch, same chain "
+                                         "barrier) instead of the engine kernel - the decode's answers are GARBAGE "
+                                         "by construction\n");
+            }
+            std::vector<const Buf*> tb{ &trivial_buf_ };
+            encode_dispatch(rec_cb_, trivial_pipe_, tb, pcs, 8, 1, 1, /*chain_barrier=*/true, /*fresh_set=*/true,
+                            VK_NULL_HANDLE);
+            ++recorded_;
+            return;
         }
-        std::vector<const Buf*> tb{ &trivial_buf_ };
-        encode_dispatch(rec_cb_, trivial_pipe_, tb, pcs, 8, 1, 1, /*chain_barrier=*/true, /*fresh_set=*/true,
-                        VK_NULL_HANDLE);
-        ++recorded_;
-        return;
     }
     const double _te0 = vk_ms();
     encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,
