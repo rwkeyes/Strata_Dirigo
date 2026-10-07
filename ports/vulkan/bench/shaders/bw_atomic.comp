@@ -1,0 +1,18 @@
+// ports/vulkan/bench/shaders/bw_atomic.comp - the ATOMIC arm of the scatter-vs-stream test.
+//
+// The top-k selection was the prime suspect for atomic access.  This arm issues N atomic read-modify-writes
+// into a small bucket array (mask+1 buckets, so contention is heavy and the destination is a handful of cache
+// lines), reading the same N input elements as bw_stream.  It states the atomic pattern's own price at the same
+// READ volume; the WRITE volume is the bucket array's, which is why this arm is reported beside, not instead
+// of, bw_scatter (which matches bw_stream byte-for-byte).
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer I { float v[]; } in_;
+layout(set = 0, binding = 1, std430) buffer A { uint v[]; } acc;
+layout(push_constant, std430) uniform PC { int n; int mask; } pc;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    const uint x = uint(in_.v[i] * 1000.0 + 2000000.0);      // finite, positive, never 0 for the fixture range
+    atomicAdd(acc.v[i & uint(pc.mask)], x);
+}

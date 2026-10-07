@@ -755,3 +755,27 @@ anywhere. The `work` sweep's one super-linear segment (W 12,288 → 65,536 is 5.
 where the per-dispatch working set crosses this card's L2 (25.2 → 134.2 MB); above it the same 4x width costs
 3.99x time again. **The grid width is not the decode lever** — see `NEXT.md`, "TARGET 2 CLOSED WITH THE
 OPPOSITE SIGN". `--only grid_curve` bounds the run to this arm; the default sweep runs the whole file.
+
+## The link-cost arms: `membw_pattern` and `membw_onchip`
+
+Two arms added by the link-cost batch to price what a decode LINK spends outside its kernel.  Both live in
+`bench/shaders/*.comp` (compiled into `bench/build/spv/` by `run_bench.sh`, NOT by `run_gate.sh`, so the gate's
+shader census never sees them - `bw_atomic` carries an atomic by design and would fail that census).
+
+`--only membw_pattern` runs the SAME byte volume through three store patterns and prints one `ROW` per pattern at
+three sizes plus an `XPAIR membw` line:
+
+* `bw_stream`  - contiguous store, `out[i]      = f(in[i])`;
+* `bw_scatter` - the SAME bytes, scattered store, `out[perm[i]] = f(in[i])` (`perm = i*2654435761 mod N`, a
+  bijection mod the power-of-two N);
+* `bw_atomic`  - N atomic read-modify-writes into a 1024-bucket array (the top-k prime suspect's pattern).
+
+`--only membw_onchip` prices the ON-CHIP alternative: a two-dispatch chain whose intermediate goes to GLOBAL
+memory (`time_two`), against ONE dispatch that keeps the identical intermediate in SHARED memory after a single
+`barrier()`, with a stream-only row as the floor.  The `XPAIR onchip` line prints `chain/fused` and
+`fused - stream` (the intra-workgroup barrier the fusion adds).
+
+Measured on the Arc Pro B70 (reps 9, warmups 3, n=3 interleaved): scatter/stream = 1.1x at 256 KiB, ~2.3x at
+4 MiB, ~1.8x at 16 MiB; the atomic arm is ~4.2x the byte-matched stream; the on-chip fusion is **1.72x on a
+16 MiB intermediate** with the shared staging costing **+0.6 us** per dispatch.  See
+`/home/bob/strata-linkcost-findings.md` for the batch report.

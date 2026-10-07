@@ -7766,3 +7766,28 @@ fall below the workgroup width is exposed, and two of them are already in the bu
 NEXT: (1) fix the reduction shape once (a barrier-based reduce removes the class); (2) re-check the two UNVERIFIED
 s_gemv lanes against the same test; (3) leave the s2_gemv_q8 shape-1 case in place but stop reading its pass as
 evidence - or better, keep it as the regression that must still pass AFTER the fix.
+
+## THE ROUTER SWAP IS BLOCKED BY THE EXPERT COUNT, NOT THE TIE-BREAK (2026-10-07, link-cost batch)
+
+The biggest lever on the table is the MoE router: `native_router_top10` benches at **24.3 us/dispatch against
+the legacy `router_top10_f32`'s 311.6-312.6** at the SAME shape and the SAME per-dispatch chain barrier (**12.8x,
+n=3**), and `router_top10_f32` is the family the warm split measured at **288.09 us/link** - 1776 dispatches over
+the decode = **511.6 ms of the 3250.3 ms base decode (15.7%)**.
+
+**It cannot be swapped as-is, and the reason is not the top-10 tie-break.** `native_router_top10.comp:46`
+hardcodes `NR_EXPERTS = 512u` and its push constant carries no expert dimension; **this model has 256 experts**
+(all 48 `blk.N.ffn_gate_inp.weight` are 2560x256 in the pack index). `src/core/layer.cpp:370` selects the native
+router only for `g.n_expert == 512 && k == 10`, so a 256-expert model is correctly routed to the generic
+`router_top10` -> `router_top10_f32.spv`. `native_router_enabled()` is already TRUE; the flag is not the gap.
+Both forms tie-break identically (strict `>` ascending scan -> lowest index); they differ only in ARITHMETIC
+(native plain-float vs the f32 legacy's Kahan sums), which is a near-tie risk, not the block.
+
+**NEXT (a shader+gate increment, not a flag flip):** (1) generalise `native_router_top10.comp` to take `n_expert`
+from the push constant; (2) expose it through the port's `router_top10` symbol (the only entry the engine calls
+for a non-512 model, and it already receives `n_expert`); (3) re-scope `case_router_top10_entry`
+(`harness/vk_gate.cpp:19494`), which today pins `router_top10 == router_top10_f32.spv` BITWISE and would fail on
+a rewire; (4) prove the two ids unmoved - the arithmetic change is the whole risk.
+
+**LATENT DEFECT:** `src/core/mtp.cpp:576` calls `native_router_top10` unconditionally under
+`native_router_enabled()`. On a 256-expert model that dispatches the 512-hardcoded shader past a 256-logit row.
+The shipped `--spec 2` path is correct; `--mtp` is exposed.

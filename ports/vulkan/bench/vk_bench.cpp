@@ -746,6 +746,105 @@ void bench_router_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) 
     ctx.free(bl); ctx.free(bi); ctx.free(bw);
 }
 
+// THE SCATTER-vs-STREAM ARM (the link-cost batch).  Same byte volume through three store patterns:
+//   bw_stream   - contiguous store, out[i]        = f(in[i])
+//   bw_scatter  - SAME bytes, scattered store, out[perm[i]] = f(in[i])   (perm = a bijection mod N)
+//   bw_atomic   - N atomic read-modify-writes into a 1024-bucket array (the top-k prime suspect's pattern)
+// The reported figure is the median per-DISPATCH time of a 8-dispatch recorded batch, each dispatch separated
+// by the compute->compute chain barrier `record_dispatch` emits - i.e. the same "per-link" quantity the decode
+// split reports, obtained through the same device layer.  The rows are per-pattern costs at a FIXED volume, so
+// the difference between them is the ACCESS PATTERN, not the bytes.
+void bench_membw_pattern(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int NMAX = 1 << 22;                               // 4,194,304 floats: 16 MiB in + 16 MiB out at the top size
+    std::vector<float> in = floats((size_t) NMAX);
+    Buf bi = alloc(ctx, (size_t) NMAX * 4), bo = alloc(ctx, (size_t) NMAX * 4);
+    ctx.write(bi, in.data(), (size_t) NMAX * 4);
+    VkPipeline ps = ctx.pipeline(dir + "/bw_stream.spv", 2, 4);
+    VkPipeline pk = ctx.pipeline(dir + "/bw_scatter.spv", 3, 4);
+    std::vector<uint32_t> perm((size_t) NMAX);
+    for (int i = 0; i < NMAX; ++i)
+        perm[(size_t) i] = (uint32_t) (((uint64_t) (uint32_t) i * 2654435761ull) & (uint64_t) (NMAX - 1));
+    Buf bp = alloc(ctx, (size_t) NMAX * 4);
+    ctx.write(bp, perm.data(), (size_t) NMAX * 4);
+
+    // SIZE SWEEP.  At each size the stream and the scatter rows carry the SAME bytes; the pair as a function of
+    // size separates the fixed per-link cost from the bandwidth term and shows where the pattern term appears.
+    for (const int N : {1 << 16, 1 << 20, 1 << 22}) {
+        const uint32_t groups = (uint32_t) (((uint64_t) N + 255) / 256);
+        char shape[96];
+        std::snprintf(shape, sizeof shape, "n=%d floats (%d KiB read, %d KiB write)", N, N * 4 / 1024, N * 4 / 1024);
+        struct { int32_t n; } pc{N};
+        Timing ts = time_kernel(ctx, ps, {&bi, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        report("bw_stream (contig)", shape, ts, (double) N, 0.0);
+        Timing tk = time_kernel(ctx, pk, {&bi, &bp, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        report("bw_scatter (permuted)", shape, tk, (double) N, 0.0);
+        std::printf("XPAIR membw n=%d | stream %.4f ms | scatter %.4f ms | scatter/stream %.3f\n",
+                    N, ts.med, tk.med, tk.med / ts.med);
+    }
+    // THE ATOMIC ARM at the top size (the top-k prime suspect's pattern).  Its WRITE volume is the 1024-bucket
+    // array (4 KiB), not the 16 MiB, so it is reported beside the byte-matched pair rather than against it.
+    {
+        const int N = NMAX, B = 1024;
+        const uint32_t groups = (uint32_t) (((uint64_t) N + 255) / 256);
+        Buf ba = alloc(ctx, (size_t) B * 4);
+        VkPipeline p = ctx.pipeline(dir + "/bw_atomic.spv", 2, 4);
+        struct { int32_t n, mask; } pc{N, B - 1};
+        Timing t = time_kernel(ctx, p, {&bi, &ba}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        char shape[96];
+        std::snprintf(shape, sizeof shape, "n=%d floats, %d-bucket atomic RMW", N, B);
+        report("bw_atomic (1024 buckets)", shape, t, (double) N, 0.0);
+        ctx.free(ba);
+    }
+    // THE ROUTER'S OWN BYTE VOLUME, streamed.  One token's logits (512 floats = 2 KiB read) and its k ids/weights
+    // (80 B written) as a PURE elementwise stream with the ordinary many-workgroup grid.  This is the floor the
+    // router's 288 us/link must be compared against: at the router's OWN bytes the streaming pattern costs the
+    // per-link fixed cost, so any excess is the router's internal structure, not its memory pattern or volume.
+    {
+        const int NE = 512;                                  // 128 tokens * 512 experts = 2^16 floats, same as the small row
+        const int NT = 128;                                  // 128 tokens so the volume is 2 KiB/token read
+        struct { int32_t n; } pc{NE * NT};
+        const uint32_t groups = (uint32_t) (NE * NT / 256);
+        char shape[96];
+        std::snprintf(shape, sizeof shape, "n=%d floats (256 KiB read) - many-workgroup stream", NE * NT);
+        VkPipeline p2 = ctx.pipeline(dir + "/bw_stream.spv", 2, 4);
+        Timing t = time_kernel(ctx, p2, {&bi, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        report("bw_stream (router-scale)", shape, t, (double) (NE * NT), 0.0);
+    }
+    ctx.free(bi); ctx.free(bo); ctx.free(bp);
+}
+
+// THE ON-CHIP ARM (deliverable 3).  A two-dispatch chain whose INTERMEDIATE goes to global memory between the
+// two dependent kernels, against ONE dispatch that keeps the identical intermediate in SHARED memory.  Both
+// rows are per-ITERATION (the chain row is both its dispatches), so chain/fused is the price of the global
+// round trip plus the removed link, and (fused - stream) is the intra-workgroup barrier() the fusion adds.
+void bench_membw_onchip(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int NMAX = 1 << 22;
+    std::vector<float> in = floats((size_t) NMAX);
+    Buf bi = alloc(ctx, (size_t) NMAX * 4), bmid = alloc(ctx, (size_t) NMAX * 4), bo = alloc(ctx, (size_t) NMAX * 4);
+    ctx.write(bi, in.data(), (size_t) NMAX * 4);
+    VkPipeline ps = ctx.pipeline(dir + "/bw_stream.spv", 2, 4);
+    VkPipeline pf = ctx.pipeline(dir + "/bw_fused.spv", 2, 4);
+    for (const int N : {1 << 16, 1 << 22}) {
+        const uint32_t groups = (uint32_t) (((uint64_t) N + 255) / 256);
+        struct { int32_t n; } pc{N};
+        char shape[96];
+        std::snprintf(shape, sizeof shape, "n=%d floats (%d KiB intermediate)", N, N * 4 / 1024);
+        Timing tchain = time_two(ctx, ps, {&bi, &bmid}, &pc, sizeof(pc), groups, 1,
+                                      ps, {&bmid, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        Timing tfused = time_kernel(ctx, pf, {&bi, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        Timing tbase = time_kernel(ctx, ps, {&bi, &bo}, &pc, sizeof(pc), groups, 1, 8, reps, warmups);
+        char sh2[256];
+        std::snprintf(sh2, sizeof sh2, "%s | chain=2 dispatches, global mid | fused=1 dispatch, shared mid", shape);
+        report("chain2 (global mid)", sh2, tchain, (double) N, 0.0);
+        report("fused1 (shared mid)", sh2, tfused, (double) N, 0.0);
+        report("stream1 (no mid)  ", sh2, tbase, (double) N, 0.0);
+        std::printf("XPAIR onchip n=%d | chain2 %.4f ms | fused1 %.4f ms | stream1 %.4f ms | "
+                    "chain/fused %.3f | fused-stream %+.4f ms\n",
+                    N, tchain.med, tfused.med, tbase.med, tchain.med / tfused.med, tfused.med - tbase.med);
+    }
+    ctx.free(bi); ctx.free(bmid); ctx.free(bo);
+}
+
 void bench_moe_combine_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
     const int n_embd = 2560, k = 10;
     std::vector<float> parts = floats((size_t) k * n_embd), w = floats((size_t) k), sh = floats((size_t) n_embd);
@@ -2384,6 +2483,8 @@ int main(int argc, char** argv) {
     // faster).  Before the sampler, which is the heavy one.
     arm("rope_pair", false, [&] { bench_rope_pair(ctx, dir, reps, warmups); });
     arm("router_pair", false, [&] { bench_router_pair(ctx, dir, reps, warmups); });
+    arm("membw_pattern", false, [&] { bench_membw_pattern(ctx, dir, reps, warmups); });
+    arm("membw_onchip", false, [&] { bench_membw_onchip(ctx, dir, reps, warmups); });
     arm("moe_combine_pair", false, [&] { bench_moe_combine_pair(ctx, dir, reps, warmups); });
     arm("rms_norm_pair", false, [&] { bench_rms_norm_pair(ctx, dir, reps, warmups); });
     // class B: native_qsa_gate_apply <- qsa_gate_apply_f32

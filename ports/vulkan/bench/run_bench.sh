@@ -63,6 +63,24 @@ for ku in 1 8; do
 done
 [ $rc -eq 0 ] || { echo "== shader build FAILED"; exit 1; }
 
+# THE BENCH-LOCAL SHADERS.  The scatter-vs-stream arm needs three kernels the GATE never sees (one of them has
+# an atomic, which the gate's census would fail by design), so they live in bench/shaders/ and are compiled here,
+# beside the kernels compiled above.  Same flags as the gate.
+echo "== compiling the bench-local shaders (bench/shaders/*.comp) -> $SPV"
+BSH="$ROOT/bench/shaders"
+shopt -s nullglob; bcomps=("$BSH"/*.comp); shopt -u nullglob
+for f in "${bcomps[@]}"; do
+  name="$(basename "$f" .comp)"
+  if ! glslc --target-env=vulkan1.3 -fshader-stage=compute "$f" -o "$SPV/$name.spv" 2>"$BUILD/$name.err"; then
+    echo "  FAIL glslc $name"; sed -n '1,8p' "$BUILD/$name.err"; rc=1; continue
+  fi
+  if ! spirv-val --target-env vulkan1.3 "$SPV/$name.spv" 2>>"$BUILD/$name.err"; then
+    echo "  FAIL spirv-val $name"; sed -n '1,8p' "$BUILD/$name.err"; rc=1; continue
+  fi
+  printf '  OK   %s\n' "$name"
+done
+[ $rc -eq 0 ] || { echo "== bench shader build FAILED"; exit 1; }
+
 echo "== building vk_bench (-O2 -Werror)"
 g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$ROOT/harness" \
     -o "$BUILD/vk_bench" "$ROOT/bench/vk_bench.cpp" \
