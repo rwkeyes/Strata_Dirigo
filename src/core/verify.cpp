@@ -1685,6 +1685,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                             stage = "sampler_greedy(argmax vs finite logits mismatch)"; tr = t; idx = out[t]; val = (double) top; nbad = 1;
                         }
                     }
+                // THE ROW'S SHAPE, once per process (same env gate).  An all-zeros output IS the sampler answering
+                // index 0, and `sampler_greedy.comp:106` returns 0 when NOTHING beats -inf - BUT a FINITE row also
+                // answers 0 whenever its lowest index holds the maximum, i.e. a tied/constant row.  The S1-S4 scans
+                // above say which of the two happened; this says what the row actually looked like, so an all-zeros
+                // decode is never again read as "NaN" by inference.  A healthy row has equal-to-max = 1 and an argmax
+                // equal to the token the sampler answered.
+                static bool shape_reported = false;
+                if (!shape_reported && T > 0 && n_vocab_ > 0) {
+                    shape_reported = true;
+                    const float* r0 = hl.data();
+                    float mn = r0[0], mx = r0[0];
+                    long long maxn = 0;
+                    for (int64_t v = 0; v < n_vocab_; ++v) {
+                        const float x = r0[v];
+                        if (x < mn) mn = x;
+                        if (x > mx) { mx = x; maxn = 1; } else if (x == mx) ++maxn;
+                    }
+                    int64_t top = 0;
+                    for (int64_t v = 1; v < n_vocab_; ++v) if (r0[v] > r0[top]) top = v;
+                    std::fprintf(stderr, "strata dbg NAN: head row0 min=%g max=%g equal-to-max=%lld argmax=%lld "
+                                         "finite=%d ; sampler answered out[0]=%d (n_vocab=%lld)\n",
+                                 mn, mx, maxn, (long long) top, (int) (std::isfinite(mn) && std::isfinite(mx)),
+                                 out != nullptr ? (int) out[0] : -1, (long long) n_vocab_);
+                }
                 if (stage != nullptr) {
                     reported = true;
                     std::fprintf(stderr, "strata dbg NAN: pos0=%lld T=%d row=%d FIRST NON-FINITE STAGE=%s "

@@ -1,19 +1,49 @@
 # Start here next session
 
+## THE ALL-ZEROS CAUSE IS **MEASURED**: A CONSTANT ZERO LOGITS ROW, **NOT** NON-FINITE LOGITS (2026-10-07, `vega`, Arc Pro B70, `nan6` = `ddb871abc6fec391`)
+
+**THE CLAIM THIS CORRECTS.** The record said "an all-zeros decode IS non-finite head logits" — read off
+`sampler_greedy.comp:106`, where a tie between `-inf` candidates leaves the sentinel and the shader answers 0. That is
+ONE route to token 0. The other is a **finite** row whose lowest index holds the maximum: the shader's reduction keeps
+the lowest index on a tie (`if (ov > rv[lid] || (ov == rv[lid] && oi < ri[lid]))`), so a constant row answers 0 as well.
+The two were never distinguished; the instrument now measures the row instead of inferring it.
+
+| arm | row0 min | row0 max | equal-to-max | argmax | finite | sampler answered | id |
+|---|---|---|---|---|---|---|---|
+| VALID (`logs/rs_valid_1.log`) | -7.07644 | 10.0923 | **1** | 4653 | yes | 4653 | `3aed108cceee` |
+| TRIVIAL (`STRATA_VK_TRIVIAL_REC=1`, `logs/rs_trivial_1.log`) | **0** | **0** | **248320** | 0 | yes | 0 | `d01eee6a3948` |
+
+**On the arm that produces all-zeros there is NO non-finite value anywhere: the logits are a CONSTANT ZERO row** (every
+one of 248,320 values exactly 0). The S1-S4 scans name no stage and the S5 arm (host argmax vs the sampler's own answer)
+does not fire **because the sampler is right** — 0 IS the argmax of a tied row. The trivialisation zeroes the head's own
+input, and a Q6_K projection of zeros is zeros.
+**THE VALID ARM IS ALSO THE POSITIVE CONTROL for the logits readback**: a healthy row (min -7.08, max 10.09, a UNIQUE
+maximum) whose argmax 4653 is exactly the token the sampler answered and the token the id `3aed108cceee` encodes. A
+zeroed/broken readback would have produced a spurious S5 mismatch on every valid arm; it never fired in 24 of them.
+
+**WHAT CHANGES AND WHAT DOES NOT.** The all-zeros screen's USE is unchanged — an all-zeros arm is degenerate, its rate is
+not a ceiling, never quote it (`run.sh`, `screen_output.sh`, `parse_flag.py`, `marginal.py`, `repro_test.sh` all enforce
+that already). What changes is the **CAUSE**, and with it two derived statements: the ceiling is void because **the output
+is not a valid token stream**, not because a numerical fault was proven; and the non-finite hunt across the head
+(S1-S4) has found **nothing on any arm**, the degenerate one included. `suspect=non-finite-logits` on the harness's
+screen line is a *suspect* label and stays — read it as "unverified alternate cause", not as a finding.
+
 ## THE 37.81/38.63 tok/s "MACHINERY CEILING" IS VOID (DEGENERATE PATH), `sync` IS `ms/round`, AND THE SERIALISATION IS THE CHAIN (2026-10-07; harness re-check, no GPU)
 
 **THE CEILING IS RETIRED — and it was never in this file.** The `triv199`/`triv199b` arms that produced
 **38.63 / 37.81 tok/s** both held output id **`d01eee6a3948`** — 17 rounds, **output all-zeros** — and so did the later
-144.58 tok/s arm. The shipped greedy sampler answers token **0** when no candidate beats `-inf`
-(`ports/vulkan/shaders/sampler_greedy.comp:106`), so an all-zeros decode means **non-finite head logits**. Every
+144.58 tok/s arm. The shipped greedy sampler answers token **0** in two distinct cases
+(`ports/vulkan/shaders/sampler_greedy.comp:106`): when no candidate beats `-inf`, **and** when a FINITE row's lowest
+index holds the maximum (the reduction keeps the lowest index on a tie). **The 2026-10-07 measurement below settles
+which: the all-zeros arms hold a CONSTANT ZERO logits row, every monitored buffer finite — not non-finite logits.** Every
 "trivial-work machinery ceiling" this project has quoted came off the **DEGENERATE path**; a number that depends on a
 numerical fault is not a ceiling. **VOID** wherever it appears — `strata-decode-latency-findings.md` and the queue
 briefs `2026-10-07-what-makes-a-producer-expensive.md`, `2026-10-07-measure-actual-memory-volumes.md`,
 `2026-10-07-family-ablation-ranked.md`, `2026-10-07-prefill-is-the-deficit.md` — and **struck from the comparisons that
 lean on it** (the "the machinery is capable of the peer's 39.19" reading; the "same technique that found the ceiling"
 references). History annotated, not deleted. **No valid machinery ceiling has been measured** — and the 2026-10-07 nan
-hunt shows why the trivial-work ROUTE cannot produce one: trivialising the work feeds the head garbage and the head
-goes non-finite (see the newest section above).
+hunt shows why the trivial-work ROUTE cannot produce one: trivialising the work zeroes the head's input, so the logits
+become a **constant ZERO row** — finite, not non-finite (measured; see the newest section above).
 
 **THE UNIT — `sync … ms/round`, not ms/run.** The `verify window` line prints `sync … ms/round` (the label is on the
 line). Read as ms/run it invents a ~30x discrepancy; there is none: `143.364 ms/round x 19 = 2,724 ms` against the
@@ -49,19 +79,21 @@ negative control, and it is why an id that stays put under a host-copy poison is
 are **clean at S1–S4** and hold `3aed108cceee` (19 rounds, 10.00–11.02 tok/s). With the 20 nan2 arms (whose OWN self-test
 named nothing, so nothing rests on them) that is **24 valid arms, zero non-finite head stages, zero all-zeros**. The only
 all-zeros arm this project has is the **trivial-work trigger itself** (`STRATA_VK_TRIVIAL_REC=1` -> `d01eee6a3948`,
-127 tok/s). Trivialising the work feeds garbage to the head and the head goes non-finite: **that is a property of the
-ablation, not of the shipped decode path.** Consequence for the old ceiling question: a machinery ceiling measured by
+127 tok/s). The trivialisation zeroes the head's own input, so the logits become a **constant ZERO row** (measured — see
+the newest section): **that is a property of the ABLATION, not of the shipped decode path.** Consequence for the old ceiling question: a machinery ceiling measured by
 trivialising work cannot be valid, so **no valid ceiling has been measured and the trivial-work route cannot produce
-one.** Still open and named: *which* stage goes non-finite FIRST on the trivial arm (`nan_trivial_3` ran on nan2, whose
-controls never fired) — the one measurement the old ceiling question still needs.
+one.** **ANSWERED (2026-10-07):** NO stage goes non-finite on the trivial arm — its logits are a **constant ZERO row**
+(measured on `nan6`: all 248,320 values exactly 0, S1-S4 silent, and the sampler's 0 IS that row's argmax). The old
+ceiling question needs nothing further from this direction; what it needs is a way to remove work **without** zeroing the
+head's input.
 
 **D4's f32 TAIL — KEPT AS AN ENV-GATED DIAGNOSTIC, QUESTION UNANSWERED, PREMISE WITHDRAWN.** `STRATA_VK_SAMPLER_F32=1`
 forces the portable f32 sibling in place of the emulated-double tail this Arc selects (ANV advertises `fp64 1` with no
 FP64 hardware). Measured: a CLI `--tokens` arm **never dispatches the sampled path** — the per-shader census lists
 `sampler_greedy.spv` (2 dispatches) and no `sampler_split/kernel/kernel_f32`, because the P6 window accepts a draft only
 if it equals the verifier's own GREEDY token — so both tails returned the same id and the same rate, exactly as a no-op
-switch must. The f32-vs-double question needs the **server/bench sampled path**. And the premise is withdrawn: an
-all-zeros decode IS non-finite HEAD logits (`sampler_greedy.comp:106` returns token 0 when nothing beats `-inf`) and a
+switch must. The f32-vs-double question needs the **server/bench sampled path**. And the premise is withdrawn twice
+over: the all-zeros cause is now MEASURED as a finite constant-zero logits row (see the newest section), and in any case a
 sampler only READS the logits — it cannot create them.
 
 ## THE DECODE GAP IS NOT THE KERNELS' EXECUTION — measured with GPU timestamps, this port's decode kernels run at **0.80–3.13 ns/workgroup** (the trivial-kernel floor is 0.7–3.8), a **flat ~3.86 µs is paid per *dispatch*** across every one of 50 families, and the round's GPU time is **13.7 ms against a 237 ms round**; and TARGET 1's SECOND kernel LANDS: the fused gate/up dequantiser (`dequant_gu_kernel`) removes **exactly 7,178** live dispatches (56,051 → 48,873) and takes the `dequant` phase **1,486–1,491 → 911–914 ms (−38.7%, ranges disjoint)**, bit-exact, both ids unmoved (2026-10-07, `vega`, Arc Pro B70)
