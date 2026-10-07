@@ -8039,3 +8039,8 @@ shaders - it expects OpenCL-flavored SPIR-V and rejects GLSL/Vulkan with `Invali
 OpenCL.std. Actual is GLSL.std.450`. The register question was answered by timing, not by an offline dump. (The
 shader-file knob `STRATA_PF_GDN_REC_CHUNK_SPV` is the reusable part of this increment: unset, it behaves exactly as
 if it did not exist.)
+
+**GATE at this HEAD** (tag `chunk_head_be5daf4`, product `4ee58b505688…`, `gate status lines: 0` = clean tree):
+intel **965/0/0**, lvp 949/0/4, radeon 951/3/2, smoke 60/0/0, rc=1 by design. Both chunk shaders pass the shader
+pass: `OK gdn_rec_chunk` and `OK gdn_rec_chunk_reg`, each `LocalSize 256 1 1 | census: none`. (radeon's failures
+are the flaky, rotating "engine wrapper == shader path, bitwise" set documented above - never in the intel block.)
