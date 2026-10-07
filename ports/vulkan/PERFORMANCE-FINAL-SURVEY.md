@@ -1,9 +1,9 @@
 # strata_dirigo (Vulkan port of Strata) — FINAL PERFORMANCE SURVEY
 
-**Written 2026-10-07 on `vega` (Intel Arc Pro B70, BMG G31), branch `vulkan-arc-port`, HEAD `9934785`,
-clean tree.** Purpose: one broad, comprehensive check of where the remaining performance is, taken
-immediately before the project is mothballed. Written for whoever picks it up — including the possibility
-that nobody does.
+**Written 2026-10-07 on `vega` (Intel Arc Pro B70, BMG G31), branch `vulkan-arc-port`, HEAD `fa6f6da`,
+clean tree.** Purpose: one broad, comprehensive check of where the remaining performance is, taken immediately
+before the project is mothballed. Written for whoever picks it up — including the possibility that nobody does.
+(Updated once after the survey: L3 shipped as `fa6f6da`, and the numbers in sections 1 and 3 are its result.)
 
 **Labels used throughout, and they matter:** **[verified]** = measured in this session with the instrument
 named; **[measured earlier]** = in this repo's records (`NEXT.md`, `PERFORMANCE-B70-2026-10-06.md`, the
@@ -26,9 +26,12 @@ tested — do not act on one of these without testing it first.
    decode round is ~237 ms of which **13.7 ms is GPU execution** — the kernels run at 0.80–3.13 ns/workgroup,
    i.e. AT the measured trivial-kernel floor (0.7–3.8), and a **flat ~3.86 us is paid per dispatch across all
    50 families**. So ~94% of the decode round is not execution.
-4. **One improvement is measured, gate-verified, and still switched off:** `STRATA_VK_DIRECT_UPLOAD=1`
-   removes **86–100 s of cold start** with no prefill regression [measured earlier; gate-verified in both
-   states]. Shipping it is a one-line default change plus a gate run.
+4. **The one ready improvement has been SHIPPED:** `STRATA_VK_DIRECT_UPLOAD` is now the DEFAULT (commit
+   `fa6f6da`), opt-out with `=0`. [verified] 199-token arm, cold start: **188–208 s wall → 99 s**, ids unmoved
+   (`56a0b28d2de6`), rates inside their existing ranges. The mechanism is visible in the port's own dispatch
+   accounting: cb-alloc 41 → 0, fence-create 34 → 0, submit 8,660 → 175, wait 27,427 → 9,586 ms. Gate re-run
+   with it as the default: **intel 965/0/0, identical to baseline** — the allocation-type assertions do not
+   object, because the gate forces staging where it asserts types.
 5. **Most of the work in this project is a closed negative.** Section 4 lists what is dead. It is the most
    valuable part of this document: it is ~20 hours of measurement that should not be repeated.
 
@@ -87,13 +90,21 @@ of anything.
   The lever is *fewer, larger submissions* and *fewer host boundaries per token*.
 - **Effort/risk:** medium-high; this is the port's correctness-sensitive seam.
 
-### L3 — Ship `STRATA_VK_DIRECT_UPLOAD` as the default. Ready now. [measured earlier, gated]
+### L3 — SHIPPED (`fa6f6da`): `STRATA_VK_DIRECT_UPLOAD` is the DEFAULT, opt-out with `=0`. [verified]
 
-- Removes 13,703 staging round-trips (−86 to −100 s of cold start), no prefill regression, ids unmoved.
-- Gate-verified in both states (`head_fae1ba6_direct`, intel 965/0/0 identical to default).
+- 199-token arm cold start: **188–208 s wall → 99 s**; ids unmoved (`56a0b28d2de6`); prefill 7,136 ms / 27.75
+  tok/s and decode 11.63 tok/s, both inside their existing ranges — it buys STARTUP only.
+- Mechanism, from the port's own dispatch accounting (not just the clock): cb-alloc 41 → 0, fence-create
+  34 → 0, submit 8,660 → 175, wait 27,427 → 9,586 ms.
+- Gate with it as the default: **intel 965/0/0 identical to baseline**, lvp 949/0/4, radeon 951/3/2 (the
+  rotating pre-existing flake), smoke 63 passed.
 - It is map-on-demand, NOT persistent mapping: a persistent mapping trips the port's host-visible flush rule
   and turned 563 batches into 45,635 (a measured +47% prefill regression) before it was fixed.
-- **Effort/risk:** one default flip + a gate run. User-visible win is time-to-first-token.
+- **CORRECTION worth keeping:** the `xfer stat` upload COUNT does NOT fall — it reads 13,702 in both modes,
+  because its counter sits above the path branch. Use the dispatch accounting above to tell the paths apart;
+  the older A/B's "0 uploads" came from a binary where the counter sat elsewhere.
+- **Undo:** `STRATA_VK_DIRECT_UPLOAD=0` restores the staged path, and the gate keeps that path exercised
+  through `set_force_staging` — which is what makes this a default rather than a one-way door.
 
 ### L4 — Anything at all in the per-phase table. [verified as unreliable]
 
@@ -176,5 +187,7 @@ decode. The remaining performance is in porting the engine's own prefill kernels
 work the decode side already finished — and nowhere else that this project has been able to find after
 ~20 hours of measurement, most of which is recorded above as negatives.
 
-If it is mothballed now: the one thing worth doing first is **L3** (ship the direct-upload default), because
-it is measured, gated, and takes one line. Everything else needs a session's worth of kernel porting to move.
+L3 is **DONE** as of `fa6f6da` — the direct-upload default, 188–208 s → 99 s of cold start, gate at baseline —
+so nothing that this project has measured remains on the table. The only open item is **L1**: porting the
+engine's remaining prefill kernels, a session's worth of tedious, well-defined transcription with a 13.5x
+prize at the end of it, and no other lead left that this project has been able to find.
