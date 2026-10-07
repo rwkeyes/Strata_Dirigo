@@ -66,6 +66,8 @@ struct DispStat {
     uint64_t barriers = 0;                        // COMPUTE->COMPUTE chain barriers emitted (one per chained dispatch)
     double t_seg_wait = 0, t_seg_submit = 0;      // the segment path's own submit + fence wait (ms)
     std::vector<std::pair<uint32_t, double>> seg_log;  // per segment submit: {executed dispatches, fence-wait ms}
+    std::vector<uint64_t> seg_fp;                      // per segment submit: sum of bound-region bytes (FOOTPRINT)
+    std::vector<double> seg_wall;                      // per segment submit: steady-clock ms, for CLOCK alignment
     double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
     // The RECORDED arm's own encode, charged at record_dispatch (the old t_encode above is the LIVE path's, so the
     // recorded arm read 0 "by construction").  Its own counter so the existing per-dispatch totals do not shift.
@@ -111,6 +113,12 @@ struct KtStat {
     size_t done_upto = 0;        // everything before this index has been read and accumulated
     std::vector<std::pair<std::string, uint64_t>> disp, wg;
     std::vector<std::pair<std::string, double>> ns;
+    // DELIVERABLE 1 READBACK: per-shader-family WRITE FOOTPRINT and BARRIER time.  `ns` above is the KERNEL window;
+    // these are the two terms the footprint-vs-price correlation needs - the barrier a link actually paid, and the
+    // bytes its bound ranges carried.  Summed over every dispatch whose four timestamps were read.
+    std::vector<std::pair<std::string, uint64_t>> fam_n, fam_fp;
+    std::vector<std::pair<std::string, double>> fam_bar_ns;
+    std::vector<uint64_t> slot_fp;   // parallel to `slots`: one footprint per recorded dispatch, in recording order
     // ---- THE FOUR-WAY SPLIT OF THE RECORDED DISPATCH (all DEVICE-SIDE, from four timestamps per dispatch) ----
     // slot i+0 = TOP_OF_PIPE before BindPipeline, i+1 = TOP_OF_PIPE before vkCmdDispatch, i+2 = BOTTOM_OF_PIPE
     // after vkCmdDispatch, i+3 = TOP_OF_PIPE after the chain barrier.  Then front-end = (i+1)-(i+0) [the binds
@@ -155,6 +163,17 @@ struct KtStat {
     double getn(const std::string& s) const {
         for (const auto& kv : ns) if (kv.first == s) return kv.second;
         return 0.0;
+    }
+    // DELIVERABLE 1: attribute ONE read dispatch's BARRIER ns and its WRITE FOOTPRINT bytes to its shader family,
+    // so the barrier price can be correlated with the footprint across every family the recording executed.
+    void addbar(const std::string& s, double bar_ns, uint64_t fp) {
+        auto bumpi = [&](std::vector<std::pair<std::string, uint64_t>>& v, uint64_t x) {
+            for (auto& kv : v) if (kv.first == s) { kv.second += x; return; }
+            v.push_back({s, x});
+        };
+        bumpi(fam_n, 1); bumpi(fam_fp, fp);
+        for (auto& kv : fam_bar_ns) if (kv.first == s) { kv.second += bar_ns; return; }
+        fam_bar_ns.push_back({s, bar_ns});
     }
     uint64_t disp_total() const {
         uint64_t t = 0;
@@ -295,7 +314,11 @@ void kt_flush_seg(VkDevice dev, VkCommandBuffer cb) {
         if (have && i == last_i + 4u && v0 >= last_c) { row.gap += (double) (v0 - last_c) * tick; ++row.gaps; }
         last_c = v3; last_i = i; have = true;
         const size_t si = (size_t) (base / 4u) + k;
-        if (si < g_kt.slots.size()) g_kt.add(g_kt.slots[si].spv, kern * tick, g_kt.slots[si].wg);
+        if (si < g_kt.slots.size()) {
+            g_kt.add(g_kt.slots[si].spv, kern * tick, g_kt.slots[si].wg);
+            // DELIVERABLE 1: this dispatch's BARRIER price and WRITE FOOTPRINT, attributed to its family.
+            g_kt.addbar(g_kt.slots[si].spv, bar * tick, si < g_kt.slot_fp.size() ? g_kt.slot_fp[si] : 0);
+        }
     }
     // merge into the replay-ordinal row and this command buffer's own cold/warm rows
     auto merge = [](KtStat::WRow& d, const KtStat::WRow& s) {
@@ -372,6 +395,35 @@ void kt_dump() {
                          "vk warm cb n=%-6u submits=%-3u | COLD %.2f+%.2f+%.2f+%.2f=%.2f | WARM %.2f+%.2f+%.2f+%.2f=%.2f "
                          "us/disp (front+kernel+barrier+gap)\n",
                          c.n, c.submits, cf, ck, cb2, cg, ct, wf2, wk2, wb2, wg2, wt);
+        }
+        // DELIVERABLE 1: THE FOOTPRINT-vs-PRICE TABLE.  One line per shader family (ordered by footprint): the
+        // dispatches read, the MEAN bound-region bytes one dispatch carries - the barrier's flush surface - and the
+        // MEAN barrier it paid.  The relation between the last two columns is the test of "the barrier costs what a
+        // link WRITES"; a flat barrier column against a 3-decade footprint spread REFUTES the flush hypothesis.
+        std::fprintf(stderr, "vk fp vs barrier (per shader family, WARM replays>=1; fp = mean bound-region bytes per "
+                             "dispatch, bar = mean barrier us/dispatch):\n");
+        {
+            auto gp = [&](const std::vector<std::pair<std::string, uint64_t>>& v, const std::string& s) -> uint64_t {
+                for (const auto& kv : v) if (kv.first == s) return kv.second;
+                return 0;
+            };
+            auto gd = [&](const std::vector<std::pair<std::string, double>>& v, const std::string& s) -> double {
+                for (const auto& kv : v) if (kv.first == s) return kv.second;
+                return 0.0;
+            };
+            std::vector<std::pair<uint64_t, std::string>> rows;   // fp_total, name  (ascending: the relation shows)
+            for (const auto& kv : g_kt.fam_n) rows.push_back({gp(g_kt.fam_fp, kv.first), kv.first});
+            std::sort(rows.begin(), rows.end());
+            for (const auto& r : rows) {
+                const std::string& s = r.second;
+                const uint64_t n = gp(g_kt.fam_n, s);
+                if (!n) continue;
+                const size_t slash = s.find_last_of('/');
+                const std::string bs = s.substr(slash == std::string::npos ? 0 : slash + 1);
+                std::fprintf(stderr, "vk fp fam %-34s n=%-8llu fp=%-12.0f B bar_us=%-8.3f kern_us=%.3f\n",
+                             bs.c_str(), (unsigned long long) n, (double) r.first / (double) n,
+                             gd(g_kt.fam_bar_ns, s) / 1e3 / (double) n, g_kt.getn(s) / 1e3 / (double) n);
+            }
         }
     } else {
         // THE FOUR-WAY SPLIT, in us per timed dispatch.  `split_n` counts dispatches whose four timestamps were
@@ -455,6 +507,30 @@ std::vector<HazardRange> g_haz;
 constexpr size_t kHazardCap = 8192;   // force a barrier rather than grow without bound
 uint64_t g_haz_barriers = 0;          // barriers actually EMITTED in the hazard mode
 uint64_t g_narrow_barriers = 0, g_wide_barriers = 0;   // Task 3: recorded-arm barriers by FORM (narrow vs global)
+// ---- STRATA_VK_FOOTPRINT: PER-DISPATCH WRITE FOOTPRINT (measurement-only, HOST-SIDE arithmetic only) ----------
+// The chain barrier's cost is the hypothesis that each link waits for its WRITES to become visible.  The hazard
+// machinery already computes, for every recorded dispatch, the bound regions `[Buf::offset, offset+Buf::bytes)`
+// the barrier has to publish, so a dispatch's write footprint is a READBACK of numbers the decision already used,
+// not a new analysis.  This instrument SUMS those regions per recorded dispatch and attributes them to the
+// command buffer (always) and to the shader family (with STRATA_VK_KERNEL_TIME), so the footprint can be
+// correlated with the drain the fence wait actually measured.  IT ADDS NO DEVICE COMMAND AND NO GPU WORK: it is
+// pure host arithmetic at RECORD time, so the decode arm cannot move under it (unlike KERNEL_TIME, whose own cost
+// is -7.8% and which is quoted wherever its numbers are used).
+bool g_fp_on = std::getenv("STRATA_VK_FOOTPRINT") != nullptr;
+struct FpStat {
+    std::map<VkCommandBuffer, uint64_t> cb_fp;   // per recorded command buffer: sum of bound-region bytes
+    std::map<VkCommandBuffer, uint64_t> cb_n;    // ...and how many dispatches contributed
+    uint64_t rec_fp = 0, rec_n = 0;
+};
+FpStat g_fp;
+// ---- STRATA_VK_TRIVIAL_REC: DELIVERABLE 2 - A TRIVIAL-KERNEL SEGMENT AT THE SAME DISPATCH COUNT ---------------
+// `record_dispatch` normally encodes the engine's real kernel.  With this flag it encodes ONE workgroup of the
+// trivial `scale` kernel (x[i] *= s) over a 4 KiB scratch instead, keeping the SAME dispatch count, the SAME
+// per-dispatch fresh descriptor set and the SAME chain barrier, through the SAME recording and the SAME segment
+// submit path.  The drain it produces is therefore turnaround + barrier with almost no work and almost no write
+// footprint - which is what separates DEVICE TURNAROUND from DEPENDENCY COST without the elision arm's confounds.
+// MEASUREMENT-ONLY: the decode's answers are garbage by construction and the id is expected to move.
+bool g_trivial_rec = std::getenv("STRATA_VK_TRIVIAL_REC") != nullptr;
 inline double vk_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -541,12 +617,18 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
     // PER-SEGMENT DRAIN: did the fence wait scale with the SEGMENT'S DISPATCH COUNT (links) or is it fixed?  One
     // line per segment submit so the relation is visible, not asserted.
     if (!g_ds.seg_log.empty()) {
-        std::fprintf(stderr, "vk seg drain (per segment submit: executed dispatches, fence-wait ms, us/dispatch):\n");
+        std::fprintf(stderr, "vk seg drain (per segment submit: dispatches, fence-wait ms, us/dispatch, bound-region "
+                             "bytes = the FOOTPRINT, bytes/link, steady-clock ms):\n");
         for (size_t i = 0; i < g_ds.seg_log.size(); ++i) {
             const uint32_t d = g_ds.seg_log[i].first;
             const double w = g_ds.seg_log[i].second;
-            std::fprintf(stderr, "vk seg drain i=%-3zu disp=%-6u wait_ms=%-9.3f us/disp=%.2f\n", i, d, w,
-                         d ? w * 1e3 / (double) d : 0.0);
+            const uint64_t fp = i < g_ds.seg_fp.size() ? g_ds.seg_fp[i] : 0;
+            const double wl = i < g_ds.seg_wall.size() ? g_ds.seg_wall[i] : 0.0;
+            std::fprintf(stderr,
+                         "vk seg drain i=%-3zu disp=%-6u wait_ms=%-9.3f us/disp=%-8.2f fp=%-13llu fp/link=%-10.0f "
+                         "wall=%.0f\n",
+                         i, d, w, d ? w * 1e3 / (double) d : 0.0, (unsigned long long) fp,
+                         d ? (double) fp / (double) d : 0.0, wl);
         }
     }
     std::fprintf(stderr, "vk disp stat RECORDED encode: %.1f ms over %llu encodes (%.4f ms/encode) - charged at "
@@ -993,6 +1075,15 @@ Ctx::Ctx(int want_device, bool need_16bit) {
                              "hazard it does not see is a WRONG answer; this PRICES the barrier.\n");
     if (g_xs.on) std::atexit(xfer_stat_dump);
     if (g_kt.on) std::atexit(kt_dump);
+    if (g_fp_on)
+        std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_FOOTPRINT=1 - per-recorded-dispatch write footprint "
+                             "(sum of bound-region bytes) attributed to the command buffer and, with KERNEL_TIME, "
+                             "to the shader family.  HOST ARITHMETIC ONLY: no device command, no GPU work, so the "
+                             "decode arm cannot move under it.\\n");
+    if (g_trivial_rec)
+        std::fprintf(stderr, "vk_compute[MEASUREMENT]: STRATA_VK_TRIVIAL_REC=1 - recorded dispatches are replaced "
+                             "by ONE workgroup of `scale` (same count, same chain barrier, same submit path).  The "
+                             "decode's answers are WRONG by construction; deliverable 2 only.\\n");
     g_fs_on_env = std::getenv("STRATA_VK_FLUSH_STAT") != nullptr;
     if (g_fs_on_env) std::atexit(flush_stat_dump);
     VkApplicationInfo app{};
@@ -1275,6 +1366,7 @@ Ctx::~Ctx() {
     if (rec_fence_) vkDestroyFence(dev_, rec_fence_, nullptr);   // the recorded step's fence: one fence for every submission
     for (VkDescriptorPool pool : desc_pools_) vkDestroyDescriptorPool(dev_, pool, nullptr);
     desc_pools_.clear();
+    if (trivial_buf_.buffer != VK_NULL_HANDLE) free(trivial_buf_);   // STRATA_VK_TRIVIAL_REC's 4 KiB scratch
     if (cmd_pool_) vkDestroyCommandPool(dev_, cmd_pool_, nullptr);
     if (dev_) vkDestroyDevice(dev_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
@@ -1895,6 +1987,19 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
 
     check_offsets(bufs);
 
+    // STRATA_VK_FOOTPRINT: the sum of the BOUND regions this dispatch carries - the byte ranges the chain barrier
+    // has to publish, which is exactly what the hazard machinery's decision already walks.  Host arithmetic only
+    // (see g_fp_on): no device command, no GPU work.  Computed whenever the footprint or the kernel-time
+    // instrument needs it, so `g_kt.slot_fp` stays parallel to `g_kt.slots` BY CONSTRUCTION rather than by luck.
+    uint64_t fp_here = 0;
+    if (g_fp_on || (g_kt.on && fresh_set)) {
+        for (const Buf* b : bufs) if (b != nullptr) fp_here += b->bytes;
+    }
+    if (g_fp_on && fresh_set) {
+        g_fp.cb_fp[cb] += fp_here; ++g_fp.cb_n[cb];
+        g_fp.rec_fp += fp_here;    ++g_fp.rec_n;
+    }
+
     std::vector<VkDescriptorBufferInfo> info(bufs.size());
     std::vector<VkWriteDescriptorSet> writes(bufs.size());
     for (size_t i = 0; i < bufs.size(); ++i) {
@@ -2055,9 +2160,11 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     if (kt_here) {
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, kt_i + 3);   // slot3: after the barrier
         g_kt.slots.push_back(KtSlot{spv_path, kt_i, (uint64_t) groups * (uint64_t) groups_y});
+        g_kt.slot_fp.push_back(fp_here);   // parallel to `slots` (see fp_here above)
     }
     if (pair_here) {
         g_kt.slots.push_back(KtSlot{spv_path, pair_i, (uint64_t) groups * (uint64_t) groups_y});
+        g_kt.slot_fp.push_back(fp_here);   // same parallel push in PAIR mode, so the vectors never diverge
     }
 }
 
@@ -2164,6 +2271,26 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
     if (!recording_) {
         std::fprintf(stderr, "record_dispatch: not recording (call record_begin)\n");
         std::exit(1);
+    }
+    // ---- STRATA_VK_TRIVIAL_REC (deliverable 2): the SAME dispatch count, the SAME chain barrier, the SAME fresh
+    // descriptor set and the SAME submit path - but ONE workgroup of the trivial `scale` kernel (x[i] *= s) over a
+    // 4 KiB scratch, so the work and the write footprint are both negligible.  What remains in the drain is device
+    // TURNAROUND + the barrier; the decode's answers are garbage by construction and the id is expected to move.
+    if (g_trivial_rec) {
+        static const float pcs[2] = {1.0f, 1.0f};
+        if (trivial_pipe_ == VK_NULL_HANDLE) {
+            const char* d = std::getenv("STRATA_VK_SPV_DIR");
+            const std::string dir = (d != nullptr && *d != '\0') ? d : "ports/vulkan/shaders";
+            trivial_buf_ = alloc(4096);
+            trivial_pipe_ = pipeline(dir + "/scale.spv", 1, 8);
+            std::fprintf(stderr, "vk TRIVIAL_REC: recording `scale` (1 workgroup, 4 KiB scratch, same chain barrier) "
+                                 "instead of the engine kernel - the decode's answers are GARBAGE by construction\n");
+        }
+        std::vector<const Buf*> tb{ &trivial_buf_ };
+        encode_dispatch(rec_cb_, trivial_pipe_, tb, pcs, 8, 1, 1, /*chain_barrier=*/true, /*fresh_set=*/true,
+                        VK_NULL_HANDLE);
+        ++recorded_;
+        return;
     }
     const double _te0 = vk_ms();
     encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,
@@ -2332,6 +2459,8 @@ void Ctx::submit_segment(const CaptureSeg& seg) {
         g_ds.t_seg_wait += _td - _tw;
         g_ds.t_seg_submit += _tw - _ts;
         g_ds.seg_log.push_back({ seg.dispatches, _td - _tw });
+        g_ds.seg_fp.push_back(g_fp.cb_fp.count(seg.cb) ? g_fp.cb_fp[seg.cb] : 0);
+        g_ds.seg_wall.push_back(_td);
     }
 }
 

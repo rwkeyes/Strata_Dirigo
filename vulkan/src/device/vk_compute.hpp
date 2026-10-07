@@ -436,6 +436,11 @@ private:
     uint64_t allocated_host_ = 0;           // the host account: staging/transfer allocations
     bool force_staging_ = false;            // STRATA_VK_FORCE_STAGING - exercises the staging path anywhere
     std::vector<Pipe> pipes_;
+    // STRATA_VK_TRIVIAL_REC (deliverable 2): the trivial `scale` pipeline and its 4 KiB scratch, created lazily the
+    // first time a recorded dispatch is substituted.  MEASUREMENT-ONLY (see g_trivial_rec); always VK_NULL_HANDLE
+    // on the shipped path, so nothing here can move a default run.
+    VkPipeline trivial_pipe_ = VK_NULL_HANDLE;
+    Buf trivial_buf_{};
 
     // One allocation, shared by all three entry points above so the refusal, the ledger and the printed
     // message cannot drift between them.  `vram_account` decides which account it is charged to.
