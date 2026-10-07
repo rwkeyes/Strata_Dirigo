@@ -8107,3 +8107,27 @@ read as "the unroll does not help". The sha check that "passed" compared two cop
 tell was the identity of the medians (0.1952 twice); the fix is to assert the `.spv` sha CHANGED and to read the
 compiler's own output, not just the exit status. `case_gemm_prefill_fma_small` plus the engine ids are the guards
 now that it is real.
+
+**AND THE SHAPE RULE FLIPPED - WHICH IS WHERE MOST OF THE WIN IS.** With the KU=8 kernel in place the
+cooperative-matrix default stopped paying. Engine A/B, interleaved A,B,A,B in ONE launch, ids checked every arm:
+
+| arm | gemm gate/up | gemm down | GPU timeline | prefill | tok/s | cm / fma dispatches |
+|---|---|---|---|---|---|---|
+| A_1 shipped (coopmat) | 1,049 | 881 | 8,839 | 8,989.7 | 22.03 | 3,840 / 7,166 |
+| B_1 `STRATA_VK_PREFILL_COOPMAT=0` | 214 | 601 | 6,527 | 6,695.8 | 29.57 | **0 / 7,702** |
+| A_2 shipped | 1,045 | 878 | 8,611 | 8,759.7 | 22.60 | 3,840 / 7,166 |
+| B_2 `STRATA_VK_PREFILL_COOPMAT=0` | 215 | 606 | 6,647 | 6,780.9 | 29.20 | **0 / 7,702** |
+
+* **-24.1% on the prefill, +31.6% tok/s, ranges DISJOINT** (B's worst 6,780.9 is under A's best 8,759.7), and the
+  id `56a0b28d2de6` unmoved on all four arms.
+* `gemm_f16`'s rule is now the REVERSE of the one that stood until today: `STRATA_VK_PREFILL_COOPMAT=1` ENABLES
+  the matrix units, and UNSET stays on the KU-FMA path. That reversal is measured, not taste: the coopmat path was
+  adopted as a +17.4% win over the *then-current* untiled FMA kernel, and the unroll changed what it is being
+  compared against.
+* VERIFIED ON THE SHIPPED DEFAULT afterwards, no env var set: id `56a0b28d2de6`, **prefill 6,790.2 ms ->
+  29.16 tok/s**, `gemm gate/up` 215 ms, and the per-shader census shows `gemm_prefill_fma_small.spv 7702` with NO
+  `gemm_prefill_f16_m8` dispatched at all.
+* Read together with the KU change: the unroll alone was -5.3% (the FMA kernel is a minority of the phase), and
+  the shape-rule reversal it made correct is -24.1%. **The bigger win came from re-deciding which kernel runs,
+  not from making the kernel faster** - and neither would exist without the bench row that priced them against
+  each other.

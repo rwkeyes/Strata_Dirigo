@@ -258,14 +258,26 @@ void gemm_f16(Stream& s, const uint16_t* X, const uint16_t* W, float* Y, int64_t
         !resolve_dev(s, Y, (uint64_t) T * ldy * 4, yv))
         refuse("prefill::Gemm::f16", "an operand is neither in this arena nor a live mapped region");
 
-    // THE COOPERATIVE-MATRIX PATH IS THE DEFAULT FOR THE SHAPES IT CAN TAKE; `STRATA_VK_PREFILL_COOPMAT=0`
-    // forces the FMA path back on (the override is kept so the choice stays measurable in one binary).  The
-    // tile kernel has no ragged edge, so it takes only the CM_M-aligned rows and the FMA kernels finish the
-    // rest - which is also what keeps the SMALL-T case on the FMA path: a row count under CM_M (or a shape
-    // whose N or K is not a tile multiple) leaves t_cma at 0 and nothing is dispatched here.
+    // THE KU-UNROLLED FMA KERNEL IS NOW THE DEFAULT FOR EVERY SHAPE, AND THE MATRIX UNITS ARE THE OPT-IN.
+    // This is a REVERSAL of the rule that stood until 2026-10-07, and the reversal is measured, not taste.  When
+    // the cooperative-matrix path landed it beat the then-current untiled FMA kernel by 17.4% end to end; the
+    // untiled kernel has SINCE been K-unrolled (`-DKU=8`, 1.6-5.6x per call at every shape), and that flips the
+    // ranking: `STRATA_VK_PREFILL_COOPMAT=1` now ENABLES the matrix units, and unset stays on the unrolled FMA
+    // path.  The engine A/B (199-token arm, interleaved A,B,A,B in one launch, ids checked in every arm):
+    //
+    //   shipped coopmat   gemm gate/up 1,049 / 1,045 ms   gemm down 881 / 878 ms   prefill 8,989.7 / 8,759.7 ms
+    //   KU-FMA (this)     gemm gate/up   214 /   215 ms   gemm down 601 / 606 ms   prefill 6,695.8 / 6,780.9 ms
+    //
+    // -24.1% of the prefill and +31.6% tok/s (22.03/22.60 -> 29.57/29.20), ranges DISJOINT, id `56a0b28d2de6`
+    // unmoved on all four arms.  The two kernels are the SAME ARITHMETIC (f16 operands, f32 accumulate, k in
+    // increasing order), which is why the ids do not move either way; only the schedule differs.
+    //
+    // The tile kernel has no ragged edge, so it takes only the CM_M-aligned rows and the FMA kernels finish the
+    // rest - which is also what kept the SMALL-T case on the FMA path all along: a row count under CM_M (or a
+    // shape whose N or K is not a tile multiple) leaves t_cma at 0 and nothing is dispatched here.
     static const int cma_env = [] {
         const char* v = std::getenv("STRATA_VK_PREFILL_COOPMAT");
-        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);   // unset -> the default; 0 -> force FMA
+        return v == nullptr ? 0 : (std::atoi(v) != 0 ? 1 : 0);   // unset -> the KU-FMA path; 1 -> the matrix units
     }();
     int64_t t_cma = 0;
     const strata::vulkan::DeviceInfo& di = s.ctx->info();
