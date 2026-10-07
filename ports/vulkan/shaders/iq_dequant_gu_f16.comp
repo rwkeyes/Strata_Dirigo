@@ -1,0 +1,62 @@
+// ports/vulkan/shaders/iq_dequant_gu_f16.comp - the FUSED gate/up dequantiser, straight to the interleaved f16
+// matrix.  THE GLSL FORM OF THE ENGINE'S OWN ONE-LAUNCH `dequant_gu_kernel`
+// (src/kernels/cuda/iq_kernels.cu:1672, driven by `iq_dequant_gu_f16` at :1856):
+//
+//     const int64_t i = blockIdx.x;          // superblock index inside ONE role matrix
+//     const int parity = blockIdx.y;         // 0 = gate, 1 = up
+//     const int64_t r = i / per_row, c = i % per_row;
+//     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2*r + parity)*per_row + c)*QK_K, threadIdx.x);
+//
+// grid = (n_ff * per_row, 2), block = 32, per_row = n_embd/256.
+//
+// WHAT IT REPLACES.  The port composed this engine call out of THREE dispatches: `iq_dequant_f32.spv` over the
+// gate role matrix, `iq_dequant_f32.spv` over the up matrix, then `pf_gu_interleave_f16.spv` to convert and
+// interleave.  This is ONE dispatch that does all three: the decode body is common/iq_dequant.glsl (the SAME
+// single copy the other two shaders include), the conversion is `f16_from_f32_port` (common/f16_bits.glsl, the
+// same round-to-nearest-even rule `f32_to_f16.spv` and the fused `iq_dequant_f16.spv` use), and the layout is
+// the CUDA's `(2r + parity)` mapping written once, here.
+//
+// BOTH ROLE MATRICES ARE IN THE ONE ARENA BUFFER, so they are ONE W binding plus a byte offset.  The engine's
+// call site is `iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, ...)` (src/prefill/prefill.cpp): up
+// is `up_off` bytes after gate in the same blob.  The decoder already takes `wbase` = the byte offset the
+// superblock's ROW starts at within the bound region, so the parity selects the matrix with `wbase = base_gate +
+// parity * delta`, and the destination element is `((2r + parity)*per_row + c) * 256`.
+//
+// THE THREAD MAPPING IS THE ENGINE'S, unaffected: `tid` = lane 0..31, `ibs` = i, `wbase` as above,
+// `obase` = the destination element.  Lanes 32..255 of each 256-lane workgroup are idle, preserving the
+// 32-lane shape verbatim (the same convention iq_dequant_f32.comp / iq_dequant_f16.comp use).
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer W   { uint8_t b[]; } w_b;   // gate, then up (byte delta)
+layout(set = 0, binding = 1, std430) readonly  buffer G1  { uint v[]; } iq1s_g;   // IQ1_S grid (IQ1_M)
+layout(set = 0, binding = 2, std430) readonly  buffer G2  { uint v[]; } iq2s_g;   // IQ2_S grid
+layout(set = 0, binding = 3, std430) readonly  buffer G3  { uint v[]; } iq3xxs_g; // IQ3_XXS grid
+layout(set = 0, binding = 4, std430) readonly  buffer G4  { uint v[]; } iq3s_g;   // IQ3_S grid
+layout(set = 0, binding = 5, std430) readonly  buffer G5  { uint v[]; } iq2xxs_g; // IQ2_XXS grid
+layout(set = 0, binding = 6, std430) readonly  buffer G6  { uint v[]; } iq2xs_g;  // IQ2_XS grid
+layout(set = 0, binding = 7, std430) writeonly buffer OUT { uint16_t y[]; } OU_;  // [2*n_ff][n_embd] fp16
+
+// ty, per_row (= n_embd/256), the gate's byte offset inside the bound region, and the up-gate delta
+layout(push_constant, std430) uniform Pc { int ty; int per_row; uint wbase_gate; uint wbase_delta; } pc;
+
+#include "common/f16_bits.glsl"
+// The decode body's ONE output hook, bound to the engine's conversion (must precede the include).
+#undef  IQ_STORE
+#define IQ_STORE(ip, iv) (OU_.y[(ip)] = f16_from_f32_port(iv))
+#include "common/iq_dequant.glsl"
+
+void main() {
+    if (gl_LocalInvocationID.x >= 32u) return;          // the decoder's 32-lane shape, verbatim
+    const uint parity = gl_WorkGroupID.y;               // 0 = gate, 1 = up
+    const uint i = gl_WorkGroupID.x;                    // superblock index inside the role matrix
+    const uint pr = uint(pc.per_row);
+    const uint r = i / pr, c = i % pr;
+    const uint wbase = pc.wbase_gate + parity * pc.wbase_delta;
+    const uint obase = ((2u * r + parity) * pr + c) * 256u;
+    iq_dq_256(pc.ty, wbase, i, gl_LocalInvocationID.x, obase);
+}

@@ -1,5 +1,99 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE DECODE GAP IS NOT THE KERNELS' EXECUTION — measured with GPU timestamps, this port's decode kernels run at **0.80–3.13 ns/workgroup** (the trivial-kernel floor is 0.7–3.8), a **flat ~3.86 µs is paid per *dispatch*** across every one of 50 families, and the round's GPU time is **13.7 ms against a 237 ms round**; and TARGET 1's SECOND kernel LANDS: the fused gate/up dequantiser (`dequant_gu_kernel`) removes **exactly 7,178** live dispatches (56,051 → 48,873) and takes the `dequant` phase **1,486–1,491 → 911–914 ms (−38.7%, ranges disjoint)**, bit-exact, both ids unmoved (2026-10-07, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH.** The queued brief said the decode gap is "in the kernels' own execution" and asked for per-kernel GPU time on BOTH engines to name it. **TASK A built that instrument on the port** (`STRATA_VK_KERNEL_TIME=1`: a `vkCmdWriteTimestamp` pair at TOP_OF_PIPE / BOTTOM_OF_PIPE around every **recorded** decode dispatch, read back with `VK_QUERY_RESULT_WITH_AVAILABILITY_BIT` and accumulated per shader) and read upstream's half from the engine's **own** stage profiler, which both trees already compile (`STRATA_VERIFY_PROFILE=1`; on the Level-Zero/SYCL backend `gpu_stamp` is deliberately INERT - `verify_kernels.dp.cpp`: "SYCL: no %globaltimer equivalent" - so the only per-stage GPU clock on that tree is `STRATA_VERIFY_EAGER=1`, a host wait + clock at each of the engine's 33 stamps). **The two rankings agree and they invert the brief's premise.** The port's decode executes **9,349 recorded dispatches at 3.861 µs of GPU time each (36.1 ms total, 0.80–3.13 ns/workgroup across the widest grids)**; upstream's decode is **49.59 ms per window (GDN 42.18 + QSA 7.41), 95% of its 40.6 ms round**. So the port's *GPU* work per round is **~13.7 ms against upstream's ~38.5 ms (0.36x)** while its round takes **237 ms against 40.6 ms (5.8x longer)**. The 4.6x per-dispatch cost is **63 µs of NON-GPU time per dispatch**; there is no kernel-side gap to close. **TASK B** then ported the already-worked-out fused gate/up dequantiser to GLSL and the phase DID move, by GPU time: `dequant` **1,486–1,491 → 911–914 ms (−38.7%, disjoint)** with the control arm (the same binary, `STRATA_VK_IQ_GU_FUSED=0`) restoring 1,485–1,486 ms and 56,051 dispatches exactly. **TASK C** pricing says the same as Task A: the top family's per-workgroup cost is AT the floor, so occupancy / vector width / coopmat / the IQ1_M decode-in-the-inner-loop are **not** the lever; the flat per-dispatch latency is.
+
+### 1. TASK A — PER-KERNEL GPU TIME, BOTH ENGINES
+
+**THE PORT — `STRATA_VK_KERNEL_TIME=1` (new, `vulkan/src/device/vk_compute.cpp`).** Each ENCODED (recorded/decode) dispatch is bracketed by a timestamp pair (`fresh_set` is true only at `record_dispatch`; the live/prefill path is untouched). The pool is reset ONCE (at creation) and slots are numbered monotonically, because **the engine records all of a capture's segments before submitting any of them** and every recorded command buffer is replayed - an in-command-buffer reset wipes the other segments on every replay (measured: **183 of ~60,000** executed dispatches ever landed) and a host `VK_QUERY_RESULT_WAIT_BIT` read **blocks the thread that services the doorbell and is a DEVICE LOST here (r=-4, measured)**. With the availability flag and a monotone read-once prefix the run reports **0 un-executed slots and no readback errors**. 199-token arm, kt199_b, `period 52.0833 ns/tick`:
+
+| shader family | disp | workgroups | GPU ms | µs/disp | ns/wg | % of GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| native_gu_any | 1,152 | 1,474,560 | 4.611 | 4.003 | 3.13 | 12.8 |
+| native_down_any | 1,152 | 2,949,120 | 4.495 | 3.902 | 1.52 | 12.5 |
+| quantize_q8_1 | 867 | 25,116 | 3.352 | 3.866 | 133.44 | 9.3 |
+| native_k_mmvq | 633 | 3,171,840 | 2.530 | 3.996 | 0.80 | 7.0 |
+| fused_gr_down | 576 | 184,320 | 2.278 | 3.954 | 12.36 | 6.3 |
+| fused_gr_mix | 576 | 1,474,560 | 2.266 | 3.934 | 1.54 | 6.3 |
+| fused_gr_rs | 576 | 2,304 | 2.185 | 3.793 | 948.19 | 6.1 |
+| fused_gr_inject | 576 | 2,304 | 2.185 | 3.793 | 948.19 | 6.1 |
+| bf16_mmvf_f32 | 318 | 142,848 | 1.222 | 3.841 | 8.55 | 3.4 |
+| swiglu_f32 | 288 | 7,968 | 1.090 | 3.786 | 136.86 | 3.0 |
+| router_top10_f32 | 288 | 288 | 1.051 | 3.650 | 3,649.99 | 2.9 |
+| gdn_step_norm_multi | 144 | 3,456 | 0.559 | 3.880 | 161.68 | 1.5 |
+| **all 50 families** | **9,349** | **10,236,780** | **36.1** | **3.861** | — | 100 |
+
+**THE FINDING IS THE COLUMN THAT DOES NOT MOVE.** `µs/disp` is 3.65–4.00 for every family, over grids from 1 to 1,474,560 workgroups - i.e. the port's decode pays a **flat ~3.86 µs of GPU-visible latency per dispatch** (the same 3.625 µs fixed term this tree's own empty-launch sweep fitted) and the per-workgroup work is **invisible** at the round level. Where the grids are wide enough to measure it, the per-workgroup cost is **at the trivial floor**: `native_k_mmvq` 0.80 ns/wg at 5,011 wg/dispatch, `iq4xs_mmvq` 1.27, `iq4nl_mmvq` 1.44, `native_down_any` 1.52, `fused_gr_mix` 1.54, `native_gu_any` 3.13 - against the bench's 0.7–3.8 ns/wg floor for a kernel that does nothing.
+
+**THE UPSTREAM RANKING — `STRATA_VERIFY_PROFILE=1 STRATA_VERIFY_EAGER=1`, 8-token arm, 32 windows** (the engine's own 33 stamps per layer at the SAME boundaries in both trees; `gpu_stamp` is inert on this backend, see above):
+
+| stage (kernel family) | ms/window | share |
+|---|---:|---:|
+| hc-read0 (= the fused GR read) | 22.650 | 45.7% |
+| VRAM hits (= the resident-expert MoE) | 6.573 | 13.3% |
+| hc-read1+router | 3.991 | 8.0% |
+| q8+qkv/q-idx gemv | 2.969 | 6.0% |
+| out-proj | 2.746 | 5.5% |
+| z + shared+quant + rec + head + ab + conv + copy+combine | 5.066 | 10.2% |
+| **total** | **49.59** | 100% |
+
+**THE TWO RANKINGS SIDE BY SIDE — per round (window), ours vs theirs.** The port carries **3,550 recorded dispatch executions per round** (`vk disp stat by arm`: 49,703 over 14 rounds), so its GPU time per round is **3,550 × 3.861 µs = 13.7 ms** (DERIVED from the measured per-dispatch figure; the 36.1 ms above is 9,349 dispatch executions, i.e. the first execution of every encoded dispatch). Upstream's decode GPU per round is **38.5 ms of `sync` + 1.4 ms of `launch`** (its own patched decode marks, `up199_patched.out`).
+
+| | port (per round) | upstream (per round) | ours/theirs |
+|---|---:|---:|---:|
+| decode GPU | 13.7 ms (derived) | 39.9 ms (measured) | **0.34x** |
+| decode round WALL | 237.3 ms | 40.6 ms | **5.84x** |
+| GPU share of the round | **5.8%** | **98%** | — |
+| recorded dispatches / kernels per round | 3,550 | 1,760 | 2.02x |
+| per-dispatch WALL | 66.8 µs | 22.7 µs | 2.94x |
+| **per-dispatch GPU (measured)** | **3.86 µs** | — (stage-granular) | — |
+
+**The top offenders by our/theirs ratio, mapped family to stage (port ms/round ÷ upstream ms/window):** `fused_gr_*` (4 dispatches, 8.914 ms / 14 rounds = 0.637) against `hc-read0` 22.650 → **0.028x**; `native_*_any + iq*_mmvq + native_k_mmvq` (12.630 / 14 = 0.902) against `VRAM hits` 6.573 → **0.137x**; `gdn_step_norm_multi + fused_gdn_*` (1.351 / 14 = 0.097) against `z+rec+ab+conv` 2.690 → **0.036x**; `bf16_mmvf_f32*` (1.402 / 14 = 0.100) against `head+out-proj` 4.149 → **0.024x**. **Every mapped family is faster on this port, not slower.** The offenders the deliverable asked for do not exist in GPU time; the 4.6x lives in the 63 µs/dispatch of non-GPU time the round pays (Task C).
+
+### 2. TASK B — THE FUSED GATE/UP DEQUANTISER (judged on GPU time)
+
+`dequant_gu_kernel` (`src/kernels/cuda/iq_kernels.cu:1672`, driven by `iq_dequant_gu_f16` at `:1856`) is now **`ports/vulkan/shaders/iq_dequant_gu_f16.comp`**: grid `(n_ff·per_row, 2)`, `parity = gl_WorkGroupID.y`, destination element `((2r + parity)·per_row + c)·256`, ONE W binding with `wbase = wbase_gate + parity·wbase_delta` (the engine's own call site, `src/prefill/prefill.cpp`: `iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, …)`, so the two roles ARE one arena buffer and the delta is a byte offset). It replaces the port's THREE dispatches (`iq_dequant_f32` over gate, `iq_dequant_f32` over up, `pf_gu_interleave_f16`); `STRATA_VK_IQ_GU_FUSED=0` restores the chain as the switch-off control. The decode body is the same single copy (`common/iq_dequant.glsl`) and the conversion is `f16_from_f32_port`, so it is bit-identical by construction and the gate grades it that way.
+
+**THE A/B** (interleaved p/n/c, one config per invocation, every arm at the SAME flags `STRATA_PREFILL_TIMING=1 STRATA_VK_DISP_STAT=1`; prev = the SAVED HEAD binary `9c2f4079…`, new = `83a06785…`, ctl = the new binary with `STRATA_VK_IQ_GU_FUSED=0`):
+
+| arm | prefill ms | prefill tok/s | decode tok/s | `dequant` ms | live dispatches |
+|---|---|---|---:|---:|---:|---:|
+| prev a/b/c | 9,267.8 / 9,290.7 / 9,426.2 | 21.36 / 21.31 / 21.01 | 9.60 / 9.63 / 9.63 | 1,491 / 1,486 / 1,486 | 56,051 |
+| **new a/b/c** | **9,264.7 / 9,234.7 / 9,441.7** | **21.37 / 21.44 / 20.97** | 9.64 / 9.62 / 9.63 | **911 / 912 / 914** | **48,873** |
+| ctl a/b/c | 9,277.4 / 9,425.9 / 9,280.9 | 21.34 / 21.01 / 21.33 | 9.63 / 9.62 / 9.60 | 1,486 / 1,485 / 1,485 | 56,051 |
+
+* **Dispatches removed: exactly 7,178** (56,051 → 48,873): `iq_dequant_f32.spv` **7,178 → 0** (the whole family was gate/up), `pf_gu_interleave_f16.spv` 3,589 → 0, `iq_dequant_gu_f16.spv` 0 → 3,589. The control restores all three counts exactly.
+* **THE PHASE MOVED, AND IT IS DISJOINT: 1,486–1,491 → 911–914 ms = −575 ms = −38.7%** (ranges [1,485, 1,491] against [911, 914]). This is the engine's own GPU-timeline instrument, so it is a **GPU-TIME** win, which is the bar this batch was set.
+* **The END-TO-END prefill did NOT:** prev [9,267.8, 9,426.2] vs new [9,234.7, 9,441.7] - **overlapping** (medians 9,290.7 → 9,264.7, −0.3%). As with the f16 batch, the dispatch removal and the phase land, the rate is not claimed.
+* 8-token arm: p8 9.37 / n8 9.41 tok/s, **32 decoded, id `3aed108cceee`** in both; 199-token arm id **`56a0b28d2de6`** in all nine arms.
+
+### 3. TASK C — THE PER-WORKGROUP GAP, PRICED
+
+For the top family (`native_gu_any`, 4.611 ms, **12.8%** of the port's decode GPU time; 1,280 wg/dispatch):
+* **per-workgroup cost is AT the floor** - 3.13 ns/wg, against the bench's 0.7–3.8 ns/wg for a kernel that does nothing, and against `native_k_mmvq`'s 0.80 and `native_down_any`'s 1.52. **The gap in the per-workgroup dimension is ~0.**
+* **occupancy / vector width / coopmat (XMX) are therefore not the lever.** `VK_KHR_cooperative_matrix` is supported on this card (the gate prints "SUPPORTED - OpCooperativeMatrixMulAddKHR is emitted") but there is no per-workgroup compute time to recover: at 3.13 ns/wg the family is 20–40x BELOW the ~60 ns/wg that the brief's arithmetic attributed to it (that figure divided whole-phase wall time by workgroups, which charges the per-dispatch latency and the host's non-GPU time to the workgroup).
+* **"does this port do more work per workgroup than upstream?"** On this evidence, no: the IQ1_M decode-in-the-inner-loop (`native_k_mmvq`, the `iq1m_mmvq` family) measures **0.80 ns/workgroup at 5,011 wg/dispatch** - the cheapest per-workgroup figure in the whole table. If the in-loop decode cost anything measurable, this is the family it would show up in, and it is the fastest one measured.
+* **WHAT IS ACTUALLY PAID** is per DISPATCH, not per workgroup: a flat **3.861 µs**, 3.65–4.00 µs in every one of 50 families, across grids spanning 1 to 1,474,560 workgroups. That is the launch/drain latency the tree's own sweep fitted at 3.625 µs, and it is the only kernel-side number in this batch that is large. **64 µs of the 66.8 µs wall per dispatch is NOT GPU time at all** - and that, not the kernels, is where the decode gap is (Task A's 13.7 ms of GPU against a 237 ms round).
+
+### 4. REJECTED, OR NAMED AS NOT BUILT
+
+* **`gdn_rec_cols_pipe_kernel` - STAYS DECLINED.** The decode's per-kernel table shows `gdn_step_norm_multi` at **0.559 ms of 36.1 ms (1.5%)** and `fused_gdn_ab + fused_gdn_conv_l2 + gdn_conv_tail` at 0.932 ms (2.6%) - it is not a large decode GPU consumer. (The PREFILL's `gdn recurrence` phase is 2,534 ms of that phase table and is a separate, already-recorded measurement - a later batch may price it there, but this batch's table does not support re-opening it.)
+* **"The decode gap is the kernels' own execution."** Falsified by this batch's own instrument, in the direction that moves the target OFF the kernels: 0.80–3.13 ns/workgroup on the widest grids, every family at a flat 3.86 µs/dispatch, 13.7 ms of GPU in a 237 ms round.
+* **The brief's "~60 ns/workgroup, 15–80x above the floor".** That arithmetic divides wall time by workgroups. Measured on GPU timestamps the same families are at 0.80–3.13 ns/wg.
+* **`STRATA_VERIFY_EAGER=1` on the port.** Tried as a cheap apples-to-apples route (the two trees compile the SAME `verify.cpp`); the port's run aborts with 0 recorded segments (`RUN_RC=2`, `kte8`), so the port's half comes from its own Vulkan timestamps instead.
+* **`VK_QUERY_RESULT_WAIT_BIT` on the readback.** Measured `VK_ERROR_DEVICE_LOST` (r=-4): it blocks the host thread that services the doorbell. Never used.
+* **Reading the `dequant` −575 ms as an end-to-end prefill win.** It is not in the rate at n=3 and is not reported as one.
+
+### 5. GUARDS, BINARIES, LOGS
+
+* Arc gate **928 → 958 passed / 0 failed / 0 skipped** on `intel_icd` (+30 = 15 `is_iq` types × 2 arms: the fused shader against the three-dispatch chain, and the engine wrapper against the same reference - every one bitwise-identical). Nothing fell, nothing new skipped: `lvp_icd` 912 → 942 (the same 4 pre-existing skips), `radeon_icd` 914 → 944/3/2 (the same documented moving-failing set), and the toolchain arm 20/0/0 on all three. `check_port_map.py` rc=0 (168 decode-path symbols - 97 kernel, 47 host, 24 refused); `make_port_map.py` regenerates `PORT-MAP.tsv` **identically** (`git diff` empty); the new shader joins the unclaimed prefill/primitive shaders (150 built, 114 claimed), reported not failed.
+* Binaries: prev **`9c2f4079f22a7dde…`** (the saved HEAD binary, `step2/bins/strata_vulkan.fused`), new **`83a06785b4a176ae…`**.
+* ids **`56a0b28d2de6`** (199-token, 32 decoded) in all nine 199 arms and **`3aed108cceee`** (8-token, list exactly `1 2 3 4 5 6 7 8`) in both 8 arms.
+* **The instrument's own cost, measured at matched flags:** decode **9.62-9.64** tok/s with `STRATA_VK_KERNEL_TIME` off (`n199_a/b/c`) against **9.04** with it on (`kt199_b`) - **−6.1%**, and the `vk disp stat` counts are unmoved. Per-dispatch attribution is quoted only from flagged arms.
+* Logs: kernel-time `/home/bob/step3/logs/kt199_b.log` (and the `ktd8b` diagnostic); A/B `/home/bob/step3/logs/{p,n,c}199_{a,b,c}.log`, `kt199_a.log`, `p8.log`, `n8.log`; upstream stage `/home/bob/step3/logs/up8_prof.{err,out,hdr}`; gate `/home/bob/step3/logs/gate_after_gu.log`; driver `/home/bob/step3/{ab.sh,vk_run.sh,up_prof.sh,ab_shim.sh}`.
+* **Not measured, and named:** upstream's per-kernel GPU time at KERNEL granularity (its decode executes through command buffers whose `urCommandBufferAppendKernelLaunchExp` carries `phEvent = nullptr`, so no per-kernel event exists - the stage table is the finest available); the port's 13.7 ms/round is DERIVED (3,550 executed dispatches/round × the measured 3.861 µs) and not a single-round timestamp trace, because the engine records all segments before submitting any and the instrument reads each slot once, at its first execution; the eager upstream table is host-clocked and includes ~11 ms/window of host gap (its total 49.59 against the non-eager 39.9 ms/round); the prefill's end-to-end win from the fusion; and the ~63 µs/dispatch of non-GPU decode time is NAMED as the target but NOT attributed to a call site by this batch.
+
 ## TARGET 2 CLOSED WITH THE OPPOSITE SIGN, AND TARGET 1's FIRST KERNEL LANDS: the grid-width curve is **LINEAR with a FALLING marginal** — **3.625 µs fixed + 0.7155 ns per workgroup** over 1..262,144 (fit residual < 0.1 µs) — so NARROWING this port's widest grids is a measured **LOSS (+125.9 ms)** and the decode gap is the kernels' own execution; and the flat f16 dequantiser now folds `f32_to_f16` **INTO** the dequantiser (exactly **3,589** dispatches removed, `dequant` **2,052 → 1,486 ms, −27.6%, ranges disjoint**), bit-exact, Arc gate **898 → 928 / 0 / 0**, both ids unmoved (2026-10-07, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH.** The queued brief asked two questions this port's own measurements had left open. **TARGET 2 was "is the per-workgroup cost SUPER-LINEAR in the workgroups a dispatch carries?",** because the two trees' means agree (4.71x the workgroups per dispatch beside 4.61x the µs per dispatch) while their totals do not. **Measured, the answer is NO, and it is no in the strongest form:** one `scale` kernel, one device-local buffer sized for the widest point, one pipeline, one descriptor set, only the GRID WIDTH moving, two sweeps at the engine's own batch (`kLiveBatchMax` = 128 dispatches/replay) — a `pad` sweep (n = 256, so W−1 workgroups run their lane guard and exit, the EMPTY launch) and a `work` sweep (n = W·256). The `pad` sweep fits **µs/dispatch = 3.625 + 0.0007155·W** with a maximum residual of **0.094 µs** at W = 1 and **< 0.013 µs** above W = 256, and its ns/workgroup FALLS monotonically from 3,719.9 (W = 1) to **0.729** (W = 262,144): there is no rising marginal anywhere in the range. The `work` sweep's one super-linear segment (W 12,288 → 65,536 is 5.33x the width for **13.69x** the time) sits exactly where the per-dispatch working set crosses this card's L2 (25.2 → 134.2 MB), and above it the same 4x width costs 3.99x again — **bandwidth, not width**. The earlier "0.102 ms fixed + ~2.8 ns/workgroup" fit was taken over a 30x SMALLER width range and over-predicts at the wide end by **3.9x**. **TARGET 1 was to port the engine's own one-launch fused kernels to GLSL, bit-exactly, one at a time.** One landed: `dequant_flat_kernel<__half>` (`src/kernels/cuda/iq_kernels.cu:1823`) → **`iq_dequant_f16.spv`**, which takes the port's `iq_dequant_f16` from two dispatches (the flat f32 dequantiser into a scratch, then `f32_to_f16.spv`) to **one**, removing **exactly 3,589** live dispatches (59,640 → 56,051; `f32_to_f16.spv` 3,625 → 0, of which the other 36 are `f32_to_f16_bulk`'s) and moving its phase `dequant` from **2,052 ms to 1,486 ms (−27.6%, disjoint)** — but NOT the end-to-end prefill, whose ranges overlap. The other two families were **not built**, and the reasons are named below rather than implied.

@@ -21713,6 +21713,110 @@ void case_iq_dequant_f16_entry(Ctx& ctx, const std::string& dir) {
     ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_g5); ctx.free(b_g6);
 }
 
+// 3c. `iq_dequant_gu_f16` -> iq_dequant_gu_f16.spv.  THE FUSED FORM of the engine's own ONE-LAUNCH
+// `dequant_gu_kernel` (src/kernels/cuda/iq_kernels.cu:1672, driven by `iq_dequant_gu_f16` at :1856): grid
+// `(n_ff * per_row, 2)`, `parity = blockIdx.y`, destination element `((2r + parity) * per_row + c) * 256`.
+// It replaces the port's THREE-dispatch composition - `iq_dequant_f32.spv` over gate, `iq_dequant_f32.spv` over
+// up, then `pf_gu_interleave_f16.spv` - so this case grades the fused output BITWISE against exactly that chain,
+// and then grades the ENGINE WRAPPER (whose default IS the fused path) against the same reference.  BF16 (ty 30)
+// is skipped: `iq_dequant_gu_f16`'s own host check is `iq_type_covered` (is_iq).  The fixture's decoded mass must
+// be non-zero or the comparison is vacuous and the verdict FAILS.
+void case_iq_dequant_gu_f16_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq_dequant_gu_f16.spv") || !have(dir, "iq_dequant_f32.spv") ||
+        !have(dir, "pf_gu_interleave_f16.spv"))
+        return;
+    if (!ctx.info().storage_buffer_8bit) { skip("iq_dequant_gu_f16 entry", "device lacks storageBuffer8BitAccess"); return; }
+    if (!ctx.info().storage_buffer_16bit || !ctx.info().shader_int16) {
+        skip("iq_dequant_gu_f16 entry", "device lacks storageBuffer16BitAccess/shaderInt16");
+        return;
+    }
+    const uint32_t n_embd = 512, per_row = n_embd / 256, n_ff = 6, n = n_ff * n_embd;
+    const uint32_t n_sb_role = n_ff * per_row, n_out = 2 * n;
+    const size_t role_max = (size_t) n_sb_role * 512;             // BF16's superblock is the widest
+    Buf b_g = ctx.alloc(role_max * 2), b_f = ctx.alloc((size_t) n * 4 * 2);
+    Buf b_h = ctx.alloc((size_t) n_out * 2), b_h2 = ctx.alloc((size_t) n_out * 2);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq1sGrid)), b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid)), b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_g5 = ctx.alloc(sizeof(strata::vkport::kIq2xxsGrid)), b_g6 = ctx.alloc(sizeof(strata::vkport::kIq2xsGrid));
+    ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    ctx.write(b_g5, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
+    ctx.write(b_g6, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
+    VkPipeline p32 = ctx.pipeline(dir + "/iq_dequant_f32.spv", 8, 4);
+    VkPipeline pil = ctx.pipeline(dir + "/pf_gu_interleave_f16.spv", 3, 8);
+    VkPipeline pgu = ctx.pipeline(dir + "/iq_dequant_gu_f16.spv", 8, 16);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(8ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("iq_dequant_gu_f16 entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(b_g); ctx.free(b_f); ctx.free(b_h); ctx.free(b_h2);
+        ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_g5); ctx.free(b_g6);
+        return;
+    }
+    // gate and up CONTIGUOUS in the one arena buffer, exactly as the engine's own call site hands them
+    uint8_t* dgate = strata::vulkan::arena_alloc<uint8_t>(*s, role_max * 2);
+    uint8_t* dup = dgate + ((role_max + 255) & ~(size_t) 255);
+    uint16_t* dout = strata::vulkan::arena_alloc<uint16_t>(*s, n_out);
+
+    for (const IqFmt& f : kIqFmts) {
+        if (f.ty == 30) continue;                    // iq_dequant_gu_f16 refuses BF16 (its host check is is_iq())
+        const size_t role_bytes = (size_t) n_sb_role * f.sb;
+        std::vector<uint8_t> wg = iq_fixture(f.ty, n_sb_role, f.sb, 3);
+        std::vector<uint8_t> wu = iq_fixture(f.ty, n_sb_role, f.sb, 11);
+        std::vector<uint8_t> both(role_max * 2, 0);
+        std::memcpy(both.data(), wg.data(), role_bytes);
+        std::memcpy(both.data() + ((role_max + 255) & ~(size_t) 255), wu.data(), role_bytes);
+        ctx.write(b_g, both.data(), both.size());
+        struct { int ty; } pc{f.ty};
+        // (A) THE CHAIN THE FUSED FORM REPLACES: two f32 dequantises, then the interleave+convert shader.
+        ctx.dispatch(p32, {&b_g, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_f}, &pc, sizeof(pc), n_sb_role);
+        // the up matrix is the SAME buffer viewed from its offset: bind a shifted copy for the second dequant
+        Buf b_gu = b_g; b_gu.offset = b_g.offset + ((role_max + 255) & ~(size_t) 255);
+        Buf b_fu = b_f; b_fu.offset = b_f.offset + (size_t) n * 4;
+        ctx.dispatch(p32, {&b_gu, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_fu}, &pc, sizeof(pc), n_sb_role);
+        struct { int32_t n_ff, n_embd; } pc2{(int32_t) n_ff, (int32_t) n_embd};
+        ctx.dispatch(pil, {&b_f, &b_fu, &b_h2}, &pc2, sizeof(pc2), (uint32_t) ((n_out + 255) / 256));
+        std::vector<uint8_t> ref((size_t) n_out * 2);
+        ctx.read(b_h2, ref.data(), ref.size());
+        double mass = 0;
+        {
+            std::vector<float> fg((size_t) n);
+            ctx.read(b_f, fg.data(), fg.size() * 4);
+            for (float v : fg) mass += std::fabs((double) v);
+        }
+        // (B) THE FUSED SHADER on the same fixture.
+        std::vector<uint8_t> sink((size_t) n_out * 2, 0xC3);
+        ctx.write(b_h, sink.data(), sink.size());
+        struct { int32_t ty; int32_t per_row; uint32_t wbase_gate; uint32_t wbase_delta; } pcg{
+            f.ty, (int32_t) per_row, 0u, (uint32_t) ((role_max + 255) & ~(size_t) 255)};
+        ctx.dispatch(pgu, {&b_g, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_h}, &pcg, sizeof(pcg), n_sb_role, 2);
+        std::vector<uint8_t> img(sink.size());
+        ctx.read(b_h, img.data(), img.size());
+        int bad = 0;
+        for (size_t i = 0; i < ref.size(); ++i) if (img[i] != ref[i]) ++bad;
+        char lab[176];
+        std::snprintf(lab, sizeof lab, "iq_dequant_gu_f16 entry (%s): fused shader == the three-dispatch chain, bitwise", f.name);
+        verdict(lab, bad == 0 && mass > 1e-3, bad, (int) ref.size(), 0, "f16 elements differ / vacuous fixture");
+        // (C) THE ENGINE WRAPPER, whose DEFAULT is the fused path.
+        strata::vulkan::stream_write(*s, dgate, both.data(), both.size());
+        std::vector<uint8_t> s2((size_t) n_out * 2, 0xC3);
+        strata::vulkan::stream_write(*s, dout, s2.data(), s2.size());
+        strata::kernels::iq_dequant_gu_f16(f.ty, dgate, dup, (int64_t) n_ff, (int64_t) n_embd, dout, s);
+        std::vector<uint8_t> wgot((size_t) n_out * 2);
+        strata::vulkan::stream_read(*s, dout, wgot.data(), wgot.size());
+        int badw = 0;
+        for (size_t i = 0; i < ref.size(); ++i) if (wgot[i] != ref[i]) ++badw;
+        std::snprintf(lab, sizeof lab, "iq_dequant_gu_f16 entry (%s): engine wrapper == the three-dispatch chain, bitwise", f.name);
+        verdict(lab, badw == 0, badw, (int) ref.size(), 0, "f16 elements differ (wrapper / default fused path)");
+    }
+    strata::vulkan::stream_close(s);
+    ctx.free(b_g); ctx.free(b_f); ctx.free(b_h); ctx.free(b_h2);
+    ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_g5); ctx.free(b_g6);
+}
+
 // 3. `iq_embed_rows` -> iq_embed_rows.spv.  2-D grid (superblock, token), a DERANGED token list, and a capture arm.
 void case_iq_embed_rows_entry(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "iq_embed_rows.spv")) return;
@@ -25549,6 +25653,10 @@ int main(int argc, char** argv) {
     // `dequant_flat_kernel<__half>`), graded bitwise against the two-dispatch chain it replaces and through
     // its own engine wrapper.  APPENDED here for the shared-RNG reason the block above states.
     case_iq_dequant_f16_entry(ctx, dir);
+    // THIS BATCH: TARGET 1's SECOND KERNEL - the FUSED gate/up dequantiser (the engine's own one-launch
+    // `dequant_gu_kernel`), graded bitwise against the three-dispatch chain it replaces and through its own
+    // engine wrapper.  APPENDED here for the shared-RNG reason the block above states.
+    case_iq_dequant_gu_f16_entry(ctx, dir);
     case_iq_embed_rows_entry(ctx, dir);
     case_s_gemv_split_async_entry(ctx, dir);
     case_moe_hit_select_entry(ctx, dir);

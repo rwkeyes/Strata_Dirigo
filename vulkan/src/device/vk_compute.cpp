@@ -84,6 +84,147 @@ struct DispStat {
     std::map<uint64_t, uint64_t> wg_hist, wg_hist_rec;
 };
 DispStat g_ds;
+// ---- STRATA_VK_KERNEL_TIME: PER-DISPATCH GPU TIME (measurement-only, off unless the env var is set) --------
+// This is the port's half of the cross-engine per-kernel attribution the decode target needs.  The recorded
+// (decode) arm's dispatches are the engine's replay, so each ENCODED dispatch is wrapped with a timestamp-query
+// PAIR (TOP_OF_PIPE before vkCmdDispatch, BOTTOM_OF_PIPE after it, before the chain barrier) and the pair is
+// read back after the submission's fence WAIT - which is what makes it correct across a replay: the recorded
+// command buffer re-writes the same slot every time it is re-submitted, so an end-of-run read would only ever
+// see the LAST replay.  Read-and-reset per submit accumulates every replay.  `fresh_set` is true ONLY at
+// `record_dispatch` (the live/prefill path passes false), so the prefill's own dispatches are not timed here.
+// THE INSTRUMENT'S OWN COST is the two extra commands per dispatch; it is quoted by running the same arm with
+// the flag on and off (the batch's table), never assumed.
+namespace {
+struct KtSlot { std::string spv; uint32_t i; uint64_t wg; };
+struct KtStat {
+    bool on = std::getenv("STRATA_VK_KERNEL_TIME") != nullptr;
+    bool ready = false, overflow = false, printed = false, dbg = false;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    uint32_t cap = 0, next = 0;
+    float period_ns = 0.0f;
+    std::vector<KtSlot> slots;   // EVERY recorded slot, in recording order (readings happen in the same order)
+    size_t done_upto = 0;        // everything before this index has been read and accumulated
+    std::vector<std::pair<std::string, uint64_t>> disp, wg;
+    std::vector<std::pair<std::string, double>> ns;
+    void add(const std::string& s, double ns_add, uint64_t wg_add) {
+        auto bump = [&](std::vector<std::pair<std::string, uint64_t>>& v, uint64_t x) {
+            for (auto& kv : v) if (kv.first == s) { kv.second += x; return; }
+            v.push_back({s, x});
+        };
+        bump(disp, 1); bump(wg, wg_add);
+        for (auto& kv : ns) if (kv.first == s) { kv.second += ns_add; return; }
+        ns.push_back({s, ns_add});
+    }
+    uint64_t get(const std::vector<std::pair<std::string, uint64_t>>& v, const std::string& s) const {
+        for (const auto& kv : v) if (kv.first == s) return kv.second;
+        return 0;
+    }
+    double getn(const std::string& s) const {
+        for (const auto& kv : ns) if (kv.first == s) return kv.second;
+        return 0.0;
+    }
+    uint64_t disp_total() const {
+        uint64_t t = 0;
+        for (const auto& kv : disp) t += kv.second;
+        return t;
+    }
+};
+KtStat g_kt;
+void kt_create(VkPhysicalDevice pd, VkDevice dev, uint32_t qfam) {
+    g_kt.ready = true;                       // decided once; a failure leaves `ready` false forever
+    VkPhysicalDeviceProperties pr{};
+    vkGetPhysicalDeviceProperties(pd, &pr);
+    g_kt.period_ns = pr.limits.timestampPeriod;
+    uint32_t n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, nullptr);
+    std::vector<VkQueueFamilyProperties> q(n);
+    if (n) vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, q.data());
+    const uint32_t vb = qfam < n ? q[qfam].timestampValidBits : 0;
+    if (vb == 0) {
+        std::fprintf(stderr, "vk kernel time: queue family %u reports timestampValidBits 0 - instrument OFF\n", qfam);
+        g_kt.ready = false;
+        return;
+    }
+    g_kt.cap = 2u * 32768u;                  // 65,536 timestamps = 32,768 timed dispatches in one recorded step
+    VkQueryPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    ci.queryCount = g_kt.cap;
+    if (vkCreateQueryPool(dev, &ci, nullptr, &g_kt.pool) != VK_SUCCESS) {
+        std::fprintf(stderr, "vk kernel time: vkCreateQueryPool failed - instrument OFF\n");
+        g_kt.ready = false;
+        return;
+    }
+    vkResetQueryPool(dev, g_kt.pool, 0, g_kt.cap);
+    std::fprintf(stderr, "vk kernel time: ON - %u timestamp queries, period %.4f ns/tick, valid bits %u, "
+                         "queue family %u (the RECORDED/decode arm only)\n", g_kt.cap, g_kt.period_ns, vb, qfam);
+}
+// read whatever the submissions so far have EXECUTED, accumulate it, and never read the same slot twice.
+//
+// THE SHAPE MATTERS: the engine records ALL of a capture's segments before submitting any of them, and each
+// recorded command buffer is replayed many times.  So (a) a whole-pool reset inside the command buffer wipes
+// the other segments' queries on every replay (measured: 183 of ~60,000 executed dispatches ever landed), and
+// (b) nothing may be reset or cleared per submit.  The pool is reset ONCE, at creation; slots are numbered
+// monotonically across every recording; and each read walks only the un-read prefix, stopping at the first
+// query that is not available yet - the un-executed tail belongs to segments the host has not submitted.
+// VK_QUERY_RESULT_WITH_AVAILABILITY_BIT: NEVER BLOCK THE HOST.  A `WAIT_BIT` read hangs the host thread that
+// services the device doorbell and that is a DEVICE LOST here (measured: r=-4), not a slow read.
+void kt_flush(VkDevice dev) {
+    if (!g_kt.on || g_kt.pool == VK_NULL_HANDLE) return;
+    if (g_kt.done_upto >= g_kt.slots.size() || g_kt.next == 0) return;
+    const size_t lo_q = g_kt.slots[g_kt.done_upto].i;
+    const size_t nq = (size_t) g_kt.next - lo_q;
+    if (nq == 0) return;
+    std::vector<uint64_t> t(nq * 2, 0);
+    const VkResult r = vkGetQueryPoolResults(dev, g_kt.pool, (uint32_t) lo_q, (uint32_t) nq, t.size() * 8, t.data(), 16,
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (!g_kt.dbg) {
+        g_kt.dbg = true;
+        std::fprintf(stderr, "vk kernel time[dbg]: r=%d lo=%zu nq=%zu slots=%zu t0=%llu avail0=%llu\n", (int) r, lo_q,
+                     nq, g_kt.slots.size(), (unsigned long long) t[0], (unsigned long long) t[1]);
+    }
+    // VK_NOT_READY is a NORMAL return here even with the availability flag (Mesa returns it when some queries in
+    // the range are not ready), and the results buffer IS written in that case; only a real error is a failure.
+    if (r != VK_SUCCESS && r != VK_NOT_READY) {
+        g_kt.overflow = true;
+        if (r == VK_ERROR_DEVICE_LOST) g_kt.on = false;
+        return;
+    }
+    auto val = [&](uint32_t i) -> int64_t { return t[(size_t) (i - lo_q) * 2 + 1] != 0 ? (int64_t) t[(size_t) (i - lo_q) * 2] : -1; };
+    while (g_kt.done_upto < g_kt.slots.size()) {
+        const KtSlot& s = g_kt.slots[g_kt.done_upto];
+        const int64_t a = val(s.i), b = val(s.i + 1);
+        if (a < 0 || b < 0) break;                       // this segment has not been submitted yet
+        g_kt.add(s.spv, (b >= a ? (double) (b - a) : 0.0) * (double) g_kt.period_ns, s.wg);
+        ++g_kt.done_upto;
+    }
+}
+void kt_dump() {
+    if (!g_kt.on || g_kt.printed) return;
+    g_kt.printed = true;
+    if (g_kt.ns.empty()) {
+        std::fprintf(stderr, "vk kernel time: no RECORDED dispatch was timed (the decode arm was never reached)\n");
+        return;
+    }
+    std::vector<std::pair<std::string, double>> v = g_kt.ns;
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    double tot = 0;
+    for (const auto& kv : v) tot += kv.second;
+    std::fprintf(stderr, "vk kernel time (RECORDED/decode arm): %zu shader families, %.1f ms GPU over %llu dispatches "
+                         "(%zu recorded slots never executed%s)\n",
+                 v.size(), tot / 1e6, (unsigned long long) g_kt.disp_total(),
+                 g_kt.slots.size() - g_kt.done_upto, g_kt.overflow ? "; READBACK ERRORS SEEN - PARTIAL" : "");
+    for (size_t i = 0; i < v.size() && i < 30; ++i) {
+        const std::string& s = v[i].first;
+        const size_t slash = s.find_last_of('/');
+        const std::string b = s.substr(slash == std::string::npos ? 0 : slash + 1);
+        const uint64_t d = g_kt.get(g_kt.disp, s), w = g_kt.get(g_kt.wg, s);
+        std::fprintf(stderr, "vk kernel time %-40s disp=%-8llu wg=%-11llu gpu_ms=%-10.3f us/disp=%-9.3f ns/wg=%.2f\n",
+                     b.c_str(), (unsigned long long) d, (unsigned long long) w, v[i].second / 1e6,
+                     d ? v[i].second / 1e3 / (double) d : 0.0, w ? v[i].second / (double) w : 0.0);
+    }
+}
+}  // namespace
 // ---- STRATA_VK_NOBARRIER: MEASUREMENT-ONLY, UNSAFE.  Every dispatch carries a full COMPUTE -> COMPUTE pipeline
 // barrier (`encode_dispatch`'s `chain_barrier`), which is what ORDERS one kernel's write against the next
 // kernel's read inside a recorded step.  This switch ELIDES it so the barrier can be PRICED - the answers are
@@ -624,6 +765,7 @@ Ctx::Ctx(int want_device, bool need_16bit) {
                              "only where a bound buffer REGION overlaps one touched since the last barrier.  A "
                              "hazard it does not see is a WRONG answer; this PRICES the barrier.\n");
     if (g_xs.on) std::atexit(xfer_stat_dump);
+    if (g_kt.on) std::atexit(kt_dump);
     g_fs_on_env = std::getenv("STRATA_VK_FLUSH_STAT") != nullptr;
     if (g_fs_on_env) std::atexit(flush_stat_dump);
     VkApplicationInfo app{};
@@ -892,6 +1034,7 @@ Ctx::~Ctx() {
     disp_stat_dump();
     xfer_stat_dump();
     flush_stat_dump();
+    kt_dump();
     flush_live();   // the last batch must reach the device before the device goes away
     if (live_fence_ && dev_) vkDestroyFence(dev_, live_fence_, nullptr);
     if (live_cb_ && cmd_pool_) vkFreeCommandBuffers(dev_, cmd_pool_, 1, &live_cb_);
@@ -1502,11 +1645,13 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    std::string spv_path;
     for (const Pipe& p : pipes_) {
         if (p.pipe == pipe) {
             layout = p.layout;
             set = p.set;
             set_layout = p.set_layout;
+            spv_path = p.spv_path;
         }
     }
     if (!layout) {
@@ -1543,7 +1688,27 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
     if (push_bytes) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+    // STRATA_VK_KERNEL_TIME: a timestamp pair around THIS dispatch.  `fresh_set` is true only for the recorded
+    // step (the decode's replay); the live (prefill) path passes false and is not timed here.
+    bool kt_here = false;
+    uint32_t kt_i = 0;
+    if (g_kt.on && fresh_set && !g_kt.ready) kt_create(phys_, dev_, queue_family_);
+    // NO RESET IS EMITTED HERE.  The pool is reset ONCE, at creation; a reset inside the command buffer is
+    // re-executed on every replay and wipes the OTHER segments' queries (measured: only 183 of ~60,000 executed
+    // dispatches ever landed).  Slots are numbered monotonically and read once each (see kt_flush).
+    if (g_kt.on && fresh_set && g_kt.ready && g_kt.next + 2 <= g_kt.cap) {
+        kt_i = g_kt.next;
+        g_kt.next += 2;
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, kt_i);
+        kt_here = true;
+    } else if (g_kt.on && fresh_set && g_kt.ready) {
+        g_kt.overflow = true;   // the pool is full for this recorded step: report it rather than pretend
+    }
     vkCmdDispatch(cb, groups, groups_y, 1);
+    if (kt_here) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_kt.pool, kt_i + 1);
+        g_kt.slots.push_back(KtSlot{spv_path, kt_i, (uint64_t) groups * (uint64_t) groups_y});
+    }
     if (chain_barrier) {
         // One kernel's output is the next one's input inside a recorded step.  Compute -> compute, not to host:
         // the step has exactly one host-read barrier, at its end.  COUNTED whether or not it is emitted (the
@@ -1815,6 +1980,7 @@ void Ctx::submit_segment(const CaptureSeg& seg) {
     // arm had no attribution.  Charged here, per segment, with its dispatch count.
     VK_CHECK(vkWaitForFences(dev_, 1, &seg.fence, VK_TRUE, UINT64_MAX));
     const double _td = vk_ms();
+    kt_flush(dev_);   // STRATA_VK_KERNEL_TIME: read this replay's per-dispatch timestamps, then reset the pool
     if (g_ds.on) {
         ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_seg;
         g_ds.t_submit += _tw - _ts;
@@ -1847,6 +2013,7 @@ void Ctx::submit_recorded() {
     VK_CHECK(vkResetFences(dev_, 1, &rec_fence_));   // the fence was signalled by the previous submission
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, rec_fence_));
     VK_CHECK(vkWaitForFences(dev_, 1, &rec_fence_, VK_TRUE, UINT64_MAX));
+    kt_flush(dev_);   // STRATA_VK_KERNEL_TIME: read this replay's per-dispatch timestamps, then reset the pool
     if (g_ds.on) { ++g_ds.submits; ++g_ds.waits; ++g_ds.sub_rec; }
 }
 

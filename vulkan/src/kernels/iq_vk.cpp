@@ -180,6 +180,43 @@ void gu_interleave_f16(Stream& s, const float* gate, const float* up, uint16_t* 
     s.ctx->dispatch(p, {&gv, &uv, &ov}, &pc, sizeof(pc), groups_for(n));
 }
 
+// ---- `iq_dequant_gu_f16` -> iq_dequant_gu_f16.spv, ONE dispatch -------------------------------------------//
+// THE GLSL FORM OF THE ENGINE'S OWN ONE-LAUNCH `dequant_gu_kernel` (src/kernels/cuda/iq_kernels.cu:1672,
+// driven by `iq_dequant_gu_f16` at :1856): grid `(n_ff * per_row, 2)`, block 32, `parity = blockIdx.y`,
+// destination element `((2r + parity) * per_row + c) * 256`.  Both role matrices live in the ONE arena buffer
+// (the engine's own call site is `iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, ...)`,
+// src/prefill/prefill.cpp), so this is ONE W binding plus a byte delta: the decoder already takes `wbase` = the
+// byte offset the superblock's ROW starts at inside the bound region, and `wbase = gate_off + parity * delta`.
+// It REPLACES the port's three-dispatch composition - `iq_dequant_f32` over gate, `iq_dequant_f32` over up, then
+// `pf_gu_interleave_f16` - with the engine's single launch.  Same decode body (common/iq_dequant.glsl, one copy),
+// same conversion (`f16_from_f32_port`, the rule `f32_to_f16.spv` uses), so it is bit-identical by construction
+// and the numeric gate's `iq_dequant_gu_f16` case checks it against the chain it replaces.
+// Bindings (0..7): W, G1..G6, OUT(uint16).  Push {int ty; int per_row; uint wbase_gate; uint wbase_delta}.
+static void iq_dequant_gu_f16_fused(Stream& s, int ggml_type, const void* gate, const void* up, int64_t n_ff,
+                                    int64_t n_embd, uint16_t* dst) {
+    const int64_t per_row = n_embd / 256;
+    const uint64_t role_bytes = strata::kernels::iq_row_bytes(ggml_type, n_embd) * (uint64_t) n_ff;
+    Buf gv{}, uv{}, ov{};
+    if (!arena_resolve(s, gate, role_bytes, gv) || !arena_resolve(s, up, role_bytes, uv) ||
+        !arena_resolve(s, dst, (uint64_t) (2 * n_ff) * (uint64_t) n_embd * 2, ov))
+        refuse("iq_dequant_gu_f16", "a pointer is not inside this stream's arena");
+    // THE ONE-ARENA-BUFFER CONTRACT.  The CUDA takes two pointers; Vulkan has no pointer, so the two roles must
+    // be one bound region with a byte delta.  If the engine ever hands two unrelated allocations the delta is
+    // meaningless - refuse rather than ship a plausible wrong row (the port's worst bug class).
+    if (gv.buffer != uv.buffer)
+        refuse("iq_dequant_gu_f16", "gate and up are not slices of the same arena buffer (no valid byte delta)");
+    const uint64_t base = gv.offset < uv.offset ? gv.offset : uv.offset;
+    const uint64_t g0 = gv.offset - base, u0 = uv.offset - base;
+    Buf wv = gv;
+    wv.offset = base;                                 // the bound region starts at the lower role matrix
+    Buf g1{}, g2{}, g3{}, g4{}, g5{}, g6{};
+    iq_grids(s, g1, g2, g3, g4, g5, g6);
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/iq_dequant_gu_f16.spv", 8, 16);
+    struct { int32_t ty; int32_t per_row; uint32_t wbase_gate; uint32_t wbase_delta; } pc{
+        ggml_type, (int32_t) per_row, (uint32_t) g0, (uint32_t) (u0 - g0)};
+    s.ctx->dispatch(p, {&wv, &g1, &g2, &g3, &g4, &g5, &g6, &ov}, &pc, sizeof(pc), (uint32_t) (n_ff * per_row), 2);
+}
+
 // ---- `iq_dequant_f16` -> iq_dequant_f16.spv, ONE dispatch ------------------------------------------------
 // THE GLSL FORM OF THE ENGINE'S OWN SINGLE LAUNCH.  `iq_dequant_f16` (src/kernels/cuda/iq_kernels.cu:1823) is
 // `dequant_flat_kernel<__half>`: ONE 32-lane block per 256-value superblock, with `dq_dispatch<__half>`
@@ -257,10 +294,19 @@ void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t 
         std::exit(1);
     }
     strata::vulkan::Stream& s = strata::vulkan::stream_for("iq_dequant_gu_f16", stream);
-    float* tmp = strata::vulkan::iq_scratch(s, (uint64_t) n * 8);   // gate then up, both f32
-    strata::vulkan::iq_dequant_f32(s, ggml_type, gate, n, tmp);
-    strata::vulkan::iq_dequant_f32(s, ggml_type, up, n, tmp + n);
-    strata::vulkan::gu_interleave_f16(s, tmp, tmp + n, dst, n_ff, n_embd);
+    // THE FUSED FORM IS THE DEFAULT (the engine's own one-launch `dequant_gu_kernel` shape);
+    // `STRATA_VK_IQ_GU_FUSED=0` restores the three-dispatch chain (iq_dequant_f32 over gate, iq_dequant_f32 over
+    // up, then pf_gu_interleave_f16), which is the switch-off CONTROL an engine A/B needs so a rebuild cannot be
+    // mistaken for the change.  THE IDS DECIDE: both arms must print 56a0b28d2de6 / 3aed108cceee.
+    const char* fused_env = std::getenv("STRATA_VK_IQ_GU_FUSED");
+    if (fused_env != nullptr && std::atoi(fused_env) == 0) {
+        float* tmp = strata::vulkan::iq_scratch(s, (uint64_t) n * 8);   // gate then up, both f32
+        strata::vulkan::iq_dequant_f32(s, ggml_type, gate, n, tmp);
+        strata::vulkan::iq_dequant_f32(s, ggml_type, up, n, tmp + n);
+        strata::vulkan::gu_interleave_f16(s, tmp, tmp + n, dst, n_ff, n_embd);
+        return;
+    }
+    strata::vulkan::iq_dequant_gu_f16_fused(s, ggml_type, gate, up, n_ff, n_embd, dst);
 }
 
 // ---- THE IQ CAPABILITY PREDICATES (model load, not decode) ---------------------------------------------------
