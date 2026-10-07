@@ -13,6 +13,7 @@ Companion documents, and which one to open for what:
 | document | what it is |
 |---|---|
 | `PERFORMANCE-FINAL-SURVEY.md` (this directory, and `~/strata-dirigo-performance-survey.md`) | the performance survey: ranked levers, the ten closed negatives in full, and the commands to re-check every number |
+| `FINAL-ANALYSIS.md` (and `~/strata-dirigo-final-analysis.md`) | **where Vulkan's ability ended**: which limits are the API's or the driver's, which are the port's unfinished work, and which are gaps in the evidence — plus every performance number in one table |
 | `/home/bob/strata-port-workqueue.md` | the session ledger — the day-by-day detail behind everything here |
 | `NEXT.md`, `STATUS.md` | the port's own working docs (both now carry banners pointing at the survey) |
 | `/home/bob/step4/z820b-hip/` | the raw HIP control-run artifacts, fetched off z820b |
