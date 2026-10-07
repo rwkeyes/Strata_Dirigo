@@ -5,6 +5,11 @@ clean tree.** Purpose: one broad, comprehensive check of where the remaining per
 before the project is mothballed. Written for whoever picks it up — including the possibility that nobody does.
 (Updated once after the survey: L3 shipped as `fa6f6da`, and the numbers in sections 1 and 3 are its result.)
 
+> **For the current state at mothball — HEAD, gate counts, the corrections log, the closed negatives in one
+> table, and where the evidence and the session harnesses live — see `MOTHBALL-REPORT.md`.** This survey keeps
+> the per-claim detail and the re-check commands; the report is the entry point. (The HEAD quoted above is the
+> one this survey was written against; it has since moved.)
+
 **Labels used throughout, and they matter:** **[verified]** = measured in this session with the instrument
 named; **[measured earlier]** = in this repo's records (`NEXT.md`, `PERFORMANCE-B70-2026-10-06.md`, the
 session ledger `/home/bob/strata-port-workqueue.md`), not re-run here; **[hypothesis]** = reasoned, not
