@@ -1,5 +1,39 @@
 # Start here next session
 
+## THE 37.81/38.63 tok/s "MACHINERY CEILING" IS VOID (DEGENERATE PATH), `sync` IS `ms/round`, AND THE SERIALISATION IS THE CHAIN (2026-10-07; harness re-check, no GPU)
+
+**THE CEILING IS RETIRED — and it was never in this file.** The `triv199`/`triv199b` arms that produced
+**38.63 / 37.81 tok/s** both held output id **`d01eee6a3948`** — 17 rounds, **output all-zeros** — and so did the later
+144.58 tok/s arm. The shipped greedy sampler answers token **0** when no candidate beats `-inf`
+(`ports/vulkan/shaders/sampler_greedy.comp:106`), so an all-zeros decode means **non-finite head logits**. Every
+"trivial-work machinery ceiling" this project has quoted came off the **DEGENERATE path**; a number that depends on a
+numerical fault is not a ceiling. **VOID** wherever it appears — `strata-decode-latency-findings.md` and the queue
+briefs `2026-10-07-what-makes-a-producer-expensive.md`, `2026-10-07-measure-actual-memory-volumes.md`,
+`2026-10-07-family-ablation-ranked.md`, `2026-10-07-prefill-is-the-deficit.md` — and **struck from the comparisons that
+lean on it** (the "the machinery is capable of the peer's 39.19" reading; the "same technique that found the ceiling"
+references). History annotated, not deleted. **No valid machinery ceiling has been measured** — and the 2026-10-07 nan
+hunt shows why the trivial-work ROUTE cannot produce one: trivialising the work feeds the head garbage and the head
+goes non-finite (see the newest section above).
+
+**THE UNIT — `sync … ms/round`, not ms/run.** The `verify window` line prints `sync … ms/round` (the label is on the
+line). Read as ms/run it invents a ~30x discrepancy; there is none: `143.364 ms/round x 19 = 2,724 ms` against the
+`2,895 ms` decode.
+
+**THE VERDICT — the serialisation IS the CHAIN.** A recorded-dispatch-pair probe found **0 of 7,719 pairs independent**
+under the interleaved order (`pair_split_1`; `pair_ctl_1` 0 of 5,355), so no reordering of the existing links is
+byte-disjoint. A **two-queue shared-expert probe makes no difference**: `sync` **143.127 / 143.219 / 143.326** ms/round
+(two queues) against **143.235 / 143.438 / 143.364** (one queue), all holding `3aed108cceee`. Fully trivialising the
+work drops `sync` **143.3 → 10.3 ms/round**, so the **host handshake is ≤ ~7%** and the remaining **~93%** is the
+per-link **producer-dependency on real memory work** — the GPU chain's own execution, not the host handshake and not a
+reorderable layout. Levers are fewer links (~1.5% residual measured) or cheaper links.
+
+**The literal "two token-groups on two queues" arm does not exist in this tree** — it creates **one** compute queue
+(`vkGetDeviceQueue(dev_, queue_family_, 0, &queue_)`, `vulkan/src/device/vk_compute.cpp:1259`) — so that kill condition
+is **untestable as written**.
+
+**NOT MEASURED (named, not fixed):** `STRATA_VERIFY_PROFILE` REFUSES on this port (`gpu_stamp` is unported), so which of
+the three `wait_flag_ge` seams dominates the handshake remains unmeasured.
+
 ## THE NAN INSTRUMENT IS VALIDATED, AND THE ALL-ZEROS FAULT IS **ABLATION-ONLY**; D4's f32 sampler select is a **NO-OP for the CLI arms** and its premise is WITHDRAWN (2026-10-07, `vega`, Arc Pro B70)
 
 **THE INSTRUMENT IS NOW A CHECK, NOT A HOPE.** `STRATA_DBG_NAN=1` names the FIRST non-finite head stage — S1
@@ -1070,6 +1104,10 @@ verify window  wait for rings 0.000  pool 0.000  host(stage) 0.986  launch 4.903
 
 `sync` alone is **4,572 ms = 95.2%** of decode ≈ 143 ms of the 150.1 ms/token. `launch` 4.9, `commit` 4.1,
 `host(stage)` 1.0, `wait for rings` 0, `pool` 0 ms/round.
+
+**UNITS (2026-10-07):** every field on the `verify window` line — in particular `sync` — is **`ms/round`** (the label is
+printed on the line). Reading `sync` as ms/run produces a phantom ~30x discrepancy; it does not exist:
+`143.364 ms/round x 19 rounds = 2,724 ms` against the `2,895 ms` decode — they agree.
 
 **WHY THE DECODE COUNTERS READ ZERO — AND THEY WERE RIGHT.** A third number had to be added, because the dispatch
 and transfer counters are blind exactly where the decode lives: a recorded block is not a `dispatch` and not a

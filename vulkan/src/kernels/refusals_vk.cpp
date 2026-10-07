@@ -169,7 +169,9 @@ void kv_stream_resolve(const KvStreamMap&, const QsaAttnPools&, const KvHostPool
 // ---- CLASS C: the speculative DRAFTER (src/core/mtp.cpp), a config the port does not select ------------------
 // `setup.py` writes `--spec 4 --mtp`, but the draft loop needs `Verifier::init` to succeed and
 // `layer_verify_compatible()` (layer.cpp:476-491) demands a conjunction the contract leaves false.  The port's
-// selected branch is a `--spec 0` run.
+// selected branch is a `--spec 2 --prefill 256` run (step4/run.sh), whose speculator is the engine's P6 verifier,
+// NOT the `--mtp` drafter this class names: a native pack REFUSES `--spec 0`/`--spec 1` (generate.cpp:2167,
+// "it needs --spec T (T >= 2)"), so `--spec 0` is not a runnable branch at all.
 size_t coupled_draft_scratch_bytes(int) {
     refuse_not_ported("coupled_draft_scratch_bytes", "--spec 4 --mtp (mtp.cpp), a drafter config the contract refuses at Verifier::init");
 }
