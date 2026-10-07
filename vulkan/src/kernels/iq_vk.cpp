@@ -180,6 +180,31 @@ void gu_interleave_f16(Stream& s, const float* gate, const float* up, uint16_t* 
     s.ctx->dispatch(p, {&gv, &uv, &ov}, &pc, sizeof(pc), groups_for(n));
 }
 
+// ---- `iq_dequant_f16` -> iq_dequant_f16.spv, ONE dispatch ------------------------------------------------
+// THE GLSL FORM OF THE ENGINE'S OWN SINGLE LAUNCH.  `iq_dequant_f16` (src/kernels/cuda/iq_kernels.cu:1823) is
+// `dequant_flat_kernel<__half>`: ONE 32-lane block per 256-value superblock, with `dq_dispatch<__half>`
+// writing `cvt<__half>(value)` INSIDE the decode body - the fp16 destination, no f32 staging image and no
+// second conversion pass.  This port composed that engine call out of TWO dispatches (the flat
+// `iq_dequant_f32.spv` into `iq_scratch`, then `f32_to_f16.spv` over the whole row), which is where the
+// 3,589-dispatch `f32_to_f16` family in the 198-token prompt's histogram came from.  The fused shader is the
+// SAME decode (one shared body, common/iq_dequant.glsl, so every per-type offset and every `j` loop is the
+// one the gate already grades) with the SAME conversion (`f16_from_f32_port` in the shared hook, the same
+// round-to-nearest-even function f32_to_f16.spv uses, and the engine's `cvt<__half>` = `__float2half` is the
+// same rule).  It is bit-identical by construction, and the numeric gate's `iq_dequant_f16` case checks it
+// against BOTH oracles: the OLD two-shader chain and the host decoder + f16 converter.
+// Bindings (0..7): W, G1..G6, OUT(uint16).  Push {int ty}.  Grid = n/256 superblocks.
+static void iq_dequant_f16_fused(Stream& s, int ggml_type, const void* src, int64_t n, uint16_t* dst) {
+    const int64_t nb = n / 256;
+    const uint64_t src_bytes = strata::kernels::iq_row_bytes(ggml_type, n);
+    Buf wv{}, g1{}, g2{}, g3{}, g4{}, g5{}, g6{}, ov{};
+    if (!arena_resolve(s, src, src_bytes, wv) || !arena_resolve(s, dst, (uint64_t) n * 2, ov))
+        refuse("iq_dequant_f16", "a pointer is not inside this stream's arena");
+    iq_grids(s, g1, g2, g3, g4, g5, g6);
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/iq_dequant_f16.spv", 8, 4);
+    struct { int32_t ty; } pc{ggml_type};
+    s.ctx->dispatch(p, {&wv, &g1, &g2, &g3, &g4, &g5, &g6, &ov}, &pc, sizeof(pc), (uint32_t) nb);
+}
+
 }  // namespace strata::vulkan
 
 // ============================================================================================================
@@ -210,9 +235,18 @@ void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, vo
         std::exit(1);
     }
     strata::vulkan::Stream& s = strata::vulkan::stream_for("iq_dequant_f16", stream);
-    float* tmp = strata::vulkan::iq_scratch(s, (uint64_t) n * 4);
-    strata::vulkan::iq_dequant_f32(s, ggml_type, src, n, tmp);
-    strata::vulkan::f32_to_f16_vk(s, tmp, dst, n);
+    // THE FUSED FORM IS THE DEFAULT (the engine's own one-launch `dequant_flat_kernel<__half>` shape);
+    // `STRATA_VK_IQ_F16_FUSED=0` restores the two-dispatch chain (iq_dequant_f32.spv -> an f32 scratch then
+    // f32_to_f16.spv), which is the switch-off CONTROL an engine A/B needs so a rebuild cannot be mistaken
+    // for the change.  THE IDS DECIDE: both arms must print 56a0b28d2de6 / 3aed108cceee.
+    const char* fused_env = std::getenv("STRATA_VK_IQ_F16_FUSED");
+    if (fused_env != nullptr && std::atoi(fused_env) == 0) {
+        float* tmp = strata::vulkan::iq_scratch(s, (uint64_t) n * 4);
+        strata::vulkan::iq_dequant_f32(s, ggml_type, src, n, tmp);
+        strata::vulkan::f32_to_f16_vk(s, tmp, dst, n);
+        return;
+    }
+    strata::vulkan::iq_dequant_f16_fused(s, ggml_type, src, n, dst);
 }
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream) {

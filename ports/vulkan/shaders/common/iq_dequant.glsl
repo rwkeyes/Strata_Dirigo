@@ -29,6 +29,17 @@
 // uses 0 and the embedding gather uses tokens[t]*row_bytes), `ibs` = the superblock index within that row,
 // `tid` = the lane (0..31), `obase` = the output element the superblock's 256 values start at.
 
+// THE DESTINATION HOOK.  Every element write below goes through `IQ_STORE(index, value)` so that ONE decode
+// body serves BOTH output types: a float destination (iq_dequant_f32, iq_embed_rows) takes the identity, and
+// an f16 destination (iq_dequant_f16) defines the hook as `f16_from_f32_port(value)` and stores the half
+// directly - which is what the engine's own `dequant_flat_kernel<__half>` does (cvt<__half> inside the
+// decode body) and what removes the f32 staging buffer and its second dispatch.  The identity expansion is
+// exactly what these shaders compiled to BEFORE the hook existed; the gate rebuilds the committed .spv and
+// the byte-identity of iq_dequant_f32.spv / iq_embed_rows.spv across this refactor is the proof.
+#ifndef IQ_STORE
+#define IQ_STORE(ip, iv) (OU_.y[(ip)] = (iv))
+#endif
+
 const float IQ1M_DELTA_GLSL = 0.125;              // third_party/ggml/ggml-common.h: #define IQ1M_DELTA 0.125f
 const int   K_IQ4NL[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
                                   1, 13, 25, 38, 53, 69, 89, 113);   // kvalues_iq4nl, verbatim
@@ -67,14 +78,14 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
     const uint il = tid / 8u, ib = tid % 8u;
     if (ty == 30) {                                              // BF16: 8 raw halves per thread, widened exactly
         const uint x0 = wbase + ibs * 512u + tid * 16u;
-        for (uint j = 0u; j < 8u; ++j) OU_.y[obase + tid * 8u + j] = uintBitsToFloat(iq_u16(x0 + j * 2u) << 16u);
+        for (uint j = 0u; j < 8u; ++j) IQ_STORE(obase + tid * 8u + j, uintBitsToFloat(iq_u16(x0 + j * 2u) << 16u));
     } else if (ty == 20) {                                       // IQ4_NL: 18 bytes per block, 8 blocks per 256
         const uint bb = wbase + ibs * 144u + ib * 18u;
         const float d = iq_h2f(bb);
         for (uint j = 0u; j < 4u; ++j) {
             const uint byte = iq_b(bb + 2u + 4u * il + j);
-            OU_.y[obase + 32u * ib + 4u * il + j]      = d * float(K_IQ4NL[byte & 0xFu]);
-            OU_.y[obase + 32u * ib + 4u * il + j + 16u] = d * float(K_IQ4NL[byte >> 4u]);
+            IQ_STORE(obase + 32u * ib + 4u * il + j, d * float(K_IQ4NL[byte & 0xFu]));
+            IQ_STORE(obase + 32u * ib + 4u * il + j + 16u, d * float(K_IQ4NL[byte >> 4u]));
         }
     } else if (ty == 23) {                                       // IQ4_XS: 136 bytes, one per 256
         const uint bb = wbase + ibs * 136u;
@@ -84,14 +95,14 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const uint qs = bb + 8u + 16u * ib + 4u * il;
         for (uint j = 0u; j < 4u; ++j) {
             const uint byte = iq_b(qs + j);
-            OU_.y[obase + 32u * ib + 4u * il + j]      = d * float(K_IQ4NL[byte & 0xFu]);
-            OU_.y[obase + 32u * ib + 4u * il + j + 16u] = d * float(K_IQ4NL[byte >> 4u]);
+            IQ_STORE(obase + 32u * ib + 4u * il + j, d * float(K_IQ4NL[byte & 0xFu]));
+            IQ_STORE(obase + 32u * ib + 4u * il + j + 16u, d * float(K_IQ4NL[byte >> 4u]));
         }
     } else if (ty == 8) {                                        // Q8_0: 34 bytes, 8 blocks per 256
         const uint bb = wbase + ibs * 272u + ib * 34u;
         const float d = iq_h2f(bb);
         for (uint j = 0u; j < 8u; ++j)
-            OU_.y[obase + 32u * ib + 8u * il + j] = float(iq_i8(bb + 2u + 8u * il + j)) * d;
+            IQ_STORE(obase + 32u * ib + 8u * il + j, float(iq_i8(bb + 2u + 8u * il + j)) * d);
     } else if (ty == 6) {                                        // Q5_0: d, qh[4], qs[16]; -16 bias, one delta
         const uint bb = wbase + ibs * 176u + ib * 22u;
         const float d = iq_h2f(bb);
@@ -101,8 +112,8 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
             const uint iqs = 4u * il + j;
             const uint v0 = (iq_b(qs + iqs) & 0xFu) | (((qh >> (iqs + 0u)) << 4u) & 0x10u);
             const uint v1 = (iq_b(qs + iqs) >> 4u) | (((qh >> (iqs + 12u))) & 0x10u);
-            OU_.y[obase + 32u * ib + iqs]      = (float(v0) - 16.0) * d;
-            OU_.y[obase + 32u * ib + iqs + 16u] = (float(v1) - 16.0) * d;
+            IQ_STORE(obase + 32u * ib + iqs, (float(v0) - 16.0) * d);
+            IQ_STORE(obase + 32u * ib + iqs + 16u, (float(v1) - 16.0) * d);
         }
     } else if (ty == 7) {                                        // Q5_1: d,m, qh[4], qs[16]; a min, no -16
         const uint bb = wbase + ibs * 192u + ib * 24u;
@@ -113,8 +124,8 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
             const uint iqs = 4u * il + j;
             const uint v0 = (iq_b(qs + iqs) & 0xFu) | (((qh >> (iqs + 0u)) << 4u) & 0x10u);
             const uint v1 = (iq_b(qs + iqs) >> 4u) | (((qh >> (iqs + 12u))) & 0x10u);
-            OU_.y[obase + 32u * ib + iqs]      = float(v0) * dmx + dmy;
-            OU_.y[obase + 32u * ib + iqs + 16u] = float(v1) * dmx + dmy;
+            IQ_STORE(obase + 32u * ib + iqs, float(v0) * dmx + dmy);
+            IQ_STORE(obase + 32u * ib + iqs + 16u, float(v1) * dmx + dmy);
         }
     } else if (ty == 42) {                                       // Q2_0: 18 bytes per 64, 4 blocks per 256
         const uint b = tid / 8u, part = tid % 8u;
@@ -123,7 +134,7 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         for (uint j = 0u; j < 8u; ++j) {
             const uint i = part * 8u + j;
             const uint code = (iq_b(bb + 2u + i / 4u) >> ((i % 4u) * 2u)) & 3u;
-            OU_.y[obase + b * 64u + i] = d * (float(code) - 1.0);
+            IQ_STORE(obase + b * 64u + i, d * (float(code) - 1.0));
         }
     } else if (ty == 12) {                                       // Q4_K: dm, scales[12], qs[128]
         const uint bb = wbase + ibs * 144u;
@@ -136,8 +147,8 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const uint q = bb + 16u + 32u * il + 4u * ib;
         for (uint l = 0u; l < 4u; ++l) {
             const uint qb = iq_b(q + l);
-            OU_.y[obase + 64u * il + 4u * ib + l]      = d1 * float(qb & 0xFu) - m1v;
-            OU_.y[obase + 64u * il + 4u * ib + l + 32u] = d2 * float(qb >> 4u) - m2v;
+            IQ_STORE(obase + 64u * il + 4u * ib + l, d1 * float(qb & 0xFu) - m1v);
+            IQ_STORE(obase + 64u * il + 4u * ib + l + 32u, d2 * float(qb >> 4u) - m2v);
         }
     } else if (ty == 13) {                                       // Q5_K: dm, scales[12], qh[32], qs[128]
         const uint bb = wbase + ibs * 176u;
@@ -153,11 +164,11 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
             const uint qh = bb + 16u + 2u * iir;
             uint hm = 1u << (2u * iil);
             const uint ob = obase + 64u * iil + 2u * iir;
-            OU_.y[ob + 0u]  = d1 * (float(iq_b(ql + 0u) & 0xFu) + (((iq_b(qh + 0u) & hm) != 0u) ? 16.0 : 0.0)) - m1v;
-            OU_.y[ob + 1u]  = d1 * (float(iq_b(ql + 1u) & 0xFu) + (((iq_b(qh + 1u) & hm) != 0u) ? 16.0 : 0.0)) - m1v;
+            IQ_STORE(ob + 0u, d1 * (float(iq_b(ql + 0u) & 0xFu) + (((iq_b(qh + 0u) & hm) != 0u) ? 16.0 : 0.0)) - m1v);
+            IQ_STORE(ob + 1u, d1 * (float(iq_b(ql + 1u) & 0xFu) + (((iq_b(qh + 1u) & hm) != 0u) ? 16.0 : 0.0)) - m1v);
             hm <<= 1u;
-            OU_.y[ob + 32u] = d2 * (float(iq_b(ql + 0u) >> 4u) + (((iq_b(qh + 0u) & hm) != 0u) ? 16.0 : 0.0)) - m2v;
-            OU_.y[ob + 33u] = d2 * (float(iq_b(ql + 1u) >> 4u) + (((iq_b(qh + 1u) & hm) != 0u) ? 16.0 : 0.0)) - m2v;
+            IQ_STORE(ob + 32u, d2 * (float(iq_b(ql + 0u) >> 4u) + (((iq_b(qh + 0u) & hm) != 0u) ? 16.0 : 0.0)) - m2v);
+            IQ_STORE(ob + 33u, d2 * (float(iq_b(ql + 1u) >> 4u) + (((iq_b(qh + 1u) & hm) != 0u) ? 16.0 : 0.0)) - m2v);
         }
     } else if (ty == 11) {                                       // Q3_K: hmask[32], qs[64], scales[12], d
         const uint bb = wbase + ibs * 110u;
@@ -177,7 +188,7 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
             const uint ob = obase + 128u * uint(n) + 32u * uint(j);
             const uint q = bb + 32u * uint(n);
             for (int l = l0; l < l0 + 4; ++l)
-                OU_.y[ob + uint(l)] = dl * float(int((iq_b(q + uint(l)) >> uint(shift)) & 3u) - (((iq_b(bb + uint(l)) & m) != 0u) ? 0 : 4));
+                IQ_STORE(ob + uint(l), dl * float(int((iq_b(q + uint(l)) >> uint(shift)) & 3u) - (((iq_b(bb + uint(l)) & m) != 0u) ? 0 : 4)));
         }
     } else if (ty == 18) {                                       // IQ3_XXS: d, qs[96]; two 4-byte grids per part
         const uint bb = wbase + ibs * 98u;
@@ -189,8 +200,8 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const float d = iq_h2f(bb) * (0.5 + float(aux32 >> 28u)) * 0.5;
         const uint signs = K_SIGNS[(aux32 >> (7u * il)) & 127u];
         for (uint j = 0u; j < 4u; ++j) {
-            OU_.y[obase + 32u * ib + 8u * il + j]     = d * float(iq_g32_byte(g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
-            OU_.y[obase + 32u * ib + 8u * il + j + 4u] = d * float(iq_g32_byte(g2, j)) * ((signs & uint(K_MASK[j + 4])) != 0u ? -1.0 : 1.0);
+            IQ_STORE(obase + 32u * ib + 8u * il + j, d * float(iq_g32_byte(g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0));
+            IQ_STORE(obase + 32u * ib + 8u * il + j + 4u, d * float(iq_g32_byte(g2, j)) * ((signs & uint(K_MASK[j + 4])) != 0u ? -1.0 : 1.0));
         }
     } else if (ty == 21) {                                       // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
         const uint bb = wbase + ibs * 110u;
@@ -202,8 +213,8 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const float d = iq_h2f(bb) * (1.0 + 2.0 * float((sc >> (4u * (ib % 2u))) & 0xFu));
         const uint signs = iq_b(bb + 74u + 4u * ib + il);
         for (uint j = 0u; j < 4u; ++j) {
-            OU_.y[obase + 32u * ib + 8u * il + j]     = d * float(iq_g32_byte(w1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
-            OU_.y[obase + 32u * ib + 8u * il + j + 4u] = d * float(iq_g32_byte(w2, j)) * ((signs & uint(K_MASK[j + 4])) != 0u ? -1.0 : 1.0);
+            IQ_STORE(obase + 32u * ib + 8u * il + j, d * float(iq_g32_byte(w1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0));
+            IQ_STORE(obase + 32u * ib + 8u * il + j + 4u, d * float(iq_g32_byte(w2, j)) * ((signs & uint(K_MASK[j + 4])) != 0u ? -1.0 : 1.0));
         }
     } else if (ty == 22) {                                       // IQ2_S: d, qs[64], qh[8], scales[8]
         const uint bb = wbase + ibs * 82u;
@@ -213,7 +224,7 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const uint signs = iq_b(bb + 2u + 32u + 4u * ib + il);
         const float d = iq_h2f(bb) * (0.5 + float((iq_b(bb + 74u + ib) >> (4u * (il / 2u))) & 0xFu)) * 0.25;
         for (uint j = 0u; j < 8u; ++j)
-            OU_.y[obase + 32u * ib + 8u * il + j] = d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
+            IQ_STORE(obase + 32u * ib + 8u * il + j, d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0));
     } else if (ty == 29) {                                       // IQ1_M: qs[32], qh[16], scales[8]
         const uint bb = wbase + ibs * 56u;
         const uint sc0 = iq_u16(bb + 48u), sc1 = iq_u16(bb + 50u), sc2 = iq_u16(bb + 52u), sc3 = iq_u16(bb + 54u);
@@ -228,8 +239,8 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const uint q0 = g & 0x0F0F0F0Fu;
         const uint q1 = (g >> 4u) & 0x0F0F0F0Fu;
         for (uint j = 0u; j < 4u; ++j) {
-            OU_.y[obase + 32u * ib + 8u * il + j]     = d * (float((q0 >> (8u * j)) & 0xFu) + delta);
-            OU_.y[obase + 32u * ib + 8u * il + j + 4u] = d * (float((q1 >> (8u * j)) & 0xFu) + delta);
+            IQ_STORE(obase + 32u * ib + 8u * il + j, d * (float((q0 >> (8u * j)) & 0xFu) + delta));
+            IQ_STORE(obase + 32u * ib + 8u * il + j + 4u, d * (float((q1 >> (8u * j)) & 0xFu) + delta));
         }
     } else if (ty == 16) {                                       // IQ2_XXS: d, qs[32] (uint16); 4 grid bytes then 4 aux bytes per 8-value part
         const uint bb = wbase + ibs * 66u;
@@ -240,7 +251,7 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const float d = iq_h2f(bb) * (0.5 + float(aux32 >> 28u)) * 0.25;
         const uint signs = K_SIGNS[(aux32 >> (7u * il)) & 127u];
         for (uint j = 0u; j < 8u; ++j)
-            OU_.y[obase + 32u * ib + 8u * il + j] = d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
+            IQ_STORE(obase + 32u * ib + 8u * il + j, d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0));
     } else if (ty == 17) {                                       // IQ2_XS: d, qs[32] (uint16), scales[8]; the 9-bit grid index carries the sign field above it
         const uint bb = wbase + ibs * 74u;
         const uint w = iq_u16(bb + 2u + 8u * ib + 2u * il);
@@ -249,7 +260,7 @@ void iq_dq_256(int ty, uint wbase, uint ibs, uint tid, uint obase) {
         const float d = iq_h2f(bb) * (0.5 + float((iq_b(bb + 66u + ib) >> (4u * (il / 2u))) & 0xFu)) * 0.25;
         const uint signs = K_SIGNS[w >> 9u];
         for (uint j = 0u; j < 8u; ++j)
-            OU_.y[obase + 32u * ib + 8u * il + j] = d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0);
+            IQ_STORE(obase + 32u * ib + 8u * il + j, d * float(iq_g64_byte(g0, g1, j)) * ((signs & uint(K_MASK[j])) != 0u ? -1.0 : 1.0));
     }
     // any other type is a caller error: the host entry points refuse it before dispatch
 }

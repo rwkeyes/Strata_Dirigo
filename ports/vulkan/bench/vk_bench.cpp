@@ -1976,6 +1976,62 @@ void bench_dispatch_gap(Ctx& ctx, const std::string& dir, int reps, int warmups)
 }
 
 // =========================================================================================================
+// THE GRID-WIDTH CURVE - is the per-workgroup cost LINEAR in the workgroups a dispatch carries?
+//
+// WHY.  The two trees' MEANS agree (this port 1,105.6 workgroups per decode dispatch against upstream's
+// 234.5, 4.71x; 66.8 us per dispatch against 14.5, 4.61x) but the TOTALS do not: the port executes 0.78x
+// upstream's total workgroups yet takes ~2.7x its decode time.  A strictly LINEAR "~60 ns per workgroup"
+// model cannot fit both, so the cost is likely SUPER-LINEAR in workgroups per dispatch - the port's widest
+// grids paying more per workgroup than its 805 one-workgroup and 1,302 four-workgroup ones.  The empty-launch
+// sweep fitted "~0.102 ms fixed + ~2.8 ns per workgroup", a cost that tracks the WORKGROUP count, so this arm
+// measures the second derivative the linear fit assumes away.
+//
+// HOW.  ONE kernel (`scale`, one f32 element per thread, `x[i] *= s`), ONE device-local buffer sized for the
+// WIDEST point, ONE pipeline, ONE descriptor set - the ONLY thing that moves between points is the GRID WIDTH
+// (gl_WorkGroupID.x's extent).  Two sweeps on that one buffer, because the phrase "per-workgroup cost" has two
+// readings and they price DIFFERENT things:
+//   work  n = W*256, so every workgroup does real work (a read, a multiply and a write per lane)
+//   pad   n = 256,  so workgroup 0 works and W-1 workgroups run their lane guard and exit (the EMPTY launch)
+// The `work` sweep is the per-workgroup cost of the work the port's wide dispatches really carry; the `pad`
+// sweep is the cost of width ITSELF, which is what "the empty launch is 65% of the gu call" and the
+// fixed+marginal fit are about.  Every row is the SAME instrument as the rest of this file (wall clock around
+// a recorded-batch fence, median/batch) at the ENGINE'S BATCH (kLiveBatchMax = 128 dispatches per replay), and
+// carries the same documented limit: a per-dispatch cost, NOT a bandwidth figure.  The `work` sweep at
+// W >= 4,096 is DRAM-bound on this card (256 KiB..256 MiB per dispatch), which is stated in the reading rather
+// than hidden: it is the port's own situation for `native_k_mmvq`/`native_down_any` too.
+// =========================================================================================================
+void bench_grid_curve(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const uint32_t Ws[] = {1, 64, 256, 1024, 4096, 12288, 65536, 262144};
+    const uint32_t WMAX = 262144;
+    const uint64_t nmax = (uint64_t) WMAX * 256ull;          // 67,108,864 f32 = 256 MiB
+    VkPipeline ps = ctx.pipeline(dir + "/scale.spv", 1, 8);
+    struct { int32_t n; float s; } pcs{0, 1.0009765625f};
+    // ONE allocation, ONE descriptor target, warm, for every point of both sweeps.
+    Buf buf = ctx.alloc_device(nmax * 4u);
+    {
+        std::vector<float> x((size_t) nmax);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.5f + (float) (i & 255u) * 0.001f;
+        ctx.write(buf, x.data(), x.size() * 4u);
+    }
+    const int BATCH = 128;                                   // kLiveBatchMax - the engine's own batch
+    for (const char* mode : {"work", "pad"}) {
+        for (uint32_t W : Ws) {
+            pcs.n = (mode[0] == 'w') ? (int32_t) ((uint64_t) W * 256ull) : 256;
+            const Timing t = time_kernel(ctx, ps, {&buf}, &pcs, sizeof(pcs), W, 1, BATCH, reps, warmups);
+            char tag[64], sh[96];
+            std::snprintf(tag, sizeof tag, "grid_%s_W%u", mode, W);
+            std::snprintf(sh, sizeof sh, "scale, grid %u x 256, one buffer, %s", W,
+                          mode[0] == 'w' ? "n=W*256 (real work)" : "n=256 (empty workgroups)");
+            report(tag, sh, t, (double) W * 256.0, 0.0);
+            std::printf("GRIDCURVE %-5s W=%7u | %10.4f us/dispatch | %9.3f ns/workgroup | batch %d\n",
+                        mode, W, t.med * 1000.0, t.med * 1e6 / (double) W, t.batch);
+        }
+        std::printf("GRIDCURVE %s sweep done (batch %d, reps %d, spv %s/scale.spv)\n", mode, BATCH, reps, dir.c_str());
+    }
+    ctx.free(buf);
+}
+
+// =========================================================================================================
 // TASK 1 AUDIT (a): `native_k_mmvq` - the "biggest dispatch producer" claim, checked, AND its launch shape.
 //
 // The brief sized the prefill's dispatch pressure as "native_k_mmvq 41,580 dispatches in one prefill
@@ -2375,6 +2431,9 @@ int main(int argc, char** argv) {
     // THIS BATCH - TASK 2: `fused_gr_mix`'s reduction cost isolated (hc varied on the same shader).
     arm("fused_gr_mix_pass", false, [&] { bench_fused_gr_mix_pass(ctx, dir, reps, warmups); });
     arm("dispatch_gap", false, [&] { bench_dispatch_gap(ctx, dir, reps, warmups); });
+    // THIS BATCH - TARGET 2: the per-workgroup cost as a function of GRID WIDTH (1 .. 262,144 workgroups),
+    // two sweeps on ONE kernel, ONE buffer, ONE descriptor set - width only, at the engine's batch.
+    arm("grid_curve", false, [&] { bench_grid_curve(ctx, dir, reps, warmups); });
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
     // single dispatch, and on the Ryzen iGPU (RADV) the full-vocabulary shape was measured to trigger a
@@ -2393,7 +2452,7 @@ int main(int argc, char** argv) {
                              "router_pair moe_combine_pair rms_norm_pair qsa_gate_pair qsa_decode_attn "
                              "gdn_conv_silu_pair gdn_l2_norm_pair gdn_beta_gate_pair gdn_gate_pair "
                              "gdn_out_norm_pair gdn_step_pair fused_gdn_conv_l2_pair fused_gdn_ab_pair "
-                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill native_grouped_engine gr_pricing native_k_mmvq_engine native_grouped_hoist fused_gr_mix_pass dispatch_gap sampler\n");
+                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill native_grouped_engine gr_pricing native_k_mmvq_engine native_grouped_hoist fused_gr_mix_pass dispatch_gap grid_curve sampler\n");
         return 2;
     }
 

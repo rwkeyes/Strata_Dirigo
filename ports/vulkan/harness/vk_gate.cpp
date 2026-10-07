@@ -21628,6 +21628,91 @@ void case_iq_dequant_f32_entry(Ctx& ctx, const std::string& dir) {
     }
 }
 
+// 3b. `iq_dequant_f16` -> iq_dequant_f16.spv.  THE FUSED FORM of the engine's own ONE-LAUNCH
+// `dequant_flat_kernel<__half>` (src/kernels/cuda/iq_kernels.cu:1823, driven by `iq_dequant_f16`).
+// It replaces the port's TWO-dispatch composition - the already-gated flat `iq_dequant_f32.spv` into an f32
+// scratch, then `f32_to_f16.spv` over the whole row - so this case grades the fused output BITWISE against
+// exactly that chain: the f32 stage run on the same fixture, converted on the host by the gate's own
+// `f16_from_f32` (the same rule the f32_to_f16 case holds to the engine's header).  Then the ENGINE WRAPPER
+// (`strata::kernels::iq_dequant_f16`, whose default IS the fused path) is run against the same reference.
+// Both arms fail if the fused shader drops a superblock, writes the wrong element, or converts with a
+// different rounding rule; the fixture's decoded mass must be non-zero or the comparison is vacuous and the
+// verdict FAILS.  BF16 (ty 30) is skipped: `iq_dequant_f16`'s own host check is `is_iq()` only.
+void case_iq_dequant_f16_entry(Ctx& ctx, const std::string& dir) {
+    if (!have(dir, "iq_dequant_f16.spv") || !have(dir, "iq_dequant_f32.spv")) return;
+    if (!ctx.info().storage_buffer_8bit) { skip("iq_dequant_f16 entry", "device lacks storageBuffer8BitAccess"); return; }
+    if (!ctx.info().storage_buffer_16bit || !ctx.info().shader_int16) {
+        skip("iq_dequant_f16 entry", "device lacks storageBuffer16BitAccess/shaderInt16");
+        return;
+    }
+    const uint32_t n_sb = 3, n = n_sb * 256;
+    std::vector<uint8_t> wmax((size_t) n_sb * 512, 0);
+    Buf b_w = ctx.alloc(wmax.size()), b_f = ctx.alloc((size_t) n * 4), b_h = ctx.alloc((size_t) n * 2);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq1sGrid)), b_g2 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid)), b_g4 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_g5 = ctx.alloc(sizeof(strata::vkport::kIq2xxsGrid)), b_g6 = ctx.alloc(sizeof(strata::vkport::kIq2xsGrid));
+    ctx.write(b_g1, strata::vkport::kIq1sGrid, sizeof(strata::vkport::kIq1sGrid));
+    ctx.write(b_g2, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g3, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g4, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    ctx.write(b_g5, strata::vkport::kIq2xxsGrid, sizeof(strata::vkport::kIq2xxsGrid));
+    ctx.write(b_g6, strata::vkport::kIq2xsGrid, sizeof(strata::vkport::kIq2xsGrid));
+    VkPipeline p32 = ctx.pipeline(dir + "/iq_dequant_f32.spv", 8, 4);
+    VkPipeline p16 = ctx.pipeline(dir + "/iq_dequant_f16.spv", 8, 4);
+
+    strata::vulkan::Stream* s = nullptr;
+    { EnginePin pin(ctx); s = strata::vulkan::stream_open(4ull << 20, dir); }
+    if (s == nullptr) {
+        verdict("iq_dequant_f16 entry: engine wrapper", false, 1, 1, 0, "the backend could not open a stream");
+        ctx.free(b_w); ctx.free(b_f); ctx.free(b_h);
+        ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_g5); ctx.free(b_g6);
+        return;
+    }
+    uint8_t* dw = strata::vulkan::arena_alloc<uint8_t>(*s, wmax.size());
+    uint16_t* dh = strata::vulkan::arena_alloc<uint16_t>(*s, n);
+
+    for (const IqFmt& f : kIqFmts) {
+        if (f.ty == 30) continue;                    // iq_dequant_f16 refuses BF16 (its host check is is_iq())
+        const std::vector<uint8_t> w = iq_fixture(f.ty, n_sb, f.sb, 0);
+        ctx.write(b_w, w.data(), w.size());
+        struct { int ty; } pc{f.ty};
+        // (A) THE CHAIN THE FUSED FORM REPLACES: its f32 stage, converted by the gate's own f16 converter.
+        ctx.dispatch(p32, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_f}, &pc, sizeof(pc), n_sb);
+        std::vector<float> fv(n);
+        ctx.read(b_f, fv.data(), (size_t) n * 4);
+        std::vector<uint16_t> want(n);
+        double mass = 0;
+        for (uint32_t i = 0; i < n; ++i) { want[i] = f16_from_f32(fv[i]); mass += std::fabs((double) fv[i]); }
+        // (B) THE FUSED SHADER on the same fixture.
+        std::vector<uint8_t> sink((size_t) n * 2, 0xC3);
+        ctx.write(b_h, sink.data(), sink.size());
+        ctx.dispatch(p16, {&b_w, &b_g1, &b_g2, &b_g3, &b_g4, &b_g5, &b_g6, &b_h}, &pc, sizeof(pc), n_sb);
+        std::vector<uint8_t> img(sink.size());
+        ctx.read(b_h, img.data(), img.size());
+        const uint16_t* got = reinterpret_cast<const uint16_t*>(img.data());
+        int bad = 0;
+        for (uint32_t i = 0; i < n; ++i) if (got[i] != want[i]) ++bad;
+        char lab[176];
+        std::snprintf(lab, sizeof lab, "iq_dequant_f16 entry (%s): fused shader == the two-shader chain, bitwise", f.name);
+        verdict(lab, bad == 0 && mass > 1e-3, bad, (int) n, 0, "f16 elements differ / vacuous fixture");
+        // (C) THE ENGINE WRAPPER, whose DEFAULT is the fused path.
+        strata::vulkan::stream_write(*s, dw, w.data(), w.size());
+        std::vector<uint8_t> s2((size_t) n * 2, 0xC3);
+        strata::vulkan::stream_write(*s, dh, s2.data(), s2.size());
+        strata::kernels::iq_dequant_f16(f.ty, dw, (int64_t) n, dh, s);
+        std::vector<uint8_t> wgot((size_t) n * 2);
+        strata::vulkan::stream_read(*s, dh, wgot.data(), wgot.size());
+        const uint16_t* wg = reinterpret_cast<const uint16_t*>(wgot.data());
+        int badw = 0;
+        for (uint32_t i = 0; i < n; ++i) if (wg[i] != want[i]) ++badw;
+        std::snprintf(lab, sizeof lab, "iq_dequant_f16 entry (%s): engine wrapper == the two-shader chain, bitwise", f.name);
+        verdict(lab, badw == 0, badw, (int) n, 0, "f16 elements differ (wrapper / default fused path)");
+    }
+    strata::vulkan::stream_close(s);
+    ctx.free(b_w); ctx.free(b_f); ctx.free(b_h);
+    ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_g4); ctx.free(b_g5); ctx.free(b_g6);
+}
+
 // 3. `iq_embed_rows` -> iq_embed_rows.spv.  2-D grid (superblock, token), a DERANGED token list, and a capture arm.
 void case_iq_embed_rows_entry(Ctx& ctx, const std::string& dir) {
     if (!have(dir, "iq_embed_rows.spv")) return;
@@ -25460,6 +25545,10 @@ int main(int argc, char** argv) {
     // with its capture arm.  APPENDED last for the shared-RNG reason every batch above states.
     case_bf16_gemv_fp32_mmvf_multi_entry(ctx, dir);
     case_iq_dequant_f32_entry(ctx, dir);
+    // THIS BATCH - TARGET 1: the FUSED flat f16 dequantiser (the engine's own one-launch
+    // `dequant_flat_kernel<__half>`), graded bitwise against the two-dispatch chain it replaces and through
+    // its own engine wrapper.  APPENDED here for the shared-RNG reason the block above states.
+    case_iq_dequant_f16_entry(ctx, dir);
     case_iq_embed_rows_entry(ctx, dir);
     case_s_gemv_split_async_entry(ctx, dir);
     case_moe_hit_select_entry(ctx, dir);

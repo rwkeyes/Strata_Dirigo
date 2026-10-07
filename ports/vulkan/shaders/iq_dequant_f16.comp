@@ -1,0 +1,50 @@
+// ports/vulkan/shaders/iq_dequant_f16.comp - the FUSED I-quant / BF16 dequantiser, flat, straight to f16.
+//
+// The GLSL form of the engine's OWN one-launch kernel `dequant_flat_kernel<__half>`
+// (src/kernels/cuda/iq_kernels.cu:1823, driven by `iq_dequant_f16` at :1823-1826): ONE 32-lane block per
+// 256-value superblock, `dq_dispatch<__half>` writing `cvt<__half>(value)` STRAIGHT into the fp16
+// destination - no f32 staging buffer, no second conversion dispatch.
+//
+// WHAT IT REPLACES.  The port composed this engine call out of two dispatches: the ALREADY-GATED flat
+// `iq_dequant_f32.spv` into an f32 scratch, then `f32_to_f16.spv` over the whole row
+// (vulkan/src/kernels/iq_vk.cpp, `iq_dequant_f16`).  Same arithmetic, same order, same bits - the f32 value
+// the decoder computes is identical because it IS the identical code (common/iq_dequant.glsl, one copy), and
+// the conversion is the identical function the f32_to_f16 shader uses (`f16_from_f32_port`, common/f16_bits.glsl,
+// round-to-nearest-even - the engine's `cvt<__half>` = `__float2half` is the same rounding rule).
+// The ONLY difference is where the conversion happens: inside the decode body, per element, instead of in a
+// second pass over an f32 image.
+//
+// THE THREAD MAPPING IS THE ENGINE'S, unaffected: the decode is `(ty, wbase=0, ibs = superblock,
+// tid = lane 0..31, obase = superblock*256)` - exactly iq_dequant_f32.comp's, so the per-type offsets, the
+// inner `j` loops and the output positions are NOT re-derived for f16.  Lanes 32..255 of each 256-lane
+// workgroup are idle, preserving the decoder's 32-lane shape verbatim.
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer W   { uint8_t b[]; } w_b;   // the raw blocks
+layout(set = 0, binding = 1, std430) readonly  buffer G1  { uint v[]; } iq1s_g;   // IQ1_S grid (IQ1_M)
+layout(set = 0, binding = 2, std430) readonly  buffer G2  { uint v[]; } iq2s_g;   // IQ2_S grid
+layout(set = 0, binding = 3, std430) readonly  buffer G3  { uint v[]; } iq3xxs_g; // IQ3_XXS grid
+layout(set = 0, binding = 4, std430) readonly  buffer G4  { uint v[]; } iq3s_g;   // IQ3_S grid
+layout(set = 0, binding = 5, std430) readonly  buffer G5  { uint v[]; } iq2xxs_g; // IQ2_XXS grid
+layout(set = 0, binding = 6, std430) readonly  buffer G6  { uint v[]; } iq2xs_g;  // IQ2_XS grid
+layout(set = 0, binding = 7, std430) writeonly buffer OUT { uint16_t y[]; } OU_;  // THE fp16 DESTINATION
+
+layout(push_constant) uniform Pc { int ty; } pc;
+
+#include "common/f16_bits.glsl"
+// The decode body's ONE output hook, bound to the engine's conversion.  Must be defined BEFORE the decoder
+// is included: the hook is expanded where the decoder's function body is defined.
+#undef  IQ_STORE
+#define IQ_STORE(ip, iv) (OU_.y[(ip)] = f16_from_f32_port(iv))
+#include "common/iq_dequant.glsl"
+
+void main() {
+    if (gl_LocalInvocationID.x >= 32u) return;
+    const uint i = gl_WorkGroupID.x;
+    iq_dq_256(pc.ty, 0u, i, gl_LocalInvocationID.x, i * 256u);
+}

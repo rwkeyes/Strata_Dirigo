@@ -727,3 +727,31 @@ census — so the kernel is priced a NO, not optimised.
   path never fired and the XTX arm aborted at the first pool exhaustion.  Fixed in
   `harness/vk_compute.cpp` (both codes now grow the pool).  The numeric gate never fills a pool, so this
   changes no gate verdict — it makes the header's "no fixed ceiling" promise true on a second Mesa version.
+
+## THE GRID-WIDTH CURVE (`grid_curve`) — the per-workgroup cost as a function of the GRID's extent (added 2026-10-07)
+
+The two trees' MEANS agree (this port 1,105.6 workgroups per decode dispatch against upstream's 234.5, 4.71x,
+beside 66.8 µs per dispatch against 14.5, 4.61x) but their TOTALS do not, so a strictly linear "~60 ns per
+workgroup" model cannot fit both and the cost was suspected to be SUPER-LINEAR in workgroups per dispatch.
+`grid_curve` measures the second derivative that suspicion assumes.
+
+ONE kernel (`scale`), ONE device-local buffer sized for the widest point (256 MiB), ONE pipeline, ONE
+descriptor set — the ONLY thing that moves between points is the grid width, at the ENGINE'S BATCH
+(`kLiveBatchMax` = 128 dispatches per replay). Two sweeps on that one buffer, because "per-workgroup cost" has
+two readings that price different things:
+
+* **`work`** — `n = W*256`, so every workgroup does real work (a read, a multiply, a write per lane);
+* **`pad`** — `n = 256`, so workgroup 0 works and W−1 workgroups run their lane guard and exit (the EMPTY
+  launch, which is what the "0.102 ms fixed + ~2.8 ns per workgroup" fit describes).
+
+Widths: **1, 64, 256, 1,024, 4,096, 12,288, 65,536, 262,144**. Each point prints a `ROW` and a `GRIDCURVE`
+line carrying µs/dispatch and **ns per workgroup**.
+
+**Measured on the Arc Pro B70 (reps 9, warmups 3), `bench/build/vk_bench --only grid_curve`:** the `pad` sweep
+is **LINEAR over the whole range with a FALLING marginal** — least squares over W ≥ 1,024 gives
+**µs/dispatch = 3.625 + 0.0007155·W** with a maximum residual of **0.094 µs** at W = 1 and **< 0.013 µs**
+above W = 256 — so ns/workgroup falls monotonically from 3,719.9 to **0.729**, and there is no rising marginal
+anywhere. The `work` sweep's one super-linear segment (W 12,288 → 65,536 is 5.33x width for 13.69x time) is
+where the per-dispatch working set crosses this card's L2 (25.2 → 134.2 MB); above it the same 4x width costs
+3.99x time again. **The grid width is not the decode lever** — see `NEXT.md`, "TARGET 2 CLOSED WITH THE
+OPPOSITE SIGN". `--only grid_curve` bounds the run to this arm; the default sweep runs the whole file.
