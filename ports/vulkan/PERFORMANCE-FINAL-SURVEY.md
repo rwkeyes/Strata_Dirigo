@@ -51,10 +51,16 @@ tested — do not act on one of these without testing it first.
 | reference | number | gap | what it means |
 |---|---|---|---|
 | engine's own SYCL backend, same card/prompt/model, DEVICE time | 515 ms prefill | **13.5x** | the honest like-for-like target: same work, same hardware, different implementation |
-| llama.cpp Vulkan, same card (`pp512 913.36`, `tg128 36.52`) | 913 / 36.5 tok/s | **~33x prefill / ~3.2x decode** | a different implementation of similar work — useful as an upper bound, weaker as a target |
+| llama.cpp Vulkan, same card — **but a DIFFERENT, SMALLER MODEL**: Qwen3.5-35B-A3B Q4_K_M, 20.49 GiB, `ngl 99` (`pp512 913.36`, `tg128 36.52`) | 913 / 36.5 tok/s | **not comparable** | **THIS IS NOT A LIKE-FOR-LIKE GAP.** llama.cpp ran a 34.66 B MoE that FITS the 32 GB card outright — nothing streamed. This port runs the **58.4 GB** Qwen3.8-Flash-Next IQ1_M pack, which does not fit and therefore streams experts through a 12,288-slot VRAM cache and the file tier. The port's numbers are streaming numbers, dominated by the cache, the file tier and the upload path — not by kernel speed. Do not quote a ratio between them, and note that the "~33x" this row used to carry was an artifact of comparing two different models. |
 
-The prefill is the whole story: the decode is within ~3x of a mature backend, the prefill is not within 10x
-of anything.
+**The port has NO model that fits this card.** Every pack available is 42–55 GB against 32 GB of VRAM
+(`coder-iq1_m` 55 G native shard, `iq3_s` 49 G, `iq3_xxs` 42 G, `swift-iq3_xxs` 42 G), so there is **no measured
+small-model, GPU-resident data point for this port at all** — which is the one comparison a reader is most
+likely to want, and it cannot be produced without first building a pack for a smaller model.
+
+The prefill is the whole story: the decode's cost is dispatch and host round-trips rather than arithmetic (§1.3),
+while the prefill is **13.5x** off the engine's own backend measured on the same model, the same card and the
+same prompt.
 
 ---
 
@@ -182,8 +188,10 @@ grep -m1 'strata prefill timing' /home/bob/step4/logs/<name>.log
 ## 7. BOTTOM LINE FOR A MOTHBALL
 
 The port works, is bit-exact against the engine's references (965 numeric cases), and is stable. It runs the
-same model as the engine's SYCL backend **13.5x slower on the prefill** and is within ~3x of llama.cpp on the
-decode. The remaining performance is in porting the engine's own prefill kernels — the tedious, well-defined
+same model as the engine's SYCL backend **13.5x slower on the prefill**, and its decode is limited by dispatch
+and host round-trip overhead — 13.7 ms of GPU execution inside a ~237 ms round — rather than by arithmetic.
+There is no valid small-model, GPU-resident number for this port at all (see section 2). The remaining
+performance is in porting the engine's own prefill kernels — the tedious, well-defined
 work the decode side already finished — and nowhere else that this project has been able to find after
 ~20 hours of measurement, most of which is recorded above as negatives.
 
