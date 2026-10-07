@@ -1615,18 +1615,81 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
+    // ---- STRATA_DBG_NAN (env-gated, INERT when unset): WHICH head stage first goes non-finite, not just "the head".
+    // The shipped greedy sampler answers token 0 when no candidate beats -inf (sampler_greedy.comp:106), so an
+    // all-zeros decode IS non-finite head logits.  This names the stage that produced them, once per process:
+    //   S1 head_gr_read   -> head_mixed_   (lm_head_mix / fused_gr_read_multi: the head's own input)
+    //   S2 act_quantiser  -> xq_          (native_quantize_q8_1 q8_1 blocks: the fp16 d/s halves of every block)
+    //   S3 head_projection-> head_logits_ (native_mmvq, ty=14 -> native_k_mmvq.spv: the Q6_K unpack + dot)
+    //   S4 pre_sampler    -> head_logits_ (the SAME buffer sampler_greedy reads: the pre-sampler logits buffer)
+    // The stages run in order; the first that is non-finite is the first stage that could have produced it, and the
+    // stage before it was finite.  A run with all-S-finite buffers prints the ARMED line and nothing else.
+    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
         static bool reported = false;
-        if (!reported) {
-            std::vector<float> h((size_t) T * (size_t) n_vocab_);
-            cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost);
-            for (int t = 0; t < T && !reported; ++t) {
-                int64_t bad = 0;
-                for (int64_t v = 0; v < n_vocab_; ++v) bad += !std::isfinite(h[(size_t) t * n_vocab_ + v]);
-                if (bad) {
+        static bool armed = false;
+        if (head_ != nullptr && head_->loaded()) {
+            const int64_t NN = g.n_embd, nblk = (NN + 31) / 32;   // q8_1: one 36-byte block per 32 values
+            std::vector<float> hm((size_t) T * (size_t) NN);
+            std::vector<uint8_t> xq((size_t) T * (size_t) nblk * 36u);
+            std::vector<float> hl((size_t) T * (size_t) n_vocab_);
+            cudaMemcpy(hm.data(), head_mixed_, hm.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            if (xq_ != nullptr) cudaMemcpy(xq.data(), xq_, xq.size(), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hl.data(), head_logits_, hl.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            if (!armed) { armed = true; std::fprintf(stderr, "strata dbg NAN: instrument ARMED "
+                             "(S1 head_gr_read/S2 act_quantiser/S3 head_projection/S4 pre_sampler)\n"); }
+            if (!reported) {
+                const char* stage = nullptr;
+                int tr = -1; long long idx = -1; double val = 0.0; long long nbad = 0;
+                // INSTRUMENT SELF-TEST (control, off unless set): poison ONE stage's HOST copy so the detector MUST
+                // name that stage.  Proves a silent run is "no non-finite value", not "a detector that never fires".
+                if (const char* pz = std::getenv("STRATA_DBG_NAN_POISON")) {
+                    const std::string ps(pz);
+                    if (ps == "head_gr_read") hm[0] = std::nanf("");
+                    else if (ps == "act_quantiser") { xq[0] = 0x00; xq[1] = 0x7C; }   // block 0 d = fp16 +inf
+                    else if (ps == "head_projection") hl[0] = std::nanf("");
+                    else if (ps == "sampler" && out != nullptr) out[0] = 99999999;     // force the S5 argmax mismatch
+                }
+                for (int t = 0; t < T && stage == nullptr; ++t)                 // S1
+                    for (int64_t i = 0; i < NN; ++i) {
+                        const float v = hm[(size_t) t * NN + i];
+                        if (!std::isfinite(v)) { stage = "head_gr_read(head_mixed)"; tr = t; idx = i; val = v; ++nbad; break; }
+                    }
+                if (stage == nullptr)                                           // S2
+                    for (int t = 0; t < T && stage == nullptr; ++t)
+                        for (int64_t b = 0; b < nblk; ++b) {
+                            const uint8_t* p = &xq[((size_t) t * nblk + b) * 36u];
+                            const uint16_t d16 = (uint16_t) (p[0] | (p[1] << 8));
+                            const uint16_t s16 = (uint16_t) (p[2] | (p[3] << 8));
+                            if (((d16 >> 10) & 0x1Fu) == 0x1Fu || ((s16 >> 10) & 0x1Fu) == 0x1Fu) {
+                                stage = "act_quantiser(xq_ q8_1 scale)"; tr = t; idx = b; break;
+                            }
+                        }
+                if (stage == nullptr)                                           // S3/S4
+                    for (int t = 0; t < T && stage == nullptr; ++t) {
+                        long long nb = 0;
+                        for (int64_t v = 0; v < n_vocab_; ++v) nb += !std::isfinite(hl[(size_t) t * n_vocab_ + v]);
+                        if (nb) { stage = "head_projection(native_mmvq/native_k_mmvq.spv Q6_K) == pre_sampler_logits"; tr = t; idx = nb; nbad = nb; }
+                    }
+                // S5: the SAMPLER's own result.  The captured window's greedy sampler binds history=nullptr (no
+                // penalties) and reads this very buffer (verify.cpp:1211), so its answer MUST equal a host argmax
+                // over these finite logits (strict >, lowest index wins - sampler_greedy.comp).  A mismatch here, with
+                // every logit finite, is the sampler's own arithmetic, not the head's.  (The device-side running
+                // max/sentinel live in sampler_greedy.comp's `shared rv/ri` and are not host-readable; this is the
+                // observable equivalent.)  Only checked when no penalty history is in play, which is this arm's case.
+                if (stage == nullptr && hist_d_ == nullptr && out != nullptr)
+                    for (int t = 0; t < T && stage == nullptr; ++t) {
+                        const float* row = &hl[(size_t) t * n_vocab_];
+                        int64_t top = 0;
+                        for (int64_t v = 1; v < n_vocab_; ++v) if (row[v] > row[top]) top = v;
+                        if ((int64_t) out[t] != top) {
+                            stage = "sampler_greedy(argmax vs finite logits mismatch)"; tr = t; idx = out[t]; val = (double) top; nbad = 1;
+                        }
+                    }
+                if (stage != nullptr) {
                     reported = true;
-                    std::fprintf(stderr, "strata dbg: verify window at position %lld, row %d: %lld of %lld logits non-finite "
-                                         "(token out %d)\n", (long long) pos0, t, (long long) bad, (long long) n_vocab_, out[t]);
+                    std::fprintf(stderr, "strata dbg NAN: pos0=%lld T=%d row=%d FIRST NON-FINITE STAGE=%s "
+                                         "idx=%lld val=%g (%lld non-finite in that row; n_vocab=%lld) token_out=%d\n",
+                                 (long long) pos0, T, tr, stage, idx, val, nbad, (long long) n_vocab_, tr < T ? out[tr] : -1);
                 }
             }
         }

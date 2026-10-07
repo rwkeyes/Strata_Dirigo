@@ -164,7 +164,31 @@ void sample_tokens(Stream& s, const float* logits, int n_tokens, int n_vocab, co
     pc.counter_hi = (uint32_t) (p.counter >> 32);
 
     const int n_blocks = (n_vocab + 4095) / 4096;      // kSplitBlockSpan, the merge's 4096-logit partitions
-    const bool fp64 = s.ctx->info().shader_float64;
+    // #3838a40 (upstream v0.1.40.2, SYCL): a device can ADVERTISE shaderFloat64 and still have no FP64 hardware -
+    // Intel Arc reports `fp64 1` through ANV while Intel's own article 000089817 says Arc has no shaderFloat64, so
+    // the tail is EMULATED (upstream measured 451 us against 20 us in float for one row on an A750, sampled decode
+    // 7.62 -> 8.10 tok/s).  The port already ships the portable sibling; this lets the emulated double tail be
+    // measured against it without a rebuild.  STRATA_VK_SAMPLER_F32=1 forces the f32 sibling; a device rule (Intel
+    // vendor id + no native fp64) is the alternative once the number is in.
+    //
+    // MEASURED 2026-10-07 (Arc Pro B70, the CLI verify-window arms, n=2 per tail): THIS SWITCH IS A NO-OP FOR THESE
+    // ARMS, because a `strata --tokens ...` run never dispatches the sampled path at all - the per-shader census of
+    // every arm lists `sampler_greedy.spv` (2 dispatches) and NO `sampler_split/kernel/kernel_f32`, since the P6
+    // verify window accepts a draft only if it equals the verifier's own GREEDY token.  Both tails returned the same
+    // id (`3aed108cceee`, 19 rounds) and the same rate, which is what a no-op switch must return.  The
+    // f32-vs-emulated-double question therefore needs the SERVER/bench sampled path (W24/W25 measured
+    // `sampler_split_def` = 2.8448 ms of a ~238 ms round and a k-round scan of 0.124 ms/round, so the tail's share
+    // is small at the shipped defaults).
+    //
+    // AND THE PREMISE IS WITHDRAWN: an all-zeros decode IS non-finite HEAD logits (`sampler_greedy.comp:106` returns
+    // token 0 when nothing beats `-inf`), and a sampler only READS the logits - it cannot create them.  The nan
+    // instrument's S1-S4 stages (all upstream of this call) are finite on every valid arm, so this tail is not the
+    // fault's cause and was never able to be.
+    static const bool prefer_f32 = [] {
+        const char* e = std::getenv("STRATA_VK_SAMPLER_F32");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const bool fp64 = s.ctx->info().shader_float64 && !prefer_f32;
     const char* which = nullptr;
     if (fp64 && n_blocks <= 64 && n_tokens <= 64) which = "/sampler_split.spv";        // the default
     else if (fp64)                                which = "/sampler_kernel.spv";       // the f64 one-block fallback

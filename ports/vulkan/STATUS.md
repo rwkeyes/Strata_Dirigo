@@ -1,5 +1,28 @@
 # Status — what is done, what is verified, what is not
 
+## THE NAN INSTRUMENT IS VALIDATED, AND THE ALL-ZEROS FAULT IS **ABLATION-ONLY**; D4's f32 sampler select is a **NO-OP for the CLI arms** and its premise is WITHDRAWN (2026-10-07, `vega`, Arc Pro B70)
+
+**THE INSTRUMENT IS NOW A CHECK.** `STRATA_DBG_NAN=1` names the FIRST non-finite head stage (S1 `head_gr_read`,
+S2 `act_quantiser(xq_ q8_1 scale)`, S3 `head_projection(... Q6_K)`, S4 `pre_sampler` = the buffer `sampler_greedy`
+reads, S5 the sampler's own argmax) and carries a **poison self-test** (`STRATA_DBG_NAN_POISON=<stage>`) that poisons
+one stage's HOST copy — so a silent run means "every stage finite", not "a detector that never fires". Inert when unset.
+**All four controls fire and name their stage** (`step4/nan_final.tsv`); the S5 arm alone MOVES the output id
+(`f7a70ef107de`) because it corrupts a real output — the negative control.
+
+**THE FAULT IS ABLATION-ONLY.** 4/4 valid arms on the validated build are clean at S1–S4 and hold `3aed108cceee`
+(two default-tail, two `STRATA_VK_SAMPLER_F32=1`; 19 rounds, 10.00–11.02 tok/s); with the 20 nan2 arms (whose own
+self-test named nothing, so nothing rests on them) that is **24 valid arms, zero non-finite head stages, zero
+all-zeros**. The only all-zeros arm this project has is the **trivial-work trigger itself** (`STRATA_VK_TRIVIAL_REC=1`
+-> `d01eee6a3948`, 127 tok/s): the ablation feeds the head garbage and the head goes non-finite. **No valid machinery
+ceiling has been measured, and the trivial-work route cannot produce one.** Open and named: which stage goes non-finite
+FIRST on the trivial arm (nan_trivial_3 ran on nan2, whose controls never fired).
+
+**D4's f32 tail (kept as an inert env-gated diagnostic):** `STRATA_VK_SAMPLER_F32=1` selects the f32 sibling over the
+emulated-double tail this Arc selects (ANV advertises `fp64 1`, no FP64 hardware). A CLI `--tokens` arm **never
+dispatches the sampled path** (the census lists `sampler_greedy.spv` only; the P6 window takes its own GREEDY token), so
+both tails returned the same id and rate — a no-op switch. The question needs the server/bench sampled path, and the
+premise (this tail causes the all-zeros fault) is WITHDRAWN: a sampler only reads the logits.
+
 ## THE DECODE GAP IS NOT THE KERNELS' EXECUTION — measured with GPU timestamps, this port's decode kernels run at **0.80–3.13 ns/workgroup** (the trivial-kernel floor is 0.7–3.8), a **flat ~3.86 µs is paid per *dispatch*** across every one of 50 families, and the round's GPU time is **13.7 ms against a 237 ms round**; and TARGET 1's SECOND kernel LANDS: the fused gate/up dequantiser (`dequant_gu_kernel`) removes **exactly 7,178** live dispatches (56,051 → 48,873) and takes the `dequant` phase **1,486–1,491 → 911–914 ms (−38.7%, ranges disjoint)**, bit-exact, both ids unmoved (2026-10-07, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH.** The queued brief said the decode gap is "in the kernels' own execution" and asked for per-kernel GPU time on BOTH engines to name it. **TASK A built that instrument on the port** (`STRATA_VK_KERNEL_TIME=1`: a `vkCmdWriteTimestamp` pair at TOP_OF_PIPE / BOTTOM_OF_PIPE around every **recorded** decode dispatch, read back with `VK_QUERY_RESULT_WITH_AVAILABILITY_BIT` and accumulated per shader) and read upstream's half from the engine's **own** stage profiler, which both trees already compile (`STRATA_VERIFY_PROFILE=1`; on the Level-Zero/SYCL backend `gpu_stamp` is deliberately INERT - `verify_kernels.dp.cpp`: "SYCL: no %globaltimer equivalent" - so the only per-stage GPU clock on that tree is `STRATA_VERIFY_EAGER=1`, a host wait + clock at each of the engine's 33 stamps). **The two rankings agree and they invert the brief's premise.** The port's decode executes **9,349 recorded dispatches at 3.861 µs of GPU time each (36.1 ms total, 0.80–3.13 ns/workgroup across the widest grids)**; upstream's decode is **49.59 ms per window (GDN 42.18 + QSA 7.41), 95% of its 40.6 ms round**. So the port's *GPU* work per round is **~13.7 ms against upstream's ~38.5 ms (0.36x)** while its round takes **237 ms against 40.6 ms (5.8x longer)**. The 4.6x per-dispatch cost is **63 µs of NON-GPU time per dispatch**; there is no kernel-side gap to close. **TASK B** then ported the already-worked-out fused gate/up dequantiser to GLSL and the phase DID move, by GPU time: `dequant` **1,486–1,491 → 911–914 ms (−38.7%, disjoint)** with the control arm (the same binary, `STRATA_VK_IQ_GU_FUSED=0`) restoring 1,485–1,486 ms and 56,051 dispatches exactly. **TASK C** pricing says the same as Task A: the top family's per-workgroup cost is AT the floor, so occupancy / vector width / coopmat / the IQ1_M decode-in-the-inner-loop are **not** the lever; the flat per-dispatch latency is.
