@@ -7897,3 +7897,43 @@ a rewire; (4) prove the two ids unmoved - the arithmetic change is the whole ris
 **LATENT DEFECT:** `src/core/mtp.cpp:576` calls `native_router_top10` unconditionally under
 `native_router_enabled()`. On a 256-expert model that dispatches the 512-hardcoded shader past a 256-logit row.
 The shipped `--spec 2` path is correct; `--mtp` is exposed.
+
+---
+
+## 2026-10-07 — the PROMPT-CHUNK recurrence (`STRATA_PF_GDN_REC_CHUNK`): BIT-EXACT, and it REFUTES the batching hypothesis
+
+**WHAT WAS BUILT.** `shaders/gdn_rec_chunk.comp` + `gdn_step_chunk` (`vulkan/src/kernels/prefill_vk.cpp`): ONE
+dispatch per layer walks every token of the chunk, holding the (S=128) state column of each (head, column) lane in
+the invocation's own storage instead of round-tripping the 3 MiB state through global memory once per token. This
+is the transcription of `src/prefill/kernels.cu`'s `gdn_rec_kernel` that the wrapper's own note deferred ("for a
+1-2 token prompt the batched kernel computes exactly what the DECODE step computes, one token at a time") - and it
+changes NO association: the token axis is walked SERIALLY, `sk` and the readout keep the single ascending-`i`
+accumulator, so the state and the readout are element-for-element the shipped path's. This is therefore NOT the
+reassociating parallel scan the port rejected on the recurrence's chaos. Opt-in (`STRATA_PF_GDN_REC_CHUNK=1`); the
+shipped chain stays the default.
+
+**WHAT IT PROVED.** Interleaved A/B (A,B,A,B) on the 199-token prompt, SAME binary, one env var: id
+`56a0b28d2de6` on ALL FOUR arms - bit-exact end-to-end, as designed.
+
+**WHAT IT REFUTED.** The phase did not fall: `gdn recurrence` 2,756/2,794 ms (chunk) against 2,705/2,721 ms
+(chain) - disjoint in the WRONG direction, 2.3% worse. Per (layer, token) that is **381 us over 7,128 lone
+dispatches (chain) against 389 us over the same 7,128 tokens carried inside 36 dispatches (chunk)**: pooling 198
+DEPENDENT tokens into one launch did not move the per-token cost. So the phase is NOT lone-dispatch latency and
+NOT the dispatch chain - it is the kernel's own per-token cost inside a dependency that is sequential by
+construction. End-to-end is unresolvable (9,526.9 ms sits inside 9,362.3-9,655.5), and the phase table's apparent
+relief is attribution moving between names (`embed+steps` 1,200 -> 18-32, `router+shared` 617 -> 84-85,
+`host grouping` 1,256 -> 1,773-2,052). The `native_gdn_step.comp` header had already named the live constraint:
+memory-LATENCY-bound at ~16% of bandwidth.
+
+**WHAT THE NEXT INCREMENT OWES (do NOT redo batching).** The SAME kernel row costs 22-292 us in this port's own
+bench (`bench/README.md`'s `gdn_step_probe`) and 381-389 us in the engine at identical shapes - a 17x gap that
+survives the state round-trip's removal, so it is neither the state traffic nor the dispatch shape. Price
+occupancy/MLP at the chunk shape (this shader compiled ROLLED: 5 `OpLoopMerge`, the state array in per-invocation
+memory - strictly less MLP than the KU=16 kernel it replaces) and kill the 128x redundant k/q reads per head with
+shared-memory staging. Reassociation stays off the table.
+
+**FOR THE NEXT SESSION.** The gate compiles `shaders/*.comp` (the `.spv` are gitignored). This shader has NO gate
+case yet: the four id-identical arms are its evidence, `case_prefill_gdn_recurrence` still covers the default path,
+and a case for the chunk form is OWED. Session-local caveat worth keeping: this box ran ~29% slower than the
+recorded 21.37 tok/s baseline on the same day, so arms must be interleaved within a session (A_1 11,949.5 ms cold,
+A_2 9,526.9 ms warm, against the record's 9,267 ms).

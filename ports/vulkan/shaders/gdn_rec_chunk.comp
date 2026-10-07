@@ -1,0 +1,80 @@
+#version 450
+// ports/vulkan/shaders/gdn_rec_chunk.comp - the GDN / DeltaNet recurrence for a PROMPT CHUNK: ONE dispatch per
+// LAYER walks every token of the chunk, holding the (S=128) state COLUMN of each (head, column) lane in
+// per-invocation storage, instead of the shipped one-dispatch-per-token loop that round-trips the 3 MiB state
+// through global memory once per token (vulkan/src/kernels/prefill_vk.cpp's `gdn_recurrence`).
+//
+// ============================================================================================================
+// WHY THIS IS NOT THE PARALLEL SCAN THIS PORT ALREADY REJECTED (native_gdn_step.comp:57-61).
+// That note is explicit: the recurrence is chaotic (an eigenvalue near -19 per token on an un-normalised
+// fixture), so ANY reassociation of the f32 sum changes the answer and moves the ids - which is why a scan was
+// rejected.  THIS KERNEL CHANGES NO ASSOCIATION.  The token axis is walked SERIALLY, one token after the other,
+// exactly as the per-token loop does; each token's `sk` contract and readout use the SAME single accumulator
+// adding terms in the SAME ascending `i` order; the update is the same `g*s + k*delta`; the readout scale is
+// the same fused 1/sqrt(S).  What changes is only (a) WHERE the state lives BETWEEN tokens - this invocation's
+// own storage rather than global memory - and (b) HOW MANY dispatches carry the layer: one instead of 2*T.
+// ============================================================================================================
+//
+// THE SHAPE BEING FIXED, MEASURED (ports/vulkan/bench/README.md's `gdn_step_probe`, re-run 2026-10-07 on the
+// Arc Pro B70): the same `native_gdn_step` kernel and grid read **0.2921 ms as a LONE dispatch** (the engine's
+// prefill issues one per (layer, token) and waits for it) and **0.0135-0.0222 ms when dispatches are not each
+// isolated**.  The engine's `gdn recurrence` phase is 2,701 ms of a 9,267 ms prefill (29.7%) over 7,128 rows =
+// 379 us per row, i.e. that lone-dispatch latency.  Fusion alone does not help (halving the dispatch count with
+// `STRATA_PF_GDN_REC_FUSED` moved the phase 3.7%): the CHAIN LENGTH is the cost, and the only way to shorten a
+// strictly dependent chain is to carry more tokens per dispatch.
+//
+// GEOMETRY (the host wrapper refuses anything else, as it does for native_gdn_step):
+//   state  (S, h_v, S), j fastest, IN PLACE   - the per-layer state, shared with the decode path
+//   qkv    T rows of (2*h_k + h_v)*S floats   - the engine's own per-token row: q | k | v
+//   g/b    (T, h_v)        the pre-exp gate and beta
+//   out    (T, h_v, S)     the readout, one row per token (the closing norm stays a separate per-token launch)
+//   S == 128, enforced by the wrapper; that is what makes the row axis a compile-time constant here and lets
+//   the state stay in the invocation's own registers instead of being re-read from global memory per token.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer STATE { float v[]; } state;      // (S, h_v, S), j fastest, in place
+layout(set = 0, binding = 1, std430) readonly buffer QKV { float v[]; } qkv;  // (T, (2*h_k + h_v)*S)
+layout(set = 0, binding = 2, std430) readonly buffer G { float v[]; } gb;     // (T, h_v) pre-exp gate
+layout(set = 0, binding = 3, std430) readonly buffer B { float v[]; } bb;     // (T, h_v) beta
+layout(set = 0, binding = 4, std430) buffer O { float v[]; } ob;              // (T, h_v, S)
+layout(push_constant, std430) uniform PC { int S; int h_k; int h_v; float scale; int T; int row; } pc;
+
+const uint SL = 128u;   // the wrapper refuses S != 128 (as native_gdn_step does); constant here on purpose
+
+void main() {
+    const uint hk = uint(pc.h_k), hv = uint(pc.h_v), T = uint(pc.T), row = uint(pc.row);
+    const uint col = gl_GlobalInvocationID.x;           // j fastest, then h: col = h*SL + j
+    if (col >= SL * hv) return;
+    const uint h = col / SL;
+    const uint j = col % SL;
+    const uint src = h % hk;                            // MODULO head pairing (not h / (h_v/h_k))
+    const uint sbase = h * SL + j;                      // state index base: (i*hv + h)*SL + j
+
+    // THE STATE COLUMN, ONCE PER LAYER.  Same values the per-token kernel re-reads every time; the same
+    // ascending-i order is used for the accumulators below, so every element is computed by exactly the same
+    // sequence of f32 operations.
+    float st[SL];
+    for (uint i = 0u; i < SL; ++i) st[i] = state.v[i * hv * SL + sbase];
+
+    for (uint t = 0u; t < T; ++t) {
+        const uint qrow = t * row + src * SL;
+        const uint krow = t * row + hk * SL + src * SL;
+        const uint vrow = t * row + 2u * hk * SL + h * SL + j;
+        const float g = exp(gb.v[t * hv + h]);          // the native body's `g_val = expf(gate[head])`
+        const float b = bb.v[t * hv + h];
+        // the contract against the UNDECAYED state, ONE accumulator, terms in ascending `i`
+        float kv = 0.0f;
+        for (uint i = 0u; i < SL; ++i) kv += st[i] * qkv.v[krow + i];
+        const float delta = (qkv.v[vrow] - g * kv) * b;
+        // the folded decay + rank-1 update, then the readout against the UPDATED state, same single accumulator
+        float attn = 0.0f;
+        for (uint i = 0u; i < SL; ++i) {
+            const float s = g * st[i] + qkv.v[krow + i] * delta;
+            st[i] = s;
+            attn += s * qkv.v[qrow + i];
+        }
+        ob.v[t * (hv * SL) + sbase] = attn * pc.scale;  // the native body's folded 1/sqrt(S) readout scale
+    }
+
+    // AND BACK ONCE PER LAYER.
+    for (uint i = 0u; i < SL; ++i) state.v[i * hv * SL + sbase] = st[i];
+}

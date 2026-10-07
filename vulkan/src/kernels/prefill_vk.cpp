@@ -58,6 +58,7 @@
 #include "vk_arena.hpp"                     // the arena + pointer->buffer resolution
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -697,6 +698,53 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     }
 }
 
+// ---- the PROMPT-CHUNK form of the recurrence: ONE dispatch per layer for the whole chunk (gdn_rec_chunk.spv).
+// WHY IT EXISTS.  The wrapper below issues 2*T dispatches per layer, and every step dispatch pays a LONE
+// dispatch's latency: the port's own bench (`ports/vulkan/bench/README.md`'s `gdn_step_probe`, re-run on the
+// B70 2026-10-07) reads the SAME `native_gdn_step`, same grid, at **0.2921 ms isolated** and **0.0135-0.0222 ms
+// when dispatches are not each isolated**.  The phase is 2,701 ms of a 9,267 ms prefill (29.7%) over 7,128 rows
+// = 379 us per row.  `STRATA_PF_GDN_REC_FUSED` already FALSIFIED the naive reading of that number: halving the
+// DISPATCH COUNT (2 -> 1 per token, the fused pair) moved the phase 3.7%, because each row still pays one lone
+// dispatch.  The chain length is the cost, so this is the deferred transcription of `src/prefill/kernels.cu`'s
+// `gdn_rec_kernel` - the port's note above says it was skipped because "for a 1-2 token prompt the batched
+// kernel computes exactly what the DECODE step computes, one token at a time"; that deferral was priced at a
+// 1-2 token prompt, and at 199 tokens it is 29.7% of the prefill.
+//
+// ARITHMETIC: the SAME expression, the SAME order, the SAME single ascending-i accumulator for both the
+// contract and the readout, the same `g*s + k*delta`, the same fused 1/sqrt(S) - see the shader's header.  The
+// only change is that the state column lives in the invocation's own storage BETWEEN tokens instead of being
+// round-tripped through global memory per token (and is written back once per layer, not once per token), which
+// is why this is NOT the reassociating parallel scan the port rejected: no sum is reassociated.
+//
+// GEOMETRY: state (S=128, h_v=48, S=128) in place; `h` is [T, C=10240] ([q 16*128 | k 16*128 | v 48*128]);
+// g/b are [T, h_v]; `out` is [T, h_v*S].  Grid = h_v*S lanes, i.e. one lane per (head, column), as the decode
+// step's - the difference is that this lane walks all T tokens.
+void gdn_step_chunk(Stream& s, float* state, const float* h, const float* gate, const float* beta, float* out,
+                    int64_t T) {
+    const uint64_t S = (uint64_t) kS, hk = (uint64_t) kHK, hv = (uint64_t) kHV;
+    Buf st{}, qv{}, gv{}, bv{}, ov{};
+    if (!resolve_dev(s, state, S * hv * S * 4, st) || !resolve_dev(s, h, (uint64_t) T * (uint64_t) kC * 4, qv) ||
+        !resolve_dev(s, gate, (uint64_t) T * hv * 4, gv) || !resolve_dev(s, beta, (uint64_t) T * hv * 4, bv) ||
+        !resolve_dev(s, out, (uint64_t) T * hv * S * 4, ov))
+        refuse("prefill::gdn_step_chunk", "a pointer is not in this arena");
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/gdn_rec_chunk.spv", 5, 24);
+    struct Push {
+        int32_t S;
+        int32_t h_k;
+        int32_t h_v;
+        float scale;
+        int32_t T;
+        int32_t row;
+    } pc{};
+    pc.S = (int32_t) S;
+    pc.h_k = (int32_t) hk;
+    pc.h_v = (int32_t) hv;
+    pc.scale = 1.0f / std::sqrt((float) S);   // the same folded readout scale the step applies
+    pc.T = (int32_t) T;
+    pc.row = (int32_t) kC;                    // the per-token row stride of `h`: (2*h_k + h_v)*S = 10240
+    s.ctx->dispatch(p, {&st, &qv, &gv, &bv, &ov}, &pc, sizeof(pc), groups_for(hv * S));
+}
+
 // ================================ the GDN recurrence (the DECODE step, per prompt token) ==================
 // THE SHAPE.  `src/prefill/kernels.cu`'s `gdn_rec_kernel` walks the chunk INSIDE one launch, carrying the state in
 // registers - but the recurrence is a sequential walk in time, so for a 1-2 token prompt the "batched" kernel
@@ -750,6 +798,23 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     // which is why `case_prefill_gdn_recurrence` holds the state to BITWISE and only bounds `y` against the rule.
     const char* rec_env = std::getenv("STRATA_PF_GDN_REC_FUSED");
     const bool rec_fused = rec_env != nullptr && rec_env[0] != '0';
+    // THE CHUNK FORM (opt-in: `STRATA_PF_GDN_REC_CHUNK=1`).  ONE dispatch carries the whole chunk - all T tokens -
+    // so a layer's recurrence costs 1 step dispatch instead of T (2*T with the norm).  The closing norm stays a
+    // per-token launch into the same `o` scratch -> `y` the chain uses, so this removes the T step dispatches and
+    // leaves the T norm dispatches for a later increment.  The arithmetic is the shipped step's element for
+    // element and in the same order (`gdn_step_chunk`, and the shader's header for why this is not the rejected
+    // reassociating scan), so this arm must reproduce the chain's ids EXACTLY: an id change refutes bit-exactness
+    // and is a finding, not a tolerance to widen.
+    const char* chunk_env = std::getenv("STRATA_PF_GDN_REC_CHUNK");
+    if (chunk_env != nullptr && chunk_env[0] != '0') {
+        float* oc = (float*) xf32(*s, (uint64_t) T * kHV * kS * 4).p;
+        gdn_step_chunk(*s, state, h, gate, beta, oc, T);
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::native_gdn_out_norm(oc + t * kHV * kS, z + t * kHV * kS, gamma, y + t * kHV * kS,
+                                                 kHV, kS, eps, stream);
+        if (y16 != nullptr) to_f16(y, y16, T * kHV * kS, stream);
+        return;
+    }
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * kC;
         if (rec_fused) {
