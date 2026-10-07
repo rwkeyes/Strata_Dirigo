@@ -1,5 +1,84 @@
 # Status — what is done, what is verified, what is not
 
+## THE EMPTY LAUNCH IS NOT IN THE OTHER LAUNCHERS, IT IS A SECOND TIME IN THE SAME ONE: `native_k_mmvq` has no window loop or y-grid (and the "41,580 dispatches" premise is STALE), `moe_grouped_s2` is a refusal, `peer_experts` only calls the launcher that already had the cap — and the grouped launcher's WINDOW-INDEPENDENT stages (SwiGLU + q8_1) ran `nwin`=8 times per call, now HOISTED (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) **The audit the brief asked for, launcher by launcher, and the pattern is not in any of them.**
+- **`native_k_mmvq` — no window loop, no y-grid, and a stale headline.** `matvec_vk.cpp:254-272` hands the kernel a
+  **one-dimensional** grid (`n_out`); `native_k_mmvq.comp` reads no `gl_WorkGroupID.y`; and the only two
+  `for (uint32_t w < nwin)` loops in the whole tree are `native_expert_grouped` and `verify::fetch_blobs`. So there
+  is no window guard and no `gy` — nothing to cap. The brief's "41,580 dispatches in one prefill histogram, ~50%
+  of the dispatch layer" is the **per-token** prefill form (210 K-quant dense tensors × 198 tokens) that the
+  batched native GEMM (`prefill_vk.cpp::Gemm::native`, the `beta == 0 && ldy == N` arm) already replaced with
+  **three dispatches per PROJECTION** (so 210, not 41,580) — and the engine's own current histogram says so:
+  `native_k_mmvq.spv` is **absent from the top-14 of the run's 59,640 live dispatches**, whose 14th entry is
+  1,152. New arm `native_k_mmvq_engine` prices both forms: **batched 5.9188 ms**/dispatch for 198 tokens
+  (**0.0299 ms/token**, 1 dispatch) against **per-token 0.0408 ms** (198 dispatches, 1.36× the per-token cost and
+  198× the count); a spurious `gy=8` is **0.2006 ms = 4.9×** — 8× the WORKGROUPS, never 8× guarded-and-empty
+  ones.
+- **`moe_grouped_s2` is a LOUD REFUSAL** (`refusals_vk.cpp:187`), reached only on a **non-native** pack
+  (`verify.cpp`'s `else`); it does not appear in any histogram of this run.
+- **`peer_experts` / `remote_experts` do not have their own launcher to sweep**: `peer_experts.cpp:233` and
+  `remote_experts.cpp:310` call **`native_expert_grouped` itself** with the default `grid_groups`, so they
+  **inherit** the `gy` cap. The port is all-resident, so neither path is dispatched here (no `fetch_blobs.spv`,
+  no S2-tier shader, in ANY histogram). **The cap's optimum for a large `ng` remains UNMEASURED** — said again,
+  not forced.
+- The only OTHER window loop is `verify::fetch_blobs` (the non-resident expert-source path, grid `cap` ≤ 64,
+  one dimension); it is not dispatched in this run.
+
+(2) **What the audit found instead is the same waste one layer up, inside the launcher that already had the cap.**
+The window loop exists **only** for the weight read (a 32-bit storage-buffer index reaches one 4 GiB window), but
+**two of the launcher's four stages read no weights** — the **SwiGLU** over the gate/up scratch and the **q8_1
+quantise** of its result — and both sat **inside** the loop. A call therefore ran **8 SwiGLU launches and 8 q8_1
+launches, 7 of each recomputing the byte-identical result** over the identical scratch (the empty-window gu
+launches write nothing, so the scratch after the loop equals the scratch after the one working launch). The
+stages are hoisted out — **gu loop → SwiGLU → q8_1 → down loop**, because `down` must read the single q8_1 image
+and `gu`/`down` are the two that ARE window-bound — which is **bit-identical by construction** and takes the call
+from **32 to 18 dispatches**. New arm `native_grouped_hoist` at the engine's shape: **4.1465 → 4.0780 ms/call
+(−1.7%)**, i.e. 14 removed dispatches at the port's own recorded-batch marginal (**~4.9 µs**; the record's
+live-batch figure is 4.6–5.4).
+
+(3) **Engine A/B, interleaved, n=3 per arm, against a saved copy of the previous binary** (`c59e8687…`, HEAD
+4f4aea7) — the changed binary is `662d2547…`:
+
+| arm | binary | segments | recorded disp (segment) | barriers | sync ms/round | seg wait ms | decode | id | log |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| `prev199`  | prev | 42 | 59,111 | 71,005 | 227.945 | 3,322 | 9.48 | `56a0b28d2de6` | `/tmp/gyfix/prev199.log` |
+| `prev199b` | prev | 42 | 59,111 | 71,005 | 227.901 | 3,322 | 9.50 | `56a0b28d2de6` | `/tmp/gyfix/prev199b.log` |
+| `prev199c` | prev | 42 | 59,111 | 71,005 | 228.047 | 3,323 | 9.50 | `56a0b28d2de6` | `/tmp/gyfix/prev199c.log` |
+| `new199`   | hoist | 42 | 49,703 | 68,989 | 225.085 | 3,281 | 9.62 | `56a0b28d2de6` | `/tmp/gyfix/new199.log` |
+| `new199b`  | hoist | 42 | 49,703 | 68,989 | 224.882 | 3,278 | 9.62 | `56a0b28d2de6` | `/tmp/gyfix/new199b.log` |
+| `new199c`  | hoist | 42 | 49,703 | 68,989 | 224.988 | 3,279 | 9.63 | `56a0b28d2de6` | `/tmp/gyfix/new199c.log` |
+
+Window sync **227.96 → 224.99 ms/round (−1.3%)** and decode **9.49 → 9.62 tok/s (+1.4%)**, with **disjoint ranges**
+on both (prev 227.901–228.047 / 9.48–9.50; new 224.882–225.085 / 9.62–9.63). The ENCODED dispatch composition
+falls by exactly the predicted **2,016**: `swiglu_f32` **1,296 → 288**, `quantize_q8_1` **1,875 → 867**,
+`native_gu_any` / `native_down_any` / `fused_gr_mix` and every other kernel **UNCHANGED**; the segment chain
+barriers fall **71,005 → 68,989**. Id `56a0b28d2de6` unmoved in every arm. The **8-token** arm (`--tokens`
+exactly `1 2 3 4 5 6 7 8`, id `3aed108cceee`) reproduces it: `prev8` 172.186 / `prev8b` 172.424 ms and 9.26 /
+9.24 tok/s against `new8` 169.366 / `new8b` 169.657 and 9.39 / 9.38, segment counts 57 / 73,126 / 21,826 →
+57 / 60,358 / 20,482 — **disjoint ranges on both metrics again (-1.6% sync, +1.5% decode)**.
+
+(4) **Target 2 closed — `fused_gr_mix` (68.3 µs, the largest priced single kernel) is a priced NO.** New arm
+`fused_gr_mix_pass` varies `hc` on the SAME shader: **hc=4 68.3 µs, hc=2 45.5, hc=1 33.8**. Each of the four
+`wg_sum` reduction trees is ~**11.5 µs (17%)**, so ~46 µs of the 68.3 µs (67%) is barrier reduction over a body of
+5 MACs per thread. The only lever that removes a reduction changes the **summation tree** — the last bits, and
+therefore the ids the contract pins — and a subgroup reduction is **banned outright by the gate census**. So the
+kernel stays as measured; the "reduce or spread" answer is a no, priced.
+
+**GATE + IDS.** Arc **intel_icd 895 passed / 0 failed / 0 skipped** — the count did NOT fall (it was 895 at HEAD)
+and nothing was skipped. lvp **879/0/4** (the four documented skips). radeon's failing set is the documented
+**moving-failing-set**: it is NOT stable across three runs on the SAME binary (run 1: `bf16_gemv_split`,
+`bf16_gemv_fp32_mmvf`, `bf16_gemv`, `bf16_gemv_fp32_mmvf_cols` = 880/4/2; run 2: `fused_gdn_ab`, `bf16_gemv`,
+`bf16_gemv_fp32_mmvf_cols`, `bf16_gemv_fp32_mmvf_multi` = 880/4/2; run 3: `fused_gdn_ab`,
+`bf16_gemv_fp32_mmvf_cols` = 882/2/2), and **not one of its cases touches `native_expert_grouped`** — the Arc
+(Intel) arm is the authority and it is green. Smoke 60/0/0. Ids `56a0b28d2de6` (199-token) and the 8-token list
+`1 2 3 4 5 6 7 8` → `3aed108cceee` in every arm; the 8-token driver REFUSES a wrong-length list.
+
+**NOT DONE.** (i) The **window count itself** (Task 3): the launcher still issues 8 launches per call (7 gu + 7
+down empty at gy=1); removing them needs a 64-bit buffer index (glslang 15.1 rejects it), buffer-device-address,
+or an 8-binding weight switch. Not attempted. (ii) The `gy` optimum for large `ng` (peer/remote tiers) is still
+unmeasured — those paths are not exercised by an all-resident run. (iii) `fused_gr_mix` is priced, not optimised.
+
 ## THE "GROUPED GEMV ncols" LEVER: FALSIFIED BY ITS OWN ARM, AND THE EMPTY LAUNCH IT EXPOSED IS A MEASURED 12.2% OF THE VERIFY WINDOW (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** (1) **The sized lever was measured before it was built, and the measurement killed it.** The brief's

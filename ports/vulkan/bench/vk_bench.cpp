@@ -1975,6 +1975,210 @@ void bench_dispatch_gap(Ctx& ctx, const std::string& dir, int reps, int warmups)
     ctx.free(ms_); ctx.free(md_); ctx.free(ds_); ctx.free(dd_); ctx.free(big);
 }
 
+// =========================================================================================================
+// TASK 1 AUDIT (a): `native_k_mmvq` - the "biggest dispatch producer" claim, checked, AND its launch shape.
+//
+// The brief sized the prefill's dispatch pressure as "native_k_mmvq 41,580 dispatches in one prefill
+// histogram, ~50% of the whole dispatch layer".  That figure PREDATES the batched native GEMM
+// (`prefill_vk.cpp::Gemm::native`, the `beta == 0 && ldy == N` arm): the per-token loop it describes pays
+// three dispatches PER TOKEN (f16_to_f32, quantize_q8_1, native_k_mmvq) for each of the 210 K-quant dense
+// tensors, hence 210 x 198 = 41,580; the batched arm pays three dispatches per PROJECTION, so 210.  The
+// engine's OWN current histogram agrees (base199): `native_k_mmvq.spv` is ABSENT from the top-14 of the
+// run's 59,640 live dispatches, whose 14th entry is 1,152 - so the whole 198-token prefill plus 32 decoded
+// tokens uses < 1,152.  This arm prices both shapes, and shows why there is no empty launch here to cap:
+// the host passes a ONE-DIMENSIONAL grid (`n_out`), there is no window loop (the only two
+// `for (uint32_t w < nwin)` loops in the tree are `native_expert_grouped` and `verify::fetch_blobs`), and
+// the shader reads no `gl_WorkGroupID.y` - `gy` is not a knob this launcher HAS.
+// =========================================================================================================
+void bench_native_k_mmvq_engine(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int n_in = 2560, n_out = 1280, ty = 14;            // Q6_K: the commonest dense K-quant in coder-iq1_m
+    const int row_bytes = (n_in / 256) * 210;                // Q6_K: 256 values in 210 B, 10 blocks per row
+    const int ncols_big = 198;                               // the engine's own --prefill chunk
+    VkPipeline p = ctx.pipeline(dir + "/native_k_mmvq.spv", 3, 20);
+    std::vector<uint8_t> wbuf((size_t) n_out * row_bytes);
+    for (size_t i = 0; i < wbuf.size(); ++i) wbuf[i] = (uint8_t) (i * 7 + 1);
+    Buf bw = ctx.alloc_device(wbuf.size());
+    ctx.write(bw, wbuf.data(), wbuf.size());
+    const std::string shape = "Q6_K n_in=2560 n_out=1280 device-local, 1-D grid (n_out,1)";
+
+    auto q8buf = [&](int nc) {
+        std::vector<uint8_t> a((size_t) nc * (n_in / 32) * 36);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = (uint8_t) (i * 11 + 3);
+        return a;
+    };
+    {   // THE BATCHED FORM - one dispatch for all 198 tokens (the shipped prefill path)
+        const int nc = ncols_big;
+        std::vector<uint8_t> a = q8buf(nc);
+        Buf ba = ctx.alloc_device(a.size()), bo = ctx.alloc_device((size_t) n_out * nc * 4);
+        ctx.write(ba, a.data(), a.size());
+        struct { int32_t n_in, n_out, row_bytes, ncols, ty; } pc{n_in, n_out, row_bytes, nc, ty};
+        report("k_mmvq_batched", shape + " | ncols=198: 1 dispatch for 198 tokens",
+               time_kernel(ctx, p, {&bw, &ba, &bo}, &pc, sizeof(pc), (uint32_t) n_out, 1, 8, reps, warmups),
+               (double) n_out * nc, 0.0);
+        ctx.free(ba); ctx.free(bo);
+    }
+    {   // THE PER-TOKEN FORM - one dispatch per token (the form the 41,580 figure counted)
+        std::vector<uint8_t> a = q8buf(1);
+        Buf ba = ctx.alloc_device(a.size()), bo = ctx.alloc_device((size_t) n_out * 4);
+        ctx.write(ba, a.data(), a.size());
+        struct { int32_t n_in, n_out, row_bytes, ncols, ty; } pc{n_in, n_out, row_bytes, 1, ty};
+        report("k_mmvq_pertoken", shape + " | ncols=1: 1 dispatch PER TOKEN (the 41,580 form)",
+               time_kernel(ctx, p, {&bw, &ba, &bo}, &pc, sizeof(pc), (uint32_t) n_out, 1, 8, reps, warmups),
+               (double) n_out, 0.0);
+        ctx.free(ba); ctx.free(bo);
+    }
+    {   // THE LAUNCH SHAPE, in the gu/down sweep's own shape: a y-grid multiplies WORKGROUPS, never "empty"
+        // ones - there is no guard to fail, so a `gy` sweep has no floor to find.  8x the grid, ~8x the time.
+        std::vector<uint8_t> a = q8buf(1);
+        Buf ba = ctx.alloc_device(a.size()), bo = ctx.alloc_device((size_t) n_out * 4);
+        ctx.write(ba, a.data(), a.size());
+        struct { int32_t n_in, n_out, row_bytes, ncols, ty; } pc{n_in, n_out, row_bytes, 1, ty};
+        report("k_mmvq_gy8_spurious", shape + " | gy=8: the shader reads NO WorkGroupID.y, so it is 8x WORK",
+               time_kernel(ctx, p, {&bw, &ba, &bo}, &pc, sizeof(pc), (uint32_t) n_out, 8, 8, reps, warmups),
+               (double) n_out, 0.0);
+        ctx.free(ba); ctx.free(bo);
+    }
+    ctx.free(bw);
+}
+
+// =========================================================================================================
+// TASK 1 AUDIT (b): the grouped launcher's SECOND per-window waste - the WINDOW-INDEPENDENT stages.
+//
+// The window loop exists ONLY for the weight read (a 32-bit storage-buffer index reaches one 4 GiB window).
+// TWO of the launcher's four stages read NO weights: the SwiGLU over the gate/up scratch, and the q8_1
+// quantise of its result.  Both sat INSIDE the window loop, so a call ran `nwin`=8 SwiGLU launches and 8
+// q8_1 launches - 7 of each recomputing the byte-identical result over the identical scratch.  Same species
+// as the empty launch, one layer up.  At the engine's shape (30 groups = the --spec 2 window's 3 tokens x
+// top-10, n_embd 2560, n_ff 1280, the arena's 8 windows, device-local):
+//   grp_call_current   8 x (gu + swiglu + q8_1 + down)     <- the shipped form
+//   grp_call_hoist     8 x gu + swiglu + q8_1 + 8 x down   <- the fix (gu and down are window-bound only)
+// =========================================================================================================
+void bench_native_grouped_hoist(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int n_embd = 2560, n_ff = 1280, cap = 30, nwin = 8;
+    const int ty_gu = 18, ty_dn = 20;                        // IQ3_XXS gu / IQ4_NL down (layer 0's formats)
+    const int gu_row = (n_embd / 256) * 98, gu_blob = 2 * n_ff * gu_row;
+    const int dn_row = (n_ff / 32) * 18, dn_blob = dn_row * n_embd;
+    std::vector<uint8_t> wgu((size_t) cap * gu_blob), wdn((size_t) cap * dn_blob);
+    for (size_t i = 0; i < wgu.size(); ++i) wgu[i] = (uint8_t) (i * 29 + 7);
+    for (size_t i = 0; i < wdn.size(); ++i) wdn[i] = (uint8_t) (i * 37 + 11);
+    std::vector<uint32_t> off_gu((size_t) cap), off_dn((size_t) cap);
+    for (int g = 0; g < cap; ++g) {
+        off_gu[(size_t) g] = (uint32_t) ((size_t) g * gu_blob);
+        off_dn[(size_t) g] = (uint32_t) ((size_t) g * dn_blob);
+    }
+    std::vector<uint8_t> act((size_t) cap * (n_embd / 32) * 36);
+    for (size_t i = 0; i < act.size(); ++i) act[i] = (uint8_t) (i * 11 + 3);
+
+    Buf b_w = ctx.alloc_device(wgu.size()), b_wd = ctx.alloc_device(wdn.size());
+    Buf b_act = ctx.alloc_device(act.size());
+    Buf b_off = ctx.alloc((size_t) cap * 4), b_offd = ctx.alloc((size_t) cap * 4);
+    Buf b_win = ctx.alloc((size_t) cap * 4), b_start = ctx.alloc(((size_t) cap + 1) * 4), b_ng = ctx.alloc(4);
+    Buf b_tok = ctx.alloc((size_t) cap * 4), b_sd = ctx.alloc(((size_t) cap + 1) * 4), b_ngd = ctx.alloc(4);
+    Buf b_g1 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid)), b_g2 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid));
+    Buf b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_gate = ctx.alloc_device((size_t) cap * n_ff * 4u + 256u);
+    Buf b_up = ctx.alloc_device((size_t) cap * n_ff * 4u + 256u);
+    Buf b_h = ctx.alloc_device((size_t) cap * n_ff * 4u + 256u);
+    Buf b_hq = ctx.alloc_device((size_t) cap * (n_ff / 32) * 36u);
+    Buf b_out = ctx.alloc_device((size_t) cap * n_embd * 4u + 256u);
+    ctx.write(b_w, wgu.data(), wgu.size()); ctx.write(b_wd, wdn.data(), wdn.size());
+    ctx.write(b_act, act.data(), act.size());
+    ctx.write(b_off, off_gu.data(), off_gu.size() * 4);
+    ctx.write(b_offd, off_dn.data(), off_dn.size() * 4);
+    std::vector<uint32_t> win0((size_t) cap, 0u);            // every group in ONE window (the engine's real case)
+    ctx.write(b_win, win0.data(), win0.size() * 4);
+    std::vector<int32_t> st((size_t) cap + 1), tk((size_t) cap);
+    for (int g = 0; g <= cap; ++g) st[(size_t) g] = g;
+    for (int g = 0; g < cap; ++g) tk[(size_t) g] = g % 3;
+    ctx.write(b_start, st.data(), st.size() * 4); ctx.write(b_sd, st.data(), st.size() * 4);
+    ctx.write(b_tok, tk.data(), tk.size() * 4); ctx.write(b_ng, &cap, 4); ctx.write(b_ngd, &cap, 4);
+    ctx.write(b_g1, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g2, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g3, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+
+    VkPipeline pgu = ctx.pipeline(dir + "/native_gu_any.spv", 12, 16);
+    VkPipeline psw = ctx.pipeline(dir + "/swiglu_f32.spv", 3, 4);
+    VkPipeline pq8 = ctx.pipeline(dir + "/quantize_q8_1.spv", 2, 8);
+    VkPipeline pdn = ctx.pipeline(dir + "/native_down_any.spv", 8, 24);
+    struct { int n_embd, n_ff, ty, win_id; } pcg{n_embd, n_ff, ty_gu, 0};
+    struct { int n; } pcs{cap * n_ff};
+    struct { int n_in, ncols; } pcq{n_ff, cap};
+    struct { int n_embd, n_ff, ty, win_id, d_row, down_off; } pcd{n_embd, n_ff, ty_dn, 0, dn_row, 0};
+    auto gu = [&](int w) { pcg.win_id = w;
+        ctx.record_dispatch(pgu, {&b_w, &b_act, &b_g1, &b_g2, &b_g3, &b_off, &b_win, &b_start, &b_ng, &b_tok,
+                                  &b_gate, &b_up}, &pcg, sizeof(pcg), (uint32_t) (2 * n_ff), 1u); };
+    auto sw = [&] { ctx.record_dispatch(psw, {&b_gate, &b_up, &b_h}, &pcs, sizeof(pcs),
+                                        (uint32_t) ((cap * n_ff + 255) / 256), 1u); };
+    auto q8 = [&] { ctx.record_dispatch(pq8, {&b_h, &b_hq}, &pcq, sizeof(pcq),
+                                        (uint32_t) ((n_ff + 255) / 256 * cap), 1u); };
+    auto dn = [&](int w) { pcd.win_id = w;
+        ctx.record_dispatch(pdn, {&b_wd, &b_hq, &b_offd, &b_win, &b_sd, &b_ngd, &b_tok, &b_out}, &pcd, sizeof(pcd),
+                            (uint32_t) n_embd, 1u); };
+    const std::string shape = "30 groups (3 tok x 10), n_embd 2560 n_ff 1280, nwin 8, device-local";
+    // the two ingredients on their own, so the delta is decomposed rather than attributed
+    report("grp_swiglu1", shape + " | ONE swiglu over cap*n_ff (window-independent stage)",
+           time_iters(ctx, 4, 1, reps, warmups, [&](int) { sw(); }), (double) cap * n_ff, 0.0);
+    report("grp_q8_1", shape + " | ONE q8_1 quantise of the intermediate (window-independent stage)",
+           time_iters(ctx, 4, 1, reps, warmups, [&](int) { q8(); }), (double) cap * (n_ff / 32) * 36, 0.0);
+    const Timing cur = time_iters(ctx, 4, 8 * 4, reps, warmups, [&](int) {
+        for (int w = 0; w < nwin; ++w) { gu(w); sw(); q8(); dn(w); }
+    });
+    const Timing ho = time_iters(ctx, 4, 8 + 1 + 1 + 8, reps, warmups, [&](int) {
+        for (int w = 0; w < nwin; ++w) gu(w);
+        sw(); q8();
+        for (int w = 0; w < nwin; ++w) dn(w);
+    });
+    report("grp_call_current", shape + " | 8 x (gu + swiglu + q8_1 + down) = 32 dispatches/call", cur, 32.0, 0.0);
+    report("grp_call_hoist", shape + " | 8 x gu + swiglu + q8_1 + 8 x down = 18 dispatches/call", ho, 18.0, 0.0);
+    const double c = cur.med * 32.0, h = ho.med * 18.0;
+    std::printf("      grouped per CALL: current %.4f ms (32 disp) | hoist %.4f ms (18 disp) | delta %.4f ms (%.1f%%)\n",
+                c, h, c - h, 100.0 * (c - h) / c);
+    ctx.free(b_w); ctx.free(b_wd); ctx.free(b_act); ctx.free(b_off); ctx.free(b_offd); ctx.free(b_win);
+    ctx.free(b_start); ctx.free(b_ng); ctx.free(b_tok); ctx.free(b_sd); ctx.free(b_ngd);
+    ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3);
+    ctx.free(b_gate); ctx.free(b_up); ctx.free(b_h); ctx.free(b_hq); ctx.free(b_out);
+}
+
+// =========================================================================================================
+// TASK 2: `fused_gr_mix` (68.3 us, the largest priced single kernel) - ONE PASS AT WHETHER IT CAN BE CUT.
+//
+// Per workgroup (one output column d) the kernel loops hc=4 streams; each stream's gate is a 320-long dot
+// reduced by the WORKGROUP BARRIER TREE (`wg_sum`, 8 rounds of 2 barriers).  Its arithmetic is 5 MACs per
+// thread, so the reductions are the whole cost.  This arm varies `hc` on the SAME shader to price one
+// reduction: if the time tracks the number of `wg_sum` calls, the kernel is reduction-bound, and the only
+// safe lever - fewer lanes or fewer rounds - changes the summation TREE, which changes the last bits and
+// moves the ids the engine's contract pins.  That is the "no" this arm has to price.
+// =========================================================================================================
+void bench_fused_gr_mix_pass(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int N = 2560, LR = 320;
+    const int64_t hc_dim = (int64_t) 4 * N;
+    std::vector<float> r = floats((size_t) hc_dim), nrm = floats((size_t) hc_dim), lof = floats((size_t) LR);
+    std::vector<float> rs = floats(4), mix = floats((size_t) N);
+    Buf b_r = ctx.alloc_device((size_t) hc_dim * 4), b_n = ctx.alloc_device((size_t) hc_dim * 4);
+    Buf b_l = ctx.alloc_device((size_t) LR * 4), b_s = ctx.alloc_device((size_t) 4 * 4);
+    Buf b_u = ctx.alloc_device((size_t) hc_dim * (size_t) (LR / 2) * 4);
+    Buf b_m = ctx.alloc_device((size_t) N * 4);
+    ctx.write(b_r, r.data(), r.size() * 4); ctx.write(b_n, nrm.data(), nrm.size() * 4);
+    ctx.write(b_l, lof.data(), lof.size() * 4); ctx.write(b_s, rs.data(), rs.size() * 4);
+    ctx.write(b_m, mix.data(), mix.size() * 4);
+    {
+        std::vector<uint8_t> wu((size_t) b_u.bytes, 0);
+        for (size_t i = 0; i < wu.size(); ++i) wu[i] = (uint8_t) (i * 7 + 3);
+        ctx.write(b_u, wu.data(), wu.size());
+    }
+    VkPipeline p_mx = ctx.pipeline(dir + "/fused_gr_mix.spv", 6, 12);
+    const std::string shape = "N=2560 LR=320 (the artifact's geometry), 1 workgroup per output column";
+    for (int hc : {4, 2, 1}) {   // the artifact's hc is 4; the other two price ONE barrier reduction each
+        struct { int n_embd, hc, hc_lr; } pc{N, hc, LR};
+        char tag[48];
+        std::snprintf(tag, sizeof tag, "mix_hc%d (%d barrier reductions/col)", hc, hc);
+        report(tag, shape + " | the SAME shader, `hc` varied: the reduction cost, isolated",
+               time_kernel(ctx, p_mx, {&b_r, &b_n, &b_s, &b_l, &b_u, &b_m}, &pc, sizeof(pc), (uint32_t) N, 1, 8,
+                           reps, warmups), (double) N, (double) N * (double) hc * LR);
+    }
+    ctx.free(b_r); ctx.free(b_n); ctx.free(b_l); ctx.free(b_s); ctx.free(b_u); ctx.free(b_m);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2164,6 +2368,12 @@ int main(int argc, char** argv) {
     arm("native_grouped_engine", true, [&] { bench_native_grouped_engine(ctx, dir, reps, warmups); });
     // THE `fused_gr_*` GROUP PRICED - 576 dispatches of each of the four, the mixture model's whole residual.
     arm("gr_pricing", false, [&] { bench_gr_pricing(ctx, dir, reps, warmups); });
+    // THIS BATCH - TASK 1: the "biggest dispatch producer" claim checked, and the grouped launcher's
+    // WINDOW-INDEPENDENT stages (SwiGLU + q8_1) priced inside vs outside the window loop.
+    arm("native_k_mmvq_engine", true, [&] { bench_native_k_mmvq_engine(ctx, dir, reps, warmups); });
+    arm("native_grouped_hoist", true, [&] { bench_native_grouped_hoist(ctx, dir, reps, warmups); });
+    // THIS BATCH - TASK 2: `fused_gr_mix`'s reduction cost isolated (hc varied on the same shader).
+    arm("fused_gr_mix_pass", false, [&] { bench_fused_gr_mix_pass(ctx, dir, reps, warmups); });
     arm("dispatch_gap", false, [&] { bench_dispatch_gap(ctx, dir, reps, warmups); });
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
@@ -2183,7 +2393,7 @@ int main(int argc, char** argv) {
                              "router_pair moe_combine_pair rms_norm_pair qsa_gate_pair qsa_decode_attn "
                              "gdn_conv_silu_pair gdn_l2_norm_pair gdn_beta_gate_pair gdn_gate_pair "
                              "gdn_out_norm_pair gdn_step_pair fused_gdn_conv_l2_pair fused_gdn_ab_pair "
-                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill native_grouped_engine gr_pricing dispatch_gap sampler\n");
+                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill native_grouped_engine gr_pricing native_k_mmvq_engine native_grouped_hoist fused_gr_mix_pass dispatch_gap sampler\n");
         return 2;
     }
 

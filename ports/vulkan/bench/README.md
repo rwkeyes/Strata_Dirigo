@@ -667,6 +667,33 @@ the engine's per-token chain: `rs` 14.7 µs, `down` 22.2, `mix` 68.3, `inject` 1
 `fused_gr_read_multi` **0.1114 ms/token** (T=3) / 0.0955 (T=8). These replaced a mixture model's 112.7 µs
 placeholder and showed the group is **10% of the verify window, not 38%**.
 
+## THE OTHER LAUNCHERS AUDITED, THE WINDOW-INDEPENDENT STAGES, AND `fused_gr_mix`'s REDUCTION COST (measured 2026-10-06, `vega`, Arc Pro B70)
+
+Three arms added by the batch that carried the empty-launch cap to the port's other grouped launchers and found
+the mechanism is not there. Same standing instrument as the rest of the file (wall clock around a recorded-batch
+fence, median/batch, device-local unless a row says otherwise).
+
+**`native_k_mmvq_engine`** — `native_k_mmvq` (Q6_K, `ty=14`) at n_in 2560, n_out 1280, on a ONE-DIMENSIONAL grid
+(`n_out`). Rows: `k_mmvq_batched` (**5.9188 ms** for 198 tokens = **0.0299 ms/token**, ONE dispatch),
+`k_mmvq_pertoken` (**0.0408 ms** per token, 198 dispatches — the form the "41,580 dispatches" figure counted),
+and `k_mmvq_gy8_spurious` (**0.2006 ms = 4.9x**). The last row is the point: the shader reads no
+`gl_WorkGroupID.y`, so a y-grid multiplies **workgroups**, never guarded-and-empty ones — there is no `gy` here
+to cap, which is why the empty-launch lever does not transfer.
+
+**`native_grouped_hoist`** — the grouped launcher's FOUR stages at the engine's shape (30 groups = 3 tokens ×
+top-10, n_embd 2560, n_ff 1280, the arena's 8 windows), in the shipped order against the hoisted order:
+`grp_call_current` **4.1465 ms/call** (8 × (gu + swiglu + q8_1 + down), 32 dispatches) against `grp_call_hoist`
+**4.0780 ms/call** (8 × gu + swiglu + q8_1 + 8 × down, 18 dispatches) — and the two stages on their own
+(`grp_swiglu1` 0.0205 ms, `grp_q8_1` 0.0216 ms). The windows exist only for the WEIGHT READ; the SwiGLU and the
+q8_1 quantise do not read weights, so 7 of each were byte-identical recomputes. The delta (0.0685 ms over 14
+removed dispatches) is the port's own recorded-batch marginal, **~4.9 µs/dispatch**.
+
+**`fused_gr_mix_pass`** — `fused_gr_mix` at N=2560 LR=320 with `hc` varied on the SAME shader: **hc=4 0.0683 ms**
+(the priced row), hc=2 0.0455, hc=1 0.0338. Each of the four `wg_sum` reduction trees is ~**11.5 µs (17%)**, so
+~46 µs of the 68.3 µs is barrier reduction over a 5-MAC-per-thread body. The lever that would remove one changes
+the summation tree (the last bits, and the ids the engine pins), and a subgroup reduction is banned by the gate
+census — so the kernel is priced a NO, not optimised.
+
 ## Evidence the harness measures something real
 
 1. **Cross-ICD (the same binary, the same kernel, different device).**  `run_bench.sh` runs every ICD, and

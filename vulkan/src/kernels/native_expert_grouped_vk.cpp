@@ -75,6 +75,15 @@ static uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocalSize - 1)
 // UNMEASURED: a very large `ng` (peer/remote experts pass their own count) would make each workgroup stride
 // over many groups; the cap leaves the caller's grid in place whenever it is already <= the cap, and the
 // variable exists to put it back.
+//
+// THE OTHER PER-WINDOW WASTE, ONE LAYER UP (2026-10-06).  The loop is for the WEIGHT READ only - but two of the
+// four stages in it, the SwiGLU over the gate/up scratch and the q8_1 quantise of its result, read NO weights.
+// They were dispatched INSIDE the loop, so a call ran `nwin` SwiGLU launches and `nwin` q8_1 launches, `nwin-1`
+// of each recomputing the byte-identical result over the identical scratch.  They are now hoisted out
+// (gu loop -> SwiGLU -> q8_1 -> down loop); `gu`/`down` stay window-bound and `down` must follow the single
+// q8_1 image.  Bit-identical by construction, 32 -> 18 dispatches per call, and the engine measures window
+// 227.9 -> 225.0 ms/round (+1.4% decode) with the ENCODED dispatch count falling by exactly 2,016
+// (swiglu_f32 1,296 -> 288, quantize_q8_1 1,875 -> 867, every other kernel unchanged).  See NEXT.md.
 // =========================================================================================================
 static const uint32_t kGyMax = []() -> uint32_t {
     const char* e = std::getenv("STRATA_VK_GROUPED_GYMAX");
@@ -172,37 +181,53 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // Named views into the scratch (gate | up | h | hq at 0, fa, 2fa, 3fa).
     Buf v_gate = view(b_scr, 0), v_up = view(b_scr, fa), v_h = view(b_scr, 2 * fa), v_hq = view(b_scr, 3 * fa);
 
+    // 1. GATE + UP, ONE LAUNCH PER ARENA WINDOW - and the window loop is ONLY for the weight read.  A group's
+    // weights live in ONE 4 GiB window (a 32-bit storage-buffer index cannot reach past one), so the shader's
+    // `grp_win[g] != win_id` guard makes every workgroup of the other `nwin-1` launches exit untouched.  That
+    // is the empty launch the `gy` cap above sizes; it does NOT remove the launches, because a different window
+    // cannot be reached from this binding.
     for (uint32_t w = 0; w < nwin; ++w) {
         const uint64_t wbase = (uint64_t) w * kWinBytes;
         if (wbase >= s.arena_bytes) break;
         Buf wview = view(s.arena, wbase);
-        // 1. gate + up, entry-major.
         pgu.win_id = (int32_t) w;
-        {
-            VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_gu_any.spv", 12, sizeof(pgu));
-            s.ctx->dispatch(pipe, {&wview, &b_act, &g1, &g2, &g3, &b_off, &b_win, &b_start, &b_ng, &b_tok,
-                                   &v_gate, &v_up},
-                            &pgu, sizeof(pgu), (uint32_t) (2 * n_ff), gy);
-        }
-        // 2. SwiGLU over cap_entries * n_ff pairs: gate in [0, nh), up in [nh, 2nh), written to h.
-        {
-            struct { int32_t n; } pcs{(int32_t) ((uint64_t) cap_entries * n_ff)};
-            VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/swiglu_f32.spv", 3, sizeof(pcs));
-            s.ctx->dispatch(pipe, {&v_gate, &v_up, &v_h}, &pcs, sizeof(pcs),
-                            groups_for((uint64_t) cap_entries * n_ff));
-        }
-        // 3. the intermediate's q8_1 image (the down dot's activation contract).  `native_quantize_q8_1` is the
-        //    port's own q8_1 quantiser, one column per entry: column e sits at h + e*n_ff, so the down shader's
-        //    `arow = e * (n_ff/32) * 36` addresses exactly this image.
-        native_quantize_q8_1((const float*) ((uint8_t*) scratch + 2 * fa), (uint8_t*) scratch + 3 * fa,
-                             (int) n_ff, (int) cap_entries, stream);
-        // 4. down: writes out[ent_dst[e]*n_embd + r].
+        VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_gu_any.spv", 12, sizeof(pgu));
+        s.ctx->dispatch(pipe, {&wview, &b_act, &g1, &g2, &g3, &b_off, &b_win, &b_start, &b_ng, &b_tok,
+                               &v_gate, &v_up},
+                        &pgu, sizeof(pgu), (uint32_t) (2 * n_ff), gy);
+    }
+    // 2. SwiGLU over cap_entries * n_ff pairs: gate in [0, nh), up in [nh, 2nh), written to h.
+    //
+    // WINDOW-INDEPENDENT, SO IT RUNS **ONCE** FOR THE CALL, NOT ONCE PER WINDOW.  It reads the WHOLE gate/up
+    // scratch, which the loop above fills entry by entry; the gu launches of the windows holding no group write
+    // nothing (their workgroups exit on the window guard), so the scratch after the loop is exactly the scratch
+    // after the one working launch - and so is the middle of it after any later empty one.  The previous form
+    // dispatched this inside the window loop: `nwin` full-grid launches, `nwin-1` of them recomputing the
+    // byte-identical result over the identical scratch.  Same species of waste as the empty launch, one layer
+    // up: work that does not depend on the window, repeated per window.  MEASURED (bench `native_grouped_hoist`
+    // at the engine's shape, `ports/vulkan/bench`; the numbers are in the commit and NEXT.md).
+    {
+        struct { int32_t n; } pcs{(int32_t) ((uint64_t) cap_entries * n_ff)};
+        VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/swiglu_f32.spv", 3, sizeof(pcs));
+        s.ctx->dispatch(pipe, {&v_gate, &v_up, &v_h}, &pcs, sizeof(pcs),
+                        groups_for((uint64_t) cap_entries * n_ff));
+    }
+    // 3. the intermediate's q8_1 image (the down dot's activation contract).  `native_quantize_q8_1` is the
+    //    port's own q8_1 quantiser, one column per entry: column e sits at h + e*n_ff, so the down shader's
+    //    `arow = e * (n_ff/32) * 36` addresses exactly this image.  ALSO WINDOW-INDEPENDENT - the same argument
+    //    as 2, so also ONCE (previously `nwin` times, `nwin-1` of them over the identical h).
+    native_quantize_q8_1((const float*) ((uint8_t*) scratch + 2 * fa), (uint8_t*) scratch + 3 * fa,
+                         (int) n_ff, (int) cap_entries, stream);
+    // 4. DOWN, one launch per arena window: writes out[ent_dst[e]*n_embd + r].  It reads the weights of ITS
+    //    window (so it stays in the loop) and the q8_1 image computed once above (so it must run AFTER 3).
+    for (uint32_t w = 0; w < nwin; ++w) {
+        const uint64_t wbase = (uint64_t) w * kWinBytes;
+        if (wbase >= s.arena_bytes) break;
+        Buf wview = view(s.arena, wbase);
         pdn.win_id = (int32_t) w;
-        {
-            VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_down_any.spv", 8, sizeof(pdn));
-            s.ctx->dispatch(pipe, {&wview, &v_hq, &b_off, &b_win, &b_start, &b_ng, &b_dst, &b_out},
-                            &pdn, sizeof(pdn), (uint32_t) n_embd, gy);
-        }
+        VkPipeline pipe = s.ctx->pipeline(s.spv_dir + "/native_down_any.spv", 8, sizeof(pdn));
+        s.ctx->dispatch(pipe, {&wview, &v_hq, &b_off, &b_win, &b_start, &b_ng, &b_dst, &b_out},
+                        &pdn, sizeof(pdn), (uint32_t) n_embd, gy);
     }
 }
 
