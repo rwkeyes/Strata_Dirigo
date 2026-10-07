@@ -66,6 +66,10 @@ struct DispStat {
     uint64_t barriers = 0;                        // COMPUTE->COMPUTE chain barriers emitted (one per chained dispatch)
     double t_seg_wait = 0, t_seg_submit = 0;      // the segment path's own submit + fence wait (ms)
     double t_alloc = 0, t_encode = 0, t_fence = 0, t_submit = 0, t_wait = 0, t_free = 0;   // ms
+    // The RECORDED arm's own encode, charged at record_dispatch (the old t_encode above is the LIVE path's, so the
+    // recorded arm read 0 "by construction").  Its own counter so the existing per-dispatch totals do not shift.
+    double t_encode_rec = 0;
+    uint64_t rec_encodes = 0;
     std::vector<std::pair<std::string, uint64_t>> by_pipe;   // per-spv dispatch counts
     // THE RECORDED ARM'S OWN COMPOSITION.  A recorded command buffer is re-executed once per segment submit, so its
     // composition IS the composition of the work the replay arm executes each round - which `by_pipe` above cannot
@@ -106,6 +110,17 @@ struct KtStat {
     size_t done_upto = 0;        // everything before this index has been read and accumulated
     std::vector<std::pair<std::string, uint64_t>> disp, wg;
     std::vector<std::pair<std::string, double>> ns;
+    // ---- THE FOUR-WAY SPLIT OF THE RECORDED DISPATCH (all DEVICE-SIDE, from four timestamps per dispatch) ----
+    // slot i+0 = TOP_OF_PIPE before BindPipeline, i+1 = TOP_OF_PIPE before vkCmdDispatch, i+2 = BOTTOM_OF_PIPE
+    // after vkCmdDispatch, i+3 = TOP_OF_PIPE after the chain barrier.  Then front-end = (i+1)-(i+0) [the binds
+    // and push constants as the device executes them], kernel = (i+2)-(i+1), barrier = (i+3)-(i+2), and the
+    // inter-dispatch GAP = (i+0 of N+1) - (i+3 of N), which is the only window that can hold a device-side
+    // stall between two recorded dispatches.  Accumulated in ns.
+    double front_ns = 0, kern_ns = 0, bar_ns = 0, gap_ns = 0;
+    uint64_t gaps = 0, split_n = 0;
+    int64_t last_c = -1;
+    uint32_t last_i = 0;
+    bool have_last = false;
     void add(const std::string& s, double ns_add, uint64_t wg_add) {
         auto bump = [&](std::vector<std::pair<std::string, uint64_t>>& v, uint64_t x) {
             for (auto& kv : v) if (kv.first == s) { kv.second += x; return; }
@@ -145,7 +160,7 @@ void kt_create(VkPhysicalDevice pd, VkDevice dev, uint32_t qfam) {
         g_kt.ready = false;
         return;
     }
-    g_kt.cap = 2u * 32768u;                  // 65,536 timestamps = 32,768 timed dispatches in one recorded step
+    g_kt.cap = 4u * 32768u;                  // 4 timestamps/DISPATCH: 32,768 timed dispatches in one recorded step
     VkQueryPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -156,8 +171,10 @@ void kt_create(VkPhysicalDevice pd, VkDevice dev, uint32_t qfam) {
         return;
     }
     vkResetQueryPool(dev, g_kt.pool, 0, g_kt.cap);
-    std::fprintf(stderr, "vk kernel time: ON - %u timestamp queries, period %.4f ns/tick, valid bits %u, "
-                         "queue family %u (the RECORDED/decode arm only)\n", g_kt.cap, g_kt.period_ns, vb, qfam);
+    std::fprintf(stderr, "vk kernel time: ON - %u timestamp queries = %u recorded dispatches, FOUR timestamps "
+                         "each (front-end / kernel / barrier / gap), period %.4f ns/tick, valid bits %u, "
+                         "queue family %u (the RECORDED/decode arm only)\n", g_kt.cap, g_kt.cap / 4u,
+                 g_kt.period_ns, vb, qfam);
 }
 // read whatever the submissions so far have EXECUTED, accumulate it, and never read the same slot twice.
 //
@@ -191,11 +208,32 @@ void kt_flush(VkDevice dev) {
         return;
     }
     auto val = [&](uint32_t i) -> int64_t { return t[(size_t) (i - lo_q) * 2 + 1] != 0 ? (int64_t) t[(size_t) (i - lo_q) * 2] : -1; };
+    // The four slots have two MEANINGS depending on the barrier mode (they can be told apart by the env var, which
+    // is fixed for the process).  OLD: [front-start, kernel-start, kernel-end, after-barrier].  PAIR:
+    // [pre-barrier, post-barrier, kernel-start, kernel-end].
+    const bool pair = std::getenv("STRATA_VK_BARRIER_PAIR") != nullptr;
     while (g_kt.done_upto < g_kt.slots.size()) {
         const KtSlot& s = g_kt.slots[g_kt.done_upto];
-        const int64_t a = val(s.i), b = val(s.i + 1);
-        if (a < 0 || b < 0) break;                       // this segment has not been submitted yet
-        g_kt.add(s.spv, (b >= a ? (double) (b - a) : 0.0) * (double) g_kt.period_ns, s.wg);
+        const int64_t v0 = val(s.i), v1 = val(s.i + 1), v2 = val(s.i + 2), v3 = val(s.i + 3);
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) break;     // this segment has not been submitted yet
+        const double tick = (double) g_kt.period_ns;
+        double front, kern, bar;
+        if (pair) { bar = (double) (v1 - v0); front = (double) (v2 - v1); kern = (double) (v3 - v2); }
+        else      { front = (double) (v1 - v0); kern = (double) (v2 - v1); bar = (double) (v3 - v2); }
+        if (front < 0) front = 0;
+        if (kern < 0) kern = 0;
+        if (bar < 0) bar = 0;
+        g_kt.add(s.spv, kern * tick, s.wg);                  // KERNEL (pure dispatch window)
+        g_kt.front_ns += front * tick;
+        g_kt.kern_ns += kern * tick;
+        g_kt.bar_ns += bar * tick;
+        // the inter-dispatch GAP = the next dispatch's FIRST slot minus this one's LAST slot, only where the two
+        // are CONSECUTIVE in the pool (a skipped slot would otherwise read as an enormous phantom gap).
+        if (g_kt.have_last && s.i == g_kt.last_i + 4u && v0 >= g_kt.last_c) {
+            g_kt.gap_ns += (double) (v0 - g_kt.last_c) * tick;
+            ++g_kt.gaps;
+        }
+        g_kt.last_c = v3; g_kt.last_i = s.i; g_kt.have_last = true; ++g_kt.split_n;
         ++g_kt.done_upto;
     }
 }
@@ -214,6 +252,21 @@ void kt_dump() {
                          "(%zu recorded slots never executed%s)\n",
                  v.size(), tot / 1e6, (unsigned long long) g_kt.disp_total(),
                  g_kt.slots.size() - g_kt.done_upto, g_kt.overflow ? "; READBACK ERRORS SEEN - PARTIAL" : "");
+    {
+        // THE FOUR-WAY SPLIT, in us per timed dispatch.  `split_n` counts dispatches whose four timestamps were
+        // read; the gap is counted only between CONSECUTIVE timed dispatches, so its own denominator is `gaps`.
+        const double n = (double) g_kt.split_n, gn = (double) g_kt.gaps;
+        const double f = n ? g_kt.front_ns / 1e3 / n : 0.0, k = n ? g_kt.kern_ns / 1e3 / n : 0.0;
+        const double b = n ? g_kt.bar_ns / 1e3 / n : 0.0, g = gn ? g_kt.gap_ns / 1e3 / gn : 0.0;
+        const char* mode = std::getenv("STRATA_VK_BARRIER_PAIR") != nullptr ? "PAIR" : "WIDE";
+        std::fprintf(stderr, "vk kernel time SPLIT [%s] (us/dispatch, device-side, %llu timed): "
+                             "front-end %.2f + kernel %.2f + barrier %.2f + gap %.2f = %.2f ; barrier+gap = %.2f\n",
+                     mode, (unsigned long long) g_kt.split_n, f, k, b, g, f + k + b + g, b + g);
+        std::fprintf(stderr, "vk kernel time SPLIT ms (whole run): front-end %.1f + kernel %.1f + barrier %.1f + "
+                             "gap %.1f (over %llu consecutive pairs)\n",
+                     g_kt.front_ns / 1e6, g_kt.kern_ns / 1e6, g_kt.bar_ns / 1e6, g_kt.gap_ns / 1e6,
+                     (unsigned long long) g_kt.gaps);
+    }
     for (size_t i = 0; i < v.size() && i < 30; ++i) {
         const std::string& s = v[i].first;
         const size_t slash = s.find_last_of('/');
@@ -246,6 +299,33 @@ bool g_nobarrier_rec = false;
 // also touched.  Otherwise the region is only remembered.  This can miss a hazard, which is why it prices the
 // barrier rather than shipping; the ids are the guard.  Off unless the env var is set.
 bool g_hazard_only = false;
+// ---- STRATA_VK_BARRIER_NARROW: an OPT-IN, MEASURED-AND-REFUTED change to the RECORDED arm's chain barrier ----
+// Task 1's four-timestamp split prices the recorded arm's per-dispatch cost as front-end 0.02 + kernel 5.3 +
+// barrier 57.4 + gap 56.7 us (cold first replay, n=2), i.e. the device-side CHAIN BARRIER and the inter-dispatch
+// gap, NOT the host bind / descriptor front-end.  So the recorded chain barrier is REPLACED here by one
+// `VkBufferMemoryBarrier` per bound buffer (`[offset, offset+bytes)`, `SHADER_WRITE -> SHADER_READ`) instead of a
+// single GLOBAL `VkMemoryBarrier`.  IT IS NEUTRAL: measured 65.91-65.95 (global) against 65.95-65.97 us/dispatch
+// (narrow) at n=3, ranges overlapping, and the split's barrier term is unchanged (57.40 -> 57.34 us), so the
+// recorded barrier's cost is its EXECUTION DEPENDENCY (a pipeline flush), not its memory range.  It is therefore
+// OPT-IN (off by default: the shipped path keeps the global barrier) and exists so the falsification is
+// reproducible.  The LIVE/prefill arm never narrows (fresh_set false): it is not the metric.
+bool g_barrier_narrow = std::getenv("STRATA_VK_BARRIER_NARROW") != nullptr;
+// ---- STRATA_VK_BARRIER_PAIR: the chain barrier decided PER CONSECUTIVE PAIR, from the REAL bound byte ranges.
+// The whole-binding range test is too coarse to find the independence that is actually there: a chain barrier is
+// needed only between two dispatches whose bound regions INTERSECT, and the port already knows each dispatch's
+// regions (`[Buf::offset, offset+Buf::bytes)`, exactly what it binds).  This mode emits, at the START of each
+// recorded dispatch, one `VkBufferMemoryBarrier` per (buffer, `[max(off), min(end))`) intersection against the
+// ranges still pending a barrier; if NOTHING intersects, NO barrier is emitted and the two dispatches may run
+// concurrently.  Emitted at the START because a barrier placed AFTER a dispatch cannot order that dispatch's own
+// reads.  Opt-in; the shipped path keeps the per-dispatch global barrier.  `g_pair_seen` counts pairs that had
+// something pending, `g_pair_indep` how many of them intersected NOTHING (no barrier), `g_pair_emit` the rest.
+bool g_barrier_pair = std::getenv("STRATA_VK_BARRIER_PAIR") != nullptr;
+struct PairRange {
+    VkBuffer buf;
+    uint64_t off, end;
+};
+std::vector<PairRange> g_pend;
+uint64_t g_pair_seen = 0, g_pair_indep = 0, g_pair_emit = 0;
 struct HazardRange {
     VkBuffer buf;
     uint64_t off, end;
@@ -253,6 +333,7 @@ struct HazardRange {
 std::vector<HazardRange> g_haz;
 constexpr size_t kHazardCap = 8192;   // force a barrier rather than grow without bound
 uint64_t g_haz_barriers = 0;          // barriers actually EMITTED in the hazard mode
+uint64_t g_narrow_barriers = 0, g_wide_barriers = 0;   // Task 3: recorded-arm barriers by FORM (narrow vs global)
 inline double vk_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -336,6 +417,20 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
                  (unsigned long long) g_ds.sub_seg, (unsigned long long) g_ds.seg_disp,
                  (unsigned long long) g_ds.barriers, g_ds.t_seg_submit,
                  g_ds.t_seg_wait);
+    std::fprintf(stderr, "vk disp stat RECORDED encode: %.1f ms over %llu encodes (%.4f ms/encode) - charged at "
+                         "record_dispatch; the OLD `encode` term read 0 on this arm BY CONSTRUCTION\n",
+                 g_ds.t_encode_rec, (unsigned long long) g_ds.rec_encodes,
+                 g_ds.rec_encodes ? g_ds.t_encode_rec / (double) g_ds.rec_encodes : 0.0);
+    if (g_narrow_barriers || g_wide_barriers)
+        std::fprintf(stderr, "vk disp stat BARRIER FORM: %llu recorded-arm chain barriers NARROWED "
+                             "(VkBufferMemoryBarrier per region) | %llu global (VkMemoryBarrier)\n",
+                     (unsigned long long) g_narrow_barriers, (unsigned long long) g_wide_barriers);
+    if (g_pair_seen || g_pair_indep || g_pair_emit)
+        std::fprintf(stderr, "vk disp stat BARRIER PAIR: %llu recorded dispatch pairs had ranges pending; "
+                             "%llu were INDEPENDENT (no intersecting (buffer,region) => NO barrier emitted, the "
+                             "two dispatches may OVERLAP); %llu emitted VkBufferMemoryBarrier(s)\n",
+                     (unsigned long long) g_pair_seen, (unsigned long long) g_pair_indep,
+                     (unsigned long long) g_pair_emit);
     if (g_hazard_only)
         std::fprintf(stderr,
                      "vk disp stat[HAZARD]: %llu of %llu chain barriers EMITTED (the rest were elided where no\n"
@@ -1685,31 +1780,84 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
     }
     vkUpdateDescriptorSets(dev_, (uint32_t) writes.size(), writes.data(), 0, nullptr);
 
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
-    if (push_bytes) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
-    // STRATA_VK_KERNEL_TIME: a timestamp pair around THIS dispatch.  `fresh_set` is true only for the recorded
-    // step (the decode's replay); the live (prefill) path passes false and is not timed here.
-    bool kt_here = false;
-    uint32_t kt_i = 0;
-    if (g_kt.on && fresh_set && !g_kt.ready) kt_create(phys_, dev_, queue_family_);
+    // ---- STRATA_VK_BARRIER_PAIR: the conditional per-pair chain barrier, at the START of THIS dispatch -------
+    const bool pair_on = g_barrier_pair && fresh_set && chain_barrier;
+    bool pair_here = false;
+    uint32_t pair_i = 0;
+    if (pair_on) {
+        if (g_kt.on && !g_kt.ready) kt_create(phys_, dev_, queue_family_);
+        if (g_kt.on && g_kt.ready && g_kt.next + 4 <= g_kt.cap) {
+            pair_i = g_kt.next; g_kt.next += 4;
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, pair_i);   // P0: before the barrier
+            pair_here = true;
+        } else if (g_kt.on && g_kt.ready) {
+            g_kt.overflow = true;
+        }
+        std::vector<VkBufferMemoryBarrier> bmbs;
+        std::vector<PairRange> cur;
+        cur.reserve(bufs.size());
+        for (const Buf* b : bufs) {
+            if (b == nullptr || b->buffer == VK_NULL_HANDLE || b->bytes == 0) continue;
+            const uint64_t s = b->offset, e = b->offset + b->bytes;
+            cur.push_back({b->buffer, s, e});
+            for (const PairRange& p : g_pend) {
+                if (p.buf != b->buffer || !(s < p.end && p.off < e)) continue;
+                VkBufferMemoryBarrier mb{};
+                mb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                mb.buffer = b->buffer;
+                mb.offset = s > p.off ? s : p.off;
+                const uint64_t e2 = e < p.end ? e : p.end;
+                mb.size = e2 > mb.offset ? e2 - mb.offset : 0;
+                if (mb.size) bmbs.push_back(mb);
+            }
+        }
+        if (!g_pend.empty()) {
+            ++g_pair_seen;
+            if (bmbs.empty()) ++g_pair_indep; else ++g_pair_emit;
+        }
+        if (!bmbs.empty()) {
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 0, nullptr, (uint32_t) bmbs.size(), bmbs.data(), 0, nullptr);
+            g_pend = cur;                                            // these writes are now ordered
+        } else {
+            for (const PairRange& r : cur) g_pend.push_back(r);       // still pending a barrier
+        }
+        ++g_ds.barriers;   // the pair barrier replaces the per-dispatch global one (counted the same way)
+        if (pair_here) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, pair_i + 1);  // P1: after barrier
+    }
+
+    // STRATA_VK_KERNEL_TIME: FOUR timestamps around THIS recorded dispatch (see the KtStat comment) - slot0
+    // TOP_OF_PIPE here (the front-end start), slot1 TOP_OF_PIPE after the binds/push and before vkCmdDispatch,
+    // slot2 BOTTOM_OF_PIPE after vkCmdDispatch, slot3 TOP_OF_PIPE after the chain barrier.  `fresh_set` is true
+    // only for the recorded step (the decode's replay); the live (prefill) path passes false and is not timed.
     // NO RESET IS EMITTED HERE.  The pool is reset ONCE, at creation; a reset inside the command buffer is
     // re-executed on every replay and wipes the OTHER segments' queries (measured: only 183 of ~60,000 executed
     // dispatches ever landed).  Slots are numbered monotonically and read once each (see kt_flush).
-    if (g_kt.on && fresh_set && g_kt.ready && g_kt.next + 2 <= g_kt.cap) {
+    bool kt_here = false;
+    uint32_t kt_i = 0;
+    if (g_kt.on && fresh_set && !pair_on && !g_kt.ready) kt_create(phys_, dev_, queue_family_);
+    if (g_kt.on && fresh_set && !pair_on && g_kt.ready && g_kt.next + 4 <= g_kt.cap) {
         kt_i = g_kt.next;
-        g_kt.next += 2;
-        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, kt_i);
+        g_kt.next += 4;
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, kt_i);        // slot0: front-end start
         kt_here = true;
-    } else if (g_kt.on && fresh_set && g_kt.ready) {
+    } else if (g_kt.on && fresh_set && !pair_on && g_kt.ready) {
         g_kt.overflow = true;   // the pool is full for this recorded step: report it rather than pretend
     }
+
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+    if (push_bytes) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+    if (kt_here) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, kt_i + 1);   // slot1: kernel start
+    if (pair_here) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, pair_i + 2);  // P2: kernel start
     vkCmdDispatch(cb, groups, groups_y, 1);
-    if (kt_here) {
-        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_kt.pool, kt_i + 1);
-        g_kt.slots.push_back(KtSlot{spv_path, kt_i, (uint64_t) groups * (uint64_t) groups_y});
-    }
-    if (chain_barrier) {
+    if (kt_here) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_kt.pool, kt_i + 2);   // slot2: kernel end
+    if (pair_here) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_kt.pool, pair_i + 3);  // P3: kernel end
+    if (chain_barrier && !pair_on) {
         // One kernel's output is the next one's input inside a recorded step.  Compute -> compute, not to host:
         // the step has exactly one host-read barrier, at its end.  COUNTED whether or not it is emitted (the
         // `STRATA_VK_NOBARRIER` and `STRATA_VK_BARRIER_HAZARD` measurements).
@@ -1732,13 +1880,52 @@ void Ctx::encode_dispatch(VkCommandBuffer cb, VkPipeline pipe, const std::vector
             else for (const HazardRange& r : cur) g_haz.push_back(r);
         }
         if (emit) {
-            VkMemoryBarrier mb{};
-            mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                                 &mb, 0, nullptr, 0, nullptr);
+            // TASK 3: the NARROWED chain barrier for the RECORDED arm (see g_barrier_wide).  One buffer barrier per
+            // bound region instead of one global memory barrier; `STRATA_VK_BARRIER_WIDE=1` restores the global
+            // barrier (the control).  If every region is unusable the global barrier is emitted, so this can only
+            // ever narrow, never elide.
+            bool narrowed = false;
+            if (fresh_set && g_barrier_narrow && !g_hazard_only) {
+                std::vector<VkBufferMemoryBarrier> bmbs;
+                bmbs.reserve(bufs.size());
+                for (const Buf* b : bufs) {
+                    if (b == nullptr || b->buffer == VK_NULL_HANDLE || b->bytes == 0) continue;
+                    VkBufferMemoryBarrier mb{};
+                    mb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    mb.buffer = b->buffer;
+                    mb.offset = b->offset;
+                    mb.size = b->bytes;
+                    bmbs.push_back(mb);
+                }
+                if (!bmbs.empty()) {
+                    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                                         (uint32_t) bmbs.size(), bmbs.data(), 0, nullptr);
+                    ++g_narrow_barriers;
+                    narrowed = true;
+                }
+            }
+            if (!narrowed) {
+                if (fresh_set) ++g_wide_barriers;
+                VkMemoryBarrier mb{};
+                mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                     &mb, 0, nullptr, 0, nullptr);
+            }
         }
+    }
+    if (kt_here) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_kt.pool, kt_i + 3);   // slot3: after the barrier
+        g_kt.slots.push_back(KtSlot{spv_path, kt_i, (uint64_t) groups * (uint64_t) groups_y});
+    }
+    if (pair_here) {
+        g_kt.slots.push_back(KtSlot{spv_path, pair_i, (uint64_t) groups * (uint64_t) groups_y});
     }
 }
 
@@ -1835,10 +2022,14 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
         std::fprintf(stderr, "record_dispatch: not recording (call record_begin)\n");
         std::exit(1);
     }
+    const double _te0 = vk_ms();
     encode_dispatch(rec_cb_, pipe, bufs, push, push_bytes, groups, groups_y, /*chain_barrier=*/true,
                     /*fresh_set=*/true, VK_NULL_HANDLE);
+    const double _te1 = vk_ms();
     ++recorded_;
     if (g_ds.on) {
+        g_ds.t_encode_rec += _te1 - _te0;
+        ++g_ds.rec_encodes;
         ++g_ds.recorded;
         for (const Pipe& p : pipes_) {
             if (p.pipe == pipe) { disp_stat_count(p.spv_path); disp_stat_count_rec(p.spv_path);

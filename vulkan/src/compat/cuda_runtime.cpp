@@ -246,16 +246,52 @@ Inflight& inflight() {
     return f;
 }
 
+// ---- STRATA_VK_ADV_STAT: the SEGMENT DRIVER's own host cost (measurement-only, off unless the env var is set) --
+// The recorded arm's fence wait cannot contain host work, but `advance_inflight` (the poll that submits each
+// segment whose host boundary has been served) and `cudaStreamQuery` (the engine's poll that drives it) are the
+// only HOST calls that interleave with the segment submits, so they are timed and counted to rule them out.
+struct AdvStat {
+    bool on = std::getenv("STRATA_VK_ADV_STAT") != nullptr;
+    uint64_t adv_calls = 0, adv_subs = 0, q_calls = 0;
+    double t_adv = 0;          // ms in advance_inflight
+    bool printed = false;
+};
+AdvStat& advstat();
+void adv_stat_dump() {
+    AdvStat& a = advstat();
+    if (!a.on || a.printed) return;
+    a.printed = true;
+    std::fprintf(stderr, "vk adv stat: advance_inflight %llu calls, %llu segment submits, %.3f ms total "
+                         "(%.5f ms/call) | cudaStreamQuery %llu calls\n",
+                 (unsigned long long) a.adv_calls, (unsigned long long) a.adv_subs, a.t_adv,
+                 a.adv_calls ? a.t_adv / (double) a.adv_calls : 0.0, (unsigned long long) a.q_calls);
+}
+AdvStat& advstat() {
+    static AdvStat a;
+    static bool reg = false;
+    if (a.on && !reg) { reg = true; std::atexit(adv_stat_dump); }
+    return a;
+}
+double adv_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void advance_inflight() {
     Inflight& f = inflight();
     if (!f.active || f.exec == nullptr) return;
+    AdvStat& a = advstat();
+    const bool on = a.on;
+    const double _t0 = on ? adv_ms() : 0.0;
+    if (on) ++a.adv_calls;
     while (f.next < f.exec->segs.size()) {
         const strata::vulkan::CaptureBoundary& b = f.exec->bounds[f.next - 1];
         const uint32_t cur = (b.flag != nullptr) ? *(const volatile uint32_t*) b.flag : UINT32_MAX;
-        if (cur < b.value) return;                       // the host has not served: leave the rest pending
+        if (cur < b.value) break;                        // the host has not served: leave the rest pending
         f.exec->owner->submit_segment(f.exec->segs[f.next]);
+        if (on) ++a.adv_subs;
         ++f.next;
     }
+    if (on) a.t_adv += adv_ms() - _t0;
 }
 
 // Drain an in-flight launch, bounded.  `where` names the caller for the refusal.  The engine raises every flag
@@ -722,6 +758,7 @@ cudaError_t cudaStreamQuery(cudaStream_t stream) {
     Stream* s = (stream != nullptr) ? strata::vulkan::stream_of(reinterpret_cast<void*>(stream)) : nullptr;
     if (stream != nullptr && s == nullptr) return fail(cudaErrorInvalidValue);
     if (s != nullptr) g_current = s;
+    if (advstat().on) ++advstat().q_calls;
 
     QueryStat& q = qstat();
     if (q.on) {

@@ -34,22 +34,23 @@ layout(push_constant, std430) uniform PC { int n_embd; int hc; float eps; int ap
 
 void main() {
     const uint c = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;           // TOKEN (0 for the single read; the multi may batch tokens)
     if (c >= uint(pc.hc)) return;              // workgroup-uniform: every barrier below is reached
     const uint n = uint(pc.n_embd);
-    const uint base = c * n;
+    const uint base = (t * uint(pc.hc) + c) * n;   // per-token R'/R base
     const uint lid = gl_LocalInvocationIndex;
     const bool ap = pc.apply != 0;
-    const float gw = ap ? 2.0f / (1.0f + exp(-inj.v[c] / float(pc.hc))) : 0.0f;   // 2*sigmoid(inj/hc)
+    const float gw = ap ? 2.0f / (1.0f + exp(-inj.v[t * uint(pc.hc) + c] / float(pc.hc))) : 0.0f;  // 2*sigmoid(inj/hc)
 
     float ss = 0.0f;
     for (uint d = lid; d < n; d += gl_WorkGroupSize.x) {
-        const float rp = r.v[base + d] + (ap ? bo.v[d] * gw : 0.0f);
+        const float rp = r.v[base + d] + (ap ? bo.v[t * n + d] * gw : 0.0f);
         ss += rp * rp;
     }
     const float rs = inversesqrt(wg_sum(ss) / float(n) + pc.eps);
-    if (lid == 0u) rsb.v[c] = rs;
+    if (lid == 0u) rsb.v[t * uint(pc.hc) + c] = rs;
     if (ap) {
         for (uint d = lid; d < n; d += gl_WorkGroupSize.x)
-            ro.v[base + d] = r.v[base + d] + bo.v[d] * gw;
+            ro.v[base + d] = r.v[base + d] + bo.v[t * n + d] * gw;
     }
 }

@@ -31,10 +31,14 @@ layout(push_constant, std430) uniform PC { int n_embd; int hc; int hc_lr; } pc;
 
 void main() {
     const uint d = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;           // TOKEN (0 for the single read; the multi may batch tokens)
     if (d >= uint(pc.n_embd)) return;          // workgroup-uniform: every barrier below is reached
     const uint n = uint(pc.n_embd);
     const uint np = uint(pc.hc_lr) / 2u;
     const uint lid = gl_LocalInvocationIndex;
+    const uint rb = t * uint(pc.hc) * n;       // per-token R/n_embd base
+    const uint sb = t * uint(pc.hc);           // per-token stream base
+    const uint lb = t * uint(pc.hc_lr);        // per-token lo base
 
     float sum = 0.0f;
     for (uint c = 0u; c < uint(pc.hc); ++c) {
@@ -42,11 +46,11 @@ void main() {
         float acc = 0.0f;
         for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
             const uint packed = wu.v[i * np + p];
-            acc += lq.v[2u * p]      * bf16_to_f32(packed & 0xFFFFu);
-            acc += lq.v[2u * p + 1u] * bf16_to_f32(packed >> 16u);
+            acc += lq.v[lb + 2u * p]      * bf16_to_f32(packed & 0xFFFFu);
+            acc += lq.v[lb + 2u * p + 1u] * bf16_to_f32(packed >> 16u);
         }
         const float s = 1.0f / (1.0f + exp(-wg_sum(acc)));      // SIGMOID (not SiLU)
-        sum += (rf.v[i] * wn.v[i] * rsb.v[c]) * s;
+        sum += (rf.v[rb + i] * wn.v[i] * rsb.v[sb + c]) * s;
     }
-    mx.v[d] = sum / float(pc.hc);              // the MEAN, not the sum
+    mx.v[t * n + d] = sum / float(pc.hc);      // the MEAN, not the sum
 }

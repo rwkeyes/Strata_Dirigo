@@ -172,6 +172,89 @@ static void fused_gr_read_one(Stream& s, const strata::kernels::FusedGrArgs& a) 
     }
 }
 
+// ---- THE TOKEN-BATCHED MULTI: the dispatch-count reduction on the RECORDED decode chain ---------------------
+// The multi loops tokens and issues FOUR dispatches per token.  On the recorded decode arm each dispatch is a
+// SERIAL LINK, and the chain's cost is the per-link DEVICE latency (measured: ~114 us of the ~120 us window per
+// dispatch, against a 5.5 us kernel - `vk kernel time SPLIT [PAIR]`), so FOUR links for n_tok tokens instead of
+// 4*n_tok is the lever.  Every (token, workgroup) of every stage writes DISJOINT elements from SHARED weights,
+// so the whole loop is ONE grid whose y dimension is the token: BITWISE IDENTICAL by construction (the shaders
+// index the per-token buffers by `t = gl_WorkGroupID.y` and `t == 0` on the single read).  Taken ONLY when the
+// per-token buffers are contiguous with the strides the shaders already compute - VERIFIED here, never assumed;
+// otherwise the loop runs unchanged.  `STRATA_FGR_TOKEN_BATCH=0` restores the loop (the control).
+static bool fused_gr_batch_ok(const strata::kernels::FusedGrArgs* a, int n_tok) {
+    const uint64_t sR = (uint64_t) FG_HC * (uint64_t) FG_N, sHC = (uint64_t) FG_HC, sN = (uint64_t) FG_N,
+                     sLo = (uint64_t) FG_LR;
+    for (int t = 1; t < n_tok; ++t) {
+        const strata::kernels::FusedGrArgs& x = a[t];
+        if ((uintptr_t) x.R != (uintptr_t) a[0].R + (uint64_t) t * sR * 4) return false;
+        if ((uintptr_t) x.R_out != (uintptr_t) a[0].R_out + (uint64_t) t * sR * 4) return false;
+        if ((uintptr_t) x.bo_prev != (uintptr_t) a[0].bo_prev + (uint64_t) t * sN * 4) return false;
+        if ((uintptr_t) x.inj_prev != (uintptr_t) a[0].inj_prev + (uint64_t) t * sHC * 4) return false;
+        if ((uintptr_t) x.lo != (uintptr_t) a[0].lo + (uint64_t) t * sLo * 4) return false;
+        if ((uintptr_t) x.rs != (uintptr_t) a[0].rs + (uint64_t) t * sHC * 4) return false;
+        if ((uintptr_t) x.mixed != (uintptr_t) a[0].mixed + (uint64_t) t * sN * 4) return false;
+        if (a[0].inject_out != nullptr &&
+            (uintptr_t) x.inject_out != (uintptr_t) a[0].inject_out + (uint64_t) t * sHC * 4) return false;
+    }
+    return true;
+}
+
+static void fused_gr_read_batch(Stream& s, const strata::kernels::FusedGrArgs* a, int n_tok) {
+    const int64_t n_embd = FG_N, hc = FG_HC, hc_lr = FG_LR;
+    const int64_t hc_dim = hc * n_embd;
+    const uint64_t nt = (uint64_t) n_tok;
+    const strata::kernels::FusedGrArgs& a0 = a[0];
+    if ((n_embd % 2) != 0 || (hc_lr % 2) != 0)
+        refuse("fused_gr_read_batch", "the artifact's geometry is odd, which these bf16-pair dots cannot address");
+    Buf rv{}, ov{}, nv{}, sv{}, dv{}, uv{}, lv{}, mv{}, bv{}, iv{}, wiv{}, jv{};
+    if (!arena_resolve(s, a0.R, (uint64_t) hc_dim * 4 * nt, rv) ||
+        !arena_resolve(s, a0.R_out, (uint64_t) hc_dim * 4 * nt, ov) ||
+        !arena_resolve(s, a0.w_norm, (uint64_t) hc_dim * 4, nv) ||
+        !arena_resolve(s, a0.w_down, (uint64_t) hc_lr * (uint64_t) (hc_dim / 2) * 4, dv) ||
+        !arena_resolve(s, a0.w_up, (uint64_t) hc_dim * (uint64_t) (hc_lr / 2) * 4, uv) ||
+        !arena_resolve(s, a0.lo, (uint64_t) hc_lr * 4 * nt, lv) ||
+        !arena_resolve(s, a0.rs, (uint64_t) hc * 4 * nt, sv) ||
+        !arena_resolve(s, a0.mixed, (uint64_t) n_embd * 4 * nt, mv))
+        refuse("fused_gr_read_batch", "a pointer is not inside this stream's arena");
+    Buf rf = a0.apply ? ov : rv;
+    if (a0.apply) {
+        if (!arena_resolve(s, a0.bo_prev, (uint64_t) n_embd * 4 * nt, bv) ||
+            !arena_resolve(s, a0.inj_prev, (uint64_t) hc * 4 * nt, iv))
+            refuse("fused_gr_read_batch", "the fold's bo_prev/inj_prev is not inside this stream's arena");
+    } else {
+        bv = iv = dummy_buf(s);
+    }
+    if (a0.w_inject != nullptr) {
+        if (!arena_resolve(s, a0.w_inject, (uint64_t) hc * (uint64_t) (hc_dim / 2) * 4, wiv) ||
+            !arena_resolve(s, a0.inject_out, (uint64_t) hc * 4 * nt, jv))
+            refuse("fused_gr_read_batch", "the inject pair is not inside this stream's arena");
+    } else {
+        wiv = jv = dummy_buf(s);
+    }
+    const uint32_t gy = (uint32_t) n_tok;
+    {
+        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/fused_gr_rs.spv", 5, 20);
+        struct { int32_t n_embd, hc; float eps; int32_t apply; } pc{(int32_t) n_embd, (int32_t) hc, a0.eps,
+                                                                   a0.apply ? 1 : 0};
+        s.ctx->dispatch(p, {&rv, &bv, &iv, &ov, &sv}, &pc, sizeof(pc), (uint32_t) hc, gy);
+    }
+    {
+        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/fused_gr_down.spv", 5, 12);
+        struct { int32_t n_embd, hc, hc_lr; } pc{(int32_t) n_embd, (int32_t) hc, (int32_t) hc_lr};
+        s.ctx->dispatch(p, {&rf, &nv, &sv, &dv, &lv}, &pc, sizeof(pc), (uint32_t) hc_lr, gy);
+    }
+    {
+        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/fused_gr_mix.spv", 6, 12);
+        struct { int32_t n_embd, hc, hc_lr; } pc{(int32_t) n_embd, (int32_t) hc, (int32_t) hc_lr};
+        s.ctx->dispatch(p, {&rf, &nv, &sv, &lv, &uv, &mv}, &pc, sizeof(pc), (uint32_t) n_embd, gy);
+    }
+    if (a0.w_inject != nullptr) {
+        VkPipeline p = s.ctx->pipeline(s.spv_dir + "/fused_gr_inject.spv", 5, 8);
+        struct { int32_t n_embd, hc; } pc{(int32_t) n_embd, (int32_t) hc};
+        s.ctx->dispatch(p, {&rf, &nv, &sv, &wiv, &jv}, &pc, sizeof(pc), (uint32_t) hc, gy);
+    }
+}
+
 }  // namespace strata::vulkan
 
 // ---- the engine's entry points: the symbols include/strata/kernels/fused_gr.hpp declares -------------------
@@ -219,8 +302,18 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         }
     }
     strata::vulkan::Stream* s = need_stream("fused_gr_read_multi", stream);
+    // The token-batched multi (see fused_gr_read_batch): one grid per stage over every token, bitwise identical,
+    // taken only when the buffers are contiguous. `STRATA_FGR_TOKEN_BATCH=0` restores the per-token loop.
+    static const bool tb_env = [] {
+        const char* v = std::getenv("STRATA_FGR_TOKEN_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     if (stamp_buf != nullptr) gpu_stamp(stamp_buf, stamp_i0, stream);
-    for (int t = 0; t < n_tok; ++t) strata::vulkan::fused_gr_read_one(*s, a[t]);
+    if (tb_env && n_tok > 1 && strata::vulkan::fused_gr_batch_ok(a, n_tok)) {
+        strata::vulkan::fused_gr_read_batch(*s, a, n_tok);
+    } else {
+        for (int t = 0; t < n_tok; ++t) strata::vulkan::fused_gr_read_one(*s, a[t]);
+    }
     if (stamp_buf != nullptr) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
 }
 

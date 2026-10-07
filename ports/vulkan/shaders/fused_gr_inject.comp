@@ -24,19 +24,22 @@ layout(push_constant, std430) uniform PC { int n_embd; int hc; } pc;
 
 void main() {
     const uint c = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;           // TOKEN (0 for the single read; the multi may batch tokens)
     if (c >= uint(pc.hc)) return;
     const uint n = uint(pc.n_embd);
     const uint np = uint(pc.hc) * n / 2u;
     const uint lid = gl_LocalInvocationIndex;
+    const uint rb = t * uint(pc.hc) * n;       // per-token R/n_embd base
+    const uint sb = t * uint(pc.hc);           // per-token stream base
 
     float acc = 0.0f;
     for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
         const uint packed = wi.v[c * np + p];
         const uint i0 = 2u * p, i1 = i0 + 1u;
         const uint cc = i0 / n;
-        acc += (rf.v[i0] * wn.v[i0] * rsb.v[cc]) * bf16_to_f32(packed & 0xFFFFu);
-        acc += (rf.v[i1] * wn.v[i1] * rsb.v[cc]) * bf16_to_f32(packed >> 16u);
+        acc += (rf.v[rb + i0] * wn.v[i0] * rsb.v[sb + cc]) * bf16_to_f32(packed & 0xFFFFu);
+        acc += (rf.v[rb + i1] * wn.v[i1] * rsb.v[sb + cc]) * bf16_to_f32(packed >> 16u);
     }
-    const float t = wg_sum(acc);              // OUTSIDE any divergent guard
-    if (lid == 0u) inj.v[c] = t;
+    const float t0 = wg_sum(acc);              // OUTSIDE any divergent guard
+    if (lid == 0u) inj.v[t * uint(pc.hc) + c] = t0;
 }

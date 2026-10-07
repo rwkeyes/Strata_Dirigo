@@ -29,22 +29,25 @@ layout(push_constant, std430) uniform PC { int n_embd; int hc; int hc_lr; } pc;
 
 void main() {
     const uint k = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;           // TOKEN (0 for the single read; the multi may batch tokens)
     if (k >= uint(pc.hc_lr)) return;
     const uint n = uint(pc.n_embd);
     const uint np = uint(pc.hc) * n / 2u;      // bf16 pairs in a weight row
     const uint lid = gl_LocalInvocationIndex;
+    const uint rb = t * uint(pc.hc) * n;       // per-token R/n_embd base
+    const uint sb = t * uint(pc.hc);           // per-token stream base
 
     float acc = 0.0f;
     for (uint p = lid; p < np; p += gl_WorkGroupSize.x) {
         const uint packed = wd.v[k * np + p];
         const uint i0 = 2u * p, i1 = i0 + 1u;
         const uint c0 = i0 / n;                // n_embd is even, so i0 and i1 share a stream
-        acc += (rf.v[i0] * wn.v[i0] * rsb.v[c0]) * bf16_to_f32(packed & 0xFFFFu);
-        acc += (rf.v[i1] * wn.v[i1] * rsb.v[c0]) * bf16_to_f32(packed >> 16u);
+        acc += (rf.v[rb + i0] * wn.v[i0] * rsb.v[sb + c0]) * bf16_to_f32(packed & 0xFFFFu);
+        acc += (rf.v[rb + i1] * wn.v[i1] * rsb.v[sb + c0]) * bf16_to_f32(packed >> 16u);
     }
-    const float t = wg_sum(acc);
+    const float t0 = wg_sum(acc);
     if (lid == 0u) {
-        const float z = t / float(pc.hc);      // the division is INSIDE the silu
-        lq.v[k] = z / (1.0f + exp(-z));
+        const float z = t0 / float(pc.hc);     // the division is INSIDE the silu
+        lq.v[t * uint(pc.hc_lr) + k] = z / (1.0f + exp(-z));
     }
 }
