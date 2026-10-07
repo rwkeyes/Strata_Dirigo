@@ -7995,3 +7995,47 @@ REGISTERS. Two routes, and they are mutually exclusive under the port's current 
    engine's `gdn_rec_kernel` does this, which is why its chunk arithmetic differs from the decode step for T>1),
    so the ids WOULD move and the port's bit-exact contract would have to be re-baselined deliberately.
 Do not start either without deciding which. Measure on the 199-token arm with the ids checked in every arm.
+
+---
+
+## 2026-10-07 (later) — THIRD VARIANT: the register-resident (generated) form. THE BIT-EXACT ROUTE IS EXHAUSTED
+
+**WHAT WAS BUILT.** `scripts/gen_gdn_rec_reg.py` emits `shaders/gdn_rec_chunk_reg.comp`: the same chunk walk with
+the 128-float state column replaced by 128 NAMED SCALARS and every index a compile-time constant - the only shape
+a compiler can keep in registers, since the rolled and KU forms' dynamically indexed `float st[128]` compiles into
+per-invocation memory. SPIR-V: 1 loop (the token walk only), 2,606 OpLoad, 6,950 lines, against the KU form's
+11 / 137 / 646. The generator landed beside it and regeneration reproduces the shader byte for byte. The host knob
+`STRATA_PF_GDN_REC_CHUNK_SPV` selects the chunk shader file, so variants can be A/B'd inside ONE launch on ONE
+binary - the variants differ by ~1%, less than this machine drifts between launches.
+
+**WHAT IT MEASURED** (`prefill_reg_ab.sh`, three variants interleaved, two rounds, 199-token, binary
+`4ee58b505688…`):
+
+| variant (n=2) | `gdn recurrence` ms | prefill ms | tok/s | ids |
+|---|---|---|---|---|
+| chain | 2,691 / 2,698 (med 2,694.5) | 9,219.7 / 9,324.1 | 21.48 / 21.24 | `56a0b28d2de6` |
+| chunk KU | 2,689 / 2,707 (med 2,698) | 9,200.9 / 9,524.4 | 21.52 / 20.79 | `56a0b28d2de6` |
+| chunk REGISTER | 2,807 / 2,645 (med 2,726) | 9,400.7 / 9,407.6 | 21.06 / 21.05 | `56a0b28d2de6` |
+
+* **The register form is ~1.4% SLOWER end-to-end** (9,400.7 / 9,407.6 - tight - against the chain's 9,219.7 /
+  9,324.1) and its phase is the noisiest of the three (2,645-2,807 against 2,691-2,698). That is the signature of
+  the 128 live scalars spilling to scratch: back where the array already was, at the cost of far more
+  instructions. A recorded negative, not a speedup.
+* **KU is a DEAD HEAT with the chain** (med 2,698 vs 2,694.5 = +0.13%): the +0.9% of the earlier launch was the
+  machine, not the variant.
+* **All six arms kept `56a0b28d2de6`** - eleven chunk arms across three variants now, not one id moved. The
+  bit-exactness claim is not in doubt; the performance claim is dead.
+
+**CONCLUSION - THE BIT-EXACT ROUTE TO THIS PHASE IS EXHAUSTED.** Three independent shapes (batch the per-token
+chain into one dispatch; the same with KU-unrolled row walks; a generated register-resident form) all land on
+~370-390 us per (layer, token): the exposed latency of the serial `t` dependency. Nothing that preserves the
+arithmetic moves it. The remaining lever is the one the CUDA itself uses - an `RG` row-split with a
+shared-memory/barrier reduction - and that REASSOCIATES both sums (which is precisely why the engine's own
+`gdn_rec_kernel` disagrees with the decode step for T>1), so adopting it means deliberately re-baselining the
+port's ids. **That is a product decision, not a measurement; the measurement has said everything it can.**
+
+**ALSO RECORDED (a dead end, so nobody repeats it):** `ocloc` CANNOT supply a register/spill report for these
+shaders - it expects OpenCL-flavored SPIR-V and rejects GLSL/Vulkan with `InvalidBuiltinSetName: Expects
+OpenCL.std. Actual is GLSL.std.450`. The register question was answered by timing, not by an offline dump. (The
+shader-file knob `STRATA_PF_GDN_REC_CHUNK_SPV` is the reusable part of this increment: unset, it behaves exactly as
+if it did not exist.)

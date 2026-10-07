@@ -698,6 +698,16 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     }
 }
 
+// WHICH CHUNK SHADER.  The chunk path has more than one shape worth measuring (the rolled per-token walk, the
+// KU-unrolled row walk, and a GENERATED register-resident variant), and their differences are smaller than this
+// machine's drift BETWEEN launches - so the file is selectable and the variants can be A/B'd inside ONE launch,
+// one env var each, against ONE binary.  Default is the shipped name, so an unset environment behaves exactly as
+// if this knob did not exist.  `STRATA_PF_GDN_REC_CHUNK` still selects the whole path.
+const char* gdn_chunk_spv() {
+    const char* e = std::getenv("STRATA_PF_GDN_REC_CHUNK_SPV");
+    return (e != nullptr && e[0] != '\0') ? e : "gdn_rec_chunk.spv";
+}
+
 // ---- the PROMPT-CHUNK form of the recurrence: ONE dispatch per layer for the whole chunk (gdn_rec_chunk.spv).
 // WHY IT EXISTS.  The wrapper below issues 2*T dispatches per layer, and every step dispatch pays a LONE
 // dispatch's latency: the port's own bench (`ports/vulkan/bench/README.md`'s `gdn_step_probe`, re-run on the
@@ -727,7 +737,7 @@ void gdn_step_chunk(Stream& s, float* state, const float* h, const float* gate, 
         !resolve_dev(s, gate, (uint64_t) T * hv * 4, gv) || !resolve_dev(s, beta, (uint64_t) T * hv * 4, bv) ||
         !resolve_dev(s, out, (uint64_t) T * hv * S * 4, ov))
         refuse("prefill::gdn_step_chunk", "a pointer is not in this arena");
-    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/gdn_rec_chunk.spv", 5, 24);
+    VkPipeline p = s.ctx->pipeline(s.spv_dir + "/" + gdn_chunk_spv(), 5, 24);
     struct Push {
         int32_t S;
         int32_t h_k;
