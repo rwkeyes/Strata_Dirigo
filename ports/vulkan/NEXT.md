@@ -7937,3 +7937,29 @@ case yet: the four id-identical arms are its evidence, `case_prefill_gdn_recurre
 and a case for the chunk form is OWED. Session-local caveat worth keeping: this box ran ~29% slower than the
 recorded 21.37 tok/s baseline on the same day, so arms must be interleaved within a session (A_1 11,949.5 ms cold,
 A_2 9,526.9 ms warm, against the record's 9,267 ms).
+
+**GATE IDENTITY, AND READ THIS BEFORE QUOTING EITHER RUN.** Two gate runs are on disk for this change:
+
+| tag | stamp `commit=` | intel | lvp | radeon | smoke |
+|---|---|---|---|---|---|
+| `chunk_head_113f17b5` | `d8f7bb5…` (PARENT - the tree was dirty when the product was built) | 965/0/0 | 949/0/4 | 946/8/2 | 60/0/0 |
+| `chunk_head_e844d33` | `e844d33…` (the commit; clean tree, re-stamped) | **965/0/0** | 949/0/4 | 951/3/2 | 60/0/0 |
+
+Quote the second: the first gated the same CODE but its stamp names the parent commit, so it does not identify
+this HEAD on its own. Both runs: `gdn_rec_chunk` compiled, validated, `LocalSize 256 1 1`, `census: none`. The
+radeon failures are FLAKY and PRE-EXISTING - and the failing SET rotates run to run (`ple_block` x4 +
+`fused_gdn_ab` at 08:19 before this change, 945/9/2; `bf16_gemv` family now, 951/3/2; 952/2/2, 953/1/2, 951/3/2
+elsewhere) - always the same class ("engine wrapper == shader path, bitwise") on the DISPLAY iGPU, never in the
+intel block. A radeon delta is not evidence about a change in this tree; read the intel line.
+
+**A REFINEMENT TO THE 17x GAP (from the same measurement, worth having before anyone "fixes" it).** The bench's
+22-292 us per row is measured over rows that are INDEPENDENT, so its best figure (22 us) is the DISPATCH-PIPELINED
+one: with 128 rows in flight the kernel's ~1-2-outstanding-loads-per-lane latency is hidden behind other rows.
+The engine's 381-389 us is the same kernel with the dependency EXPOSED - the recurrence's rows are strictly
+sequential in `t`, so nothing hides the latency. The chunk walk pooled the dependent rows into one launch and did
+NOT recover the overlap, because the dependency lives in the ARITHMETIC (a serial walk in `t`), not in the dispatch
+mechanism. So the gap is a pipelining factor, not a defect in the dispatch path - and the way to attack it is to
+give each LANE more work in flight: unroll the row walk the way the shipped KU=16 kernel does (this shader
+compiled ROLLED: 5 `OpLoopMerge`) so the 128-load row read issues as a batch instead of a chain. Predict a
+material per-token drop; REFUTE if the phase does not move, which would say the exposed latency is in the `t`
+dependency itself and not in the per-token memory walk.
