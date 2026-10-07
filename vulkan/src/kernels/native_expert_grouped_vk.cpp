@@ -44,6 +44,50 @@ namespace strata::vulkan {
 static constexpr uint32_t kLocalSize = 256;
 static uint32_t groups_for(uint64_t n) { return (uint32_t) ((n + kLocalSize - 1) / kLocalSize); }
 
+// =========================================================================================================
+// THE Y-GRID CAP: the empty launch is ~65% of this launcher's dispatch time, and it is a LAUNCH-SHAPE knob.
+//
+// `gy` (the caller's `grid_groups`) is how many GROUPS a launch covers side by side; the shaders stride
+// `g += gl_NumWorkGroups.y`, so the RESULTS do not depend on it (the gate's `native_expert_grouped` case
+// runs grid_groups=1 already, and `native_grouped_parity` sweeps 0,1,2,3,4,cap+3 for bitwise identity).
+// What it decides is how many WORKGROUPS each launch creates - and this launcher loops the arena's WINDOWS
+// (`nwin`, 8 for this model's 27 GiB arena), dispatching gu and down ONCE PER WINDOW even though a layer's
+// groups are contiguous and live in ONE window.  So the engine runs 1 working launch and `nwin - 1` EMPTY
+// ones, and an empty launch of the caller's grid (2*n_ff x cap_groups) was measured at 0.3168 ms for gu and
+// 0.1606 ms for down - 65% of the call's gu time and 49% of its down time, spent launching workgroups that
+// all `continue` on `grp_win[g] != win_id`.
+//
+// MEASURED on the Arc Pro B70 (ports/vulkan/bench, `native_grouped_engine`, IQ3_XXS gu / IQ4_NL down,
+// n_embd 2560 n_ff 1280, 30 groups, device-local), per `native_expert_grouped` CALL = 1 working launch +
+// (nwin-1) empty launches:
+//
+//     gy    gu work   gu empty   gu call    dn empty   dn call (dn work 1.1825)
+//      1    1.5883    0.1092     2.3527     0.0619
+//      2    1.5807    0.1156     2.3898     0.0638
+//      4    1.5804    0.1317     2.5022     0.0688
+//      8    1.5983    0.1575     2.7011     0.0795
+//     16    1.6375    0.2106     3.1116     0.1075
+//     30    1.6912    0.3167     3.9082     0.1606     2.307
+//
+// The empty launch is ~0.10 ms FIXED + ~2.8 ns per workgroup, so gy=1 (2,560 workgroups) is the measured
+// optimum and ALSO the fastest full launch (1.5883 vs 1.6912 at gy=30).  The cap is a one-number policy:
+// `STRATA_VK_GROUPED_GYMAX` (default 1; 0 restores the caller's request exactly, so one binary can A/B it).
+// UNMEASURED: a very large `ng` (peer/remote experts pass their own count) would make each workgroup stride
+// over many groups; the cap leaves the caller's grid in place whenever it is already <= the cap, and the
+// variable exists to put it back.
+// =========================================================================================================
+static const uint32_t kGyMax = []() -> uint32_t {
+    const char* e = std::getenv("STRATA_VK_GROUPED_GYMAX");
+    if (e == nullptr) return 1u;
+    return (uint32_t) std::strtoul(e, nullptr, 10);
+}();
+
+static uint32_t cap_gy(uint32_t requested, uint32_t cap_groups) {
+    const uint32_t req = (requested > 0 && requested <= cap_groups) ? requested : cap_groups;
+    if (kGyMax == 0 || kGyMax >= req) return req;      // 0 = the caller's request (the previous behaviour)
+    return kGyMax;
+}
+
 // The window the weights binding advances by.  4 GiB minus 64 MiB, so a blob (the pack's largest is 2.66 MB)
 // cannot straddle the 4 GiB index limit at the top of a window.  The rebase shader and this host MUST agree;
 // the value is passed to the shader as a push constant so there is only one number in the file.
@@ -113,7 +157,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         s.ctx->dispatch(pipe, {&b_ptr, &b_ng, &b_off, &b_win}, &pc, sizeof(pc), groups_for((uint64_t) cap_groups));
     }
 
-    const uint32_t gy = (grid_groups > 0 && grid_groups <= cap_groups) ? (uint32_t) grid_groups : (uint32_t) cap_groups;
+    const uint32_t gy = cap_gy((uint32_t) grid_groups, (uint32_t) cap_groups);
 
     // The gu shader declares all three IQ grids as bindings whatever the format is, so ALL are placed and bound
     // (a null descriptor is invalid here).  They are small (8 KiB + 1 KiB + 2 KiB) and live with the stream.

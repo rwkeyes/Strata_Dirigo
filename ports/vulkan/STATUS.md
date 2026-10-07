@@ -1,5 +1,79 @@
 # Status — what is done, what is verified, what is not
 
+## THE "GROUPED GEMV ncols" LEVER: FALSIFIED BY ITS OWN ARM, AND THE EMPTY LAUNCH IT EXPOSED IS A MEASURED 12.2% OF THE VERIFY WINDOW (2026-10-06, `vega`, Arc Pro B70)
+
+**DONE.** (1) **The sized lever was measured before it was built, and the measurement killed it.** The brief's
+premise — `iq1m_mmvq` n_out=1280 `ncols=3` = 51.8 µs against `ncols=1` = 111.0 µs, "3x the work for half the
+cost", so the window's 2,304 `native_gu_any`/`down_any` dispatches should go ~265 → ~124 ms — was taken apart by
+one new arm (`iq1m_controlled`: all four rows, ONE process, interleaved, because this port already knows a row's
+POSITION decides its value). **The 51.8-vs-111.0 pair is `device-local ncols=3` against `mapped ncols=1`.** In the
+memory type the engine actually uses: **device-local ncols=1 = 26.8-30.1 µs, ncols=3 = 58.2-58.5 µs**, i.e.
+1.94x the time for 3x the work — a **1.45x per-dispatch gain, not 6.4x** — while the mapped pair reads 111.0 →
+58.2 µs. (2) **The token-batching shape is SLOWER at the engine's own geometry**, so **no grouped-GEMV kernel
+change was made.** The new engine-shaped arm (`native_grouped_engine`: IQ3_XXS gu / IQ4_NL down, n_embd 2560,
+n_ff 1280, 30 groups, device-local, the 8-window loop) gives `gu_port8` (the port's existing form) **0.4932
+ms/dispatch** against `gu_1grp30` (30 entries on ONE expert — the brief's idea) **1.4725**. (3) **What the same
+arm found instead.** The grouped expert launcher dispatches gu and down **once per arena WINDOW** (8 windows on
+this 27 GiB arena) for a layer whose groups are contiguous and live in ONE of them, so the engine runs **1 working
+launch + 7 EMPTY ones** whose every workgroup exits at `grp_win[g] != win_id`: an empty launch of the caller's
+grid measures **0.3168 ms (gu) / 0.1606 ms (down)**, i.e. **65% of the gu call and 49% of the down call**. (4)
+**The fix is the launch shape, not the kernel.** `gy` (the caller's `grid_groups`) decides only how many groups a
+launch covers side by side; the shaders stride it, so RESULTS are invariant (the gate's own launcher case runs
+`grid_groups=1`; `native_grouped_parity` sweeps 0/1/2/3/4/cap+3 for bitwise identity). Swept in-process, the empty
+launch falls **0.3167 → 0.1092 ms** (gu) and **0.1606 → 0.0619** (down) from gy=30 to gy=1, and the WORKING launch
+is also fastest at gy=1 (1.5883 vs 1.6912). `vulkan/src/kernels/native_expert_grouped_vk.cpp` now caps the
+y-grid at **1** (`STRATA_VK_GROUPED_GYMAX`, default 1; `=0` restores the caller's request exactly, so one binary
+A/Bs both). **No shader changed, no binding changed, no dispatch was removed.**
+
+**VERIFIED.** Engine A/B, `--spec 2 --prefill 256`, one config per invocation, every arm logging its own env,
+shader sha256s and binary sha256 (`/tmp/gap2/`). The `gy0` arms are the SAME changed binary with
+`STRATA_VK_GROUPED_GYMAX=0` — the control that separates the change from the rebuild (they reproduce HEAD to
+within 0.04%):
+
+| arm | `gy` | segments | recorded disp | barriers | sync ms/round | seg wait ms | µs/dispatch | decode | ids |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `base199` (HEAD) | caller | 42 | 59,111 | 71,005 | 260.427 | 3,786 | 64.05 | 8.34 | `56a0b28d2de6` |
+| `gy1_199` | **1** | 42 | 59,111 | 71,005 | **228.020** | **3,326** | **56.26** | **9.46** | `56a0b28d2de6` |
+| `gy0_199` | 0 | 42 | 59,111 | 71,005 | 260.327 | 3,785 | 64.03 | 8.35 | `56a0b28d2de6` |
+| `base8` (HEAD) | caller | 57 | 73,126 | 21,826 | 195.334 | 3,863 | 52.83 | 8.18 | `3aed108cceee` |
+| `gy1_8` | **1** | 57 | 73,126 | 21,826 | **172.344** | **3,417** | **46.73** | **9.21** | `3aed108cceee` |
+| `gy0_8` | 0 | 57 | 73,126 | 21,826 | 195.003 | — | — | 8.20 | `3aed108cceee` |
+
+**The window's GPU time falls 12.5% / 11.8%; decode rises 13.4% / 12.6%; the dispatch, segment and barrier
+counts are IDENTICAL** — the change removed GPU EXECUTION, not dispatches. Arc `intel_icd` **895 passed / 0
+failed / 0 skipped** (the count did NOT fall, nothing skipped); `lvp_icd` 879/0/4 (the four documented skips);
+`radeon_icd` 882/2/2, **both** failures in the documented RADV moving-failing-set family
+(`bf16_gemv entry` 509/512, `bf16_gemv_fp32_mmvf_cols entry` 2491/2496 — neither is a case this batch touches);
+smoke **60/0/0**. The launcher's own gate case (`native_expert_grouped`: window 0 == window 1 bitwise 2560/2560,
+a different expert moves it, the gate/up half reaches the output, zeroing it gives exactly 0) passes.
+
+**TARGET 2 CLOSED — THE `fused_gr_*` RESIDUAL IS A MISSING ROW, NOT A COST.** New arm `gr_pricing` at the
+artifact's geometry (N=2560 HC=4 LR=320, device-local; `fused_gr_read_multi` is 4 dispatches per token):
+`fused_gr_rs` **14.7 µs**, `fused_gr_down` **22.2**, `fused_gr_mix` **68.3**, `fused_gr_inject` **15.1**; the
+per-token chain **0.1114 ms/token** (T=3) / 0.0955 (T=8). The four groups are **2,304 dispatches (21% of the
+window's 11,365 recorded) and price at 69.3 ms — 10% of the 687.6 ms the named histogram takes**, NOT the
+**112.7 µs each (259.5 ms)** the previous mixture model's residual assigned them. Rebuilt model
+(`/tmp/gap2/mixture_model2.py`): **99% of the histogram priced, and the residual is gone.** Its remaining
+honest caveat: the engine-shaped gu/down rows price the whole grouped family at **983.5 ms = 143% of the
+window**, so the synthetic fixture's ABSOLUTE scale over-states the engine's real per-call work; **the ratio
+across `gy` is the result, the absolute is not a window cost** (the engine A/B above is the authority).
+
+**NOT VERIFIED / NOT DONE.** (i) The engine-shaped fixture's entry/group mix is not the engine's real one — the
+window's true per-call `cap_entries`/formats were not read back, so the fixture's absolute is a shape estimate.
+(ii) The **8-window launch count is unchanged**: reducing `nwin` needs a 64-bit storage-buffer index (glslang
+15.1 rejects it), buffer-device-address, or a per-window binding ARRAY (8 weight bindings selected by `grp_win`)
+— the last is implementable and was NOT attempted. (iii) The same `gy` question was NOT asked of `native_k_mmvq`,
+`moe_grouped_s2` or the `peer_experts` launcher, which dispatch their own grids. (iv) The A/B is **n=1 per
+configuration** for the first arm pair; repeats are recorded in the log set and not folded into a median here.
+(v) `fused_gr_mix` (68.3 µs, the largest of the four) is measured but not optimised. The 199-token A/B is **n=3
+per arm on the changed binary** (227.972-228.020 against the control's 260.119-260.399, disjoint) plus the HEAD
+binary, and n=1 for each 8-token arm. Logs, exact:
+`/tmp/gap2/{base199,gy1_199,gy1_199b,gy1_199c,gy0_199,gy0_199b,gy0_199c,base8,gy1_8,gy0_8}.log` (engine),
+`/tmp/gap2/bench_{iq1m_controlled,native_grouped_engine,gr_pricing}.log` (bench),
+`/tmp/gap2/mixture_model2.py` + `.out`, `/tmp/gap2/gate_final.log` (the Arc gate + the per-ICD arms),
+`/tmp/gap2/{ab.sh,chain.sh,run.sh,driver.sh}` (the sequencing and the id-list guard),
+`ports/vulkan/harness/build/icd-{intel,lvp,radeon}_icd.log`.
+
 ## THE VERIFY WINDOW'S WAIT STRUCTURE: PRICED, RESTRUCTURED, FALSIFIED (2026-10-06, `vega`, Arc Pro B70)
 
 **DONE.** (1) **The structure was priced BEFORE it was touched.** 199-token arm, `--spec 2`: the whole run has

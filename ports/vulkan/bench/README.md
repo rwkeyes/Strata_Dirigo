@@ -643,6 +643,30 @@ llama.cpp's `mul_mm.comp`/`mul_mmq.comp` do - both are built by `run_bench.sh` a
   the harness's host-visible memory type.  They are a ranking and an in-stream marginal cost; they are NOT
   bandwidth figures.
 
+## THE GROUPED EXPERT GEMV AT THE ENGINE'S SHAPE, THE EMPTY LAUNCH, AND THE `fused_gr_*` GROUP TIED TO DATES (measured 2026-10-06, `vega`, Arc Pro B70)
+
+Three arms added by the batch that falsified the "grouped GEMV ncols" lever. All rows are the file's standing
+instrument (wall clock around a recorded-batch fence, median/batch, device-local unless the row says otherwise).
+
+**`iq1m_controlled`** — the six rows of `iq1m_mmvq` n_out=1280 (ncols 1/3 × mapped/device-local, plus repeats)
+in **ONE process, interleaved**. It exists because the committed `ncols=3 51.8 µs` against `ncols=1 111.0 µs`
+pair crossed a memory type: measured properly, **mapped 111.0 → 58.2 µs** but **device-local 28.5 → 58.2 µs**.
+Quote the memory type with the ncols count, or the ratio is the type.
+
+**`native_grouped_engine`** — `native_gu_any` / `native_down_any` driven at the ENGINE's own shape (IQ3_XXS gu /
+IQ4_NL down, n_embd 2560, n_ff 1280, 30 groups = the `--spec 2` window's 3 tokens × top-10, the launcher's
+8-window loop). Rows: `gu_1win` / `gu_port8` / `gu_engine1` / `gu_1grp30` / `gu_empty` / `dn_*` plus a **`gy`
+sweep** (1,2,4,8,16,30) of both the working and the empty launch. The two results worth keeping: (a) **token
+batching is SLOWER than the port's existing per-group form** (`gu_1grp30` 1.4725 ms against `gu_port8` 0.4932
+ms/dispatch), and (b) **an EMPTY launch is 65% of the gu call** (0.3168 ms for gu, 0.1606 for down at the
+caller's `gy`=30; 0.1092 / 0.0619 at `gy`=1) — it is `~0.102 ms fixed + ~2.8 ns per workgroup`, the same species
+as this file's `F = 67 µs per submit`. The working launch is also fastest at `gy`=1.
+
+**`gr_pricing`** — the four `fused_gr_*` kernels at the artifact's geometry (N=2560 HC=4 LR=320), singly and as
+the engine's per-token chain: `rs` 14.7 µs, `down` 22.2, `mix` 68.3, `inject` 15.1, and
+`fused_gr_read_multi` **0.1114 ms/token** (T=3) / 0.0955 (T=8). These replaced a mixture model's 112.7 µs
+placeholder and showed the group is **10% of the verify window, not 38%**.
+
 ## Evidence the harness measures something real
 
 1. **Cross-ICD (the same binary, the same kernel, different device).**  `run_bench.sh` runs every ICD, and

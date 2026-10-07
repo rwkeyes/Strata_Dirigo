@@ -1578,6 +1578,249 @@ void bench_gdn_step_unroll(Ctx& ctx, const std::string& dir, int reps, int warmu
 // wash.  The CUDA's one-thread-per-row naive decomposition was ALSO measured and is NOT shipped: at the engine's
 // shapes it is 14-18x slower on the GPUs (Arc 0.073x, Ryzen iGPU 0.103x of the workgroup form at n_out=512) and
 // the CUDA does not take it above n_out=64 anyway.
+// Forward declaration: `time_iters` (the per-dispatch instrument) is defined further down the file.
+template <class RecordIter>
+Timing time_iters(Ctx& ctx, int iters, int disp_per_iter, int reps, int warmups, RecordIter rec);
+
+// =========================================================================================================
+// (A) THE VERIFY WINDOW'S GROUPED EXPERT GEMV (`native_gu_any` / `native_down_any`), AT THE ENGINE'S SHAPE.
+//
+// The mixture model prices the window's 2,304 `native_gu_any`/`native_down_any` dispatches at the
+// `iq1m_mmvq` n_out=1280 ncols=1 row (111 us).  That is a DIFFERENT shader, a DIFFERENT grid (`n_out`
+// workgroups vs `2*n_ff x gy`) and a DIFFERENT memory type - so this arm prices the kernel that actually
+// fills the window, and moves ONE property at a time so the lever is named rather than assumed:
+//
+//   gu_1win      ONE dispatch, grid (2*n_ff, 30) - all 30 groups in one window (the CUDA's shape)
+//   gu_port8     EIGHT dispatches, one per window, the 30 groups spread over the windows (the port's shape:
+//                a 4 GiB storage-buffer index limit forces one launch per arena window, so the launch count
+//                is multiplied by nwin and ~7/8 of each launch has no matching group)
+//   gu_1grp30    30 entries on ONE expert, ONE dispatch (the "batch tokens per weight read" hypothesis)
+//   dn_1win / dn_port8   the same two shapes for the down projection
+//
+// The two mechanisms the task names (tokens per dispatch, and dispatch count) therefore have separate rows.
+// =========================================================================================================
+void bench_native_grouped_engine(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int n_embd = 2560, n_ff = 1280;
+    const int n_tok = 3, K = 10, cap = n_tok * K;              // 30 entries - the engine's --spec 2 window
+    const int ty_gu = 18;                                      // IQ3_XXS (layer 0's gate/up): 98 B / 256
+    const int ty_dn = 20;                                      // IQ4_NL (layer 0's down): 18 B / 32
+    const int nwin = 8;                                        // the 27 GiB arena in 4 GiB-64 MiB windows
+
+    const int nb_gu = n_embd / 256, gu_row = nb_gu * 98, gu_blob = 2 * n_ff * gu_row;
+    std::vector<uint8_t> wgu((size_t) cap * (size_t) gu_blob);
+    for (size_t i = 0; i < wgu.size(); ++i) wgu[i] = (uint8_t) (i * 29 + 7);
+    std::vector<uint32_t> off_gu((size_t) cap);
+    for (int g = 0; g < cap; ++g) off_gu[(size_t) g] = (uint32_t) ((size_t) g * (size_t) gu_blob);
+    std::vector<uint8_t> agu((size_t) cap * (size_t) (n_embd / 32) * 36u);
+    for (size_t i = 0; i < agu.size(); ++i) agu[i] = (uint8_t) (i * 11 + 3);
+
+    Buf b_w = ctx.alloc_device(wgu.size()), b_a = ctx.alloc_device(agu.size()), b_off = ctx.alloc((size_t) cap * 4);
+    Buf b_win = ctx.alloc((size_t) cap * 4), b_s = ctx.alloc(((size_t) cap + 1) * 4), b_ng = ctx.alloc(4);
+    Buf b_e = ctx.alloc((size_t) cap * 4), b_g1 = ctx.alloc(sizeof(strata::vkport::kIq2sGrid));
+    Buf b_g2 = ctx.alloc(sizeof(strata::vkport::kIq3xxsGrid)), b_g3 = ctx.alloc(sizeof(strata::vkport::kIq3sGrid));
+    Buf b_og = ctx.alloc_device((size_t) cap * n_ff * 4u + 256u), b_ou = ctx.alloc_device((size_t) cap * n_ff * 4u + 256u);
+    ctx.write(b_w, wgu.data(), wgu.size()); ctx.write(b_a, agu.data(), agu.size());
+    ctx.write(b_off, off_gu.data(), off_gu.size() * 4);
+    ctx.write(b_g1, strata::vkport::kIq2sGrid, sizeof(strata::vkport::kIq2sGrid));
+    ctx.write(b_g2, strata::vkport::kIq3xxsGrid, sizeof(strata::vkport::kIq3xxsGrid));
+    ctx.write(b_g3, strata::vkport::kIq3sGrid, sizeof(strata::vkport::kIq3sGrid));
+    VkPipeline pgu = ctx.pipeline(dir + "/native_gu_any.spv", 12, 16);
+    const std::string gshape = "n_embd=2560 n_ff=1280 ty=IQ3_XXS entries=30 device-local";
+
+    auto set_layout = [&](int mode) {                          // 0: 30 groups x1 win0 | 1: 30 groups x1 spread | 2: 1 group x30
+        std::vector<int32_t> s((size_t) cap + 1), e((size_t) cap), ng(1, cap);
+        std::vector<uint32_t> win((size_t) cap, 0u);
+        if (mode == 2) {
+            s[0] = 0; s[1] = cap;
+            ng[0] = 1;
+        } else {
+            for (int g = 0; g <= cap; ++g) s[(size_t) g] = g;
+            if (mode == 1) for (int g = 0; g < cap; ++g) win[(size_t) g] = (uint32_t) (g % nwin);
+        }
+        for (int g = 0; g < cap; ++g) e[(size_t) g] = g % n_tok;
+        ctx.write(b_s, s.data(), s.size() * 4); ctx.write(b_e, e.data(), e.size() * 4);
+        ctx.write(b_win, win.data(), win.size() * 4); ctx.write(b_ng, ng.data(), 4);
+    };
+    auto gu_disp = [&](uint32_t ngy, int win_id) {
+        struct { int n_embd, n_ff, ty, win_id; } pc{n_embd, n_ff, ty_gu, win_id};
+        ctx.record_dispatch(pgu, {&b_w, &b_a, &b_g1, &b_g2, &b_g3, &b_off, &b_win, &b_s, &b_ng, &b_e, &b_og, &b_ou},
+                            &pc, sizeof(pc), (uint32_t) (2 * n_ff), ngy);
+    };
+
+    set_layout(0);
+    report("gu_1win", gshape + " | 1 dispatch, all 30 groups in one window",
+           time_iters(ctx, 8, 1, reps, warmups, [&](int) { gu_disp((uint32_t) cap, 0); }), (double) cap * n_ff, 0.0);
+    set_layout(1);
+    report("gu_port8", gshape + " | 8 dispatches (one per arena window), groups spread over the windows",
+           time_iters(ctx, 1, nwin, reps, warmups, [&](int) {
+               for (int w = 0; w < nwin; ++w) gu_disp((uint32_t) cap, w);
+           }), (double) cap * n_ff, 0.0);
+    set_layout(2);
+    report("gu_1grp30", gshape + " | 1 dispatch, 30 entries on ONE expert (tokens batched)",
+           time_iters(ctx, 8, 1, reps, warmups, [&](int) { gu_disp((uint32_t) cap, 0); }), (double) cap * n_ff, 0.0);
+    // THE ENGINE'S REAL CASE: a layer's 30 groups are CONTIGUOUS in the pack, so they live in ONE window -
+    // the port still issues nwin launches, 1 doing all the work and nwin-1 with no matching group at all.
+    set_layout(0);
+    report("gu_engine1", gshape + " | 8 dispatches, all 30 groups in ONE window (the engine's real case)",
+           time_iters(ctx, 1, nwin, reps, warmups, [&](int) {
+               for (int w = 0; w < nwin; ++w) gu_disp((uint32_t) cap, w);
+           }), (double) cap * n_ff, 0.0);
+    // THE COST OF AN EMPTY LAUNCH ON ITS OWN: the same grid, no group in this dispatch's window.
+    set_layout(1);
+    report("gu_empty", gshape + " | 1 dispatch, NO group in this window (an empty launch of the same grid)",
+           time_iters(ctx, 8, 1, reps, warmups, [&](int) { gu_disp((uint32_t) cap, 99); }), (double) cap * n_ff, 0.0);
+    // THE Y-GRID SWEEP.  `gy` is the number of groups a launch covers side by side (the port's
+    // `grid_groups`); the groups are strided by it, so the RESULTS do not depend on it - only how the work
+    // is spread.  A SMALL gy makes each launch fewer workgroups, which is what the nwin-1 empty launches
+    // (the engine's real case) pay for; the full launch may pay for it in parallelism.  Per-call cost =
+    // full(gy) + (nwin-1) * empty(gy).
+    for (uint32_t gy : {1u, 2u, 4u, 8u, 16u, 30u}) {
+        char sh[96];
+        set_layout(0);
+        std::snprintf(sh, sizeof sh, "gy=%u | all 30 groups in one window (the work)", gy);
+        Timing tf = time_iters(ctx, 8, 1, reps, warmups, [&](int) { gu_disp(gy, 0); });
+        report("gu_gysweep", sh, tf, (double) cap * n_ff, 0.0);
+        set_layout(1);
+        std::snprintf(sh, sizeof sh, "gy=%u | no group in this window (an empty launch)", gy);
+        Timing te = time_iters(ctx, 8, 1, reps, warmups, [&](int) { gu_disp(gy, 99); });
+        report("gu_gysweep_empty", sh, te, (double) cap * n_ff, 0.0);
+        std::printf("      gy=%u: full %.4f ms + %d empty x %.4f = %.4f ms per call (vs 1 full + 0 empty = %.4f)\n",
+                    gy, tf.med, nwin - 1, te.med, tf.med + (nwin - 1) * te.med, tf.med);
+    }
+
+    const int d_row = (n_ff / 32) * 18, dn_blob = d_row * n_embd;
+    std::vector<uint8_t> wdn((size_t) cap * (size_t) dn_blob);
+    for (size_t i = 0; i < wdn.size(); ++i) wdn[i] = (uint8_t) (i * 37 + 11);
+    std::vector<uint32_t> off_dn((size_t) cap);
+    for (int g = 0; g < cap; ++g) off_dn[(size_t) g] = (uint32_t) ((size_t) g * (size_t) dn_blob);
+    std::vector<uint8_t> hq((size_t) cap * (size_t) (n_ff / 32) * 36u);
+    for (size_t i = 0; i < hq.size(); ++i) hq[i] = (uint8_t) (i * 13 + 5);
+    Buf b_wd = ctx.alloc_device(wdn.size()), b_hq = ctx.alloc_device(hq.size()), b_offd = ctx.alloc((size_t) cap * 4);
+    Buf b_wind = ctx.alloc((size_t) cap * 4), b_sd = ctx.alloc(((size_t) cap + 1) * 4), b_ngd = ctx.alloc(4);
+    Buf b_ed = ctx.alloc((size_t) cap * 4), b_yd = ctx.alloc_device((size_t) cap * n_embd * 4u + 256u);
+    ctx.write(b_wd, wdn.data(), wdn.size()); ctx.write(b_hq, hq.data(), hq.size());
+    ctx.write(b_offd, off_dn.data(), off_dn.size() * 4);
+    VkPipeline pdn = ctx.pipeline(dir + "/native_down_any.spv", 8, 24);
+    const std::string dshape = "n_embd=2560 n_ff=1280 ty=IQ4_NL entries=30 device-local";
+    std::vector<int32_t> sd((size_t) cap + 1), ed((size_t) cap);
+    for (int g = 0; g <= cap; ++g) sd[(size_t) g] = g;
+    for (int g = 0; g < cap; ++g) ed[(size_t) g] = g % n_tok;
+    ctx.write(b_sd, sd.data(), sd.size() * 4); ctx.write(b_ed, ed.data(), ed.size() * 4);
+    ctx.write(b_ngd, &cap, 4);
+    auto dn_disp = [&](uint32_t ngy, int win_id) {
+        struct { int n_embd, n_ff, ty, win_id, d_row, down_off; } pc{n_embd, n_ff, ty_dn, win_id, d_row, 0};
+        ctx.record_dispatch(pdn, {&b_wd, &b_hq, &b_offd, &b_wind, &b_sd, &b_ngd, &b_ed, &b_yd},
+                            &pc, sizeof(pc), (uint32_t) n_embd, ngy);
+    };
+    std::vector<uint32_t> win0((size_t) cap, 0u), winsp((size_t) cap);
+    for (int g = 0; g < cap; ++g) winsp[(size_t) g] = (uint32_t) (g % nwin);
+    ctx.write(b_wind, win0.data(), win0.size() * 4);
+    report("dn_1win", dshape + " | 1 dispatch, all 30 groups in one window",
+           time_iters(ctx, 8, 1, reps, warmups, [&](int) { dn_disp((uint32_t) cap, 0); }), (double) cap * n_embd, 0.0);
+    ctx.write(b_wind, winsp.data(), winsp.size() * 4);
+    report("dn_port8", dshape + " | 8 dispatches (one per arena window), groups spread over the windows",
+           time_iters(ctx, 1, nwin, reps, warmups, [&](int) {
+               for (int w = 0; w < nwin; ++w) dn_disp((uint32_t) cap, w);
+           }), (double) cap * n_embd, 0.0);
+    ctx.write(b_wind, win0.data(), win0.size() * 4);
+    report("dn_engine1", dshape + " | 8 dispatches, all 30 groups in ONE window (the engine's real case)",
+           time_iters(ctx, 1, nwin, reps, warmups, [&](int) {
+               for (int w = 0; w < nwin; ++w) dn_disp((uint32_t) cap, w);
+           }), (double) cap * n_embd, 0.0);
+    // THE EMPTY DOWN LAUNCH - the same grid with no group in this dispatch's window (the gu side's twin).
+    ctx.write(b_wind, winsp.data(), winsp.size() * 4);
+    report("dn_empty", dshape + " | 1 dispatch, NO group in this window (an empty launch of the same grid)",
+           time_iters(ctx, 8, 1, reps, warmups, [&](int) { dn_disp((uint32_t) cap, 99); }), (double) cap * n_embd, 0.0);
+    for (uint32_t gy : {1u, 2u, 4u, 8u, 16u, 30u}) {
+        char sh[96];
+        ctx.write(b_wind, win0.data(), win0.size() * 4);
+        std::snprintf(sh, sizeof sh, "gy=%u | all 30 groups in one window (the work)", gy);
+        Timing tf = time_iters(ctx, 8, 1, reps, warmups, [&](int) { dn_disp(gy, 0); });
+        report("dn_gysweep", sh, tf, (double) cap * n_embd, 0.0);
+        ctx.write(b_wind, winsp.data(), winsp.size() * 4);
+        std::snprintf(sh, sizeof sh, "gy=%u | no group in this window (an empty launch)", gy);
+        Timing te = time_iters(ctx, 8, 1, reps, warmups, [&](int) { dn_disp(gy, 99); });
+        report("dn_empty_gy", sh, te, (double) cap * n_embd, 0.0);
+        std::printf("      dn gy=%u: work %.4f + %d empty x %.4f = %.4f ms per call\n", gy, tf.med, nwin - 1,
+                    te.med, tf.med + (nwin - 1) * te.med);
+    }
+
+    ctx.free(b_w); ctx.free(b_a); ctx.free(b_off); ctx.free(b_win); ctx.free(b_s); ctx.free(b_ng);
+    ctx.free(b_e); ctx.free(b_g1); ctx.free(b_g2); ctx.free(b_g3); ctx.free(b_og); ctx.free(b_ou);
+    ctx.free(b_wd); ctx.free(b_hq); ctx.free(b_offd); ctx.free(b_wind); ctx.free(b_sd); ctx.free(b_ngd);
+    ctx.free(b_ed); ctx.free(b_yd);
+}
+
+// =========================================================================================================
+// (B) THE `fused_gr_*` GROUP, PRICED - the mixture model's entire 112.7 us residual.
+//
+// The RECORDED-arm histogram carries 576 dispatches of EACH of `fused_gr_rs` / `_down` / `_mix` / `_inject`
+// (2,304 = 21% of the window's count) and the mixture model has NO row for them, so the model closes only by
+// making them carry 112.7 us each.  `fused_gr_read_multi` (vulkan/src/kernels/fused_gr_vk.cpp) is a LOOP over
+// tokens and each token is FOUR dispatches at the ARTIFACT'S geometry (N=2560 HC=4 LR=320), so this arm
+// measures the four kernels singly AND the chain the engine actually issues, at the engine's batch.
+// =========================================================================================================
+void bench_gr_pricing(Ctx& ctx, const std::string& dir, int reps, int warmups) {
+    const int N = 2560, HC = 4, LR = 320;                       // fused_gr.cu:20-23, the artifact's geometry
+    const int64_t hc_dim = (int64_t) HC * N;
+    std::vector<float> r = floats((size_t) hc_dim), z = floats((size_t) hc_dim);
+    std::vector<float> nrm = floats((size_t) hc_dim), bo = floats((size_t) N), inj = floats((size_t) HC);
+    std::vector<float> lof = floats((size_t) LR), rs = floats((size_t) HC), mix = floats((size_t) N);
+    Buf b_r = ctx.alloc_device((size_t) hc_dim * 4), b_o = ctx.alloc_device((size_t) hc_dim * 4);
+    Buf b_n = ctx.alloc_device((size_t) hc_dim * 4);
+    Buf b_d = ctx.alloc_device((size_t) LR * (size_t) (hc_dim / 2) * 4);     // w_down: bf16 pairs
+    Buf b_u = ctx.alloc_device((size_t) hc_dim * (size_t) (LR / 2) * 4);     // w_up:   bf16 pairs
+    Buf b_l = ctx.alloc_device((size_t) LR * 4), b_s = ctx.alloc_device((size_t) HC * 4);
+    Buf b_m = ctx.alloc_device((size_t) N * 4), b_b = ctx.alloc_device((size_t) N * 4);
+    Buf b_i = ctx.alloc_device((size_t) HC * 4), b_w = ctx.alloc_device((size_t) HC * (size_t) (hc_dim / 2) * 4);
+    Buf b_j = ctx.alloc_device((size_t) HC * 4);
+    ctx.write(b_r, r.data(), r.size() * 4); ctx.write(b_o, z.data(), z.size() * 4);
+    ctx.write(b_n, nrm.data(), nrm.size() * 4); ctx.write(b_b, bo.data(), bo.size() * 4);
+    ctx.write(b_i, inj.data(), inj.size() * 4); ctx.write(b_l, lof.data(), lof.size() * 4);
+    ctx.write(b_s, rs.data(), rs.size() * 4); ctx.write(b_m, mix.data(), mix.size() * 4);
+    ctx.write(b_j, inj.data(), inj.size() * 4);
+    {
+        std::vector<uint8_t> wd((size_t) b_d.bytes, 0), wu((size_t) b_u.bytes, 0), wi((size_t) b_w.bytes, 0);
+        for (size_t i = 0; i < wd.size(); ++i) wd[i] = (uint8_t) (i * 7 + 1);
+        for (size_t i = 0; i < wu.size(); ++i) wu[i] = (uint8_t) (i * 7 + 3);
+        for (size_t i = 0; i < wi.size(); ++i) wi[i] = (uint8_t) (i * 7 + 5);
+        ctx.write(b_d, wd.data(), wd.size()); ctx.write(b_u, wu.data(), wu.size()); ctx.write(b_w, wi.data(), wi.size());
+    }
+    const std::string shape = "N=2560 HC=4 LR=320 (the artifact's geometry)";
+    const uint32_t g_rs = HC, g_dn = LR, g_mx = N, g_in = HC;
+    VkPipeline p_rs = ctx.pipeline(dir + "/fused_gr_rs.spv", 5, 20);
+    VkPipeline p_dn = ctx.pipeline(dir + "/fused_gr_down.spv", 5, 12);
+    VkPipeline p_mx = ctx.pipeline(dir + "/fused_gr_mix.spv", 6, 12);
+    VkPipeline p_in = ctx.pipeline(dir + "/fused_gr_inject.spv", 5, 8);
+    struct { int n_embd, hc; float eps; int apply; } pcrs{N, HC, 1e-6f, 1};
+    struct { int n_embd, hc, hc_lr; } pcdn{N, HC, LR}, pcmx{N, HC, LR};
+    struct { int n_embd, hc; } pcin{N, HC};
+    auto one = [&](int) {
+        ctx.record_dispatch(p_rs, {&b_r, &b_b, &b_i, &b_o, &b_s}, &pcrs, sizeof(pcrs), g_rs, 1);
+        ctx.record_dispatch(p_dn, {&b_o, &b_n, &b_s, &b_d, &b_l}, &pcdn, sizeof(pcdn), g_dn, 1);
+        ctx.record_dispatch(p_mx, {&b_o, &b_n, &b_s, &b_l, &b_u, &b_m}, &pcmx, sizeof(pcmx), g_mx, 1);
+        ctx.record_dispatch(p_in, {&b_o, &b_n, &b_s, &b_w, &b_j}, &pcin, sizeof(pcin), g_in, 1);
+    };
+    report("fused_gr_rs", shape, time_kernel(ctx, p_rs, {&b_r, &b_b, &b_i, &b_o, &b_s}, &pcrs, sizeof(pcrs), g_rs, 1, 8,
+                                             reps, warmups), (double) HC, 0.0);
+    report("fused_gr_down", shape, time_kernel(ctx, p_dn, {&b_o, &b_n, &b_s, &b_d, &b_l}, &pcdn, sizeof(pcdn), g_dn, 1,
+                                               8, reps, warmups), (double) LR, 0.0);
+    report("fused_gr_mix", shape, time_kernel(ctx, p_mx, {&b_o, &b_n, &b_s, &b_l, &b_u, &b_m}, &pcmx, sizeof(pcmx), g_mx,
+                                              1, 8, reps, warmups), (double) N, 0.0);
+    report("fused_gr_inject", shape, time_kernel(ctx, p_in, {&b_o, &b_n, &b_s, &b_w, &b_j}, &pcin, sizeof(pcin), g_in, 1,
+                                                 8, reps, warmups), (double) HC, 0.0);
+    for (int nt : {3, 8}) {
+        char sh[96];
+        std::snprintf(sh, sizeof sh, "%s | fused_gr_read_multi T=%d (%d dispatches)", shape.c_str(), nt, 4 * nt);
+        Timing t = time_iters(ctx, nt, 4, reps, warmups, one);
+        report("fused_gr_multi", sh, t, (double) N, 0.0);
+        std::printf("      fused_gr_multi T=%d: %.4f ms/token (%d dispatches), %.4f ms/dispatch\n", nt, t.med * 4.0,
+                    4 * nt, t.med);
+    }
+    ctx.free(b_r); ctx.free(b_o); ctx.free(b_n); ctx.free(b_d); ctx.free(b_u); ctx.free(b_l); ctx.free(b_s);
+    ctx.free(b_m); ctx.free(b_b); ctx.free(b_i); ctx.free(b_w); ctx.free(b_j);
+}
+
 // =========================================================================================================
 void bench_bf16_gemv_pair(Ctx& ctx, const std::string& dir, int reps, int warmups) {
     const int shapes[][2] = {{2560, 512}, {2560, 48}};   // the router/indexer projection; the GDN alpha/beta projection
@@ -1859,6 +2102,17 @@ int main(int argc, char** argv) {
     arm("iq1m_mmvq_2560", false, [&] { bench_iq1m(ctx, dir, 2560, 1, false, reps, warmups); });
     arm("iq1m_mmvq_2560_dev", false, [&] { bench_iq1m(ctx, dir, 2560, 1, true, reps, warmups); });
     arm("iq1m_mmvq_1280_n3_dev", false, [&] { bench_iq1m(ctx, dir, 1280, 3, true, reps, warmups); });
+    // THE CONTROLLED COMPARISON the ncols lever rests on: the SAME four rows (ncols 1/3 x mapped/dev) in ONE
+    // process, interleaved and repeated, so a memory-type or process-POSITION effect cannot be read as an
+    // ncols effect (the port's own "a row's position in the process decides its value" artifact).
+    arm("iq1m_controlled", false, [&] {
+        bench_iq1m(ctx, dir, 1280, 1, false, reps, warmups);
+        bench_iq1m(ctx, dir, 1280, 3, false, reps, warmups);
+        bench_iq1m(ctx, dir, 1280, 1, true, reps, warmups);
+        bench_iq1m(ctx, dir, 1280, 3, true, reps, warmups);
+        bench_iq1m(ctx, dir, 1280, 3, false, reps, warmups);
+        bench_iq1m(ctx, dir, 1280, 1, true, reps, warmups);
+    });
 
     arm("quantize_q8_0", false, [&] { bench_quantize_q8_0(ctx, dir, reps, warmups); });
     arm("quantize_q8_1", true, [&] { bench_quantize_q8_1(ctx, dir, reps, warmups); });
@@ -1904,6 +2158,12 @@ int main(int argc, char** argv) {
     // THE PER-DISPATCH GAP: the engine's replay (64.0 us) / live prefill (152.5 us) against this harness's
     // in-stream marginal (5-20 us).  Holds the work per dispatch fixed and moves ONE structural property at
     // a time (pipeline diversity, memory type, descriptor-target spread, command-buffer length).
+    // THE WINDOW'S GROUPED EXPERT GEMV, AT THE ENGINE'S OWN SHAPE: `native_gu_any`/`native_down_any`, the
+    // kernel the mixture model priced with a PROXY row.  One property at a time: group spread over the arena
+    // windows (the port's shape) vs one window (the CUDA's), and 30 entries on one expert vs 30 groups.
+    arm("native_grouped_engine", true, [&] { bench_native_grouped_engine(ctx, dir, reps, warmups); });
+    // THE `fused_gr_*` GROUP PRICED - 576 dispatches of each of the four, the mixture model's whole residual.
+    arm("gr_pricing", false, [&] { bench_gr_pricing(ctx, dir, reps, warmups); });
     arm("dispatch_gap", false, [&] { bench_dispatch_gap(ctx, dir, reps, warmups); });
 
     // THE SAMPLER LAST, ON PURPOSE.  Its one-block top-k over the whole vocabulary is the port's heaviest
@@ -1923,7 +2183,7 @@ int main(int argc, char** argv) {
                              "router_pair moe_combine_pair rms_norm_pair qsa_gate_pair qsa_decode_attn "
                              "gdn_conv_silu_pair gdn_l2_norm_pair gdn_beta_gate_pair gdn_gate_pair "
                              "gdn_out_norm_pair gdn_step_pair fused_gdn_conv_l2_pair fused_gdn_ab_pair "
-                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill dispatch_gap sampler\n");
+                             "fused_gdn_step_norm_pair gdn_rec_batch_sweep gdn_step_probe gdn_step_unroll bf16_gemv_pair gemm_prefill native_grouped_engine gr_pricing dispatch_gap sampler\n");
         return 2;
     }
 

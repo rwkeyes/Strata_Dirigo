@@ -1,5 +1,84 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE "GROUPED GEMV ncols" LEVER IS FALSIFIED, AND THE EMPTY LAUNCH IT EXPOSED IS WORTH 12.2% OF THE VERIFY WINDOW — `native_expert_grouped`'s y-grid capped, window 260.4 → 228.0 ms/round, decode 8.34 → 9.46 tok/s, ids unmoved (2026-10-06, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH.** The queued brief sized the next lever as *"batch tokens per weight-reading dispatch: `iq1m_mmvq` n_out=1280 at ncols=3 is 51.8 µs against 111.0 µs at ncols=1 — 3x the work for HALF the cost — so the window's 2,304 `native_gu_any`/`down_any` dispatches should go ~265 ms → ~124 ms."* **Both halves of that premise are wrong and the measurement says so.** (1) The 51.8-vs-111.0 ratio is a **memory-type confound**: ncols=3 was measured in the arena's DEVICE_LOCAL type and ncols=1 in the harness's MAPPED type, and `iq1m_controlled` — the same four rows, one process, interleaved — gives **mapped 111.0 → 58.2 µs** (ncols 1 → 3) but **device-local 28.5 → 58.2 µs**, i.e. within the memory type the engine actually uses, three columns cost **2.07x one column for 3x the work — a 1.45x per-dispatch gain, not 6.4x**, and the `ncols=1` device-local row (26.8-30.1 µs) is already the FAST one. (2) The port's grouped expert kernel does not dispatch per token at all: the brief's own `native_gu_any` runs **one launch per arena WINDOW for ALL groups at once** (grid `2*n_ff × gy`, and each workgroup strides every entry of its group), and the engine-shaped rows say the token-batching alternative is **slower**: `gu_1grp30` (30 entries on one expert, one dispatch) 1.4725 ms against `gu_port8` (the port's 8-window form) 0.4932 ms/dispatch. **THERE IS NO SEPARATE GROUPED-GEMV CHANGE TO MAKE, AND NONE WAS MADE.** What the same arm DID find is that **an EMPTY launch is 65% of the port's `native_expert_grouped` call**: a layer's groups are contiguous in the pack and live in ONE arena window, yet the launcher loops all 8 windows, so the engine runs 1 working launch and **7 launches whose every workgroup `continue`s on `grp_win[g] != win_id`** — measured **0.3168 ms** for gu and **0.1606 ms** for down per empty launch. The empty launch is the launch of the caller's grid (`2*n_ff × cap_groups` = 76,800 workgroups), so **the fix is the launch shape, not the kernel**: cap the y-grid at 1 (`gy` only strided how many groups a launch covers — results do not depend on it, proven by the gate's own `grid_groups=1` arm and `native_grouped_parity`'s 0/1/2/3/4/cap+3 sweep). The full launch is **also** faster at gy=1 (1.5883 vs 1.6912 ms), and per CALL the grouped path goes **3.91 → 2.35 ms (gu)**. In the engine: window **260.427 → 228.020 ms/round**, per recorded dispatch **64.05 → 56.26 µs**, decode **8.34 → 9.46 tok/s (+13.4%)**, with the segment count, the 59,111 recorded dispatches and the 71,005 chain barriers all UNCHANGED and the id `56a0b28d2de6` unmoved.
+
+### 1. THE FALSIFIED PREMISE, MEASURED IN ONE PROCESS (the port's own "a row's position decides its value" trap)
+
+`iq1m_mmvq` n_out=1280, batch 8, reps 9, `intel_icd`, all six rows of ONE arm (`iq1m_controlled`) so an ordering or memory-type effect cannot be read as an ncols effect:
+
+| row (one process, interleaved) | ncols=1 | ncols=3 | 3 cols / 1 col |
+|---|---:|---:|---:|
+| **mapped** (the harness's default) | 0.1446 ms (min 0.1108) | 0.0588 ms | 0.41x |
+| **device-local** (the ARENA's type) | 0.0301 ms (0.0298) | 0.0585 ms | **1.94x** |
+| repeat: mapped / device-local | — | 0.0586 | — |
+| repeat: device-local ncols=1 | 0.0268 ms | — | — |
+
+The committed `51.8-vs-111.0` pair is `dev ncols=3` against `mapped ncols=1`. The honest pair is the device-local one, **and the direction is the opposite of the brief's**: 3 columns cost 1.94x the time, so per dispatch the family gains **1.45x**, and ncols=1 device-local (26.8-30.1 µs) is faster per column than ncols=3 (19.5 µs/column). The engine's arena is device-local, so the device-local row is the one that applies — and it says the 265 → 124 ms projection had already assumed the answer.
+
+### 2. THE PORT'S GROUPED GEMV ALREADY BATCHES — AND AT THE ENGINE'S SHAPE IT BEATS TOKEN-BATCHING
+
+New arm `native_grouped_engine` (IQ3_XXS gate/up, IQ4_NL down, n_embd 2560, n_ff 1280, 30 groups = the `--spec 2` window's 3 tokens × top-10, DEVICE_LOCAL, batch 8). `gu_*`/`dn_*` are **per dispatch**; a "call" is the launcher's 8-window loop:
+
+| row | what it is | ms/dispatch | ms per CALL |
+|---|---|---:|---:|
+| `gu_1win` | 1 dispatch, all 30 groups in ONE window (the CUDA's shape) | 1.6918 | 1.69 |
+| `gu_port8` | 8 dispatches, groups spread over the 8 windows | 0.4932 | **3.95** |
+| `gu_engine1` | 8 dispatches, all 30 groups in ONE window (the ENGINE's real case) | 0.4817 | **3.85** |
+| `gu_1grp30` | 1 dispatch, 30 entries on ONE expert (the "batch tokens" idea) | 1.4725 | 1.47 |
+| `dn_1win` / `dn_engine1` | the down side, same two shapes | 1.1825 / 0.2853 | 1.18 / **2.28** |
+| `gu_empty` / `dn_empty` | ONE dispatch, no group in its window | **0.3168** / **0.1606** | 7 × → 2.22 / 1.12 |
+
+**Two things fall out.** (a) **Token-batching is slower, not faster**: folding 30 entries onto one expert (`gu_1grp30`, 1.4725) is 3x the port's per-dispatch form (0.4932) and the same as the single-window launch — the port's grouping is already the efficient shape. (b) **The empty launch is 65% of the gu call and 49% of the down call** (7 × 0.3168 = 2.22 of 3.85; 7 × 0.1606 = 1.12 of 2.28). It is not the kernel — the shader exits at `grp_win[g] != win_id` on its first load — it is the **workgroup launch itself**.
+
+### 3. THE EMPTY LAUNCH, DECOMPOSED BY THE ONE KNOB THAT SIZES IT
+
+`gy` (the caller's `grid_groups`) is how many groups a launch covers side by side; the shaders stride `g += gl_NumWorkGroups.y`, so results are invariant and only the WORKGROUP COUNT moves. Swept in the same process (`gy` = 1, 2, 4, 8, 16, 30):
+
+| gy | gu work | gu empty | **gu per call** | dn empty | dn work |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1.5883 | 0.1092 | **2.3527** | 0.0619 | — |
+| 2 | 1.5807 | 0.1156 | 2.3898 | 0.0638 | — |
+| 4 | 1.5804 | 0.1317 | 2.5022 | 0.0688 | — |
+| 8 | 1.5983 | 0.1575 | 2.7011 | 0.0795 | — |
+| 16 | 1.6375 | 0.2106 | 3.1116 | 0.1075 | — |
+| 30 (the caller's) | 1.6912 | 0.3167 | **3.9082** | 0.1606 | 1.1825 |
+
+An empty launch fits **~0.102 ms FIXED + ~2.8 ns per workgroup** (2,560 workgroups at gy=1, 76,800 at gy=30). The fixed term is the same species as this record's **F = 67 µs per submit**; the per-workgroup term is the launch throughput. **gy=1 is optimal on both sides** — it is also the fastest WORKING launch (1.5883 vs 1.6912), because 2,560 workgroups each striding 30 groups beats 76,800 workgroups doing one each here. Per call the grouped path falls **3.91 → 2.35 ms (gu, -40%)** and the down side falls proportionally.
+
+### 4. THE CHANGE (four lines, no shader, no binding, no dispatch-count change)
+
+`vulkan/src/kernels/native_expert_grouped_vk.cpp`: `gy = min(the caller's request, STRATA_VK_GROUPED_GYMAX)` with the cap defaulting to **1** (`STRATA_VK_GROUPED_GYMAX=0` restores the caller's request exactly, so one binary A/Bs both). Nothing else moves: the same 8 windows are dispatched, the same descriptors bound, the same `ptr_to_off` rebase, the same shaders — only the y-extent of each launch.
+
+### 5. THE ENGINE A/B (199-token and 8-token ids; each arm its own env, shader hashes and binary sha256)
+
+`--spec 2 --prefill 256`, one config per invocation (`setsid nohup`, polled), `STRATA_VK_DISP_STAT=1` + `STRATA_VK_FLUSH_STAT=1` in every run. `gy0` is the **same changed binary** with `STRATA_VK_GROUPED_GYMAX=0`, i.e. the OLD grid — the control that separates the change from the rebuild:
+
+| arm | binary | gy | segments | recorded disp | barriers | window sync ms/round | segment wait ms | µs/dispatch | decode tok/s | id |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `base199` | HEAD | caller (30) | 42 | 59,111 | 71,005 | 260.427 | 3,786 | 64.05 | 8.34 | `56a0b28d2de6` |
+| **`gy1_199`** | **changed** | **1** | 42 | 59,111 | 71,005 | **228.020** | **3,326** | **56.26** | **9.46** | `56a0b28d2de6` |
+| `gy0_199` | changed | 0 → caller | 42 | 59,111 | 71,005 | 260.327 | 3,785 | 64.03 | 8.35 | `56a0b28d2de6` |
+| `base8` | HEAD | caller | 57 | 73,126 | 21,826 | 195.334 | 3,863 | 52.83 | 8.18 | `3aed108cceee` |
+| **`gy1_8`** | **changed** | **1** | 57 | 73,126 | 21,826 | **172.344** | **3,417** | **46.73** | **9.21** | `3aed108cceee` |
+| `gy0_8` | changed | 0 → caller | 57 | 73,126 | 21,826 | 195.003 | — | — | 8.20 | `3aed108cceee` |
+
+**The window's GPU time falls 12.5% (199-token) and 11.8% (8-token); decode rises 13.4% / 12.6%; the per-dispatch cost falls 64.05 → 56.26 µs and 52.83 → 46.73 µs. The dispatch count, the segment count and the barrier count are IDENTICAL — the change removed GPU EXECUTION, not dispatches, which is exactly the shape a launch-size fix should have.** The control arms (`gy0_*`) reproduce the HEAD built from a different binary to within 0.04% (260.427 vs 260.327; 195.334 vs 195.003), so the delta is the grid, not the rebuild.
+
+### 6. TARGET 2 CLOSED: THE `fused_gr_*` GROUP IS PRICED, AND IT WAS NEVER THE 112.7 µs RESIDUAL
+
+New arm `gr_pricing` at the artifact's geometry (N=2560 HC=4 LR=320, DEVICE_LOCAL, batch 8; `fused_gr_read_multi` is four dispatches per token):
+
+| kernel | ms/dispatch | | chain | ms/token | ms/dispatch |
+|---|---:|---|---|---:|---:|
+| `fused_gr_rs` | 0.0147 | | `fused_gr_read_multi` T=3 (12 disp) | 0.1114 | 0.0279 |
+| `fused_gr_down` | 0.0222 | | `fused_gr_read_multi` T=8 (32 disp) | 0.0955 | 0.0239 |
+| `fused_gr_mix` | 0.0683 | | | | |
+| `fused_gr_inject` | 0.0151 | | | | |
+
+The four `fused_gr_*` groups are **2,304 of the window's 11,365 recorded dispatches (21%), and they price at 69.3 ms — 10% of the 687.6 ms the named histogram takes, NOT the 112.7 µs each (259.5 ms) the previous mixture model's residual assigned them.** **The residual was a missing row and it disappears when the row exists** (`/tmp/gap2/mixture_model2.py`, 99% of the histogram priced). The same rebuild also shows the engine-shaped gu/down rows OVER-subscribe the window (983.5 ms = 143%), i.e. the synthetic fixture's absolute scale overstates the engine's real per-call work (its 30 IQ3_XXS groups × 2,560 rows is heavier than the real mix) — **the RATIO across gy is what this fixture is for, and the absolute is not a window cost**; the engine A/B above is the authority for the absolute.
+
 ## THE 3-12x PER-DISPATCH "GAP" IS CLOSED: it was a comparison error — the engine's MIXTURE AVERAGE against the bench's LIGHT-kernel marginals — and the like-for-like measurement says the window costs what its own kernels cost, to within 11% (2026-10-06, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH.** The queued brief called "replay 64.0 µs, live 152.5 µs against the bench's in-stream marginal 5-20 µs" **the largest unexplained number in the record**, and asked for the per-dispatch overhead that must cause it. There is no such overhead, and the comparison is the defect: **64.0 µs is an average over the verify window's whole kernel mixture, and that mixture contains ~2,300 weight-reading MoE GEMVs per round — a kernel family this bench had never measured.** Adding the missing row (`iq1m_mmvq`, the window's own IQ1_M format) prices that family at **99.5 / 111.0 / 119.2 µs** per dispatch at the engine's shapes in **device-local** memory — 5-24x the "5-20 µs" the average was held against, and squarely around the 64 µs average. A mixture model built only from measured bench rows prices **77% of the window's dispatches at 38.6 µs each**, leaving **112.7 µs** for the 23% it cannot price (2,304 of which are the `fused_gr_*` hyper-connection read group) — i.e. the window's 64 µs is exactly what a mixture of ~110 µs weight-reading GEMVs and ~3-9 µs elementwise kernels should cost. **The four candidate overheads were also tested one at a time, in ONE process, and all four are falsified**: a different pipeline every dispatch (identical work, identical grid, identical buffer), a device-local buffer, 128 descriptor targets spread over 1 GiB, and all three at once each move the per-dispatch marginal by **<20%** (3.7-4.4 µs against a 3.8 µs uniform baseline). The harness's own fixed cost is **F = 67 µs per submit and c = 3.3 µs marginal per dispatch**, measured by a 1→1,408 sweep — and the engine pays the *same* fixed cost: a single-dispatch live flush in the real run costs **70 µs** (`flush site 11`, n=2,364), which is the F = 67 µs the bench measures, in a different process, on a different instrument. **This is the same class of error as the pooled 1.20/0.30 barriers-per-dispatch: two phases merged into one ratio.** What the window's 64 µs is NOT is host submit time — the decode issues **42** submits for 59,111 dispatches, and the engine's own live-batch `vkQueueSubmit` is **4.6 µs**. A separate, real finding came out of the same counters and is reported as its own thing: the **expert-load** path spends ~12-14 s of host time in 16,114 small upload submits, and that one is **bandwidth-bound, not submit-bound** — a 2 GiB staged-upload probe is **flat at 1.75-2.02 GB/s across 1/4/16/64 MiB chunks** with a ~37 µs per-call overhead, so batching the submits cannot move it; the lever there is the 2.4x between the staged path (1.9 GB/s) and the mapped path (4.65 GB/s).
