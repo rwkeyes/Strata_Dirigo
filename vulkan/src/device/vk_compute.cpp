@@ -519,10 +519,21 @@ bool g_barrier_pair = std::getenv("STRATA_VK_BARRIER_PAIR") != nullptr;
 // MEASURED BASIS (Arc Pro B70, port's own instruments, 2026-10-07): host store into the mapped type 5.64 GB/s
 // against the staged path's 1.92 (probe_mem), and the GPU reads a mappable allocation ~3% slower (probe_gpuread:
 // 499.71 vs 512.49 GB/s).  Applied to the 53.7 GB of cold-start uploads the flag is worth roughly -18 s of a
-// ~163 s startup for ~0.4% of the prefill.  OPT-IN ON PURPOSE: making model memory mappable is the port's parked
-// policy question, not a tuning knob, so the shipped default keeps the staged path and the gate keeps asserting
-// the types it asserts today.
-bool g_direct_upload = std::getenv("STRATA_VK_DIRECT_UPLOAD") != nullptr;
+// ~163 s startup for ~0.4% of the prefill.
+//   * THE MEASURED A/B (both states, `direct_upload_ab.sh`, 535adeaa), and it is far larger than the estimate
+//     above: default 188-208 s wall with 13,752 uploads; flagged 98-108 s with 49 (the 49 are downloads, still
+//     staged).  No prefill regression: 6,589.6-7,866.1 ms / 25.17-30.05 tok/s over four arms, the slow arm being
+//     box interference that did not reproduce (du_B2 6,589.6 / 30.05).
+// NOW THE DEFAULT (2026-10-07), with `STRATA_VK_DIRECT_UPLOAD=0` as the opt-out so the staged path stays
+// reachable and the gate can still exercise it (`set_force_staging`).  It was parked as "the port's policy
+// question, not a tuning knob" - making model memory mappable - and it is taken now deliberately, because the
+// measured win is ~90 s of cold start, which is the largest user-visible gain left in this project.
+// DEFAULT ON, opt-out with =0 (the `force_staging_` convention): the staged path must stay reachable so the
+// gate can exercise it, and so a device whose mappable heap behaves badly has an escape without a rebuild.
+bool g_direct_upload = [] {
+    const char* const e = std::getenv("STRATA_VK_DIRECT_UPLOAD");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+}();
 struct PairRange {
     VkBuffer buf;
     uint64_t off, end;
@@ -1913,9 +1924,13 @@ void Ctx::stage_upload(Buf& dst, const void* src, uint64_t bytes, uint64_t offse
     // own instruments: a host store into the mapped device-local type runs at 5.64 GB/s against the staged path's
     // 1.92 GB/s (tools/probe_mem.cpp) - 2.9x on the 53.7 GB of cold-start uploads, i.e. ~29 s -> ~10 s of a
     // ~163 s startup.  The cost of the trade is measured too: the GPU READS a mappable allocation ~3% slower
-    // (tools/probe_gpuread.cpp, 499.71 vs 512.49 GB/s), which is why this is opt-in and not a default - it is the
-    // port's parked policy question (a staging buffer in VRAM is model memory by the account rule), so the DEFAULT
-    // path below is untouched and the choice stays with the operator.
+    // (tools/probe_gpuread.cpp, 499.71 vs 512.49 GB/s).
+    // IT IS THE DEFAULT AS OF 2026-10-07, and the trade is why that had to be a deliberate decision rather than
+    // a tuning pass: a mappable allocation is host-writable model memory, which the port's account rule cares
+    // about, so the flag spent its life parked as the operator's choice.  It is taken because the measured win
+    // is ~90 s of cold start (188-208 s -> 99 s wall, ids and rates unmoved), the largest user-visible gain left
+    // in this project.  STRATA_VK_DIRECT_UPLOAD=0 restores the staged path below, which the gate still exercises
+    // through `set_force_staging`.
     // Host-coherent is a precondition, not an assumption: `mem_type_` was selected for HOST_VISIBLE|HOST_COHERENT,
     // so per the Vulkan memory model the stores are available to the device without a flush.  The barrier the
     // staged path emits orders TRANSFER_WRITE before SHADER_READ/HOST_READ; with a direct coherent store there is
