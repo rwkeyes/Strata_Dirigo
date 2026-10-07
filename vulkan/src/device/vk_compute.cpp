@@ -10,6 +10,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fstream>
+#include <map>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -70,6 +71,17 @@ struct DispStat {
     // composition IS the composition of the work the replay arm executes each round - which `by_pipe` above cannot
     // show, because it pools the (one-shot) prefill with the (repeated) replay.  Counted once per ENCODE.
     std::vector<std::pair<std::string, uint64_t>> by_pipe_rec;
+    // ---- STRATA_VK_GRID_STAT: THE LAUNCH GEOMETRY (measurement-only, off unless the env var is set).  An
+    // earlier empty-launch sweep on this device fitted the per-dispatch cost as `~0.102 ms fixed + ~2.8 ns PER
+    // WORKGROUP`, so the question "why does one dispatch cost this port 4.6x upstream's" cannot be answered by a
+    // dispatch COUNT - the same count can carry a 20x different workgroup count.  `wg` is the total workgroups
+    // over every encoded dispatch; `wg_hist[w]` counts dispatches that carried exactly `w` workgroups, so the
+    // DISTRIBUTION is available and not only the mean.  `_rec` mirrors the RECORDED (replay) arm alone, which
+    // is the decode.  Counted at the same two call sites as `by_pipe` (the live dispatch and the recorder).
+    bool grid = std::getenv("STRATA_VK_GRID_STAT") != nullptr;
+    uint64_t wg = 0, wg_rec = 0;
+    std::vector<std::pair<std::string, uint64_t>> by_pipe_wg, by_pipe_rec_wg;
+    std::map<uint64_t, uint64_t> wg_hist, wg_hist_rec;
 };
 DispStat g_ds;
 // ---- STRATA_VK_NOBARRIER: MEASUREMENT-ONLY, UNSAFE.  Every dispatch carries a full COMPUTE -> COMPUTE pipeline
@@ -114,6 +126,25 @@ void disp_stat_count_rec(const std::string& spv) {
         if (kv.first == spv) { ++kv.second; return; }
     }
     g_ds.by_pipe_rec.push_back({spv, 1});
+}
+// STRATA_VK_GRID_STAT: one dispatch's workgroup count (`groups * groups_y`) into the pooled totals, the
+// per-arc histogram and (for the recorded arm) the replay-only histogram.  `rec` is true only at the recorder.
+void disp_stat_grid(const std::string& spv, uint64_t w, bool rec) {
+    if (!g_ds.grid) return;
+    auto bump = [&](std::vector<std::pair<std::string, uint64_t>>& v) {
+        for (auto& kv : v) {
+            if (kv.first == spv) { kv.second += w; return; }
+        }
+        v.push_back({spv, w});
+    };
+    bump(g_ds.by_pipe_wg);
+    ++g_ds.wg_hist[w];
+    g_ds.wg += w;
+    if (rec) {
+        bump(g_ds.by_pipe_rec_wg);
+        ++g_ds.wg_hist_rec[w];
+        g_ds.wg_rec += w;
+    }
 }
 bool g_ds_printed = false;
 void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx still reports
@@ -166,9 +197,39 @@ void disp_stat_dump() {   // callable from both ~Ctx and atexit, so a leaked Ctx
                  g_ds.t_seg_wait);
     if (g_hazard_only)
         std::fprintf(stderr,
-                     "vk disp stat[HAZARD]: %llu of %llu chain barriers EMITTED (the rest were elided where no "
+                     "vk disp stat[HAZARD]: %llu of %llu chain barriers EMITTED (the rest were elided where no\n"
                      "bound REGION overlapped a dispatch since the last barrier)\n",
                      (unsigned long long) g_haz_barriers, (unsigned long long) g_ds.barriers);
+    if (g_ds.grid) {
+        // THE LAUNCH GEOMETRY, as a distribution and per shader.  The replay (recorded) arm is the decode.
+        auto dump_hist = [](const char* tag, const std::map<uint64_t, uint64_t>& h) {
+            uint64_t nd = 0, wtot = 0;
+            for (const auto& kv : h) { nd += kv.second; wtot += kv.first * kv.second; }
+            std::string line;
+            for (const auto& kv : h) {
+                if (line.size() > 380) { line += " ..."; break; }
+                line += " " + std::to_string(kv.first) + "wg:" + std::to_string(kv.second);
+            }
+            std::fprintf(stderr, "vk grid %s: %llu dispatches, %llu workgroups, mean %.1f wg/dispatch\n",
+                         tag, (unsigned long long) nd, (unsigned long long) wtot,
+                         nd ? (double) wtot / (double) nd : 0.0);
+            std::fprintf(stderr, "vk grid %s hist (workgroups-per-dispatch:dispatches):%s\n", tag, line.c_str());
+        };
+        dump_hist("live+rec", g_ds.wg_hist);
+        dump_hist("RECORDED (decode)", g_ds.wg_hist_rec);
+        auto dump_pipe = [](const char* tag, std::vector<std::pair<std::string, uint64_t>> v) {
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string line;
+            for (size_t i = 0; i < v.size() && i < 16; ++i) {
+                const size_t slash = v[i].first.find_last_of('/');
+                line += " " + v[i].first.substr(slash == std::string::npos ? 0 : slash + 1) + " " +
+                        std::to_string(v[i].second);
+            }
+            std::fprintf(stderr, "vk grid %s workgroups by shader (top):%s\n", tag, line.c_str());
+        };
+        dump_pipe("live+rec", g_ds.by_pipe_wg);
+        dump_pipe("RECORDED (decode)", g_ds.by_pipe_rec_wg);
+    }
 }
 }  // namespace
 
@@ -1559,7 +1620,7 @@ void Ctx::dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, const v
         g_ds.t_encode += vk_ms() - _te0;
         ++g_ds.n;
         for (const Pipe& p : pipes_) {
-            if (p.pipe == pipe) { disp_stat_count(p.spv_path); break; }
+            if (p.pipe == pipe) { disp_stat_count(p.spv_path); disp_stat_grid(p.spv_path, (uint64_t) groups * groups_y, false); break; }
         }
     }
     if (++live_n_ >= kLiveBatchMax) flush_live();
@@ -1615,7 +1676,8 @@ void Ctx::record_dispatch(VkPipeline pipe, const std::vector<const Buf*>& bufs, 
     if (g_ds.on) {
         ++g_ds.recorded;
         for (const Pipe& p : pipes_) {
-            if (p.pipe == pipe) { disp_stat_count(p.spv_path); disp_stat_count_rec(p.spv_path); break; }
+            if (p.pipe == pipe) { disp_stat_count(p.spv_path); disp_stat_count_rec(p.spv_path);
+                                  disp_stat_grid(p.spv_path, (uint64_t) groups * groups_y, true); break; }
         }
     }
 }

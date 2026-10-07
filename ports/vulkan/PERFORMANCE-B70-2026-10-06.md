@@ -1,5 +1,96 @@
 # Measured performance on the Intel Arc Pro B70 — 2026-10-06
 
+## THE DECODE GAP IS **GRID WIDTH**, NOT A PER-DISPATCH LAYER — and the PREFILL'S is `gdn recurrence` (262x) plus `dequant` (13.2x): the same counters on both trees, at the engine's own phase boundaries (2026-10-06, `vega`, Arc Pro B70)
+
+**THE ONE PARAGRAPH.** Step 0 ruled the engine version out and left one number: the port pays **66.8 µs per decode dispatch against upstream's SYCL port's 14.5 (4.6x)** while issuing **13% FEWER** kernels per token. The reading that suggests itself — *our per-dispatch layer is hot, theirs is not* — is **wrong**, and this port's own empty-launch sweep said where to look instead: its cost fits **`~0.102 ms fixed + ~2.8 ns PER WORKGROUP`**, i.e. with the launch's **workgroup** count, not the dispatch's identity. So the two trees were counted by **launch geometry**. Upstream, from the **Unified-Runtime tracing layer** (`UR_ENABLE_LAYERS=UR_LAYER_TRACING`, external to its tree): every `urEnqueueKernelLaunch*` range, with the command-buffer launches weighted by each CB's own enqueue count — because a raw append/enqueue count is not the executed count. This port, from a new env-gated counter, **`STRATA_VK_GRID_STAT=1`**, recording `groups * groups_y` at the **two** dispatch call sites (`vk_compute.cpp` `dispatch()` and `record_dispatch()`) as a **distribution** and not only a mean. **Upstream's decode executes 56,330 kernels at 234.5 workgroups each; this port's replay arm carries 9,349 encoded dispatches at 1,105.6 each — 4.71x. The per-dispatch cost ratio is 4.61x.** There is no hot per-dispatch layer here: this port's decode dispatches are **4.7x WIDER GRIDS**, and the two trees then cost almost the same **per workgroup** (57-60 ns). The prefill says the same thing from the other side — its grid widths are **2,164.7 (port) against 2,345.8 (upstream), 0.92x, comparable** — so the prefill's 3.9x kernel surplus is **not** geometry and must be a COUNT, and the engine's own phase table (identical phase names in both trees, `STRATA_PREFILL_TIMING=1`) puts it in **`gdn recurrence` (2621 ms = 28.6% of this port's prompt GPU timeline, against upstream's 10 ms = 1.9% — a 262x phase ratio)** and **`dequant` (2050 ms / 22.3% against 155 ms / 30.2% — 13.2x)**: the two families whose per-engine-call dispatch counts are **`T` times and `3` times** the reference's, each with a named CUDA kernel in this same tree that does the whole thing in ONE launch. Nothing was optimised in this batch; the deliverable is the differential instrument and the attribution.
+
+### 1. THE INSTRUMENT (both sides; measurement-only, and both proven able to fail)
+
+| | this port | upstream (SYCL) |
+|---|---|---|
+| counter | **`STRATA_VK_GRID_STAT=1`** (new, `vk_compute.cpp`) | **`UR_ENABLE_LAYERS=UR_LAYER_TRACING UR_LOG_TRACING="level:debug;output:file,<path>"`** (external; no tree change) |
+| call sites | `dispatch()` (live) and `record_dispatch()` (recorded) — the ONLY two places `vkCmdDispatch` is reached from | every `urEnqueueKernelLaunch*` and `urCommandBufferAppendKernelLaunchExp` |
+| what it counts | `groups * groups_y` per dispatch, pooled + per-shader + a workgroups-per-dispatch histogram | the `pGlobalWorkSize`/`pLocalWorkSize` range per launch; groups = `prod(ceil(g/l))` |
+| the executed population | the RECORDED arm (each encoded CB re-executes per segment submit), reported separately from the live/prefill pool | direct enqueues (prefill) **plus** `urEnqueueCommandBufferExp` × that CB's encoded kernel count (decode) |
+| proof it can fail | empty id list ⇒ `ARM_DIDNOTRUN reason=empty-ids-file`; an id count that disagrees ⇒ `reason=id-count-mismatch`; with the flag unset the `vk grid` lines are ABSENT while every other line is unchanged; and the same counter proves itself against the port's own independent `vk disp stat` dispatch total (9,349 encoded / 59,640 live / 68,989 gridded = 59,640 + 9,349) | a 2-kernel SYCL probe ⇒ 2 launches; `/bin/true` under the same logger ⇒ 0; and `--max-new 1` vs `--max-new 32` gave the **same 20,209 direct launches** while only the CB term moved, which is what splits prefill from decode. (An `LD_PRELOAD` shim on `zeCommandListAppendLaunchKernel*` reads **0** and was discarded — the UR adapter resolves those by `dlopen`+`dlsym`.) |
+
+**The instrument's OWN cost, measured at matched flags** (the same binary, `STRATA_VK_GRID_STAT` on vs off, interleaved n=2, 199-token arm): decode **9.59 / 9.63** with it on against **9.62 / 9.65** with it off — inside the run-to-run spread, and the engine's own phase table is unmoved (every phase ratio 1.00, GPU timeline 9,179 vs 9,186 ms). **A first flagged run read 8.97 / 18.34 tok/s and was NOT the counter**: it ran concurrently with a 12-way `icpx` AOT rebuild, which is what a shared host does to a run whose prompt path has host-side work. Flagged runs are compared only against flagged runs; the geometry above is what the flag is for.
+
+### 2. THE LAUNCH GEOMETRY, BOTH SIDES (workgroups PER DISPATCH — the quantity the empty-launch sweep says the cost tracks)
+
+| | this port (decode, RECORDED arm) | upstream (decode, executed & enqueue-weighted) | ratio |
+|---|---:|---:|---:|
+| dispatches | 9,349 encoded (57,690 executed in the grid arm's run) | 56,330 executed | — |
+| **total workgroups** | **10,336,674** | **13,210,151** | 0.78x |
+| **workgroups / dispatch (mean)** | **1,105.6** | **234.5** | **4.71x** |
+| p50 / p90 / p99 | 30 / 2,560 / 248,320 | 40 / 640 / 2,560 | — |
+| widest | 248,320 (×3, the 248,320-vocab sampler) | 62,080 | 4.0x |
+| **us / dispatch (Step 0, same arms)** | **66.8** | **14.5** | **4.61x** |
+| **us per workgroup per dispatch** | **60.4 ns** | **61.8 ns** | **0.98x** |
+
+The distributions, not the means — this port's decode: `1wg:805 4wg:1302 10wg:255 20wg:243 24wg:288 30wg:291 40wg:115 128wg:36 256wg:288 320wg:582 640wg:288 1280wg:1152 2560wg:2022 6144wg:108 10240wg:120 12288wg:36 248320wg:3`; upstream's decode: `1wg:582 5wg:433 40wg:415 48wg:396 80wg:724 160wg:772 640wg:384 2560wg:148 62080wg:4` (shape counts, over the encoded set). **Upstream spreads the same work over ~4.7x more, narrower dispatches; this port puts it in fewer, wider ones** — and the per-dispatch average is that grid width divided by the dispatch count. The port's widest decode families are `native_k_mmvq` (3,171,840 wg), `native_down_any` (2,949,120), `fused_gr_mix` (1,474,560), `native_gu_any` (1,474,560).
+
+**PREFILL, same instrument, the other way round:** this port's live path **2,164.7 wg/dispatch** (59,640 dispatches, 129,098,884 wg) against upstream's direct launches **2,345.8 wg/dispatch** (20,209 dispatches, 47,406,149 wg) — **0.92x, comparable**. So the prefill gap is not geometry, and the port's own 5.7x prefill µs/dispatch (156.5 vs 27.3) is the same population mismatch one level up: its live-batch average is taken over a dispatch set that carries the same grids but 2.95x the count.
+
+### 3. THE PHASE-ATTRIBUTED TABLE (the port's own counters added to the SYCL checkout at the engine's OWN boundaries)
+
+The port already carried two DECODE marks the SYCL tree did not (`ms_launch`, `ms_sync` in `verify.hpp`). They were added to `/home/bob/strata-pr1111` (a throwaway checkout, 3 files / 11 insertions) at the **identical** boundary — `t_launch` set just before the window's graph launch, `ms_launch` closed just before `cs_->wait()`, `ms_sync` the blocking wait itself — and the `verify window` line now prints the same six fields on both sides. **Both trees put ~95% of the decode round in `sync`:**
+
+| phase (ms/round → µs/dispatch) | this port | upstream | ratio | port % of round | up % of round |
+|---|---:|---:|---:|---:|---:|
+| wait for rings / pool | 0.000 → 0.00 | 0.000 → 0.00 | — | 0.0 | 0.0 |
+| host (stage) | 0.813 → **0.23** | 0.374 → **0.21** | 1.1x | 0.3 | 1.4 |
+| launch | 4.538 → **1.28** | 0.476 → **0.27** | 4.7x | 1.9 | 1.8 |
+| **sync (the window's GPU work)** | **224.940 → 63.35** | **24.926 → 14.16** | **4.5x** | **94.6** | **95.5** |
+| commit | 4.812 → **1.36** | 0.628 → **0.36** | 3.8x | 2.0 | 2.4 |
+| round (measured) | 237.75 → **66.9** | 26.09 → **14.8** | 4.5x | 100 | 100 |
+
+**The phase that carries the decode gap is `sync`** — the window's own GPU execution — at 94.6% of the port's round and 63.35 µs/dispatch. The submission layer is NOT carrying it: this port's `vk disp stat by arm` reads `segment 42 (49,703 recorded dispatches, 68,989 chain barriers, submit 1 ms, wait 3,279 ms)` — **submit is 1 ms of a 3,322 ms decode (0.03%)**, and the wait is the GPU. `launch` and `commit` also scale 4.5x, but they are 1.9% and 2.0% of the round. Within `sync` the two trees cost **57.3 ns (port) against 60.4 ns (upstream) per workgroup** — 0.95x — which is the geometry result arriving through a second, independent instrument.
+
+**PREFILL, the same engine phase names on both sides** (`strata prefill timing:`, 198 tokens, GPU timeline; port 9,179 ms / upstream 515 ms = **17.8x**):
+
+| phase | port ms | port % | up ms | up % | ms ratio |
+|---|---:|---:|---:|---:|---:|
+| **gdn recurrence** | **2621** | **28.6** | **10** | **1.9** | **262x** |
+| **dequant** | **2050** | **22.3** | **155** | **30.2** | **13.2x** |
+| **host grouping** | **1746** | **19.0** | **51** | **10.0** | **34x** |
+| qsa proj | 772 | 8.4 | 20 | 3.8 | 39x |
+| gemm down | 607 | 6.6 | 41 | 7.9 | 14.8x |
+| gemm gate/up | 589 | 6.4 | 66 | 12.9 | 8.9x |
+| qsa attn | 264 | 2.9 | 3 | 0.7 | 88x |
+| hc read | 250 | 2.7 | 30 | 5.8 | 8.3x |
+| gdn (conv etc.) | 84 | 0.9 | 54 | 10.5 | 1.6x |
+| ple | 52 | 0.6 | 7 | 1.5 | 7.4x |
+| router+shared | 38 | 0.4 | 25 | 4.9 | 1.5x |
+| gdn out proj | 26 | 0.3 | 27 | 5.2 | 0.96x |
+| combine | 24 | 0.3 | 6 | 1.1 | 4.0x |
+| embed+steps | 17 | 0.2 | 3 | 0.6 | 5.7x |
+| qsa indexer | 16 | 0.2 | 1 | 0.1 | 16x |
+| gather | 19 | 0.2 | 1 | 0.2 | 19x |
+| qsa select | 1 | 0.0 | 12 | 2.4 | **0.08x** |
+| **TOTAL (GPU timeline)** | **9179** | 100 | **515** | 100 | **17.8x** |
+
+Two readings fall out. **`gdn recurrence` is the worst phase by ratio (262x) and the largest by absolute time (28.6% of the port's prompt)** — and it is the phase the port implements as a per-token, per-layer dependent dispatch pair. **`dequant` is 22.3% of the port against 30.2% of upstream** — the port pays the *same share* for a step that costs 13.2x more here, and it is the phase the port builds out of three dispatches per call. `qsa select` is the only phase the port wins (**0.08x**, 12x faster). The phase table charges a gap where the GPU waited to the phase that was waiting (the instrument's own documented caveat), which is why `host grouping`'s 34x is a WAIT on the host's expert grouping and not a dispatch cost.
+
+### 4. THE PREFILL COUNT VERDICT — which families can COLLAPSE several dispatches into one
+
+The surplus families were known by name from Step 0. What closes it is that each has **a CUDA kernel in this same tree that does the whole thing in ONE launch**, so the collapse is a transcription rather than a new idea:
+
+| family (this port) | port dispatches (198-tok arm) | the reference's launch count for the SAME engine call | removable |
+|---|---:|---|---:|
+| `iq_dequant_f32` (the gate/up path) + `pf_gu_interleave_f16` | **10,767** + **3,589** | **1** — `dequant_gu_kernel<<<dim3(n_ff*per_row, 2), 32>>>` (`src/kernels/cuda/iq_kernels.cu:1854`) dequantises gate and up **and** interleaves straight to f16 | **10,767** |
+| `f32_to_f16` (the plain `iq_dequant_f16` path) | **3,625** | **1** — `dequant_flat_kernel<__half>` (`:1823`) writes f16 directly, no f32 staging buffer | **~3,589** |
+| `native_gdn_step` + `native_gdn_out_norm` | **7,128** + **7,128** = 14,256 | **2 per layer** (72 total) — `gdn_rec_cols_pipe_kernel<<<HV*NCB, dim3(CB,RG)>>>` (`src/prefill/kernels.cu:908`) walks the whole `T` recurrence **inside** the block, then `gdn_out_norm_kernel<<<dim3(T,HV),S>>>` | **14,184** |
+| **total** | | | **≈28,540 of 59,640 = 47.9%** |
+
+The signatures are exact rather than inferred: `iq_dequant_f32` is **10,767 = 3 × 3,589**, i.e. exactly two dequantises plus one interleave per `iq_dequant_gu_f16` call, which is what `iq_vk.cpp:217-230` reads; `native_gdn_step` is **7,128 = 36 layers × 198 tokens**, i.e. one dependent dispatch per token per layer, which is what `prefill_vk.cpp:753-765` reads. **Per token that is 144.1 of the 235.1 marginal prefill kernels** — taking the port to **~91 marginal kernels/token against upstream's 59.7**, i.e. the count surplus would be gone, and with it the two phases that hold **50.9% of the prompt's GPU timeline** (`dequant` 2050 + `gdn recurrence` 2621 of 9179 ms). What this does NOT price is whether the collapsed forms are FASTER end to end: the port's own record already has one family where the same reasoning came to nothing (`gdn_recurrence` was audited as "clean — both stages depend on `t`", true of the *arithmetic* and false of the *dispatch count*, which is the correction this batch makes), and `NEXT.md`'s standing note that the phase is not dispatch-count-bound must be re-measured, not assumed, once a batched form exists. **Nothing was built in this batch.**
+
+### GUARDS, AND WHAT WAS NOT MEASURED
+
+* **Arc gate `898/0/0`** (nothing skipped, no count fallen), ids **`56a0b28d2de6`** (199-token, 32 decoded) and **`3aed108cceee`** (8-token list exactly `1 2 3 4 5 6 7 8`), engine A/B interleaved n=3 against the saved previous binary `333c2a7c…`: prev **9.62 / 9.61 / 9.61** tok/s, new **9.63 / 9.62 / 9.61**, prefill 21.25 / 21.16 / 21.21 against 21.22 / 21.24 / 20.87 — **overlapping, no regression**; every arm `RUN_RC=0`, `decoded=32`, ids identical.
+* **Not measured, and named:** the upstream decode geometry is from the **199/32 arm's UR trace** while the port's is from its own grid arm; the two are the same arm and the same pack, but the speculation acceptance is data-dependent (14 vs 18 rounds), so per-token DISPATCH TOTALS differ by ~16% between the port's own runs while the per-dispatch MEAN is what is compared and is stable. Upstream's kernel names are not in the UR trace (handles only), so its families are matched by launch SHAPE, not by name. The SYCL phase table is from a **warm** run with `STRATA_PREFILL_TIMING=1` on (prefix 512-515 ms against the 430 ms unflagged record — the phase instrument's own cost, so the 17.8x is a flagged-vs-flagged number). The `gdn recurrence` and `dequant` collapse candidates are **priced, not built**, and their per-workgroup cost is unmeasured.
+* **Logs.** port A/B + phase tables `/tmp/pfaudit/s1_*_{a,b,c}.log`; port geometry `/tmp/pfaudit/s1_199_gridon_{a,b}.log`, `/tmp/pfaudit/grid199.log`; upstream geometry `/home/bob/step0/up/logs/up199_32t.trace` ⇢ `/home/bob/step1/up199_geom_w.txt`; upstream phases `/home/bob/step1/logs/up199_w{1,2,3}.out|.err`; gate `/home/bob/step1/logs/s1_gate.log`; parsers `/home/bob/step1/{ur_geom_w.py,pf_phases.py,up_run.sh,seq1.sh,seq2.sh}`; port tree `eaf624d` + this commit, binary `832d6d6c…`; SYCL `3f37281` + 11 insertions, binary `951718d1…`.
+
 ## THE PATTERN PAYS A THIRD TIME — AND THIS ONE IS **PREFILL**: the QSA indexer's per-cell POSITION UPLOAD sat inside its per-cell dispatch loop, so a 198-token chunk issued **198 single-dispatch submits** (`stream_write` flushes the live batch by contract); hoisting the upload out of the loop (one n-int row, cell `t` binds its own 4 bytes) drops the prefill's flushes **3,021 → 681** with the dispatch count **UNCHANGED at 59,640**, and moves the prefill **9,752 → 9,313 ms median (20.30 → 21.26 tok/s, −4.5%/+4.7%, ranges disjoint)** (2026-10-06, `vega`, Arc Pro B70)
 
 **THE ONE PARAGRAPH.** The win pattern is *a loop that exists for one reason while repeating a stage inside it that does not
