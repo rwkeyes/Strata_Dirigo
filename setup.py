@@ -1560,10 +1560,27 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
+def apply_warm_retune(llama: Path) -> None:
+    """This fork's step: carry the runtime-retune patch into the vendored llama.cpp.  A no-op when the
+    patch is absent or already applied, and never fatal - Strata's own engine does not build
+    tools/server, so a failed apply must not stop the setup (warm-retune/apply.sh does it by hand)."""
+    script = ROOT / "warm-retune" / "apply.sh"
+    if not script.exists() or not (llama / "tools" / "server").is_dir():
+        return
+    try:
+        r = subprocess.run(["bash", str(script), "apply"], capture_output=True, text=True, timeout=180)
+        lines = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        if lines:
+            say("  " + lines[-1])
+    except Exception as e:                       # never fail the setup over this
+        warn(f"warm-retune/apply.sh could not run ({e}); apply it by hand for the retune endpoint")
+
+
 def get_llama_cpp():
     """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
     llama = ROOT / "third_party" / "llama.cpp"
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+        apply_warm_retune(llama)
         return llama
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
@@ -1571,8 +1588,11 @@ def get_llama_cpp():
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(z) as f:
         # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
-        # folder like Downloads\Strata-main\Strata-main (#206)
-        f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
+        # folder like Downloads\Strata-main\Strata-main (#206).  This fork keeps it OFF WINDOWS ONLY: tools/CMakeLists.txt
+        # adds tools/ui unconditionally when LLAMA_BUILD_SERVER is on, so a llama-server built from this vendored tree
+        # cannot even configure without it (see WARM-RETUNABLE.md).
+        skip = "/tools/ui/" if WIN else None
+        f.extractall(tmp, [m for m in f.namelist() if skip is None or skip not in m])
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
@@ -1590,6 +1610,7 @@ def get_llama_cpp():
     shutil.rmtree(tmp, ignore_errors=True)
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)
+    apply_warm_retune(llama)
     return llama
 
 

@@ -618,13 +618,18 @@ class LiteralThinkTags(unittest.TestCase):
             self.assertIn(part, text)
 
     def test_a_client_that_sends_the_reasoning_inline(self):
-        # an assistant turn whose content opens with its own <think>...</think> block keeps that block's markers
+        # an assistant turn whose content opens with its own <think>...</think> block keeps that block's markers.
+        # This fork (Minefield 04/25) writes no <think></think> wrapper for a turn with NO reasoning_content, so
+        # the count is (2, 1): the inline block's pair plus the generation prompt's own "<think>".  Upstream
+        # renders the empty wrapper as well and counts (3, 2); "preserve_empty_think": true brings that back.
         msgs = [{"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "<think>\nplan: say </x> hello\n</think>\n\nHello, </think> is a tag."},
                 {"role": "user", "content": "again"}]
         ids = self.ids(msgs)
-        self.assertEqual((ids.count(self.open), ids.count(self.close)), (3, 2))   # template's + the inline block's
+        self.assertEqual((ids.count(self.open), ids.count(self.close)), (2, 1))
         self.assertIn("Hello, </think> is a tag.", self.tok.decode(ids))
+        restored = self.ids(msgs, preserve_empty_think=True)                      # upstream's rendering, asked for
+        self.assertEqual((restored.count(self.open), restored.count(self.close)), (3, 2))
 
     def test_the_real_tokenizer_reads_the_tag_as_text(self):
         import strata_tokenizer as ST
@@ -1201,8 +1206,14 @@ class UnfinishedToolCall(unittest.TestCase):
                             "messages": [{"role": "user", "content": "save my notes"}]}
                     req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
-                    with urllib.request.urlopen(req, timeout=30) as r:
-                        raw = r.read().decode()
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            raw = r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        # Minefield 78 in this fork: a choice naming a tool the request does not offer is refused
+                        # (upstream logs it and lets the model decide).  Everything else below is upstream's.
+                        self.assertEqual((want, e.code), ("400", 400), choice)
+                        continue
                     if stream:
                         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
                         if api == "openai":
@@ -3506,17 +3517,29 @@ class ForcedToolChoice(unittest.TestCase):
         finish, calls, _ = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("length", []))
 
-    def test_values_it_cannot_honour_act_as_auto(self):
-        """Not a 400: an odd tool_choice is logged and the model decides."""
+    def test_values_it_cannot_honour_are_a_400_here(self):
+        """This fork's reading (Minefield 78), where upstream logs an odd `tool_choice` and acts as "auto":
+
+        a choice the server cannot honour is a **400** - a typo must not read as a choice that was applied.
+        `{"type": "function"}` with no name, an unknown type and an unknown word are all refused; `"required"`
+        with no tools is a request that cannot be honoured either.  Set the fork's own behaviour aside by
+        sending a value upstream accepts ("auto", "none", "required", or a name the request offers)."""
         named = lambda n: {"type": "function", "function": {"name": n}}  # noqa: E731
         for choice, tools in ((named("nope"), self.TOOLS), ({"type": "function"}, self.TOOLS),
-                              ("required", None), ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
+                              ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
             with self.subTest(choice=choice, tools=bool(tools)):
                 self.engine.prompts = []
                 code, b = self.openai(tool_choice=choice, tools=tools)
-                self.assertEqual(code, 200, b)
-                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                self.assertEqual(code, 400, b)
+                self.assertIn("tool_choice", json.dumps(b))
+                self.assertEqual(self.engine.prompts, [])           # nothing was sent to the engine
+        # "required" with no tools at all is not a 400 in either tree: there is nothing to force, the request is
+        # served and the fork's `strata` block says so (upstream serves it silently).
+        self.engine.prompts = []
+        code, b = self.openai(tool_choice="required", tools=None)
+        self.assertEqual(code, 200, b)
+        self.assertFalse(b["strata"]["tool_choice"]["applied"])
+        self.assertEqual(b["strata"]["tools_offered"], 0)
 
     def test_the_flat_shape_names_a_function(self):
         code, b = self.openai(tool_choice={"type": "function", "name": "search"})
@@ -3529,7 +3552,7 @@ class ForcedToolChoice(unittest.TestCase):
                 "type": "object", "properties": {}}}]
         for choice, want in (({"type": "any"}, "tool_use"), ({"type": "tool", "name": "search"}, "tool_use"),
                              ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn"),
-                             ({"type": "tool", "name": "nope"}, "end_turn")):
+                             ({"type": "tool", "name": "nope"}, "400")):   # this fork: 400, upstream: "auto"
             for stream in (False, True):
                 with self.subTest(choice=choice, stream=stream):
                     self.engine.prompts = []
@@ -3537,8 +3560,14 @@ class ForcedToolChoice(unittest.TestCase):
                             "messages": [{"role": "user", "content": "2+2?"}]}
                     req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(), headers={
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
-                    with urllib.request.urlopen(req, timeout=30) as r:
-                        raw = r.read().decode()
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            raw = r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        # Minefield 78 in this fork: a choice naming a tool the request does not offer is refused
+                        # (upstream logs it and lets the model decide).  Everything else below is upstream's.
+                        self.assertEqual((want, e.code), ("400", 400), choice)
+                        continue
                     if stream:
                         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
                         stop = [e for e in evs if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
@@ -4911,6 +4940,43 @@ class UntimedReads(unittest.TestCase):
         v.proc = SimpleNamespace(stdout=SimpleNamespace(readline=lambda: "OK 7 1 1 1\n"))
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
+
+class NoBrowser(unittest.TestCase):
+    """--no-open and $STRATA_NO_BROWSER: a start never pops a browser tab (upstream's setup writes --open into
+    every launcher, which puts a window on whichever desktop runs it - a kiosk or a headless box has none)."""
+
+    def test_the_environment_values(self):
+        from serve.server import browser_suppressed
+        for env in ({"STRATA_NO_BROWSER": "1"}, {"STRATA_NO_BROWSER": "true"}, {"STRATA_NO_BROWSER": " YES "},
+                    {"STRATA_NO_BROWSER": "on"}, {"STRATA_NO_BROWSER": "2"}):
+            self.assertTrue(browser_suppressed(env), env)
+        for env in ({}, {"STRATA_NO_BROWSER": ""}, {"STRATA_NO_BROWSER": "0"}, {"STRATA_NO_BROWSER": "false"},
+                    {"STRATA_NO_BROWSER": "no"}, {"STRATA_NO_BROWSER": "off"}, {"OTHER": "1"}):
+            self.assertFalse(browser_suppressed(env), env)
+
+    def test_open_browser_opens_only_when_asked_and_nothing_suppresses_it(self):
+        from serve.server import open_browser
+        with mock.patch("webbrowser.open") as wb:
+            self.assertTrue(open_browser("127.0.0.1", 8095, True))
+            wb.assert_called_once_with("http://127.0.0.1:8095/")
+            wb.reset_mock()
+            self.assertFalse(open_browser("127.0.0.1", 8095, False))                          # no --open, no tab
+            self.assertFalse(open_browser("127.0.0.1", 8095, True, {"STRATA_NO_BROWSER": "1"}))  # the env wins
+            self.assertFalse(open_browser("127.0.0.1", 8095, False, {"STRATA_NO_BROWSER": "0"}))
+            wb.assert_not_called()
+        out = io.StringIO()                                        # a suppressed popup still says where the page is
+        with contextlib.redirect_stdout(out):
+            open_browser("192.168.1.5", 8095, True, {"STRATA_NO_BROWSER": "1"})
+        self.assertIn("http://192.168.1.5:8095/", out.getvalue())
+        self.assertIn("STRATA_NO_BROWSER", out.getvalue())
+
+    def test_the_flag_exists_and_is_documented(self):
+        import subprocess
+        p = subprocess.run([sys.executable, str(ROOT / "serve/server.py"), "--help"],
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("--no-open", p.stdout)
+        self.assertIn("STRATA_NO_BROWSER", p.stdout)
 
 if __name__ == "__main__":
     unittest.main()

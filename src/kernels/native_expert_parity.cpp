@@ -534,6 +534,17 @@ int main(int argc, char** argv) {
                              "       native_expert_parity --bf16-embd\n");
         return 2;
     }
+    // check_blob compares the AVX2 kernels (iq256_*, kq256_*) against the float reference.  On a CPU without
+    // AVX2 there is nothing to compare, and calling them anyway executes an instruction the CPU does not have:
+    // SIGILL in q4k_dot's vpbroadcastq, seen on an AVX-only Xeon E5 v2.  The AVX-512 call below is guarded for
+    // the same reason ("the binary runs on AVX-2 CPUs too"); the AVX2 ones were not.
+    // Deliberately NOT an early return: --synthetic q6_K/q8_0 must stay reachable so native_expert_supported
+    // still refuses it (native_expert_parity_refuses_q6_K is WILL_FAIL and needs a non-zero exit).
+    const bool have_avx2 = cpu::cpu_avx2_ok();
+    if (!have_avx2) {
+        std::printf("SKIPPED: this CPU has no AVX2; the kernels under test (iq256_*, kq256_*) are compiled for "
+                    "AVX2 and the engine refuses to use them here.\n");
+    }
     // #152's width check tests the opt-in rule (the multi-token kernels from one token on)
     if (std::getenv("STRATA_IQ_MT_MIN") == nullptr) {
 #ifdef _WIN32
@@ -564,7 +575,7 @@ int main(int argc, char** argv) {
                 ++failures;
                 continue;
             }
-            failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
+            if (have_avx2) failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
         }
     } else {
         const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
@@ -591,7 +602,7 @@ int main(int argc, char** argv) {
             std::memcpy(blob.data() + f.up_off, data[1] + (size_t) E * f.up_off, f.up_off);
             std::memcpy(blob.data() + f.down_off, data[2] + (size_t) E * (f.bytes - f.down_off),
                         f.bytes - f.down_off);
-            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
+            if (have_avx2) failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
         }
     }
     std::printf("native_expert_parity: %d failures\n", failures);

@@ -1,0 +1,1107 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd9a..44855833c 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1416,6 +1416,40 @@ llama_context * common_init_result::context() {
+     return pimpl->context.get();
+ }
+ 
++bool common_init_result::reload_context(const common_params & params) {
++    if (!pimpl->model) {
++        COM_ERR("%s", "cannot recreate the context: no model is loaded\n");
++        return false;
++    }
++
++    auto cparams = common_context_params_to_llama(params);
++
++    // the backend samplers are attached to the context when it is created
++    if (params.sampling.backend_sampling && !pimpl->samplers_seq_config.empty()) {
++        cparams.samplers   = pimpl->samplers_seq_config.data();
++        cparams.n_samplers = pimpl->samplers_seq_config.size();
++    }
++
++    // the threadpools follow the context, and the old context must go first so that a larger
++    // KV cache can be allocated from the memory that the old one releases
++    pimpl->threadpools.reset();
++    pimpl->context.reset();
++
++    llama_context * lctx = llama_init_from_model(pimpl->model.get(), cparams);
++    if (lctx == NULL) {
++        COM_ERR("failed to recreate context with model '%s'\n", params.model.path.c_str());
++        return false;
++    }
++
++    pimpl->context.reset(lctx);
++
++    set_process_priority(params.cpuparams.priority);
++
++    pimpl->threadpools.init(lctx, params);
++
++    return true;
++}
++
+ common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
+     if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
+         return nullptr;
+@@ -1775,11 +1809,18 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
+ }
+ 
+ common_threadpools::~common_threadpools() {
++    reset();
++}
++
++void common_threadpools::reset() {
+     if (!free_fn) {
+         return;
+     }
+     free_fn(threadpool);
+     free_fn(threadpool_batch);
++    threadpool       = nullptr;
++    threadpool_batch = nullptr;
++    free_fn          = nullptr;
+ }
+ 
+ void common_threadpools::init(llama_context * ctx, const common_params & params) {
+diff --git a/common/common.h b/common/common.h
+index 63d0badd0..b9467835c 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -933,6 +933,12 @@ struct common_init_result {
+     llama_model * model();
+     llama_context * context();
+ 
++    // recreate the llama_context from the already-loaded model, using the given params.
++    // the weights are not reloaded: they stay where they are (VRAM or RAM).
++    // on failure the previous context is already gone, so a caller that wants to keep serving
++    // must call this again with the previous params
++    bool reload_context(const common_params & params);
++
+     common_sampler * sampler(llama_seq_id seq_id);
+     void reset_samplers();
+ 
+@@ -974,6 +980,9 @@ struct common_threadpools {
+ 
+     void init(llama_context * ctx, const common_params & params);
+ 
++    // free the threadpools, so that init() can be called again (e.g. after the context is replaced)
++    void reset();
++
+ private:
+     ggml_threadpool * threadpool       = nullptr;
+     ggml_threadpool * threadpool_batch = nullptr;
+diff --git a/tools/server/README.md b/tools/server/README.md
+index ef9033404..656a0268f 100644
+--- a/tools/server/README.md
++++ b/tools/server/README.md
+@@ -929,7 +929,49 @@ To use this endpoint with POST method, you need to start server with `--props`
+ 
+ *Options:*
+ 
+-- None yet
++- `parallel` (int): number of slots that accept new requests, 1 to the `--parallel` value at startup. Slots taken out of service are cleared and skipped when a slot is picked for a new request.
++- `ctx_per_slot` (int): per-request context ceiling, i.e. how many tokens a single request may use. Requires `--kv-unified` (see below).
++- `allow_oversubscribe` (bool, default `false`): allow `parallel * ctx_per_slot` to exceed the KV pool. Without it such a request is rejected with the arithmetic in the error message.
++- `ctx` (int): total KV pool, i.e. the `-c` value. Recreates the `llama_context`.
++- `cache_type_k`, `cache_type_v` (string): same values as `--cache-type-k` / `--cache-type-v`. Recreates the `llama_context`.
++- `flash_attn` (string): `on`, `off` or `auto`. Recreates the `llama_context`.
++- `parallel_max` (int): number of slots to create, i.e. the `--parallel` value. Recreates the `llama_context`.
++- `kv_unified` (bool): turn the shared KV pool on or off. Recreates the `llama_context`.
++- `rebuild` (bool): force a context recreation even if only the keys above are given.
++
++Two groups of properties behave differently:
++
++**Slot policy (`parallel`, `ctx_per_slot`) is applied in place.** These need no context recreation, so they are immediate: no reload, no VRAM change, in-flight requests are unaffected and existing prompts stay in the KV cache of the slots that remain in service. This works when the server runs with `--kv-unified`, because then the whole `-c` window is one pool shared by the slots, and the split between them is server-side policy. Per-slot ceiling changes apply to the next admitted prompt.
++
++```sh
++# shrink the window from 4 x 64k to 2 x 128k on the same pool, without touching the weights
++curl -X POST http://127.0.0.1:8080/props -d '{"parallel":2,"ctx_per_slot":131072}'
++```
++
++Without `--kv-unified` the `-c` window is divided between the slots when the KV cache is created
++(`n_ctx_seq = n_ctx / n_seq_max`), so the split cannot change at runtime and these calls are rejected with
++an explanation. Restart with `--kv-unified`, or use the rebuild keys below.
++
++**Context properties (`ctx`, `cache_type_*`, `flash_attn`, `parallel_max`, `kv_unified`) recreate the
++`llama_context`.** The model weights are not reloaded and stay where they are (VRAM or RAM), so this is
++much cheaper than restarting the server, but the KV cache and the prompt state are dropped and the call
++is only applied once no request is being decoded. If the new context cannot be created (e.g. it does not
++fit in VRAM) the previous one is restored and the call reports the failure.
++
++```sh
++# double the pool and switch the V cache to f16, weights stay in VRAM
++curl -X POST http://127.0.0.1:8080/props -d '{"ctx":262144,"cache_type_v":"f16"}'
++```
++
++The response echoes the configuration that is now in effect, e.g.
++```json
++{"success":true,"slots":2,"slots_max":8,"ctx_per_slot":131072,"kv_unified":true,"kv_pool_n_ctx":262144}
++```
++and `GET /props` reports `total_slots` (slots in service), `slots_max` (slots created), `kv_unified`,
++`kv_unified_per_slot` and `kv_pool_n_ctx`.
++
++Note: `parallel_max` and `kv_unified` cannot be applied by the slot policy, and a multimodal server
++(`--mmproj`) does not support the rebuild path.
+ 
+ ### POST `/embeddings`: non-OpenAI-compatible embeddings API
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b6835e434..0832417c9 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -844,6 +844,18 @@ public:
+     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+     const llama_vocab * vocab = nullptr;
+ 
++    // live runtime properties, for GET /props (thread-safe: only atomics and stable sizes)
++    json get_runtime_props() const {
++        return json {
++            { "total_slots",         rt.n_slots_active.load() },
++            { "slots_max",           (int) slots.size() },
++            { "kv_unified",          rt.kv_unified.load() },
++            { "kv_unified_per_slot", rt.kv_unified_per_slot.load() },
++            { "kv_pool_n_ctx",       rt.kv_pool_n_ctx.load() },
++            { "slot_n_ctx",          rt.slot_n_ctx.load() },
++        };
++    }
++
+     server_queue    queue_tasks;
+     server_response queue_results;
+ 
+@@ -933,6 +945,9 @@ private:
+ 
+     bool sleeping = false;
+ 
++    // runtime-tunable properties (see server_runtime_state in server-context.h)
++    server_runtime_state rt;
++
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
+@@ -1001,6 +1016,164 @@ private:
+         return true;
+     }
+ 
++    // create the speculative / MTP draft context against ctx_tgt (it shares the target model's weights)
++    bool init_spec_context(bool has_draft, bool (*progress_cb)(float, void *), void * progress_data) {
++        // spec_mtp does not load a model internally, so we report 0.0 and 1.0 manually
++        if (progress_cb) {
++            progress_cb(0.0f, progress_data);
++        }
++        if (progress_data) {
++            static_cast<load_progress_data *>(progress_data)->t_last_load_progress_ms = 0; // reset so internal cbs aren't delayed
++        }
++
++        {
++            common_params params_dft = common_base_params_to_speculative(params_base);
++
++            // progress callback
++            params_dft.load_progress_callback           = progress_cb;
++            params_dft.load_progress_callback_user_data = progress_data;
++
++            spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
++            model_dft = spec_init->model();
++            ctx_dft   = spec_init->context();
++
++            if (has_draft && model_dft == nullptr) {
++                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
++                return false;
++            }
++
++            if (ctx_dft == nullptr) {
++                SRV_ERR("%s", "failed to create MTP context\n");
++                return false;
++            }
++
++            params_base.speculative.draft.ctx_tgt = ctx_tgt;
++            params_base.speculative.draft.ctx_dft = ctx_dft;
++        }
++
++        if (progress_cb) {
++            progress_cb(1.0f, progress_data);
++        }
++
++        return true;
++    }
++
++    // create the slot objects and the state attached to the current context
++    // note: called from load_model() and from rebuild_context(), keep the two paths in sync
++    bool init_slots() {
++        slots.clear();
++
++        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
++        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
++            SRV_WRN("%s", "speculative decoding not supported by this context\n");
++        }
++
++        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
++            SRV_TRC("%s", "speculative decoding will use checkpoints\n");
++        }
++
++        // setup slots
++        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
++                params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
++
++        // initialize slots
++        for (int i = 0; i < params_base.n_parallel; i++) {
++            slots.emplace_back();
++        }
++
++        // try speculative decoding
++        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
++            try {
++                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
++            } catch (const std::exception & e) {
++                SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
++                if (params_base.speculative.has_synth()) {
++                    return false;
++                }
++            }
++        }
++
++        if (ctx_dft) {
++            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
++        }
++
++        if (spec) {
++            SRV_TRC("%s", "speculative decoding context initialized\n");
++        } else {
++            spec_init.reset();
++            ctx_dft   = nullptr;
++            model_dft = nullptr;
++        }
++
++        if (!spec && params_base.speculative.has_synth()) {
++            SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
++            return false;
++        }
++
++        for (int i = 0; i < params_base.n_parallel; i++) {
++            server_slot & slot = slots[i];
++
++            slot.id      = i;
++            slot.ctx_tgt = ctx_tgt;
++            slot.ctx_dft = ctx_dft;
++            slot.mem.init(ctx_tgt, ctx_dft);
++            slot.spec    = spec.get();
++            slot.n_ctx   = n_ctx_slot();
++
++            slot.mctx                   = mctx;
++            slot.prompt.tokens.has_mtmd = mctx != nullptr;
++
++            SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
++
++            slot.callback_on_release = [this](int id_slot) {
++                queue_tasks.pop_deferred_task(id_slot);
++            };
++
++            slot.callback_on_reset = [this](const server_slot & slot) {
++                // flush the generated token stats before reset()
++                if (slot.stats.n_gen > 0) {
++                    metrics_on_prediction(slot);
++                }
++            };
++
++            slot.reset();
++        }
++
++        // publish the runtime-tunable properties (POST /props)
++        rt.kv_unified          = params_base.kv_unified;
++        rt.kv_pool_n_ctx       = n_ctx;
++        rt.kv_unified_per_slot = params_base.kv_unified_per_slot;
++        rt.n_slots_active      = params_base.n_parallel;
++        rt.slot_n_ctx          = n_ctx_slot();
++
++        return true;
++    }
++
++    // the batch and the prompt cache are sized from the current context
++    // note: called from load_model() and from rebuild_context(), keep the two paths in sync
++    void init_batch_and_caches() {
++        // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
++        // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
++        {
++            const int32_t n_batch = llama_n_batch(ctx_tgt);
++            const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
++            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
++        }
++
++        if (params_base.cache_ram_mib != 0) {
++            if (params_base.cache_ram_mib < 0) {
++                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
++            } else {
++                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
++            }
++            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
++
++            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++        } else {
++            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
++        }
++    }
++
+     // load the model and initialize llama_context
+     // this may also be called to resume from sleeping state
+     bool load_model(common_params & params) {
+@@ -1117,37 +1290,8 @@ private:
+ 
+         add_bos_token = llama_vocab_get_add_bos(vocab);
+ 
+-        if (has_spec) {
+-            // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
+-            load_progress_callback(0.0f, &load_progress_spec);
+-            load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
+-
+-            {
+-                common_params params_dft = common_base_params_to_speculative(params_base);
+-
+-                // progress callback
+-                params_dft.load_progress_callback           = load_progress_callback;
+-                params_dft.load_progress_callback_user_data = &load_progress_spec;
+-
+-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+-                model_dft = spec_init->model();
+-                ctx_dft   = spec_init->context();
+-
+-                if (has_draft && model_dft == nullptr) {
+-                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+-                    return false;
+-                }
+-
+-                if (ctx_dft == nullptr) {
+-                    SRV_ERR("%s", "failed to create MTP context\n");
+-                    return false;
+-                }
+-
+-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+-                params_base.speculative.draft.ctx_dft = ctx_dft;
+-            }
+-
+-            load_progress_callback(1.0f, &load_progress_spec);
++        if (has_spec && !init_spec_context(has_draft, load_progress_callback, &load_progress_spec)) {
++            return false;
+         }
+ 
+         if (has_mmproj) {
+@@ -1235,84 +1379,10 @@ private:
+             }
+         }
+ 
+-        slots.clear();
+-
+-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+-            SRV_WRN("%s", "speculative decoding not supported by this context\n");
+-        }
+-
+-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+-            SRV_TRC("%s", "speculative decoding will use checkpoints\n");
+-        }
+-
+-        // setup slots
+-        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
+-                params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+-
+-        // initialize slots
+-        for (int i = 0; i < params_base.n_parallel; i++) {
+-            slots.emplace_back();
+-        }
+-
+-        // try speculative decoding
+-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+-            try {
+-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+-            } catch (const std::exception & e) {
+-                SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+-                if (params_base.speculative.has_synth()) {
+-                    return false;
+-                }
+-            }
+-        }
+-
+-        if (ctx_dft) {
+-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+-        }
+-
+-        if (spec) {
+-            SRV_TRC("%s", "speculative decoding context initialized\n");
+-        } else {
+-            spec_init.reset();
+-            ctx_dft   = nullptr;
+-            model_dft = nullptr;
+-        }
+-
+-        if (!spec && params_base.speculative.has_synth()) {
+-            SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
++        if (!init_slots()) {
+             return false;
+         }
+ 
+-        for (int i = 0; i < params_base.n_parallel; i++) {
+-            server_slot & slot = slots[i];
+-
+-            slot.id      = i;
+-            slot.ctx_tgt = ctx_tgt;
+-            slot.ctx_dft = ctx_dft;
+-            slot.mem.init(ctx_tgt, ctx_dft);
+-            slot.spec    = spec.get();
+-            slot.n_ctx   = n_ctx_slot();
+-
+-            slot.mctx                   = mctx;
+-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+-
+-            SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+-
+-            slot.callback_on_release = [this](int id_slot) {
+-                queue_tasks.pop_deferred_task(id_slot);
+-            };
+-
+-            slot.callback_on_reset = [this](const server_slot & slot) {
+-                // flush the generated token stats before reset()
+-                if (slot.stats.n_gen > 0) {
+-                    metrics_on_prediction(slot);
+-                }
+-            };
+-
+-            slot.reset();
+-        }
+-
+         {
+             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
+             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
+@@ -1340,26 +1410,7 @@ private:
+             }
+         }
+ 
+-        // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
+-        // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+-        {
+-            const int32_t n_batch = llama_n_batch(ctx_tgt);
+-            const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
+-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+-        }
+-
+-        if (params_base.cache_ram_mib != 0) {
+-            if (params_base.cache_ram_mib < 0) {
+-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+-            } else {
+-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+-            }
+-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+-
+-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+-        } else {
+-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+-        }
++        init_batch_and_caches();
+         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+ 
+         if (params_base.n_ctx_checkpoints > 0) {
+@@ -1549,9 +1600,24 @@ private:
+ 
+         bool update_cache = false;
+ 
++        // slots that were taken out of service give their KV back here, at a point where nothing is
++        // decoding (see reconfigure) - otherwise their tokens keep occupying the KV pool
++        for (server_slot & slot : slots) {
++            if (!slot_in_service(slot) && slot.prompt.n_tokens() > 0) {
++                SRV_INF("purging slot %d (%d tokens), it is out of service\n",
++                        slot.id, (int) slot.prompt.n_tokens());
++                slot.prompt_clear();
++            }
++        }
++
+         // if a specific slot is requested, use it (still goes through cache update logic below)
+         if (task.id_slot != -1) {
+             ret = get_slot_by_id(task.id_slot);
++            if (ret && !slot_in_service(*ret)) {
++                SLT_INF(*ret, "requested by id (%d) but out of service (n_slots_active = %d)\n",
++                        task.id_slot, rt.n_slots_active.load());
++                ret = nullptr;
++            }
+             if (ret) {
+                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+             }
+@@ -1566,6 +1632,11 @@ private:
+                     continue;
+                 }
+ 
++                // skip slots that are out of service
++                if (!slot_in_service(slot)) {
++                    continue;
++                }
++
+                 // skip the slot if it is not available
+                 if (slot.is_processing()) {
+                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+@@ -1614,6 +1685,11 @@ private:
+             int64_t t_last = -1;
+ 
+             for (server_slot & slot : slots) {
++                // skip slots that are out of service
++                if (!slot_in_service(slot)) {
++                    continue;
++                }
++
+                 // skip the slot if it is not available
+                 if (slot.is_processing()) {
+                     continue;
+@@ -2250,7 +2326,7 @@ private:
+     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
+         std::vector<server_slot *> free_slots;
+         for (auto & slot : slots) {
+-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
++            if (!slot.is_processing() && slot.id != exclude_id_slot && slot_in_service(slot)) {
+                 free_slots.push_back(&slot);
+             }
+             if (free_slots.size() >= n_slots_needed) {
+@@ -2371,10 +2447,351 @@ private:
+                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+     }
+ 
++    // recreate the llama_context with new context properties, keeping the model weights loaded:
++    // the window (-c), the KV cache types, flash attention, the number of slots and kv_unified can
++    // all change without reloading the weights (POST /props)
++    // note: called from the task queue thread, so no encode/decode is in flight
++    bool rebuild_context(const json & req, bool & success, std::string & message, json & data) {
++        if (mctx != nullptr) {
++            success = false;
++            message = "recreating the context of a multimodal server is not supported";
++            return false;
++        }
++
++        // the KV of every slot lives in the context that is about to be destroyed
++        for (auto & slot : slots) {
++            if (slot.is_processing()) {
++                success = false;
++                message = string_format("slot %d is busy, cannot recreate the context", slot.id);
++                return false;
++            }
++        }
++
++        const common_params params_old = params_base;
++        common_params new_params = params_base;
++
++        auto fail = [&success, &message](const std::string & msg) {
++            success = false;
++            message = msg;
++            return false;
++        };
++
++        if (req.contains("ctx")) {
++            if (!req.at("ctx").is_number_integer()) {
++                return fail("\"ctx\" must be an integer");
++            }
++            const int v = req.at("ctx").get<int>();
++            if (v < 1) {
++                return fail("\"ctx\" must be >= 1");
++            }
++            new_params.n_ctx = v;
++        }
++
++        if (req.contains("parallel_max")) {
++            if (!req.at("parallel_max").is_number_integer()) {
++                return fail("\"parallel_max\" must be an integer");
++            }
++            const int v = req.at("parallel_max").get<int>();
++            if (v < 1 || v > 256) {
++                return fail("\"parallel_max\" must be between 1 and 256");
++            }
++            new_params.n_parallel = v;
++        }
++
++        if (req.contains("kv_unified")) {
++            if (!req.at("kv_unified").is_boolean()) {
++                return fail("\"kv_unified\" must be a boolean");
++            }
++            new_params.kv_unified = req.at("kv_unified").get<bool>();
++        }
++
++        // same list as --cache-type-k / --cache-type-v
++        static const std::vector<ggml_type> cache_types = {
++            GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
++            GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
++        };
++
++        for (const char * key : { "cache_type_k", "cache_type_v" }) {
++            if (!req.contains(key)) {
++                continue;
++            }
++            if (!req.at(key).is_string()) {
++                return fail(string_format("\"%s\" must be a string", key));
++            }
++
++            const std::string s = req.at(key).get<std::string>();
++
++            ggml_type type = GGML_TYPE_COUNT;
++            for (const auto & t : cache_types) {
++                if (s == ggml_type_name(t)) {
++                    type = t;
++                    break;
++                }
++            }
++            if (type == GGML_TYPE_COUNT) {
++                return fail(string_format("unsupported \"%s\": %s", key, s.c_str()));
++            }
++
++            if (std::string(key) == "cache_type_k") {
++                new_params.cache_type_k = type;
++            } else {
++                new_params.cache_type_v = type;
++            }
++        }
++
++        if (req.contains("flash_attn")) {
++            if (!req.at("flash_attn").is_string()) {
++                return fail("\"flash_attn\" must be a string: on, off or auto");
++            }
++
++            const std::string s = req.at("flash_attn").get<std::string>();
++
++            if (s == "on" || s == "true" || s == "1") {
++                new_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++            } else if (s == "off" || s == "false" || s == "0") {
++                new_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++            } else if (s == "auto") {
++                new_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
++            } else {
++                return fail(string_format("unknown \"flash_attn\": %s (expected on, off or auto)", s.c_str()));
++            }
++        }
++
++        // tear down what is attached to the old context and recreate everything against `p`.
++        // returns false if the context or anything attached to it could not be created
++        auto apply = [&](const common_params & p) -> bool {
++            spec.reset();
++            spec_init.reset();
++            ctx_dft   = nullptr;
++            model_dft = nullptr;
++            prompt_cache.reset();
++            slots.clear();
++
++            if (!llama_init->reload_context(p)) {
++                return false;
++            }
++
++            params_base = p;
++            ctx_tgt     = llama_init->context();
++            n_ctx       = llama_n_ctx(ctx_tgt);
++
++            // --- same order as load_model(): spec context, slots, batch, caches ---
++            {
++                const bool spec_mtp = std::find(p.speculative.types.begin(), p.speculative.types.end(),
++                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != p.speculative.types.end();
++
++                if ((spec_mtp || p.speculative.has_dft()) &&
++                        !init_spec_context(p.speculative.has_dft(), nullptr, nullptr)) {
++                    return false;
++                }
++            }
++
++            if (!init_slots()) {
++                return false;
++            }
++
++            init_batch_and_caches();
++
++            return true;
++        };
++
++        if (!apply(new_params)) {
++            // the new context did not fit (or the spec context did not): go back to the previous
++            // configuration so the server keeps serving, and report the failure
++            SRV_ERR("%s", "failed to recreate the context, restoring the previous one\n");
++
++            if (!apply(params_old)) {
++                GGML_ABORT("failed to restore the context after a failed reconfigure");
++            }
++
++            return fail("failed to recreate the context (out of memory?); the previous one was restored");
++        }
++
++        SRV_INF("rebuilt context: n_ctx = %d, n_parallel = %d, kv_unified = %d, ct_k = %s, ct_v = %s, flash_attn = %s\n",
++                n_ctx, params_base.n_parallel, (int) params_base.kv_unified,
++                ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v),
++                llama_flash_attn_type_name(params_base.flash_attn_type));
++
++        // the slots share the pool, so this is legal, but say so when they cannot all be full at once
++        {
++            const int cap_eff = params_base.kv_unified_per_slot > 0 ?
++                std::min(params_base.kv_unified_per_slot, n_ctx) : n_ctx;
++
++            if ((int64_t) rt.n_slots_active.load() * cap_eff > (int64_t) n_ctx) {
++                SRV_WRN("the new KV pool (%d) cannot back %d slots of %d tokens - at most %d can be full at the "
++                        "same time (POST /props to adjust \"parallel\" or \"ctx_per_slot\")\n",
++                        n_ctx, rt.n_slots_active.load(), cap_eff, n_ctx / std::max(cap_eff, 1));
++            }
++        }
++
++        data = {
++            { "rebuilt",          true },
++            { "ctx",              n_ctx },
++            { "slots",            (int) slots.size() },
++            { "slots_max",        (int) slots.size() },
++            { "ctx_per_slot",     n_ctx_slot() },
++            { "kv_unified",       params_base.kv_unified },
++            { "kv_pool_n_ctx",    n_ctx },
++            { "cache_type_k",     ggml_type_name(params_base.cache_type_k) },
++            { "cache_type_v",     ggml_type_name(params_base.cache_type_v) },
++            { "flash_attn",       llama_flash_attn_type_name(params_base.flash_attn_type) },
++        };
++
++        success = true;
++        return true;
++    }
++
++    // a request needs a new llama_context when it touches the pool, the cache types, flash attention, the
++    // number of slots to create, or kv_unified (see reconfigure)
++    static bool reconfigure_needs_rebuild(const json & req) {
++        return req.contains("ctx") || req.contains("cache_type_k") || req.contains("cache_type_v") ||
++               req.contains("flash_attn") || req.contains("parallel_max") || req.contains("kv_unified") ||
++               req.value("rebuild", false);
++    }
++
++    // apply a runtime property change requested via POST /props
++    // note: called from the task queue thread, so an encode/decode is never running here
++    void reconfigure(const json & req, bool & success, std::string & message, json & data) {
++        const int n_slots_max = (int) slots.size();
++        const int pool        = rt.kv_pool_n_ctx.load();
++        const int n_ctx_train = (int) llama_model_n_ctx_train(model_tgt);
++
++        // properties that need a new llama_context: apply them by rebuilding it (the weights stay
++        // loaded), then continue with the slot policy below on the new pool
++        const bool want_rebuild = reconfigure_needs_rebuild(req);
++
++        const bool want_slots = req.contains("parallel");
++        const bool want_cap   = req.contains("ctx_per_slot");
++
++        if (!want_rebuild && !want_slots && !want_cap) {
++            success = false;
++            message = "nothing to do: expected one of \"parallel\", \"ctx_per_slot\", \"ctx\", "
++                      "\"cache_type_k\", \"cache_type_v\", \"flash_attn\", \"parallel_max\", \"kv_unified\"";
++            return;
++        }
++
++        if (want_rebuild) {
++            if (!rebuild_context(req, success, message, data)) {
++                return;
++            }
++            if (!want_slots && !want_cap) {
++                success = true;
++                return; // the rebuild already reported the new configuration
++            }
++        }
++
++        if (!params_base.kv_unified) {
++            success = false;
++            message = "this server was started without --kv-unified: without a shared KV pool the -c window is "
++                      "split between the slots when the llama_context is created, so the split cannot be changed "
++                      "at runtime. Restart with --kv-unified (then this call works without reloading the weights), "
++                      "or pick the split at startup with --parallel N.";
++            return;
++        }
++
++        int n_slots = rt.n_slots_active.load();
++        int cap     = rt.kv_unified_per_slot.load();
++
++        if (want_slots) {
++            if (!req.at("parallel").is_number_integer()) {
++                success = false;
++                message = "\"parallel\" must be an integer";
++                return;
++            }
++
++            n_slots = req.at("parallel").get<int>();
++
++            if (n_slots < 1 || n_slots > n_slots_max) {
++                success = false;
++                message = string_format("\"parallel\" must be between 1 and %d (the --parallel value at startup)",
++                        n_slots_max);
++                return;
++            }
++
++            // never pull a slot out from under a running request
++            for (int i = n_slots; i < n_slots_max; i++) {
++                if (slots[i].is_processing()) {
++                    success = false;
++                    message = string_format("slot %d is busy, cannot take it out of service", i);
++                    return;
++                }
++            }
++        }
++
++        if (want_cap) {
++            if (!req.at("ctx_per_slot").is_number_integer()) {
++                success = false;
++                message = "\"ctx_per_slot\" must be an integer";
++                return;
++            }
++
++            cap = req.at("ctx_per_slot").get<int>();
++
++            if (cap < 1) {
++                success = false;
++                message = "\"ctx_per_slot\" must be >= 1";
++                return;
++            }
++
++            if (cap > n_ctx_train) {
++                success = false;
++                message = string_format("\"ctx_per_slot\" (%d) exceeds the training context of the model (%d)",
++                        cap, n_ctx_train);
++                return;
++            }
++        }
++
++        // ceiling the server enforces per request: the cap, or the whole pool when unset
++        const int cap_eff = cap > 0 ? std::min(cap, pool) : pool;
++
++        if (!req.value("allow_oversubscribe", false) && (int64_t) n_slots * cap_eff > (int64_t) pool) {
++            success = false;
++            message = string_format("%d slots x %d tokens = %" PRId64 " tokens exceeds the KV pool (-c %d); "
++                    "lower \"parallel\" or \"ctx_per_slot\", or pass \"allow_oversubscribe\": true to let the "
++                    "slots compete for the pool", n_slots, cap_eff, (int64_t) n_slots * cap_eff, pool);
++            return;
++        }
++
++        if (want_cap) {
++            params_base.kv_unified_per_slot = cap;
++        }
++
++        // note: the slots that leave service give their KV back lazily, from get_available_slot(), which
++        // runs at a point where no slot is decoding. Clearing it here would touch the KV cache during
++        // another slot's decode, because this handler is allowed through the is_yielding guard.
++
++        rt.kv_unified          = params_base.kv_unified;
++        rt.kv_unified_per_slot = cap;
++        rt.kv_pool_n_ctx       = pool;
++        rt.n_slots_active      = n_slots;
++
++        for (auto & slot : slots) {
++            slot.n_ctx = n_ctx_slot();
++        }
++        rt.slot_n_ctx = n_ctx_slot();
++
++        SRV_INF("reconfigure: slots = %d/%d, ctx_per_slot = %d, kv_unified_per_slot = %d, kv pool = %d\n",
++                n_slots, n_slots_max, cap_eff, cap, pool);
++
++        data = {
++            { "slots",           n_slots     },
++            { "slots_max",       n_slots_max },
++            { "ctx_per_slot",    cap_eff     },
++            { "kv_unified",      params_base.kv_unified },
++            { "kv_pool_n_ctx",   pool        },
++            { "slots_total_cap", n_slots * cap_eff },
++        };
++
++        success = true;
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
++        // note: RECONFIGURE is allowed through here, but it declines itself when the request needs a new
++        // context - see the SERVER_TASK_TYPE_RECONFIGURE case
++        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
++                task.type != SERVER_TASK_TYPE_RECONFIGURE) {
+             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
+             return false;
+         }
+@@ -2395,6 +2812,19 @@ private:
+ 
+                     const int id_task = task.id;
+ 
++                    if (task.id_slot != -1 && task.id_slot >= rt.n_slots_active.load()) {
++                        // an explicitly requested slot is out of service (see POST /props)
++                        auto res_err = std::make_unique<server_task_result_error>();
++                        res_err->id      = task.id;
++                        res_err->err_type = ERROR_TYPE_INVALID_REQUEST;
++                        res_err->err_msg  = string_format(
++                                "slot %d is out of service: %d of %d slots are active "
++                                "(raise it with POST /props {\"parallel\": N})",
++                                task.id_slot, rt.n_slots_active.load(), (int) slots.size());
++                        queue_results.send(std::move(res_err));
++                        break;
++                    }
++
+                     server_slot * slot = get_available_slot(task);
+ 
+                     //
+@@ -2492,6 +2922,23 @@ private:
+                         res->message = "unknown control action";
+                     }
+ 
++                    queue_results.send(std::move(res));
++                } break;
++            case SERVER_TASK_TYPE_RECONFIGURE:
++                {
++                    // the slot policy only touches server-side bookkeeping, so it is safe to apply while
++                    // other slots decode - that is what keeps a retune from waiting for a quiet moment.
++                    // A context rebuild replaces the llama_context, so it has to wait for one.
++                    if (is_yielding && reconfigure_needs_rebuild(task.reconfigure)) {
++                        SRV_DBG("decoding, decline context rebuild, id_task = %d\n", task.id);
++                        return false;
++                    }
++
++                    auto res = std::make_unique<server_task_result_reconfigure>();
++                    res->id = task.id;
++
++                    reconfigure(task.reconfigure, res->success, res->message, res->data);
++
+                     queue_results.send(std::move(res));
+                 } break;
+             case SERVER_TASK_TYPE_NEXT_RESPONSE:
+@@ -4023,6 +4470,11 @@ private:
+         });
+     }
+ 
++    // slots with id >= n_slots_active are out of service: they accept no new tasks
++    bool slot_in_service(const server_slot & slot) const {
++        return (int) slot.id < rt.n_slots_active.load();
++    }
++
+     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+     int n_ctx_slot() const {
+         int res = llama_n_ctx_seq(ctx_tgt);
+@@ -4808,20 +5260,63 @@ void server_routes::init_routes() {
+             std::unique_lock<std::mutex> lock(mutex_cache);
+             res->ok(cached_props);
+         } else {
+-            res->ok(get_res_props(*meta, params, false));
++            json props = get_res_props(*meta, params, false);
++
++            // report the live runtime properties: they can change without a reload (POST /props)
++            const json live = ctx_server.get_runtime_props();
++            for (const auto & [key, value] : live.items()) {
++                props[key] = value;
++            }
++            props["default_generation_settings"]["n_ctx"] = live["slot_n_ctx"];
++
++            res->ok(props);
+         }
+         return res;
+     };
+ 
+-    this->post_props = [this](const server_http_req &) {
++    this->post_props = [this](const server_http_req & req) {
+         auto res = create_response();
+         if (!params.endpoint_props) {
+             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
+             return res;
+         }
+-        // update any props here
+ 
+-        res->ok({{ "success", true }});
++        json body = json::object();
++        if (!req.body.empty()) {
++            try {
++                body = json::parse(req.body);
++            } catch (const std::exception & e) {
++                res->error(format_error_response(string_format("Invalid JSON body: %s", e.what()), ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++            if (!body.is_object()) {
++                res->error(format_error_response("body must be a JSON object", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++        }
++
++        // the task queue thread owns the slots and the KV cache, so the change is applied there
++        // (an in-flight encode/decode declines the task and it is applied right after)
++        auto & rd = res->rd;
++        {
++            server_task task(SERVER_TASK_TYPE_RECONFIGURE);
++            task.id          = rd.get_new_id();
++            task.reconfigure = body;
++            rd.post_task(std::move(task));
++        }
++
++        auto result = rd.next(req.should_stop);
++        if (!result) {
++            GGML_ASSERT(req.should_stop());
++            return res;
++        }
++
++        const json out = result->to_json();
++        if (out.value("success", false)) {
++            res->ok(out);
++        } else {
++            res->error(format_error_response(out.value("message", std::string("reconfigure failed")), ERROR_TYPE_INVALID_REQUEST));
++        }
+         return res;
+     };
+ 
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 0acbbffa9..96cb8a9bf 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -6,6 +6,7 @@
+ 
+ #include "json.h"
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <memory>
+ #include <mutex>
+@@ -81,6 +82,16 @@ static server_state server_state_from_str(const std::string & str) {
+ 
+ using server_state_callback_t = std::function<void(server_state, json /* payload */)>;
+ 
++// properties that can be changed at runtime through POST /props.
++// written on the task-queue thread (see server_context_impl::reconfigure), read from HTTP threads.
++struct server_runtime_state {
++    std::atomic<int>  n_slots_active     {0};     // slots that accept new tasks, <= --parallel
++    std::atomic<int>  kv_unified_per_slot{0};     // per-slot context cap, 0 = unset (whole pool)
++    std::atomic<int>  kv_pool_n_ctx      {0};     // total KV pool, i.e. the -c value
++    std::atomic<int>  slot_n_ctx         {0};     // context a single slot may use, see n_ctx_slot()
++    std::atomic<bool> kv_unified         {false}; // KV pool shared by all slots
++};
++
+ struct server_context {
+     std::unique_ptr<server_context_impl> impl;
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143f8..08dce0536 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -19,6 +19,7 @@ enum server_task_type {
+     SERVER_TASK_TYPE_INFILL,
+     SERVER_TASK_TYPE_CANCEL,
+     SERVER_TASK_TYPE_CONTROL,
++    SERVER_TASK_TYPE_RECONFIGURE,
+     SERVER_TASK_TYPE_NEXT_RESPONSE,
+     SERVER_TASK_TYPE_METRICS,
+     SERVER_TASK_TYPE_SLOT_GET,
+@@ -172,6 +173,9 @@ struct server_task {
+     // used by SERVER_TASK_TYPE_METRICS
+     bool metrics_reset_bucket = false;
+ 
++    // used by SERVER_TASK_TYPE_RECONFIGURE - requested runtime properties (see server_runtime_state)
++    json reconfigure = json::object();
++
+     // used by SERVER_TASK_TYPE_SET_LORA
+     std::map<int, float> set_lora; // mapping adapter ID -> scale
+ 
+@@ -548,6 +552,22 @@ struct server_task_result_control : server_task_result {
+     }
+ };
+ 
++// used by POST /props - echo of the applied runtime properties
++struct server_task_result_reconfigure : server_task_result {
++    bool        success = false;
++    std::string message; // optional detail when success is false
++    json        data = json::object();
++
++    virtual json to_json() override {
++        json out = data;
++        out["success"] = success;
++        if (!message.empty()) {
++            out["message"] = message;
++        }
++        return out;
++    }
++};
++
+ struct server_task_result_get_lora : server_task_result {
+     struct lora {
+         common_adapter_lora_info info;

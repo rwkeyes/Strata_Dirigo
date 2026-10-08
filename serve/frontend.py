@@ -125,6 +125,9 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
+# TEMPLATE_FLAGS: the template kwargs a client may set about rendering the *history* (Minefield 04/25):
+# preserve_thinking (keep a prior turn's reasoning) and preserve_empty_think (keep its empty <think> wrapper).
+TEMPLATE_FLAGS = ("preserve_thinking", "preserve_empty_think")
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
@@ -393,6 +396,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+        elif k in TEMPLATE_FLAGS:                      # the history rendering: what a prior turn keeps
+            kwargs[k] = bool(v)
     return _late_system_to_user(messages), tools, kwargs
 
 
@@ -423,6 +428,118 @@ def pin_billing_stamp(system: str) -> str:
                 tail = v + len(".".join(parts[:3])) + 1
                 s[tail:end] = "f" * (end - tail)
     return "".join(s)
+# ------------------------------------------------------------------- tool_choice (Minefield trap 78)
+TOOL_CHOICES = ("auto", "none", "required")
+
+
+def _tool_name(tool) -> str | None:
+    """A tool's function name, whether it arrived OpenAI-shaped ({"type": "function", "function": {...}}) or
+    Anthropic-shaped ({"name": ...}), and whether or not the frontend already flattened it."""
+    if not isinstance(tool, dict):
+        return None
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    name = fn.get("name")
+    return name if isinstance(name, str) else None
+
+
+def tool_choice_strict(req: dict, api: str = "openai") -> tuple[str, str | None]:
+    """The request's `tool_choice` -> (mode, name), mode being "auto" | "none" | "required" | "function".
+    This is the fork's STRICT reading: upstream's `tool_choice_of` (below) takes the value and reads an odd one
+    as "auto" after logging; this one raises, so a choice the server cannot honour is a 400 rather than a
+    silent "auto".
+
+    Minefield trap 78: this server accepted `tool_choice` and ignored it, which fails OPEN - a turn the caller
+    believed was read-only called a tool.  Every value outside the set below is therefore a 400 (a choice that
+    cannot be honoured must not read as one that was), and whatever `offer_tools` does with it is reported back
+    in the response's `strata` block."""
+    choice = req.get("tool_choice") if isinstance(req, dict) else None
+    if choice is None:
+        return "auto", None
+    if isinstance(choice, str):
+        mode = choice.strip().lower()
+        if mode not in TOOL_CHOICES:
+            raise ValueError(f"tool_choice={choice!r}: expected \"auto\", \"none\" or \"required\"")
+        return mode, None
+    if not isinstance(choice, dict):
+        raise ValueError("tool_choice must be a string or an object")
+    kind = str(choice.get("type") or "").strip().lower()
+    if kind in ("function", "tool"):
+        # Every shape upstream accepts is accepted here too - this reading is STRICTER about what it will
+        # refuse, never narrower about what it will serve (a fork must not 400 a request upstream answers):
+        #   OpenAI nested  {"type": "function", "function": {"name": N}}
+        #   OpenAI flat    {"type": "function", "name": N}
+        #   Anthropic      {"type": "tool", "name": N}
+        fn = choice.get("function")
+        name = (fn.get("name") if isinstance(fn, dict) else None) or choice.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f'tool_choice of type "{kind}" needs a name '
+                             '(function.name, or "name" in the flat shape)')
+        return "function", name
+    if kind in ("any", "required"):                          # Anthropic "any" / OpenAI "required"
+        return "required", None
+    if kind in TOOL_CHOICES:                                 # "auto" | "none"
+        return kind, None
+    raise ValueError(f"tool_choice type {kind!r}: expected \"auto\", \"none\", \"required\", \"function\" or \"tool\"")
+
+
+def offer_tools(tools: list[dict] | None, mode: str, name: str | None) -> tuple[list[dict] | None, dict]:
+    """(the tools the engine is offered, what that choice actually did) — the report goes in the response.
+
+    "none" drops the payload rather than asking anyone to ignore it: a lane that is never offered a tool cannot
+    call one, whatever its template or output parser does with a choice (that is the check that works everywhere,
+    Minefield 78).  A named function narrows the offer to that one.  "required" is offered as sent and reported
+    UNENFORCED — no chat template here can force a call, and saying otherwise would be the same lie as ignoring
+    the field in the first place."""
+    offered = list(tools or [])
+    if not offered:
+        return None, {"requested": mode, "applied": False, "why": "the request offered no tools"}
+    if mode == "auto":
+        return tools, {"requested": "auto", "applied": True, "how": "the tools payload as sent"}
+    if mode == "none":
+        return None, {"requested": "none", "applied": True,
+                      "how": "the tools payload was omitted, so no call can come back"}
+    if mode == "function":
+        picked = [t for t in offered if _tool_name(t) == name]
+        if not picked:
+            raise ValueError(f"tool_choice names {name!r}, which this request does not offer")
+        return picked, {"requested": "function", "applied": True, "how": f"only {name!r} was offered"}
+    # "required": the payload is offered as sent AND the reply is opened as a call by upstream's forced_call()
+    # (which landed in 0.1.41) - so this is applied, not merely accepted.  It used to be reported unenforced
+    # here because no chat template could force a call; the forcing is done on the prompt instead of the template.
+    return tools, {"requested": "required", "applied": True,
+                   "how": "the tools payload as sent; the reply is opened as a call (forced_call)"}
+
+
+# ------------------------------------------------------------------- the request surface (Minefield trap 77)
+# The fields each API's request may carry.  Minefield trap 77: this server accepted any invented top-level
+# field with a 200, so a misspelling was silent and a status code confirmed nothing.  `unknown_params` names
+# them (logged, or a 400 when the config sets strict_params), and every response carries the effective settings
+# in a `strata` block, so a client can assert on what actually happened per request rather than per config.
+OPENAI_PARAMS = frozenset((
+    "model", "messages", "frequency_penalty", "logit_bias", "logprobs", "top_logprobs", "max_tokens",
+    "max_completion_tokens", "n", "presence_penalty", "response_format", "seed", "service_tier", "stop",
+    "store", "stream", "stream_options", "temperature", "top_p", "tools", "tool_choice",
+    "parallel_tool_calls", "user", "metadata", "modalities", "prediction", "audio", "reasoning_effort",
+    "reasoning", "verbosity", "web_search_options", "prompt_cache_key", "safety_identifier", "instructions",
+    "function_call", "functions", "echo", "best_of", "logit_bias",
+    # this server's own (upstream and the fork's):
+    "chat_template_kwargs", "enable_thinking", "thinking", "reasoning_budget_tokens", "strata_tune",
+    "strata_mcp", "output_config", "anthropic_think_unasked", "preserve_thinking", "add_generation_prompt",
+    "experimental_speed_projection", "strata_echo",
+))
+ANTHROPIC_PARAMS = frozenset((
+    "model", "messages", "system", "max_tokens", "metadata", "stop_sequences", "stream", "temperature",
+    "top_k", "top_p", "tools", "tool_choice", "thinking", "service_tier", "container", "mcp_servers",
+    "betas", "context_management", "anthropic_version", "user",
+    "chat_template_kwargs", "reasoning_budget_tokens", "strata_tune", "strata_mcp", "output_config",
+    "strata_think_unasked", "add_generation_prompt",
+))
+
+
+def unknown_params(req: dict, api: str = "openai") -> list[str]:
+    """The top-level request fields this server does not implement, in the order they were sent."""
+    known = ANTHROPIC_PARAMS if api == "anthropic" else OPENAI_PARAMS
+    return [k for k in req if k not in known] if isinstance(req, dict) else []
 
 
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
@@ -469,6 +586,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
+    for k, v in (req.get("chat_template_kwargs") or {}).items():   # the history rendering, as on the OpenAI path
+        if k in TEMPLATE_FLAGS:
+            kwargs[k] = bool(v)
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")

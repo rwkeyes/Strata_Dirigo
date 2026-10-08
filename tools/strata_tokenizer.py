@@ -311,6 +311,15 @@ def extract(gguf_path, out_dir) -> dict:
     from gguf_reader import GGUFFile
     tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
+        # ... with the fork's empty-think guard applied (Minefield 04/25): this pack's copy is what the server
+        # renders - it prefers tokenizer/chat_template.jinja to the repo's serve/chat_template.jinja - so the
+        # guard has to be baked in here, not only in the repo's template.  A template without the pattern this
+        # fixes (another architecture) is left exactly as the model shipped it, and says so.
+        from empty_think_guard import apply as guard
+        tpl, what = guard(tpl)
+        if what == "pattern not found":
+            print(f"[strata] the pack's chat template has no empty-think pattern to guard ({len(tpl)} chars): "
+                  f"kept as the model shipped it", flush=True)
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
 

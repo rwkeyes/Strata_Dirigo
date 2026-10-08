@@ -116,8 +116,18 @@
             {%- set reasoning_content = message.reasoning_content %}
         {%- endif %}
         {%- set reasoning_content = reasoning_content|trim %}
-        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
-            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {#- Minefield 04/25: a prior assistant turn whose reasoning is empty (thinking was off for it, or the
+            client did not resend it) used to render an empty <think></think> block.  That nudges the model to
+            skip its reasoning on later turns and makes two equivalent histories render differently (a cache
+            miss), so the wrapper is now written only when there is reasoning to preserve.
+            "preserve_empty_think": true - in the config or in the request's chat_template_kwargs - restores
+            the pack's rendering exactly. -#}
+        {%- if reasoning_content or (preserve_empty_think is defined and preserve_empty_think) %}
+            {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
         {%- else %}
             {{- '<|im_start|>' + message.role + '\n' + content }}
         {%- endif %}

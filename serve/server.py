@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import codecs
 import ctypes
+import ipaddress
 import json
 import math
 import os
@@ -55,8 +56,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            forced_call, images_of, literal_tags, mark_think_literals, offer_tools,
+                            openai_to_messages, tool_choice_of, tool_choice_strict, unmark_think_literals,
+                            unknown_params)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -196,6 +198,58 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+# The API key's SCOPE: which callers may use the API WITHOUT presenting it.  A key that is set protects the
+# server; the scope says who is already trusted by address, so a home LAN does not need the key on every device
+# while the tunnel in front of the server still does.  "lan" (the default) exempts this PC and the local network,
+# "localhost" exempts this PC only, "all" exempts nobody (upstream 0.1.38's behaviour: the key is required from
+# every caller, loopback included), "off" asks nobody for a key (the feature is off).
+API_KEY_SCOPES = ("all", "lan", "localhost", "off")
+# What "the local network" means: the private ranges (RFC 1918), link-local (auto-configuration addresses) and
+# IPv6's unique-local (fc00::/7) plus link-local (fe80::/10).  Loopback is exempt in the "lan" and "localhost"
+# scopes (never in "all"); the allow list applies in those two as well.  Carrier-grade NAT (100.64.0.0/10) is
+# deliberately NOT here: it is an ISP's network, not yours.  The DEFAULT scope is "all" - upstream 0.1.38's
+# behaviour, every caller presents the key - so these exemptions are only ever opt-in.
+LAN_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10")
+LOOPBACK_NETS = ("127.0.0.0/8", "::1/128")
+# RUNTIME TUNE KEYS: engine settings a running server may change without a restart (see
+# warm-retune/RETUNE-CANDIDATES.md).  Each rides the request line to the engine, so a value that is out of range
+# is refused here rather than sent; `strata_tune` in one request applies to that request only, while POST /props
+# {"strata_tune": {...}} makes it the default for every later request.  name -> (kind, low, high).
+TUNE_KEYS = {
+    "pcie_frac":          ("float", 0.0, 1.0),     # share of a missed expert's bytes moved over PCIe
+    "spec_min_p":         ("float", 0.0, 1.0),     # draft-probability floor for the MTP window
+    "prefill":            ("int", 0, 32768),       # prompt chunk (down any time; up to the startup chunk)
+    "short_read":         ("int", 0, 1 << 20),     # read at most N fresh tokens through the decode windows
+    "prompt_cache":       ("int", 0, 4096),        # conversation checkpoints kept between requests
+    "prompt_cache_every": ("int", 0, 1 << 24),     # and one every N fresh prompt tokens
+    "adapt_every":        ("int", 0, 1 << 30),     # adaptive expert-swap cadence, in decode rounds
+    "suffix_draft":       ("int", 0, 64),          # prompt-lookup draft depth (0 = MTP only)
+    "mtp_max_t":          ("int", 0, 8),           # cap the MTP's windows at M tokens
+}
+
+
+def clean_tune(tune: dict, strict: bool = True) -> dict:
+    """A `strata_tune` dict with only known keys and checked values.  `strict` (the POST /props path) raises
+    ValueError naming the offender, because a typo in a tuning key would otherwise look like it was applied; a
+    request's own keys (the engine line) are cleaned leniently instead - a bad one is dropped, never fatal."""
+    out = {}
+    for k, v in (tune or {}).items():
+        if k not in TUNE_KEYS:
+            if strict:
+                raise ValueError(f"strata_tune: unknown key {k!r} (known: {', '.join(TUNE_KEYS)})")
+            continue
+        kind, lo, hi = TUNE_KEYS[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= float(v) <= hi):
+            if strict:
+                raise ValueError(f"strata_tune.{k}: expected a number in {lo} .. {hi}")
+            continue
+        out[k] = int(v) if kind == "int" else float(v)
+    return out
+
+
+def tune_str(tune: dict) -> str:
+    """`strata_tune` as the engine's own request keys: " prefill=4096 spec_min_p=0.5"."""
+    return "".join(f" {k}={int(v) if TUNE_KEYS[k][0] == 'int' else float(v)!r}" for k, v in (tune or {}).items())
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -610,6 +664,9 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        # the engine's own tune state: a `TUNE key=value` line changes it in place (warm-retune), so the server
+        # sends one only when the values a request wants differ from what the engine already has
+        self.applied_tune: dict = {}
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -959,13 +1016,12 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
+        # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart.
+        # The keys are the engine's own per-request tuning keys (see TUNE_KEYS); the same set can be set as the
+        # server's default with POST /props {"strata_tune": {...}}.
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
-            for k in ("pcie_frac", "spec_min_p"):
-                v = tune.get(k)
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
-                    keys += f" {k}={float(v)!r}"
+            keys += tune_str(clean_tune(tune, strict=False))     # a bad value is dropped, never sent
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
@@ -1479,6 +1535,18 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        # The engine tune keys this request wants (svc.tune_defaults + the request's own strata_tune, merged by
+        # Service.run).  A change goes as a `TUNE` line before the request; its `TUNED ...` reply is one more stdout
+        # line, which the reader below treats as what it is: output, so it also resets the silence deadline.
+        want = (sampling or {}).get("strata_tune")
+        want = clean_tune(want, strict=False) if isinstance(want, dict) else {}
+        if want != getattr(self, "applied_tune", {}):     # getattr: a bare/hand-built engine has no tune state
+            try:
+                self.proc.stdin.write("TUNE" + tune_str(want) + "\n")
+                self.proc.stdin.flush()
+                self.applied_tune = want
+            except OSError:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -2611,6 +2679,17 @@ class Service:
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
+        # Who is exempt from that key (see API_KEY_SCOPES / LAN_NETS): the scope, plus api_key_allow, an ALLOW
+        # list of addresses and netblocks ("10.0.0.0/8", "192.168.4.7").  Both are retunable at runtime through
+        # POST /props; `api_key_nets` is the parsed form of the list, kept so the request path does no parsing.
+        # The DEFAULT is upstream 0.1.38's behaviour: every caller must present the key, this PC included.  An
+        # exemption is opt-in, chosen when the server starts (--api-key-scope / "api_key_scope" /
+        # $STRATA_API_KEY_SCOPE).
+        self.api_key_scope = "all"
+        self.api_key_allow: list[str] = []
+        self.api_key_nets: tuple = ()                  # parse_netblocks(api_key_allow), kept for the request path
+        # POST /props: engine tune keys that apply to every later request (a request's own `strata_tune` wins)
+        self.tune_defaults: dict = {}
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
@@ -2655,8 +2734,21 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        # Minefield 77: an unknown request field is named in the log, or - "strict_params": true - a 400.
+        # Minefield 04/25: "preserve_empty_think": true renders the pack's empty <think></think> for a prior
+        # assistant turn that has no reasoning; the default skips the empty wrapper.
+        self.strict_params = False
+        self.preserve_empty_think = False
+        self.params_warned = set()                        # field names already reported (once per server)
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def template_kwargs(self, kwargs: dict | None) -> dict:
+        """The request's template kwargs plus this server's defaults (the config's `preserve_empty_think`)."""
+        out = dict(kwargs or {})
+        if self.preserve_empty_think and "preserve_empty_think" not in out:
+            out["preserve_empty_think"] = True
+        return out
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -2724,6 +2816,37 @@ class Service:
                          "timings": {"save_ms": r["ms"]}}
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
+    def set_api_key_policy(self, scope=None, allow=None) -> dict:
+        """Set the API key's scope and/or the allow list (POST /props).  Only what is given changes, and both are
+        validated BEFORE either is applied, so a bad value in one answers 400 with the reason and leaves the other
+        untouched.  Returns the policy now in effect."""
+        new_scope = None
+        if scope is not None:
+            if not isinstance(scope, str) or scope.strip().lower() not in API_KEY_SCOPES:
+                raise ValueError(f"api_key_scope must be one of {', '.join(API_KEY_SCOPES)} (\"lan\" = this PC and "
+                                 f"the local network skip the key, \"localhost\" = this PC only, \"all\" = every "
+                                 f"caller needs it, \"off\" = nobody needs it)")
+            new_scope = scope.strip().lower()
+        new_nets = None
+        if allow is not None:
+            if not isinstance(allow, list):
+                raise ValueError("api_key_allow must be a list of IP addresses or netblocks")
+            new_nets = parse_netblocks(allow)               # ValueError on anything unreadable
+        if new_scope is not None:
+            self.api_key_scope = new_scope
+        if new_nets is not None:
+            self.api_key_nets = new_nets
+            self.api_key_allow = [str(n) for n in new_nets]
+        return self.api_key_policy()
+
+    def api_key_policy(self) -> dict:
+        """What GET /props reports and POST /props echoes: the scope, the allow list, and whether a key is set."""
+        return {"api_key": bool(self.api_key), "api_key_scope": self.api_key_scope,
+                "api_key_allow": list(self.api_key_allow)}
+
+    def key_needed_for(self, addr) -> bool:
+        """Does this peer address have to present the API key?  See key_needed_for() above."""
+        return key_needed_for(addr, self.api_key, self.api_key_scope, self.api_key_nets)
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -3170,6 +3293,9 @@ class Service:
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
+        # This fork (Minefield 04/25): the server's own rendering defaults - the config's `preserve_empty_think` -
+        # join the request's template kwargs here, the one place both APIs' prompts are rendered from.
+        kwargs = self.template_kwargs(kwargs)
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
@@ -3410,6 +3536,11 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if self.tune_defaults:         # POST /props: the engine tune keys every request carries (per request wins)
+            own = (sampling or {}).get("strata_tune")
+            sampling = {**(sampling or {}),
+                        "strata_tune": {**self.tune_defaults, **(own if isinstance(own, dict) else {})}}
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
@@ -3941,9 +4072,10 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None, strata=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run.  `strata`: the request's effective settings, on the first chunk - a
+    client reading the stream asserts on the same block a non-streamed response carries (Minefield 77)."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
@@ -3954,7 +4086,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    first = chunk({"role": "assistant", "content": ""})
+    if strata:
+        first["strata"] = strata
+    yield first
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -4011,13 +4146,49 @@ def _is_json(text: str) -> bool:
         return False
 
 
+def check_params(req: dict, api: str, svc) -> list[str]:
+    """Minefield trap 77: name the request fields this server does not implement.
+
+    It used to accept any invented top-level field with a 200, so a misspelled parameter was silent and a status
+    code confirmed nothing.  Every field is now implemented, named here, or — with the config's `strict_params` —
+    a 400.  A name is printed once per server lifetime, so a typo in a loop cannot flood the log."""
+    unknown = unknown_params(req, api)
+    if not unknown:
+        return []
+    if svc.strict_params:
+        raise ValueError("unknown request parameter(s): " + ", ".join(sorted(unknown))
+                         + " — this server implements none of them (config \"strict_params\": true)")
+    fresh = [k for k in unknown if k not in svc.params_warned]
+    if fresh:
+        svc.params_warned.update(fresh)
+        print(f"[strata] {api}: ignoring request parameter(s) this server does not implement: "
+              f"{', '.join(sorted(fresh))}", flush=True)
+    return unknown
+
+
+def effective_settings(svc, req: dict, *, thinking, tools, tool_choice, max_new) -> dict:
+    """What this request actually ran with — the response's `strata` block (Minefield trap 77: the status code
+    confirms nothing, so a client must be able to assert on the response per request rather than per config).
+    The sampling string is the engine's own (`Service.sampling_keys`), not a second guess at it."""
+    out = {"thinking": bool(thinking), "max_tokens": max_new, "tools_offered": len(tools or []),
+           "tool_choice": tool_choice}
+    if thinking:
+        out["reasoning_budget_tokens"] = svc.reasoning_budget(req) or 0
+    sampling = StrataEngine.sampling_keys(req if isinstance(req, dict) else {}).strip()
+    if sampling:
+        out["sampling"] = sampling
+    return out
+
+
 def openai_collect(chunks) -> dict:
-    content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    content, reasoning, by_index, last, mcp, strata = [], [], {}, None, [], None
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
+        if c.get("strata"):
+            strata = c["strata"]                  # the request's effective settings, lifted to the response
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -4044,6 +4215,10 @@ def openai_collect(chunks) -> dict:
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if strata:
+        if out["choices"][0]["finish_reason"] == "length" and not msg.get("content") and msg.get("reasoning_content"):
+            strata = dict(strata, cap_hit="reasoning")   # Minefield 12: the budget went on thinking, not on an answer
+        out["strata"] = strata
     return out
 
 
@@ -4316,30 +4491,31 @@ def make_handler(svc: Service):
                 pass
 
         def parse_request(self):
-            """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
-            (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
-            proxies that pass their own name on keep working."""
+            """The Host check (DNS rebinding) applies whenever the request is not authenticated - see
+            _host_check_applies(), which is deliberately not the negation of the key check."""
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
-            if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
+            if not self._host_check_applies() or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
+            way_out = ("send the API key (Authorization: Bearer ...) to skip this check" if svc.api_key else
+                       "or set an API key (\"api_key\"), which turns this check off for authenticated requests")
             print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
-                  f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
+                  f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, {way_out})",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
                              f"Host {host!r} is not allowed (DNS rebinding protection). Reaching Strata under this "
                              f"name on purpose? Add it to \"allowed_hosts\" in the config (strata-<model>.json) or to "
-                             f"the STRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), which "
-                             f"turns this check off"}})
+                             f"the STRATA_ALLOWED_HOSTS environment variable, {way_out}"}})
             return False
 
         def _foreign_page(self) -> bool:
-            """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
-            there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
+            """A /v1 POST from a browser page of another site (any site can POST text/plain there without a CORS
+            preflight) would burn GPU time: an Origin header must name an allowed page, and then the body must be
+            JSON.  An authenticated caller's Origin does not matter (upstream's rule); no Origin (curl, the SDKs,
+            other servers) means any content type, as before."""
             origin = self.headers.get("Origin")
-            if svc.api_key or not origin:
+            if not self._host_check_applies() or not origin:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
@@ -4439,14 +4615,44 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
-        def _authorized(self) -> bool:
+        def _key_matches(self) -> bool:
+            """Does this request carry the API key (when one is set)?  No response and no logging: the callers
+            decide what a mismatch means."""
             if not svc.api_key:
-                return True
+                return False
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            return bool(key_matches(given, svc.api_key))
+
+        def _key_ok(self) -> bool:
+            """Does this request pass the API-key check (without answering)?  What the API endpoints ask: no key is
+            set, or the scope/allow list exempts this address, or the key is present and right."""
+            return (not svc.api_key or not svc.key_needed_for(self.client_address[0])
+                    or self._key_matches())
+
+        def _host_check_applies(self) -> bool:
+            """The Host (DNS rebinding) and Origin checks run for a request that is NOT authenticated.  A request
+            that carries the key skips them (upstream's rule: a tunnel or proxy passing its own name on keeps
+            working), and so does one that must carry a key but did not - `_authorized` refuses it anyway.
+
+            **This is deliberately NOT the negation of `_key_ok()`**, and the difference is the whole security
+            story: the API check passes on a KEYLESS server (there is nothing to present), while the rebinding and
+            cross-site checks must run exactly there - the keyless server is the one they exist for.  Only an
+            address `api_key_scope` exempts turns `_key_ok()` true without the key, and a rebinding page arrives
+            from that address (127.0.0.1), so it must keep the checks."""
+            return not (svc.key_needed_for(self.client_address[0]) or self._key_matches())
+
+        def _authorized(self, force_key: bool = False) -> bool:
+            # `force_key` (POST /props) ignores the scope's exemptions: the key itself, or no key at all
+            ok = (self._key_matches() or not svc.api_key) if force_key else self._key_ok()
+            if ok:
                 return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+            where = (" (the key itself is the owner's: POST /props ignores api_key_scope)" if force_key else
+                     "" if svc.api_key_scope == "off" else
+                     f" (api_key_scope is \"{svc.api_key_scope}\": this address is not exempt; add it to "
+                     f"api_key_allow, or use scope \"lan\")")
+            self._json(401, {"error": {"type": "authentication_error",
+                                       "message": f"missing or wrong API key{where}"}})
             return False
 
         def do_GET(self):
@@ -4606,6 +4812,9 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
+            if path == "/props":                             # the retunable settings: API-key policy, engine tune
+                if self._own_page("the server's settings can be changed"):
+                    self._props_set()
             if path in ("/unload", "/load") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
@@ -4756,7 +4965,9 @@ def make_handler(svc: Service):
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
-                     "is_sleeping": not svc.loaded()}
+                     "is_sleeping": not svc.loaded(),
+                     **svc.api_key_policy(), "strata_tune": dict(svc.tune_defaults),
+                     "strict_params": svc.strict_params, "preserve_empty_think": svc.preserve_empty_think}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -4798,6 +5009,81 @@ def make_handler(svc: Service):
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
+        def _props_set(self):
+            """POST /props - the server's retunable settings, in one place with GET /props:
+                {"api_key_scope": "all"|"lan"|"localhost"|"off"}  who skips the API key ("all" = the default:
+                                                                  nobody: upstream 0.1.38's behaviour)
+                {"api_key_allow": ["10.0.0.0/8", "192.168.4.7"]}  and which addresses do, on top of the scope
+                {"api_key": "..."}                          the key itself ("" = none: the API becomes open)
+                {"strata_tune": {"prefill": 4096, ...}}      engine keys every later request carries
+            Changing the API key's policy is the key owner's business: when a key is set it must be presented here
+            even from an exempt address, or the exempt network could turn its own exemption into everyone's."""
+            if not self._authorized(force_key=True):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                length = 0
+            try:
+                req = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object")
+            except (ValueError, TypeError) as e:
+                self._json(400, {"error": {"message": f"bad JSON body: {e}"}})
+                return
+            known = ("api_key_scope", "api_key_allow", "api_key", "strata_tune",
+                     "strict_params", "preserve_empty_think")
+            unknown = [k for k in req if k not in known]
+            if unknown:
+                self._json(400, {"error": {"message": f"unknown setting(s) {', '.join(sorted(unknown))} "
+                                                      f"(retunable: {', '.join(known)})"}})
+                return
+            changed = []
+            try:
+                scope = req.get("api_key_scope")
+                allow = req.get("api_key_allow")
+                if scope is not None or allow is not None:
+                    svc.set_api_key_policy(scope=scope, allow=allow)     # ValueError -> 400, nothing half-applied
+                    changed += [k for k in ("api_key_scope", "api_key_allow") if k in req]
+                if "api_key" in req:
+                    key = req["api_key"]
+                    if not isinstance(key, str):
+                        raise ValueError("api_key must be a string (\"\" sets none)")
+                    svc.api_key = key.strip()
+                    if not svc.api_key:
+                        print("[strata] the API key was cleared by POST /props: anyone who can reach this server can "
+                              "use it", flush=True)
+                    changed.append("api_key")
+                if "strata_tune" in req:
+                    tune = req["strata_tune"]
+                    if not isinstance(tune, dict):
+                        raise ValueError("strata_tune must be an object of tuning keys")
+                    for k, v in tune.items():          # a null value drops a key back to the engine's default
+                        if v is None:
+                            if k not in TUNE_KEYS:
+                                raise ValueError(f"strata_tune: unknown key {k!r} (known: {', '.join(TUNE_KEYS)})")
+                            svc.tune_defaults.pop(k, None)
+                    svc.tune_defaults.update(clean_tune({k: v for k, v in tune.items() if v is not None}))
+                    changed.append("strata_tune")
+                for name in ("strict_params", "preserve_empty_think"):   # the Minefield knobs, without a restart
+                    if name in req:
+                        if not isinstance(req[name], bool):
+                            raise ValueError(f"{name} must be true or false")
+                        setattr(svc, name, req[name])
+                        changed.append(name)
+            except ValueError as e:
+                self._json(400, {"error": {"message": str(e)}})
+                return
+            if changed:
+                print(f"[strata] POST /props changed {', '.join(changed)}: api_key_scope="
+                      f"\"{svc.api_key_scope}\", api_key_allow={svc.api_key_allow or '[]'}, "
+                      f"key {'set' if svc.api_key else 'none'}, strata_tune={svc.tune_defaults or '{}'}, "
+                      f"strict_params={svc.strict_params}, preserve_empty_think={svc.preserve_empty_think}",
+                      flush=True)
+            self._json(200, {"success": True, "changed": changed, **svc.api_key_policy(),
+                             "strata_tune": dict(svc.tune_defaults), "tune_keys": sorted(TUNE_KEYS),
+                             "strict_params": svc.strict_params,
+                             "preserve_empty_think": svc.preserve_empty_think})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -4939,17 +5225,21 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            check_params(req, "openai", svc)                 # Minefield 77: name what this server does not implement
+            tc_mode, tc_name = tool_choice_strict(req)       # Minefield 78: 400 on a choice it cannot honour
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
-            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
-                tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            # Minefield 78: "none" drops the payload before the format check below sees it (as the Responses
+            # route does - no tools are offered), a named choice narrows the offer to that one function
+            tools, tool_report = offer_tools(tools, tc_mode, tc_name)
+            force = forced_call(req.get("tool_choice"), tools)      # "required" / a named tool: the call's opening
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            # tool_choice "none" means no tool may be called on this turn: the MCP tools are not even collected
+            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None and tc_mode != "none"
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
@@ -4963,12 +5253,15 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+            strata = effective_settings(svc, req, thinking=thinking, tools=tools, tool_choice=tool_report,
+                                        max_new=max_new)      # Minefield 77: the echo, per request
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force,
+                                   strata=strata)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -5168,22 +5461,25 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
+            check_params(req, "anthropic", svc)              # Minefield 77
+            tc_mode, tc_name = tool_choice_strict(req, "anthropic")   # Minefield 78 (its own shapes: "any"/"tool")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
-            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
-                tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            tools, tool_report = offer_tools(tools, tc_mode, tc_name)
+            force = forced_call(req.get("tool_choice"), tools)         # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+            strata = effective_settings(svc, req, thinking=thinking, tools=tools, tool_choice=tool_report,
+                                        max_new=max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                return self._json(200, dict(anthropic_collect(events), strata=strata))
             self._sse()
             try:
                 for item in events:
@@ -5452,6 +5748,68 @@ def key_matches(given: str, key) -> bool:
         except UnicodeEncodeError:
             pass
     return ok
+def parse_netblocks(entries) -> tuple:
+    """Addresses and netblocks, parsed: "10.0.0.0/8", "192.168.4.7" (a bare address is a /32, or a /128 in IPv6),
+    "fd00::/8".  A host name, a port or anything else is an error - this list decides who skips the API key, so a
+    value that cannot be read must stop the caller rather than quietly exempt nobody (or everybody)."""
+    out = []
+    for raw in entries:
+        if isinstance(raw, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            out.append(raw)
+            continue
+        x = str(raw).strip()
+        try:
+            # a bare address is a host route (/32, or /128 in IPv6); an explicit netblock must BE a netblock -
+            # "192.168.4.7/24" is a typo, not a request for the whole /24, so it is refused rather than widened
+            out.append(ipaddress.ip_network(x) if "/" in x
+                       else ipaddress.ip_network(x + ("/128" if ":" in x else "/32")))
+        except ValueError:
+            raise ValueError(f"api_key_allow: {x!r} is not an IP address or a netblock like 10.0.0.0/8 or "
+                             f"192.168.4.7") from None
+    return tuple(dict.fromkeys(out))
+
+
+LOOPBACK_NETWORKS = parse_netblocks(LOOPBACK_NETS)   # 127.0.0.0/8, ::1/128 - exempt in every scope but "off"
+LAN_NETWORKS = parse_netblocks(LAN_NETS)             # the private/link-local ranges, exempt under scope "lan"
+
+
+def api_key_allow_of(value) -> list[str]:
+    """The api_key_allow setting (an address/netblock, a list of them, or a comma-separated string as
+    --api-key-allow / $STRATA_API_KEY_ALLOW take it), normalized: the addresses that skip the API key on top of
+    the scope's own exemptions."""
+    items = [] if value in (None, "") else value
+    if isinstance(items, str):
+        items = [x for x in items.split(",") if x.strip()]
+    if not isinstance(items, list):
+        raise ValueError("api_key_allow: expected an IP address or netblock, or a list of them")
+    return [str(n) for n in parse_netblocks(items)]
+
+
+def in_netblocks(addr, nets) -> bool:
+    """`addr` (a peer address) is inside one of the parsed `nets`.  An address that cannot be read is not."""
+    try:
+        ip = ipaddress.ip_address(str(addr).strip().strip("[]").split("%")[0])
+    except ValueError:
+        return False
+    return any(ip.version == n.version and ip in n for n in nets)
+
+
+def key_needed_for(addr, api_key, scope: str = "all", nets=()) -> bool:
+    """Does this peer address have to present the API key?  False when no key is set, or the scope is "off";
+    "all" (the default, and upstream 0.1.38's behaviour) asks everyone including this PC; otherwise this PC never
+    needs it, then the allow list (api_key_allow), then - with scope "lan" - the local network.  An address that
+    cannot be read needs the key (fail closed): a malformed peer address must not be an exemption."""
+    if not api_key or scope == "off":
+        return False
+    if scope == "all":                                 # upstream 0.1.38: the key is required from every caller
+        return True
+    if in_netblocks(addr, LOOPBACK_NETWORKS):          # this PC, in the scopes that exempt anything
+        return False
+    if in_netblocks(addr, nets):                       # api_key_allow
+        return False
+    if scope == "lan":
+        return not in_netblocks(addr, LAN_NETWORKS)
+    return True                                        # scope "localhost": anything but this PC needs the key
 
 
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
@@ -5472,6 +5830,29 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
         return True
     name = host_name(rest)
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
+
+
+def browser_suppressed(env=None) -> bool:
+    """$STRATA_NO_BROWSER=1 (or true/yes/on): a start never opens a browser tab, whatever --open says.  For a
+    launcher (setup writes one per model, with --open) whose command line cannot be edited, and for a headless
+    or kiosk start where a browser window would land on somebody's desktop."""
+    v = ((os.environ if env is None else env).get("STRATA_NO_BROWSER") or "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
+def open_browser(where: str, port: int, wanted: bool, env=None) -> bool:
+    """Open the local page in a browser tab, if the start asked for it (`--open`) and nothing suppresses it.
+    Returns whether a tab was opened; a suppressed popup says where the page is instead, so a user who expected
+    a window knows the server came up."""
+    if not wanted:
+        return False                                    # the default: no popup, --open asks for one
+    url = f"http://{where}:{port}/"
+    if browser_suppressed(env):
+        print(f"[strata] not opening a browser tab ($STRATA_NO_BROWSER is set); the page is at {url}", flush=True)
+        return False
+    import webbrowser
+    webbrowser.open(url)
+    return True
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
@@ -5625,12 +6006,27 @@ def main() -> int:
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
+    ap.add_argument("--no-open", dest="open", action="store_false",
+                    help="never open a browser tab; also $STRATA_NO_BROWSER=1.  --no-open after --open wins (the last "
+                         "of the two decides) and the environment variable beats both, so a launcher that passes "
+                         "--open can still be silenced without editing it")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
+    ap.add_argument("--api-key-scope", default=os.environ.get("STRATA_API_KEY_SCOPE") or None,
+                    choices=list(API_KEY_SCOPES),
+                    help="who is exempt from that key - default \"all\": every caller must present it, exactly as "
+                         "0.1.38 did. \"lan\" exempts this PC AND the local network (the private/link-local "
+                         "ranges), \"localhost\" this PC only, \"off\" nobody needs it; also \"api_key_scope\" in "
+                         "the config or $STRATA_API_KEY_SCOPE")
+    ap.add_argument("--api-key-allow", default=os.environ.get("STRATA_API_KEY_ALLOW") or None, metavar="LIST",
+                    help="addresses that skip the key on top of the scope, comma-separated "
+                         "(needed with the default scope \"all\", which exempts nobody): "
+                         "\"10.1.2.0/24,192.168.4.7\"; also \"api_key_allow\" in the config or "
+                         "$STRATA_API_KEY_ALLOW")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
@@ -5758,6 +6154,29 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    # Who is exempt from that key (0.1.38's api_key): the scope - "all" (the default: nobody, every caller
+    # presents the key, exactly as upstream), "lan" for this PC and the local network, "localhost" for this PC
+    # only, "off" for nobody needing it - plus api_key_allow, an ALLOW list of addresses and netblocks.  Chosen
+    # at invocation (--api-key-scope / --api-key-allow, or the two config keys / $STRATA_API_KEY_SCOPE /
+    # $STRATA_API_KEY_ALLOW) and retunable while it runs: POST /props {"api_key_scope": .., "api_key_allow": [..]}.
+    try:
+        allow_value = a.api_key_allow if a.api_key_allow is not None else cfg.get("api_key_allow")
+        svc.api_key_allow = api_key_allow_of(allow_value)
+        svc.api_key_nets = parse_netblocks(svc.api_key_allow)
+        svc.api_key_scope = a.api_key_scope or cfg.get("api_key_scope") or "all"
+        if svc.api_key_scope not in API_KEY_SCOPES:
+            raise ValueError(f"api_key_scope must be one of {', '.join(API_KEY_SCOPES)}, not "
+                             f"{svc.api_key_scope!r}")
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if svc.api_key:
+        where = {"all": "no one: every caller must present it (0.1.38's behaviour)",
+                 "lan": "this PC and the local network",
+                 "localhost": "this PC",
+                 "off": "nobody (the key is NOT checked: api_key_scope \"off\")"}[svc.api_key_scope]
+        print(f"[strata] API key: required from every address except {where}"
+              + (f", plus {', '.join(svc.api_key_allow)} (api_key_allow)" if svc.api_key_allow else "")
+              + " - change it while it runs with POST /props", flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
@@ -5819,6 +6238,13 @@ def main() -> int:
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+    svc.strict_params = bool(cfg.get("strict_params"))       # Minefield 77: an unknown request field is a 400
+    svc.preserve_empty_think = bool(cfg.get("preserve_empty_think"))   # Minefield 04/25: the pack's rendering
+    if svc.strict_params:
+        print("[strata] strict_params: a request field this server does not implement is a 400", flush=True)
+    if svc.preserve_empty_think:
+        print("[strata] preserve_empty_think: a prior turn without reasoning keeps its empty <think> block",
+              flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
@@ -5845,7 +6271,7 @@ def main() -> int:
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
-          f"{', API key required' if svc.api_key else ''})", flush=True)
+          f"{', API key required' + (' (scope ' + svc.api_key_scope + ')') if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
@@ -5856,15 +6282,17 @@ def main() -> int:
             print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
         if not svc.api_key:
             print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
+                  "to the config (clients send it as their API key; the web page asks for it). With a key, "
+                  "\"api_key_scope\" decides who may skip it: \"lan\" (the default: this PC and the local network), "
+                  "\"localhost\" (this PC only) or \"off\" (nobody asked)", flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
-        import webbrowser                                  # run-<model>.bat still passes --open)
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        # run-<model>.bat still passes --open); $STRATA_NO_BROWSER beats both
+        open_browser("127.0.0.1" if a.host in ("0.0.0.0", "") else a.host, a.port, a.open)
     # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
