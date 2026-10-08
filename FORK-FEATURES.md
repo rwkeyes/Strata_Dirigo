@@ -231,6 +231,7 @@ are the changes an existing user can actually meet:
 | With `api_key` set, the **`Host`/`Origin` checks are skipped only for a request that presents the key**, not for every request | an address exemption would otherwise re-open the DNS-rebinding hole (a rebinding page arrives from an exempt `127.0.0.1`) | a tunnel that passes its own name on should send the key, or be listed in `allowed_hosts` |
 | **A prior assistant turn with no reasoning renders without the empty `<think></think>` wrapper** | the empty block nudges thinking collapse and costs the conversation cache (minefield 04/25) | `"preserve_empty_think": true` |
 | **`tool_choice: "none"` actually gates the turn** where upstream ignored it | ignoring it fails *open* (minefield 78) | nothing needed — an absent `tool_choice` behaves exactly as before |
+| **A `tool_choice` this server cannot honour is a 400**, not a silent "auto" (upstream logs it and lets the model decide) | a typo must not read as a choice that was applied | send a value upstream accepts: `"auto"`, `"none"`, `"required"`, or a function name the request actually offers |
 
 ## File map
 
@@ -240,8 +241,8 @@ warm-retune/apply.sh                                 feature 1 — apply | undo 
 warm-retune/RETUNE-CANDIDATES.md                     feature 7 — the audit behind feature 2
 src/program/generate.cpp                             feature 2 — the TUNE line and its handler
 serve/server.py                                      features 2,3,4 — POST /props, the scope, --no-open
-CMakeLists.txt                                       feature 5 — the STRATA_ISA_FLOOR block
-src/kernels/cpu/kq_avx1.cpp + kq_avx1.hpp            feature 5 — the AVX1 router dot
+CMakeLists.txt                                       feature 5 — upstream's since v0.1.39 (this fork's origin)
+src/kernels/cpu/kq_avx1.cpp + kq_avx1.hpp            feature 5 — upstream's since v0.1.39 (this fork's origin)
 src/kernels/cpu/expert_layout.cpp + .hpp,
 src/kernels/cpu/native_expert.cpp,
 src/kernels/cpu/iq_avx2.cpp,
@@ -263,9 +264,16 @@ Ops scripts (not in the repo, they drive a deployment):
 
 ## Verification status
 
-* **Features 2–4, 8–10**: **271 tests** green (test_minefield 45, test_security 47, test_server 121+,
-  lifecycle 8, mcp 25, monitor 7, structured 8); `test_detok`'s 3 errors are pre-existing on v0.1.38 (a missing
-  `regex` module in this environment).  Features 8–10 also carry the upstream minefield doctor's own probes — 77,
+* **Features 2–4, 8–10, on the v0.1.41 base**: **667 tests green, 11 skipped**, which is the WHOLE `serve/`
+  suite (`python -m unittest discover -s serve -p 'test_*.py'`): test_security 47, test_minefield 45, test_server
+  (upstream's own, ~460) and the rest.  The previously-noted `test_detok` errors are gone on this base.
+  **Upstream's own test files are upstream's**: `serve/test_server.py` is upstream's file plus this fork's
+  `NoBrowser` class and **three adjusted methods**, each naming the fork behaviour it disagrees with —
+  `ForcedToolChoice.test_values_it_cannot_honour_are_a_400_here` (upstream logs and acts as "auto"),
+  `ForcedToolChoice.test_anthropic_any_tool_none` (a name the request does not offer: 400 here, "auto" there) and
+  `LiteralThinkTags.test_a_client_that_sends_the_reasoning_inline` (upstream counts the empty `<think></think>`
+  wrapper's markers; this fork writes no wrapper unless asked, Minefield 04/25).  Every other file of upstream's
+  test set is byte-identical to the release.  Features 8–10 also carry the upstream minefield doctor's own probes — 77,
   78 and 04/25 come back **clean** on the retest, and the two that remain (12, 21) are properties of the lane and
   the checkpoint, reported and remediable as `warm-retune/MINEFIELD-FINDINGS.md` sets out.  The engine half of
   feature 2 compiles (`g++ -fsyntax-only … 0 errors`) but has **not been run** on a pack yet.
@@ -275,6 +283,10 @@ Ops scripts (not in the repo, they drive a deployment):
   ~12% decode on a tighter controlled test — treat "no cost" as unmeasured.
 * **Feature 6**: exercised by every setup run; the vendored tree it patches is gitignored and re-extracted by
   setup, which is exactly why the patch ships as a patch.
+* **The v0.1.41 sync**: the engine **builds and loads** on gfx1100 with `STRATA_ISA_FLOOR=avx`
+  (`engine/BUILD.json`, version 0.1.41, source hash `ae92017307778aa2`).  It has **not been run on a GPU** from
+  this tree — the machine that carried the sync has no AMD card — so the fork makes **no throughput claim** for
+  this build; the floor's own measurements above are the only engine-level numbers it has.
 
 ## Licence
 

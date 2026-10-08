@@ -40,7 +40,9 @@ Measured on an RX 7900 XTX serving a 35B-A3B MoE (Vulkan, KV q8_0):
 
 Upstream cannot start on a CPU without AVX2 + FMA/F16C: the CPU expert kernels are AVX2 at least, and the
 released ggml-cpu is compiled for the *build host*, so such a machine gets an illegal instruction instead of
-an error message. With `STRATA_ISA_FLOOR=ON` this fork compiles ggml-cpu **once** for ggml's own
+an error message. **Upstream carries this since v0.1.41's predecessor, v0.1.39** (its `CMakeLists.txt` credits
+this fork), with the string spelling `STRATA_ISA_FLOOR=avx`. The measurements below are this fork's, from before
+that, and are kept as the evidence. With `STRATA_ISA_FLOOR=ON` this fork compiled ggml-cpu **once** for ggml's own
 `sandybridge` feature set (SSE4.2 + AVX — no FMA, no F16C, no AVX2) and relaxes the startup gate to
 "AVX2 with FMA/F16C, **or** AVX1". Measured on the machine this exists for: a Xeon E5-2687W (AVX only)
 *started* fine and then died in `bf16_rows_dot_multi+0x1d9` (`vpmovzxwd`) on the **first request** — the
@@ -49,14 +51,19 @@ fallback, and the AVX2 sign table in `iq_avx2.cpp` is `constexpr` (its runtime c
 vectorised into AVX-2 and ran before `main`).
 
 ```sh
-STRATA_ISA_FLOOR=1 ./setup.sh --backend hip --family qwen --model IQ3_XXS --context 32768 \
+# v0.1.41 (upstream's own, and what this tree uses now):
+STRATA_ISA_FLOOR=avx ./setup.sh --backend hip --family qwen --model IQ3_XXS --context 32768 \
     --kv int8 --gguf-dir /path/to/the/two/shards --build --no-start --yes
+
+# the fork's old boolean form, on the pre-0.1.39 line only:
+STRATA_ISA_FLOOR=1 ./setup.sh ... --build --no-start --yes
 ```
 
-**`STRATA_ISA_FLOOR` is not a CMake `option()`** in this tree — it is only read by `if(STRATA_ISA_FLOOR)`,
-so on a fresh build directory it is undefined (OFF) and you silently get a build-host-native engine. That is
-why `setup.py` here passes `-DSTRATA_ISA_FLOOR=ON` explicitly when `STRATA_ISA_FLOOR=1` is set (see
-`isa_floor_defs()`), and why a hand-run cmake needs the same flag. Leaving it unset breaks nothing — you
+**On the fork's old line, `STRATA_ISA_FLOOR` was not a CMake `option()`** — it was only read by
+`if(STRATA_ISA_FLOOR)`, so a fresh build directory left it undefined (OFF) and you silently got a
+build-host-native engine; that is why `setup.py` there passed `-DSTRATA_ISA_FLOOR=ON` explicitly. Upstream's
+own `isa_floor_defs()` now passes the string value and clears a build directory configured for a different
+floor, and `setup.py` auto-detects the floor from `/proc/cpuinfo`. Leaving it unset breaks nothing — you
 simply never get the floor.
 
 **What it costs:** the floor is ggml-cpu-only. Strata's own AVX2/AVX-512 kernel units (`iq_avx2.cpp`,
