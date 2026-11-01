@@ -1,0 +1,87 @@
+[
+  {
+    "label": "ab029-d",
+    "leg": "code",
+    "http": 200,
+    "wall_s": 2.74,
+    "metrics": {
+      "prompt_tokens": 32.0,
+      "reused": 0.0,
+      "fresh": 32.0,
+      "prefill_ms": 682.0,
+      "prefill_tps": 46.9,
+      "generated": 83.0,
+      "decode_ms": 2049.0,
+      "decode_tps": 40.5
+    },
+    "usage": {
+      "prompt_tokens": 32,
+      "completion_tokens": 83,
+      "total_tokens": 115,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish": "stop",
+    "content": "```python\nclass ListNode:\n    def __init__(self, val=0, next=None):\n        self.val = val\n        self.next = next\n\ndef reverse_list(head):\n    prev = None\n    curr = head\n    while curr:\n        nxt = curr.next\n        curr.next = prev\n        prev = curr\n        curr = nxt\n    return prev\n```"
+  },
+  {
+    "label": "ab029-d",
+    "leg": "long",
+    "http": 200,
+    "wall_s": 21.17,
+    "metrics": {
+      "prompt_tokens": 30178.0,
+      "reused": 0.0,
+      "fresh": 30178.0,
+      "prefill_ms": 21137.0,
+      "prefill_tps": 1427.7,
+      "generated": 1.0,
+      "decode_ms": 23.0,
+      "decode_tps": 44.0
+    },
+    "usage": {
+      "prompt_tokens": 30178,
+      "completion_tokens": 1,
+      "total_tokens": 30179,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish": "length",
+    "content": "Every"
+  },
+  {
+    "label": "ab029-d",
+    "leg": "needle",
+    "http": 200,
+    "wall_s": 5.63,
+    "metrics": {
+      "prompt_tokens": 7855.0,
+      "reused": 0.0,
+      "fresh": 7855.0,
+      "prefill_ms": 5444.0,
+      "prefill_tps": 1443.0,
+      "generated": 10.0,
+      "decode_ms": 179.0,
+      "decode_tps": 56.0
+    },
+    "usage": {
+      "prompt_tokens": 7855,
+      "completion_tokens": 10,
+      "total_tokens": 7865,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish": "stop",
+    "content": "ZQ-7731-KX"
+  },
+  {
+    "label": "ab029-d",
+    "leg": "overflow",
+    "http": 400,
+    "body": "{\"error\": {\"type\": \"invalid_request_error\", \"message\": \"request exceeds the context window: prompt (165779 tokens) leaves no room to answer in the context (131072); requests are never truncated\"}}",
+    "wall_s": 0.04
+  }
+]

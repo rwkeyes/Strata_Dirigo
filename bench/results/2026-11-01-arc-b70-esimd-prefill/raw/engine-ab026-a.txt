@@ -1,0 +1,3 @@
+strata generate: pre-filled 11743 of 11743 slots from the profile in 103.5 s (232 MB/s); slot 0 verified
+strata generate: 545 of 545 experts missing from VRAM (+ 0 in the prompt loan's slots) mirrored in pinned host memory (1.05 GiB, 0.5 s); the GPU reads them over PCIe
+strata generate: session is up (engine 0.1.51)

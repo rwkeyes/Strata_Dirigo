@@ -1,0 +1,263 @@
+[
+  {
+    "label": "ab029-b",
+    "kind": "warmup",
+    "trial": 0,
+    "wall_s": 0.2873158360016532,
+    "metrics": {
+      "prompt_tokens": 15.0,
+      "reused": 0.0,
+      "fresh": 15.0,
+      "prefill_ms": 175.0,
+      "prefill_tps": 85.6,
+      "generated": 2.0,
+      "decode_ms": 97.0,
+      "decode_tps": 20.6
+    },
+    "usage": {
+      "prompt_tokens": 15,
+      "completion_tokens": 2,
+      "total_tokens": 17,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "stop",
+    "message": {
+      "role": "assistant",
+      "content": "READY"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "fresh",
+    "trial": 1,
+    "wall_s": 15.501092358026654,
+    "metrics": {
+      "prompt_tokens": 4210.0,
+      "reused": 0.0,
+      "fresh": 4210.0,
+      "prefill_ms": 11389.0,
+      "prefill_tps": 369.6,
+      "generated": 128.0,
+      "decode_ms": 4107.0,
+      "decode_tps": 31.2
+    },
+    "usage": {
+      "prompt_tokens": 4210,
+      "completion_tokens": 128,
+      "total_tokens": 4338,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The source code defines a series of exported functions named `rule0` through `rule139`, each implementing a specific conditional arithmetic transformation based on an integer input `x`. For any given function `ruleN`, the logic checks if the input `x` is strictly equal to the constant `N`; if this condition is true, the function returns `x + (N + 1)`, effectively incrementing the value by one more than its index. If the condition is false, the function returns `x - N`, subtracting the index value from the input. This pattern creates a family of functions where each rule acts as"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "followup",
+    "trial": 1,
+    "wall_s": 5.858364643994719,
+    "metrics": {
+      "prompt_tokens": 4451.0,
+      "reused": 4203.0,
+      "fresh": 248.0,
+      "prefill_ms": 1412.0,
+      "prefill_tps": 175.7,
+      "generated": 128.0,
+      "decode_ms": 4442.0,
+      "decode_tps": 28.8
+    },
+    "usage": {
+      "prompt_tokens": 4451,
+      "completion_tokens": 128,
+      "total_tokens": 4579,
+      "prompt_tokens_details": {
+        "cached_tokens": 4203
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the **exact match condition** where `x === N` (e.g., calling `rule5(5)`), which triggers the unique \"increment\" branch (`x + N + 1`) rather than the default \"decrement\" branch (`x - N`). This is critical because it represents the only scenario where the function's output increases relative to its input, whereas all other integer inputs result in a decrease.\n\nThe **smallest useful regression test** should verify this specific transition for a non-zero index to ensure the logic isn't accidentally collapsing into the default branch or mishandling arithmetic precedence."
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "fresh",
+    "trial": 2,
+    "wall_s": 9.72448038199218,
+    "metrics": {
+      "prompt_tokens": 8830.0,
+      "reused": 0.0,
+      "fresh": 8830.0,
+      "prefill_ms": 6216.0,
+      "prefill_tps": 1420.5,
+      "generated": 128.0,
+      "decode_ms": 3502.0,
+      "decode_tps": 36.5
+    },
+    "usage": {
+      "prompt_tokens": 8830,
+      "completion_tokens": 128,
+      "total_tokens": 8958,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "This source code defines a series of exported functions named `rule0` through `rule279`, each accepting a single numeric argument `x`. Every function follows an identical logical pattern: it checks if the input `x` is strictly equal to the integer value embedded in its name (e.g., `rule5` checks for 5). If this equality condition is met, the function returns the result of adding one more than that specific index to `x` (for example, `rule5(5)` returns `5 + 6 = 11`). Conversely, if the input does not match the expected value, the"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "followup",
+    "trial": 2,
+    "wall_s": 3.9592513579991646,
+    "metrics": {
+      "prompt_tokens": 9071.0,
+      "reused": 8958.0,
+      "fresh": 113.0,
+      "prefill_ms": 555.0,
+      "prefill_tps": 203.6,
+      "generated": 128.0,
+      "decode_ms": 3400.0,
+      "decode_tps": 37.6
+    },
+    "usage": {
+      "prompt_tokens": 9071,
+      "completion_tokens": 128,
+      "total_tokens": 9199,
+      "prompt_tokens_details": {
+        "cached_tokens": 8958
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the **exact match** condition where `x` equals the function's specific index (e.g., calling `rule0(0)` or `rule279(279)`). This triggers the \"true\" branch of the ternary operator, resulting in an output that is significantly larger than the input (`x + (index + 1)`), whereas any other integer input triggers the \"false\" branch, resulting in a smaller output (`x - index`).\n\nThe **smallest useful regression test** should verify this branching logic for both the boundary and non-boundary cases. A minimal test"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "fresh",
+    "trial": 3,
+    "wall_s": 5.359522692044266,
+    "metrics": {
+      "prompt_tokens": 4210.0,
+      "reused": 0.0,
+      "fresh": 4210.0,
+      "prefill_ms": 3117.0,
+      "prefill_tps": 1350.5,
+      "generated": 128.0,
+      "decode_ms": 2237.0,
+      "decode_tps": 57.2
+    },
+    "usage": {
+      "prompt_tokens": 4210,
+      "completion_tokens": 128,
+      "total_tokens": 4338,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The source code defines a series of exported functions named `rule0` through `rule139`, each accepting a single numeric argument `x`. Every function follows an identical logical pattern: it checks if the input `x` is strictly equal to the integer value embedded in its name (e.g., `rule5` checks for `5`). If this equality condition is met, the function returns the result of adding one more than that specific index to `x` (i.e., `x + (index + 1)`); otherwise, it returns the result of subtracting that same index from `x` (i.e.,"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "followup",
+    "trial": 3,
+    "wall_s": 4.467047764977906,
+    "metrics": {
+      "prompt_tokens": 4451.0,
+      "reused": 4203.0,
+      "fresh": 248.0,
+      "prefill_ms": 507.0,
+      "prefill_tps": 489.3,
+      "generated": 128.0,
+      "decode_ms": 3957.0,
+      "decode_tps": 32.4
+    },
+    "usage": {
+      "prompt_tokens": 4451,
+      "completion_tokens": 128,
+      "total_tokens": 4579,
+      "prompt_tokens_details": {
+        "cached_tokens": 4203
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the specific integer value that triggers the \"true\" branch of a given rule function (e.g., `x === 0` for `rule0`, `x === 139` for `rule139`). For any other input, including negative integers, zero (when not the target), or large positive integers, the function executes the \"false\" branch (`x - index`). The smallest useful regression test should verify this exact equality condition because it is the only path that produces a different arithmetic result than the default subtraction. A robust test suite must also include inputs for negative numbers and unexpected types"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "fresh",
+    "trial": 4,
+    "wall_s": 7.968814748048317,
+    "metrics": {
+      "prompt_tokens": 8830.0,
+      "reused": 0.0,
+      "fresh": 8830.0,
+      "prefill_ms": 6017.0,
+      "prefill_tps": 1467.5,
+      "generated": 128.0,
+      "decode_ms": 1946.0,
+      "decode_tps": 65.8
+    },
+    "usage": {
+      "prompt_tokens": 8830,
+      "completion_tokens": 128,
+      "total_tokens": 8958,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The source code defines a series of exported functions named `rule0` through `rule279`, each accepting a single numeric argument `x`. Every function follows an identical logical pattern: it checks if the input `x` is strictly equal to the integer value embedded in its name (e.g., `rule5` checks for 5). If this equality condition is met, the function returns the result of adding one more than that specific integer to `x` (for example, `rule5(5)` returns `5 + 6 = 11`). Conversely, if the input does not match the expected value, the"
+    }
+  },
+  {
+    "label": "ab029-b",
+    "kind": "followup",
+    "trial": 4,
+    "wall_s": 2.712602676008828,
+    "metrics": {
+      "prompt_tokens": 9071.0,
+      "reused": 8958.0,
+      "fresh": 113.0,
+      "prefill_ms": 342.0,
+      "prefill_tps": 330.8,
+      "generated": 128.0,
+      "decode_ms": 2366.0,
+      "decode_tps": 54.1
+    },
+    "usage": {
+      "prompt_tokens": 9071,
+      "completion_tokens": 128,
+      "total_tokens": 9199,
+      "prompt_tokens_details": {
+        "cached_tokens": 8958
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the **exact match** condition where `x` equals the function's specific index (e.g., `rule0(0)` or `rule279(279)`). This triggers the \"true\" branch of the ternary operator, returning `x + (index + 1)`. For example, `rule0(0)` returns `1` and `rule279(279)` returns `558`. This is critical because it distinguishes the function's special behavior from its default fallback.\n\nThe **smallest useful regression test** should verify both branches"
+    }
+  }
+]

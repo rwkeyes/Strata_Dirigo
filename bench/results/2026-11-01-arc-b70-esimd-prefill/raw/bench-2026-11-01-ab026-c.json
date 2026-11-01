@@ -1,0 +1,263 @@
+[
+  {
+    "label": "ab026-c",
+    "kind": "warmup",
+    "trial": 0,
+    "wall_s": 0.2971081249997951,
+    "metrics": {
+      "prompt_tokens": 15.0,
+      "reused": 0.0,
+      "fresh": 15.0,
+      "prefill_ms": 178.0,
+      "prefill_tps": 84.1,
+      "generated": 2.0,
+      "decode_ms": 105.0,
+      "decode_tps": 19.1
+    },
+    "usage": {
+      "prompt_tokens": 15,
+      "completion_tokens": 2,
+      "total_tokens": 17,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "stop",
+    "message": {
+      "role": "assistant",
+      "content": "READY"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "fresh",
+    "trial": 1,
+    "wall_s": 16.55735054903198,
+    "metrics": {
+      "prompt_tokens": 4210.0,
+      "reused": 0.0,
+      "fresh": 4210.0,
+      "prefill_ms": 11580.0,
+      "prefill_tps": 363.6,
+      "generated": 128.0,
+      "decode_ms": 4973.0,
+      "decode_tps": 25.7
+    },
+    "usage": {
+      "prompt_tokens": 4210,
+      "completion_tokens": 128,
+      "total_tokens": 4338,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The source code defines a series of exported functions named `rule0` through `rule139`, each following an identical structural pattern where the function name's numeric suffix corresponds to a specific integer constant $n$. Each function accepts a single argument `x` and employs a strict equality check (`===`) to determine if the input matches its associated constant $n$; if the condition is true, the function returns the sum of the input and $n+1$, whereas if the condition is false, it returns the difference between the input and $n$. Consequently, every function acts as a conditional arithmetic operator that either increments the input by"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "followup",
+    "trial": 1,
+    "wall_s": 5.395328339014668,
+    "metrics": {
+      "prompt_tokens": 4451.0,
+      "reused": 4338.0,
+      "fresh": 113.0,
+      "prefill_ms": 1269.0,
+      "prefill_tps": 89.1,
+      "generated": 128.0,
+      "decode_ms": 4122.0,
+      "decode_tps": 31.1
+    },
+    "usage": {
+      "prompt_tokens": 4451,
+      "completion_tokens": 128,
+      "total_tokens": 4579,
+      "prompt_tokens_details": {
+        "cached_tokens": 4338
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the **exact match** of the function's specific constant (e.g., `rule0(0)`, `rule1(1)`), which triggers the \"true\" branch (`x + n + 1`) rather than the default subtraction. This is critical because it distinguishes the function's identity from its generic behavior; for example, `rule0(0)` returns `1` (not `0`), and `rule5(5)` returns `11` (not `0`).\n\nThe **smallest useful regression test** should verify this exact-match behavior for a non-zero case"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "fresh",
+    "trial": 2,
+    "wall_s": 10.440450654015876,
+    "metrics": {
+      "prompt_tokens": 8830.0,
+      "reused": 0.0,
+      "fresh": 8830.0,
+      "prefill_ms": 6928.0,
+      "prefill_tps": 1274.6,
+      "generated": 128.0,
+      "decode_ms": 3507.0,
+      "decode_tps": 36.5
+    },
+    "usage": {
+      "prompt_tokens": 8830,
+      "completion_tokens": 128,
+      "total_tokens": 8958,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "This source code defines a series of exported functions named `rule0` through `rule279`, each accepting a single numeric argument `x`. Every function follows an identical logical pattern: it checks if the input `x` is strictly equal to the integer value embedded in its name (e.g., `rule5` checks for 5). If this equality condition is met, the function returns the result of adding one more than that specific index to `x` (i.e., `x + (index + 1)`); otherwise, it returns the result of subtracting that specific index from `x` (i.e.,"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "followup",
+    "trial": 2,
+    "wall_s": 3.776925030979328,
+    "metrics": {
+      "prompt_tokens": 9071.0,
+      "reused": 8823.0,
+      "fresh": 248.0,
+      "prefill_ms": 539.0,
+      "prefill_tps": 460.5,
+      "generated": 128.0,
+      "decode_ms": 3234.0,
+      "decode_tps": 39.6
+    },
+    "usage": {
+      "prompt_tokens": 9071,
+      "completion_tokens": 128,
+      "total_tokens": 9199,
+      "prompt_tokens_details": {
+        "cached_tokens": 8823
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the **exact match condition** where `x` equals the function's index (e.g., `rule0(0)` or `rule279(279)`), because this triggers the unique \"addition\" branch (`x + index + 1`) rather than the default \"subtraction\" branch (`x - index`). This is critical because it represents the only scenario where the function returns a value *greater* than the input, whereas all other inputs result in a smaller value.\n\nThe **smallest useful regression test** should verify this boundary behavior for both the lowest and highest defined"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "fresh",
+    "trial": 3,
+    "wall_s": 5.457179825985804,
+    "metrics": {
+      "prompt_tokens": 4210.0,
+      "reused": 0.0,
+      "fresh": 4210.0,
+      "prefill_ms": 3538.0,
+      "prefill_tps": 1190.0,
+      "generated": 128.0,
+      "decode_ms": 1915.0,
+      "decode_tps": 66.8
+    },
+    "usage": {
+      "prompt_tokens": 4210,
+      "completion_tokens": 128,
+      "total_tokens": 4338,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The source code defines a series of exported functions named `rule0` through `rule139`, each accepting a single numeric argument `x`. Every function follows an identical logical pattern: it checks if the input `x` is strictly equal to the integer value embedded in its name (e.g., `rule5` checks for `5`). If this equality condition is met, the function returns the result of adding one more than that specific index to `x` (i.e., `x + (index + 1)`); otherwise, it returns the result of subtracting that same index from `x` (i.e.,"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "followup",
+    "trial": 3,
+    "wall_s": 2.781350238015875,
+    "metrics": {
+      "prompt_tokens": 4451.0,
+      "reused": 4203.0,
+      "fresh": 248.0,
+      "prefill_ms": 481.0,
+      "prefill_tps": 515.4,
+      "generated": 128.0,
+      "decode_ms": 2296.0,
+      "decode_tps": 55.7
+    },
+    "usage": {
+      "prompt_tokens": 4451,
+      "completion_tokens": 128,
+      "total_tokens": 4579,
+      "prompt_tokens_details": {
+        "cached_tokens": 4203
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the specific integer value that matches the function's name (e.g., `x === 0` for `rule0`, `x === 139` for `rule139`), because this triggers the unique \"addition\" branch (`x + index + 1`) rather than the default \"subtraction\" branch (`x - index`). For example, calling `rule0(0)` returns `1` (since `0 + 1 = 1`), whereas calling `rule0(-5)` returns `-5` (since `-5 - 0 = -5`)."
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "fresh",
+    "trial": 4,
+    "wall_s": 9.105376839987002,
+    "metrics": {
+      "prompt_tokens": 8830.0,
+      "reused": 0.0,
+      "fresh": 8830.0,
+      "prefill_ms": 6717.0,
+      "prefill_tps": 1314.6,
+      "generated": 128.0,
+      "decode_ms": 2382.0,
+      "decode_tps": 53.7
+    },
+    "usage": {
+      "prompt_tokens": 8830,
+      "completion_tokens": 128,
+      "total_tokens": 8958,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "This source code defines a series of exported functions named `rule0` through `rule279`, each accepting a single numeric argument `x`. Every function follows an identical logical pattern: it checks if the input `x` is strictly equal to the integer value embedded in its name (e.g., `rule5` checks for 5). If this equality condition is met, the function returns the result of adding one more than that specific index to `x` (effectively returning `2 * index + 1`); if the condition fails, it returns `x` minus the index value. Consequently, each function acts as"
+    }
+  },
+  {
+    "label": "ab026-c",
+    "kind": "followup",
+    "trial": 4,
+    "wall_s": 2.605316227010917,
+    "metrics": {
+      "prompt_tokens": 9071.0,
+      "reused": 8823.0,
+      "fresh": 248.0,
+      "prefill_ms": 563.0,
+      "prefill_tps": 440.5,
+      "generated": 128.0,
+      "decode_ms": 2038.0,
+      "decode_tps": 62.8
+    },
+    "usage": {
+      "prompt_tokens": 9071,
+      "completion_tokens": 128,
+      "total_tokens": 9199,
+      "prompt_tokens_details": {
+        "cached_tokens": 8823
+      }
+    },
+    "finish_reason": "length",
+    "message": {
+      "role": "assistant",
+      "content": "The most relevant boundary case is the **exact match condition** where `x` equals the function's index (e.g., `rule0(0)` or `rule279(279)`), because this triggers the unique \"addition\" branch (`x + index + 1`) rather than the default \"subtraction\" branch (`x - index`). This is critical because it represents the only scenario where the function returns a value *greater* than the input, whereas all other inputs result in a smaller value.\n\nThe **smallest useful regression test** should verify this boundary behavior for at least one representative function ("
+    }
+  }
+]
